@@ -1,0 +1,16 @@
+{
+  "name": "idlefill",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Run background AI work on the local LLM server only when it has been idle.",
+  "type": "module",
+  "workspaces": [
+    "server",
+    "client",
+    "adapters/career-ops"
+  ],
+  "scripts": {
+    "test": "npm test --workspaces --if-present",
+    "build": "npm run build --workspaces --if-present"
+  }
+}
