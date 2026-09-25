@@ -49,6 +49,12 @@ trap 'rm -rf "$WORK"' EXIT
 URZA_HOME="$(ssh "$URZA" 'printf %s "$HOME"')"
 REMOTE_HOME="${IDLEFILL_REMOTE_DIR:-$URZA_HOME/idlefill}"
 
+# The image runs as non-root appuser (uid 10001), but the host state dir and
+# config file are owned by the deploying user with 0700/0600 — appuser gets
+# EACCES on the first state write. Run the container AS that host uid (this is
+# how the pre-script container was launched; state.json is uid-1000-owned).
+URZA_UID_GID="$(ssh "$URZA" 'printf %s:%s "$(id -u)" "$(id -g)"')"
+
 # --- config: token + URL from the Mac's client config (gitignored) ---------
 CLIENT_CFG="$REPO_ROOT/client/config.json"
 [ -f "$CLIENT_CFG" ] || { echo "missing $CLIENT_CFG (need server_url + token)" >&2; exit 1; }
@@ -105,12 +111,13 @@ REMOTE
 # --- swap: stop/rm/run ------------------------------------------------------
 PREV="$(ssh "$URZA" "docker inspect -f '{{.Config.Image}}' $CONTAINER 2>/dev/null || true")"
 echo "==> swapping container (previous image: ${PREV:-none})"
-ssh "$URZA" "bash -s" "$REMOTE_HOME" "$TAG" "$CONTAINER" <<'REMOTE'
+ssh "$URZA" "bash -s" "$REMOTE_HOME" "$TAG" "$CONTAINER" "$URZA_UID_GID" <<'REMOTE'
 set -euo pipefail
-REMOTE_HOME="$1"; TAG="$2"; CONTAINER="$3"
+REMOTE_HOME="$1"; TAG="$2"; CONTAINER="$3"; UID_GID="$4"
 docker stop "$CONTAINER" >/dev/null 2>&1 || true
 docker rm "$CONTAINER" >/dev/null 2>&1 || true
 docker run -d --name "$CONTAINER" --restart unless-stopped --network host \
+  --user "$UID_GID" \
   -v "$REMOTE_HOME/data:/data" \
   -v "$REMOTE_HOME/config.json:/app/config.json:ro" \
   -e IDLEFILL_STATE=/data/state.json \
@@ -140,14 +147,15 @@ if [ "$ok" -ne 1 ]; then
   # against ANY previous image generation. (Config read on URZA, base64'd —
   # the raw JSON must never pass through shell expansion.)
   CFG_B64="$(ssh "$URZA" "base64 < '$REMOTE_HOME/config.json' | tr -d '\n'")"
-  ssh "$URZA" "bash -s" "$REMOTE_HOME" "$PREV" "$CONTAINER" "$CFG_B64" <<'REMOTE'
+  ssh "$URZA" "bash -s" "$REMOTE_HOME" "$PREV" "$CONTAINER" "$CFG_B64" "$URZA_UID_GID" <<'REMOTE'
 set -euo pipefail
-REMOTE_HOME="$1"; PREV="$2"; CONTAINER="$3"; CFG_B64="$4"
+REMOTE_HOME="$1"; PREV="$2"; CONTAINER="$3"; CFG_B64="$4"; UID_GID="$5"
 docker stop "$CONTAINER" >/dev/null 2>&1 || true
 docker rm "$CONTAINER" >/dev/null 2>&1 || true
 [ -n "$PREV" ] || { echo "no previous image to roll back to" >&2; exit 1; }
 CONFIG_JSON="$(echo "$CFG_B64" | base64 -d)"
 docker run -d --name "$CONTAINER" --restart unless-stopped --network host \
+  --user "$UID_GID" \
   -v "$REMOTE_HOME/data:/data" \
   -e "IDLEFILL_CONFIG=$CONFIG_JSON" \
   -e IDLEFILL_STATE=/data/state.json \
