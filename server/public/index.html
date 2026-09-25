@@ -45,19 +45,38 @@
     margin: 0 0 8px; font-size: 11px; text-transform: uppercase;
     letter-spacing: 1px; color: var(--dim); font-weight: 600;
   }
-  section h2 .sub { text-transform: none; letter-spacing: 0; }
-  .sec-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
-  .sec-head h2 { margin: 0; flex: 1 1 auto; min-width: 120px; }
-  .sec-head select {
+  /* Logs — fixed bottom tray (dock). Slim bar when collapsed; the body
+     slides up above the bar when expanded. */
+  body { padding-bottom: 40px; } /* keep the footer clear of the tray bar */
+  #logs-tray {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
+    background: var(--panel); border-top: 1px solid var(--border);
+  }
+  .tray-head { display: flex; align-items: center; gap: 10px; padding: 5px 16px; }
+  #logs-toggle {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: none; border: none; padding: 2px 4px; cursor: pointer;
+    color: var(--text); font: inherit; font-size: 11px; font-weight: 600;
+    letter-spacing: 1px; text-transform: uppercase;
+  }
+  #logs-toggle .chev { display: inline-block; transition: transform 0.15s ease; font-size: 13px; }
+  #logs-tray.expanded #logs-toggle .chev { transform: rotate(180deg); }
+  .tray-head .tabs { display: flex; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
+  .tray-head .tabs button {
+    background: var(--bg); border: none; color: var(--dim);
+    font: inherit; font-size: 11px; padding: 2px 10px; cursor: pointer;
+  }
+  .tray-head .tabs button.active { color: var(--text); background: var(--panel); }
+  .tray-head select {
     background: var(--bg); color: var(--text); border: 1px solid var(--border);
     border-radius: 4px; font: inherit; font-size: 11px; padding: 2px 4px;
   }
-  .sec-head label.tgl {
-    display: inline-flex; align-items: center; gap: 5px; cursor: pointer;
-    color: var(--dim); font-size: 11px; user-select: none;
+  .tray-count { margin-left: auto; }
+  .tray-body {
+    display: none; max-height: 45vh; overflow: auto;
+    padding: 10px 16px 12px; border-top: 1px solid var(--border); background: var(--bg);
   }
-  .sec-head label.tgl input { accent-color: var(--accent); margin: 0; }
-  table.collapse { display: none; }
+  #logs-tray.expanded .tray-body { display: block; }
   .kv { display: flex; justify-content: space-between; padding: 2px 0; }
   .kv .k { color: var(--dim); }
   .big { font-size: 22px; }
@@ -113,40 +132,41 @@
     <div id="projects"><div class="empty">none configured</div></div>
   </section>
 
-  <section style="grid-column: 1 / -1;">
-    <div class="sec-head">
-      <h2>Recent events</h2>
-      <select id="events-limit" title="records to show" aria-label="records to show">
-        <option value="10" selected>10</option>
-        <option value="25">25</option>
-        <option value="50">50</option>
-        <option value="100">100</option>
-      </select>
-      <label class="tgl" title="toggle table"><input type="checkbox" id="events-collapsed" checked>hide</label>
-    </div>
-    <table class="collapse">
-      <thead><tr><th>time</th><th>kind</th><th>project</th><th>detail</th></tr></thead>
-      <tbody id="events"><tr><td colspan="4" class="empty">no events yet</td></tr></tbody>
-    </table>
-  </section>
-
-  <section style="grid-column: 1 / -1;">
-    <div class="sec-head">
-      <h2>Leases <span class="sub">(active + last N terminal)</span></h2>
-      <select id="leases-limit" title="records to show" aria-label="records to show">
-        <option value="10" selected>10</option>
-        <option value="25">25</option>
-        <option value="50">50</option>
-        <option value="100">100</option>
-      </select>
-      <label class="tgl" title="toggle table"><input type="checkbox" id="leases-collapsed" checked>hide</label>
-    </div>
-    <table class="collapse">
-      <thead><tr><th>lease</th><th>client</th><th>project</th><th>job</th><th>state</th><th>granted</th><th>age</th><th>ttl left</th><th>tokens out</th><th>reason</th></tr></thead>
-      <tbody id="leases"><tr><td colspan="10" class="empty">no leases yet</td></tr></tbody>
-    </table>
-  </section>
 </main>
+
+<!-- Logs — events + leases in one bottom tray (tabs: Events / Leases). -->
+<div id="logs-tray">
+  <div class="tray-body" id="logs-body">
+    <div id="pane-events">
+      <table>
+        <thead><tr><th>time</th><th>kind</th><th>project</th><th>detail</th></tr></thead>
+        <tbody id="events"><tr><td colspan="4" class="empty">no events yet</td></tr></tbody>
+      </table>
+    </div>
+    <div id="pane-leases" style="display:none">
+      <table>
+        <thead><tr><th>lease</th><th>client</th><th>project</th><th>job</th><th>state</th><th>granted</th><th>age</th><th>ttl left</th><th>tokens out</th><th>reason</th></tr></thead>
+        <tbody id="leases"><tr><td colspan="10" class="empty">no leases yet</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+  <div class="tray-head">
+    <button id="logs-toggle" type="button" title="expand / collapse logs">
+      <span class="chev">&#9650;</span>logs
+    </button>
+    <div class="tabs" role="tablist">
+      <button id="tab-events" type="button" class="active" role="tab" aria-selected="true">Events</button>
+      <button id="tab-leases" type="button" role="tab" aria-selected="false">Leases</button>
+    </div>
+    <select id="logs-limit" title="records to show" aria-label="records to show">
+      <option value="10" selected>10</option>
+      <option value="25">25</option>
+      <option value="50">50</option>
+      <option value="100">100</option>
+    </select>
+    <span class="sub tray-count" id="logs-count">—</span>
+  </div>
+</div>
 
 <footer>
   phase 1: dashboard is unauthenticated read-only on a LAN/tailnet port — acceptable by design;
@@ -174,7 +194,7 @@ function esc(x) {
 }
 
 async function refresh() {
-  const limit = $("events-limit").value;
+  const limit = $("logs-limit").value;
   let st;
   try {
     const res = await fetch("/api/state?limit=" + encodeURIComponent(limit), { cache: "no-store" });
@@ -274,6 +294,7 @@ async function refresh() {
       return "<tr><td>" + t + "Z</td><td class=\"accent\">" + esc(e.kind) + "</td><td>" + esc(e.project ?? "") + "</td><td>" + esc(e.detail ?? "") + "</td></tr>";
     }).join("");
   }
+  $("logs-count").textContent = "events " + st.events.length + " · leases " + st.leases.length;
 
   // leases table
   const lt = $("leases");
@@ -302,27 +323,34 @@ async function refresh() {
 refresh();
 setInterval(refresh, 5000);
 
-// shared records-to-show combo (events + leases stay in sync; one window
-// size drives both tables via /api/state?limit=)
-const limitSels = Array.from(document.querySelectorAll("select[id$='-limit']"));
-limitSels.forEach((sel) =>
-  sel.addEventListener("change", () => {
-    limitSels.forEach((o) => { if (o !== sel && o.value !== sel.value) o.value = sel.value; });
-    refresh();
-  })
-);
-// collapse toggles (collapsed by default; persist the operator's choice)
-[["events-collapsed", "idlefill.eventsCollapsed"], ["leases-collapsed", "idlefill.leasesCollapsed"]].forEach(
-  ([id, key]) => {
-    const cb = $(id);
-    const tbl = cb.closest("section").querySelector("table");
-    const collapsed = () => cb.checked;
-    const apply = () => tbl.classList.toggle("collapse", collapsed());
-    try { cb.checked = localStorage.getItem(key) !== "0"; } catch { cb.checked = true; }
-    cb.addEventListener("change", () => { apply(); try { localStorage.setItem(key, collapsed() ? "1" : "0"); } catch {} });
-    apply();
-  }
-);
+// Logs tray: expand/collapse toggle (bottom dock; collapsed by default,
+// persisted), Events/Leases tabs, and the shared records-to-show combo.
+const tray = $("logs-tray");
+const logsToggle = $("logs-toggle");
+function setTray(expanded) {
+  tray.classList.toggle("expanded", expanded);
+  try { localStorage.setItem("idlefill.logsExpanded", expanded ? "1" : "0"); } catch {}
+}
+try { setTray(localStorage.getItem("idlefill.logsExpanded") === "1"); } catch {}
+logsToggle.addEventListener("click", () => setTray(!tray.classList.contains("expanded")));
+[["tab-events", "pane-events"], ["tab-leases", "pane-leases"]].forEach(([tabId, paneId]) => {
+  const tab = $(tabId);
+  tab.addEventListener("click", () => {
+    ["tab-events", "tab-leases"].forEach((id) => {
+      const on = id === tabId;
+      $(id).classList.toggle("active", on);
+      $(id).setAttribute("aria-selected", on ? "true" : "false");
+    });
+    $("pane-events").style.display = tabId === "tab-events" ? "" : "none";
+    $("pane-leases").style.display = tabId === "tab-leases" ? "" : "none";
+    try { localStorage.setItem("idlefill.logsTab", tabId); } catch {}
+  });
+});
+try {
+  const savedTab = localStorage.getItem("idlefill.logsTab");
+  if (savedTab === "tab-leases") $("tab-leases").click();
+} catch {}
+$("logs-limit").addEventListener("change", () => refresh());
 </script>
 </body>
 </html>
