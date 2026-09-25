@@ -202,11 +202,19 @@ async function refresh() {
   if (st.clients.length === 0) {
     cbox.innerHTML = '<div class="empty">none registered</div>';
   } else {
-    cbox.innerHTML = "<table><thead><tr><th>name</th><th>id</th><th>ip</th><th>registered</th></tr></thead><tbody>" +
-      st.clients.map((c) =>
-        "<tr><td>" + esc(c.name) + "</td><td>" + esc(c.client_id) + "</td><td>" + esc(c.ip) +
-        "</td><td>" + ago(st.now - new Date(c.registered_at).getTime()) + "</td></tr>"
-      ).join("") + "</tbody></table>";
+    cbox.innerHTML = "<table><thead><tr><th>name</th><th>id</th><th>ip</th><th>state</th><th>registered</th></tr></thead><tbody>" +
+      st.clients.map((c) => {
+        const ov = c.override;
+        let badge = '<span class="tag" style="color:var(--dim)">active</span>';
+        if (ov && ov.override === 'pause') {
+          badge = '<span class="tag" style="color:var(--err);border-color:var(--err)">paused</span>';
+        } else if (ov && ov.override === 'force') {
+          const until = ov.until != null ? new Date(ov.until).toISOString().slice(11, 16) + 'Z' : null;
+          badge = '<span class="tag" style="color:var(--warn);border-color:var(--warn)" title="may run despite idle gate">' + 'forced' + (until ? '→' + until : '') + '</span>';
+        }
+        return "<tr><td>" + esc(c.name) + "</td><td>" + esc(c.client_id) + "</td><td>" + esc(c.ip) +
+        "</td><td>" + badge + "</td><td>" + ago(st.now - new Date(c.registered_at).getTime()) + "</td></tr>";
+      }).join("") + "</tbody></table>";
   }
 
   // projects

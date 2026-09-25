@@ -3,6 +3,11 @@
  * 127.0.0.1 port implementing the minimal arbiter API surface the client
  * uses, plus a WS endpoint that can push `revoked` events. No network
  * access — everything is loopback.
+ *
+ * `override` steers the client-pause/force behavior: it is what
+ * GET /api/state reports in clients[].override, and the
+ * /api/clients/:id/override route updates it (so tests can drive the
+ * daemon the same way the real control script does).
  */
 
 import http from 'node:http';
@@ -24,6 +29,10 @@ export interface FakeArbiter {
   usageReports: UsageReport[];
   /** Currently active lease ids (mirrors what GET /api/state reports). */
   activeLeases: string[];
+  /** Operator override reported in GET /api/state clients[] (null = none). */
+  override: { override: string; until: number | null } | null;
+  /** Steer the override directly (the POST /api/clients/:id/override route does this too). */
+  setOverride(kind: 'pause' | 'force' | null, until?: number): void;
   grant(leaseId: string): void;
   revoke(leaseId: string, reason: string): void;
   nextLeaseId(): string;
@@ -33,6 +42,7 @@ export interface FakeArbiter {
 export function startFakeArbiter(): Promise<FakeArbiter> {
   const state = {
     idle: true,
+    override: null as { override: string; until: number | null } | null,
     leaseRequests: [] as { project: string; job_id: string; client_id: string }[],
     usageReports: [] as UsageReport[],
     activeLeases: [] as string[],
@@ -61,11 +71,18 @@ export function startFakeArbiter(): Promise<FakeArbiter> {
       if (req.method === 'POST' && url.pathname === '/api/clients/register') {
         return send(200, { client_id: 'c-test', created: true });
       }
+      const ov = url.pathname.match(/^\/api\/clients\/[^/]+\/override$/);
+      if (req.method === 'POST' && ov) {
+        const kind = j.override === null ? null : String(j.override);
+        state.override = kind === null ? null : { override: kind, until: typeof j.until === 'number' ? j.until : null };
+        return send(200, { ok: true, client: 'test-client', override: state.override });
+      }
       if (req.method === 'GET' && url.pathname === '/api/state') {
         return send(200, {
           now: Date.now(),
           idle: { idle: state.idle, degraded: false, reidle_gated: false },
           active_leases: state.activeLeases.map((id) => ({ lease_id: id })),
+          clients: [{ client_id: 'c-test', name: 'test-client', ip: '100.94.165.102', override: state.override }],
         });
       }
       if (req.method === 'POST' && url.pathname === '/api/leases') {
@@ -105,6 +122,12 @@ export function startFakeArbiter(): Promise<FakeArbiter> {
         },
         set idle(v: boolean) {
           state.idle = v;
+        },
+        get override() {
+          return state.override;
+        },
+        setOverride(kind: 'pause' | 'force' | null, until?: number) {
+          state.override = kind === null ? null : { override: kind, until: until ?? null };
         },
         leaseRequests: state.leaseRequests,
         usageReports: state.usageReports,

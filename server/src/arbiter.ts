@@ -33,7 +33,7 @@ import type { IdleDetector } from './idle.js';
 import { activeLeaseExemptIps } from './idle.js';
 import type { IdleSignal } from './types.js';
 import type { StateStore } from './state.js';
-import type { Lease, ProjectConfig, ServerConfig, UtcDate } from './types.js';
+import type { ClientOverride, Lease, ProjectConfig, ServerConfig, UtcDate } from './types.js';
 
 export type LeaseRejectionReason =
   | 'not_idle'
@@ -41,7 +41,8 @@ export type LeaseRejectionReason =
   | 'project_paused'
   | 'budget_exhausted'
   | 'unknown_project'
-  | 'unknown_client';
+  | 'unknown_client'
+  | 'client_paused';
 
 export interface LeaseGrantResult {
   ok: boolean;
@@ -105,6 +106,72 @@ export class Arbiter {
   }
 
   // ------------------------------------------------------------------
+  // Client overrides (pause / force)
+  // ------------------------------------------------------------------
+
+  /**
+   * The override that is in force for a client at `now`, or null:
+   *   - no override stored
+   *   - override expired (until !== null && now >= until)
+   *   - client no longer registered (defensive; tick trims these)
+   */
+  activeOverride(clientId: string, now?: number): ClientOverride | null {
+    const n = now ?? Date.now();
+    const o = this.store.state.overrides[clientId];
+    if (!o) return null;
+    if (o.until !== null && n >= o.until) return null;
+    if (!this.store.state.clients.some((c) => c.client_id === clientId)) return null;
+    return o;
+  }
+
+  /**
+   * Set (replace) or clear (override: null) the override for a client,
+   * addressed by name or client_id. Persists + records an event.
+   */
+  setClientOverride(
+    ref: string,
+    override: 'pause' | 'force' | null,
+    until?: number,
+  ): { ok: boolean; reason?: string; override?: ClientOverride | null; client_name?: string } {
+    const s = this.store.state;
+    const client = s.clients.find((c) => c.client_id === ref || c.name === ref);
+    if (!client) return { ok: false, reason: 'unknown_client' };
+    if (override !== null && until !== undefined) {
+      const n = Date.now();
+      if (!Number.isFinite(until) || until <= n) return { ok: false, reason: 'until_must_be_in_the_future' };
+    }
+
+    if (override === null) {
+      const had = s.overrides[client.client_id];
+      delete s.overrides[client.client_id];
+      if (had) {
+        this.store.appendEvent({
+          kind: 'client_override_cleared',
+          detail: `${client.name}: ${had.override} cleared`,
+        });
+      }
+      this.store.trim();
+      this.store.save();
+      return { ok: true, override: null, client_name: client.name };
+    }
+
+    const o: ClientOverride = {
+      client_id: client.client_id,
+      override,
+      until: until ?? null,
+      set_at: Date.now(),
+    };
+    s.overrides[client.client_id] = o;
+    this.store.appendEvent({
+      kind: override === 'pause' ? 'client_paused' : 'client_forced',
+      detail: `${client.name}${o.until ? ` (until ${new Date(o.until).toISOString().slice(11, 16)}Z)` : ''}`,
+    });
+    this.store.trim();
+    this.store.save();
+    return { ok: true, override: o, client_name: client.name };
+  }
+
+  // ------------------------------------------------------------------
   // Grants
   // ------------------------------------------------------------------
 
@@ -123,13 +190,33 @@ export class Arbiter {
     if (!client) return { ok: false, reason: 'unknown_client' };
 
     const sig = params.signal ?? this.detector.signal(now);
+
+    // A 'pause' override is a hard stop for that client — it is reported
+    // preferentially (before idle/busy) so the operator's decision is the
+    // reason a denied lease gets. It does not touch an already-active lease
+    // (the client is mid-run; revocation is driven by idle/preempt/TTL only).
+    if (this.activeOverride(params.client_id, now)?.override === 'pause') {
+      return { ok: false, reason: 'client_paused' };
+    }
+
     // `sig.idle` is false while degraded (detector invariant), so this single
     // check enforces both "system idle" and "no grants while degraded".
-    if (!sig.idle) return { ok: false, reason: 'not_idle' };
-    // Post-revocation reidle rule: after any revocation, require a fresh full
-    // idle before the next grant (a regrant in the same poll would let a burst
-    // of backfill follow a preempt).
-    if (this.reidleAfter !== null) return { ok: false, reason: 'not_idle' };
+    // An active 'force' override bypasses ONLY the idle verdict and the
+    // post-revocation reidle gate — never a degraded signal, because a
+    // degraded signal means the activity data itself is unreliable and a
+    // forced grant on stale data is exactly the interactive-traffic
+    // collision the arbiter exists to prevent.
+    const forced = this.activeOverride(params.client_id, now)?.override === 'force';
+    if (!forced) {
+      if (!sig.idle) return { ok: false, reason: 'not_idle' };
+      // Post-revocation reidle rule: after any revocation, require a fresh
+      // full idle before the next grant (a regrant in the same poll would let
+      // a burst of backfill follow a preempt).
+      if (this.reidleAfter !== null) return { ok: false, reason: 'not_idle' };
+    } else if (sig.signal_degraded) {
+      // Force ≠ "grant on stale data": degraded still blocks (see above).
+      return { ok: false, reason: 'not_idle' };
+    }
 
     const active = this.activeLeases(now);
     if (active.length >= this.cfg.max_concurrent_leases) return { ok: false, reason: 'busy' };
@@ -207,6 +294,15 @@ export class Arbiter {
           revoked.push({ lease, reason: 'preempted' });
         }
       }
+    }
+
+    // Sweep client overrides: drop expired ones (now >= until) and orphans
+    // (client no longer registered) so state stays clean between writes.
+    for (const [cid, o] of Object.entries(s.overrides)) {
+      const gone =
+        !s.clients.some((c) => c.client_id === cid) ||
+        (o.until !== null && nowMs >= o.until);
+      if (gone) delete s.overrides[cid];
     }
 
     // Reidle bookkeeping: any revocation (preempt or TTL) arms the gate;

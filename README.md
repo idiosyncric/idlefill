@@ -119,6 +119,33 @@ data/       gitignored; queue.jsonl, results.jsonl land here
   to `/api/state` *does* carry a token, a bad one is rejected (401). Phase 2
   adds traefik's `middleware-local-ip-range` in front.
 
+## Operator overrides (pause / force clients)
+
+Per-client, operator-set, persisted in the state file, surfaced on the
+dashboard (Clients panel) and in `GET /api/state` (`clients[].override`):
+
+| Override | Effect |
+|---|---|
+| `pause` | The arbiter refuses **new** leases for that client (reason `client_paused`). A lease already running is NOT revoked — revocation stays driven by idle/preempt/TTL. The client daemon also stops asking for work while paused. |
+| `force` | The arbiter grants the client a lease even while the box is **not idle** (bypasses the idle verdict and the post-revocation reidle gate). It does **not** bypass: a degraded signal (activity data unreliable ⇒ never grant), `max_concurrent_leases`, project pause, or the daily budget. The client daemon requests work while forced. |
+
+Overrides optionally carry an `until` (epoch ms) and auto-expire; expired or
+orphaned entries are swept on each arbiter tick.
+
+```bash
+# token is read at runtime from the gitignored client/server config —
+# it never appears on a command line
+node scripts/idlefill-control.mjs clients
+node scripts/idlefill-control.mjs pause  <name-or-id> [--for 30m]
+node scripts/idlefill-control.mjs force  <name-or-id> [--for 30m]
+node scripts/idlefill-control.mjs clear  <name-or-id>
+```
+
+HTTP equivalent (token-authed): `POST /api/clients/:ref/override` with body
+`{"override":"pause"|"force"|null, "until":<epoch_ms>}` — `null` clears.
+The dashboard is read-only by design (phase 1); drive overrides via the
+script or curl.
+
 ## Conventions
 
 See `AGENTS.md`. Short version: Node 22, ESM, `node --test` (run via tsx for

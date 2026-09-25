@@ -8,6 +8,8 @@
  *   - queue is the source of truth: a failed (non-zero exit) job does NOT
  *     leave the queue and does NOT append a result
  *   - busy arbiter (idle=false) → no lease request is even made
+ *   - client-pause override → the daemon stops requesting leases
+ *   - force override → the daemon requests a lease while the box is busy
  */
 
 import { test, after, before } from 'node:test';
@@ -165,4 +167,56 @@ test('busy arbiter: no lease request is made', async () => {
   await d.stop();
   assert.equal(arb.leaseRequests.length, before, 'while busy, the client must not ask for leases');
   assert.equal(readQueueLines().length, 1);
+});
+
+test('client-pause override: daemon stops requesting leases', async () => {
+  cfg.projects = [
+    {
+      name: 'test-proj',
+      queue_file: queueFile,
+      results_file: resultsFile,
+      model: 'm',
+      executor: `${nodeBin} ${join(here, 'fixtures', 'sleep-exec.mjs')} {payload_file} {result_file}`,
+    },
+  ];
+  mkQueue([{ id: 'job-5' }]);
+  arb.idle = true; // box idle, but…
+  arb.setOverride('pause'); // …the operator paused THIS client.
+  const d = makeDaemon();
+  await d.start();
+  const before = arb.leaseRequests.length;
+  await new Promise((r) => setTimeout(r, 300));
+  await d.stop();
+  assert.equal(arb.leaseRequests.length, before, 'a paused client must not ask for leases even when idle');
+  arb.setOverride(null);
+});
+
+test('force override: daemon requests a lease while the box is busy', async () => {
+  cfg.projects = [
+    {
+      name: 'test-proj',
+      queue_file: queueFile,
+      results_file: resultsFile,
+      model: 'm',
+      executor: `${nodeBin} ${join(here, 'fixtures', 'sleep-exec.mjs')} {payload_file} {result_file}`,
+    },
+  ];
+  mkQueue([{ id: 'job-6' }]);
+  arb.idle = false; // box busy —
+  arb.setOverride('force'); // — but the operator forced this client through.
+  const d = makeDaemon();
+  await d.start();
+  const before = arb.leaseRequests.length;
+  const deadline = Date.now() + 3000;
+  let requested = false;
+  while (Date.now() < deadline) {
+    if (arb.leaseRequests.length > before) {
+      requested = true;
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  await d.stop();
+  assert.ok(requested, 'force ⇒ the daemon asks for a lease despite a busy box (server is the final arbiter)');
+  arb.setOverride(null);
 });

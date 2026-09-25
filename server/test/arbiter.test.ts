@@ -10,6 +10,9 @@
  *   - TTL revocation
  *   - preempt revocation on foreign activity + the "must re-idle before
  *     re-grant" rule
+ *   - client overrides: pause blocks new grants (active lease untouched);
+ *     force grants while busy / behind the reidle gate; force NEVER grants
+ *     while degraded; `until` auto-expiry + the tick sweep
  */
 
 import { test } from 'node:test';
@@ -257,5 +260,167 @@ test('degraded feed: no grants, no preempts', async () => {
   assert.equal(revoked.length, 0, 'degraded ⇒ never preempt on stale signals');
   const r = grant(h, T0 + 61_000, 'b');
   assert.equal(r.ok, false, 'degraded ⇒ no grants');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// Client overrides (pause / force)
+// ---------------------------------------------------------------------------
+
+test('pause override: new grants refused (client_paused), active lease untouched', () => {
+  const h = makeHarness();
+  h.det.entries = mkEntries([400]);
+  const g = grant(h, T0, 'a');
+  assert.equal(g.ok, true);
+
+  const set = h.arbiter.setClientOverride(h.client.client_id, 'pause');
+  assert.equal(set.ok, true);
+  assert.equal(h.arbiter.activeOverride(h.client.client_id, T0)?.override, 'pause');
+
+  // A second job for the SAME paused client is refused…
+  const paused = grant(h, T0 + 1000, 'b');
+  assert.equal(paused.ok, false);
+  assert.equal(paused.reason, 'client_paused', `expected client_paused, got ${JSON.stringify(paused)}`);
+
+  // …but the lease already running for the paused client keeps running.
+  assert.equal(h.arbiter.activeLeases(T0 + 1000).length, 1, 'pause does not revoke a running lease');
+
+  // A DIFFERENT client is unaffected by the pause.
+  h.arbiter.registerClient('other', '10.0.0.5', '127.0.0.1');
+  const otherClient = h.store.state.clients[1]!;
+  h.arbiter.finishLease({ lease_id: g.lease!.lease_id, ok: true, now: T0 + 2000 });
+  const g2 = h.arbiter.requestLease({ client_id: otherClient.client_id, project: 'career-ops', job_id: 'c', estimated_seconds: 10, now: T0 + 3000 });
+  assert.equal(g2.ok, true, 'unpaused client still gets a grant');
+
+  // Clear → the paused client can be granted again.
+  const clear = h.arbiter.setClientOverride('mac', null); // addressed by NAME
+  assert.equal(clear.ok, true);
+  assert.equal(h.arbiter.activeOverride(h.client.client_id, T0 + 4000), null);
+  h.arbiter.finishLease({ lease_id: g2.lease!.lease_id, ok: true, now: T0 + 4000 });
+  const g3 = grant(h, T0 + 5000, 'd');
+  assert.equal(g3.ok, true, 'cleared override ⇒ grants resume');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('force override: grants while the box is busy', () => {
+  const h = makeHarness({ maxLeases: 1 });
+  // Fresh activity → NOT idle.
+  h.det.entries = mkEntries([5], 'ip:10.0.0.9', Date.now());
+  const detNow = Date.now();
+  h.det.entries = mkEntries([5], 'ip:10.0.0.9', detNow);
+
+  // No override: busy box refuses.
+  const refused = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'x', estimated_seconds: 10, now: detNow });
+  assert.equal(refused.ok, false);
+  assert.equal(refused.reason, 'not_idle');
+
+  // Force: same busy box now grants.
+  h.arbiter.setClientOverride(h.client.client_id, 'force');
+  const forced = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'x', estimated_seconds: 10, now: detNow + 1000 });
+  assert.equal(forced.ok, true, `force grants despite busy box, got ${JSON.stringify(forced)}`);
+  assert.equal(h.arbiter.activeLeases(detNow + 1000).length, 1);
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('force override: grants behind the post-revocation reidle gate', async () => {
+  const h = makeHarness({ ttl: 3600 });
+  h.det.entries = mkEntries([400]);
+  const g = grant(h, T0, 'a');
+  assert.equal(g.ok, true);
+
+  // External activity lands → preempt → reidle gate arms.
+  h.det.entries = [...mkEntries([3], 'ip:10.0.0.9', T0 + 5_000), ...h.det.entries];
+  const { revoked } = await h.arbiter.tick(T0 + 5_000);
+  assert.equal(revoked.length, 1);
+  const plain = grant(h, T0 + 6_000, 'b');
+  assert.equal(plain.ok, false, 'reidle gate blocks a normal grant');
+
+  // Force slips through the gate even while still not idle.
+  h.arbiter.setClientOverride(h.client.client_id, 'force');
+  const forced = grant(h, T0 + 6_000, 'c');
+  assert.equal(forced.ok, true, `force bypasses the reidle gate, got ${JSON.stringify(forced)}`);
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('force override does NOT grant while the signal is degraded', () => {
+  const h = makeHarness();
+  h.det.entries = mkEntries([400]);
+  h.det.fail = true; // feed down ⇒ degraded ⇒ idle=false with stale data
+  h.arbiter.setClientOverride(h.client.client_id, 'force');
+  const r = grant(h, T0, 'a');
+  assert.equal(r.ok, false, 'degraded ⇒ no grants, even forced');
+  assert.equal(r.reason, 'not_idle');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('force still honors busy (max concurrent) and project pause', () => {
+  const h = makeHarness({ maxLeases: 1 });
+  h.det.entries = mkEntries([400]);
+  h.arbiter.setClientOverride(h.client.client_id, 'force');
+  const g1 = grant(h, T0, 'a');
+  assert.equal(g1.ok, true);
+  const g2 = grant(h, T0 + 1000, 'b');
+  assert.equal(g2.ok, false);
+  assert.equal(g2.reason, 'busy', 'force does not bypass max_concurrent_leases');
+
+  // Free the slot, then check the project check (busy is evaluated first).
+  h.arbiter.finishLease({ lease_id: g1.lease!.lease_id, ok: true, now: T0 + 2000 });
+  const g3 = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'paused-proj', job_id: 'c', estimated_seconds: 10, now: T0 + 2000 });
+  assert.equal(g3.ok, false);
+  assert.equal(g3.reason, 'project_paused', 'force does not bypass a paused project');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('override `until` auto-expires (grant time + tick sweep)', async () => {
+  const h = makeHarness();
+  // `until` is validated against the REAL clock (setClientOverride uses
+  // Date.now()), so anchor the whole test to real time and drive the
+  // detector entries to match.
+  const realNow = Date.now();
+  const until = realNow + 10_000; // future ⇒ accepted
+  const before = realNow + 1_000; // < until ⇒ override still active
+  const after = realNow + 20_000; // > until ⇒ expired
+
+  h.det.entries = mkEntries([400], 'ip:10.0.0.9', before);
+  const set = h.arbiter.setClientOverride(h.client.client_id, 'pause', until);
+  assert.equal(set.ok, true);
+  assert.equal(h.arbiter.activeOverride(h.client.client_id, before)?.override, 'pause', 'active before `until`');
+
+  // Before expiry: refused (the reason is client_paused, not not_idle).
+  const blocked = grant(h, before, 'a');
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.reason, 'client_paused');
+
+  // After expiry: granted.
+  h.det.entries = mkEntries([400], 'ip:10.0.0.9', after);
+  const afterGrant = grant(h, after, 'b');
+  assert.equal(afterGrant.ok, true, `expired override no longer blocks, got ${JSON.stringify(afterGrant)}`);
+
+  // The tick sweep drops the expired entry from state entirely.
+  h.arbiter.finishLease({ lease_id: afterGrant.lease!.lease_id, ok: true, now: after + 1_000 });
+  h.det.entries = mkEntries([400], 'ip:10.0.0.9', after + 10_000);
+  await h.arbiter.tick(after + 10_000);
+  assert.equal(h.store.state.overrides[h.client.client_id], undefined, 'expired override swept from state');
+
+  // And setClientOverride rejects a non-future `until`.
+  const bad = h.arbiter.setClientOverride(h.client.client_id, 'pause', Date.now() - 1000);
+  assert.equal(bad.ok, false);
+  assert.equal(bad.reason, 'until_must_be_in_the_future');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('setClientOverride: unknown client rejected; idempotent re-registration keeps the override', () => {
+  const h = makeHarness();
+  const bad = h.arbiter.setClientOverride('c-nope', 'force');
+  assert.equal(bad.ok, false);
+  assert.equal(bad.reason, 'unknown_client');
+  const byName = h.arbiter.setClientOverride('mac', 'force');
+  assert.equal(byName.ok, true, 'addressable by name');
+
+  // Simulate a restart: the client re-registers under the SAME name.
+  // (Idempotent register keeps the same id → the override survives on purpose.)
+  const re = h.arbiter.registerClient('mac', '100.94.165.102', '127.0.0.1');
+  assert.equal(re.created, false);
+  assert.equal(h.arbiter.activeOverride(h.client.client_id)?.override, 'force', 'idempotent re-register keeps the same client_id ⇒ override persists');
   rmSync(h.dir, { recursive: true, force: true });
 });

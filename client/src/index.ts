@@ -364,6 +364,7 @@ export class ClientDaemon {
     const { status, body } = await api<{
       idle: { idle: boolean; degraded: boolean; reidle_gated: boolean };
       active_leases: { lease_id: string }[];
+      clients?: { client_id: string; override?: { override: string } | null }[];
     }>(this.cfg, 'GET', '/api/state');
     if (status !== 200) {
       this.log.info(`state poll HTTP ${status}`);
@@ -379,8 +380,18 @@ export class ClientDaemon {
 
     if (this.activeLease) return; // busy: the executor loop owns the flow
 
-    // Only ask for work when the arbiter says it is idle.
-    if (!st.idle.idle || st.idle.degraded || st.idle.reidle_gated) return;
+    // A client-pause override stops the daemon asking for work (server-side,
+    // a paused client gets client_paused anyway — this just avoids the spam).
+    const me = st.clients?.find((c) => c.client_id === this.clientId);
+    if (me?.override?.override === 'pause') return;
+
+    // Only ask for work when the arbiter says it is idle — unless the operator
+    // has forced THIS client to run anyway (force bypasses the idle verdict and
+    // the reidle gate on the server too; degraded signal, busy, project pause,
+    // and daily budget still block there).
+    if (st.idle.degraded) return;
+    const forced = me?.override?.override === 'force';
+    if (!forced && (!st.idle.idle || st.idle.reidle_gated)) return;
 
     const job = await this.claimNextJob();
     if (!job) {

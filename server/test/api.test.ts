@@ -105,6 +105,7 @@ after(async () => {
 test('bad token is rejected on every API route (401)', async () => {
   for (const [method, path] of [
     ['POST', '/api/clients/register'],
+    ['POST', '/api/clients/mac-test/override'],
     ['POST', '/api/leases'],
     ['GET', '/api/leases'],
     ['POST', '/api/leases/l-x/usage'],
@@ -246,6 +247,104 @@ test('/api/state shape', async () => {
   assert.equal(typeof proj.budget_today.tokens_out, 'number');
   assert.ok('cap' in proj.budget_today);
   assert.ok((st.clients as unknown[]).length >= 1, 'registered client visible');
+  const clientRow = (st.clients as { name: string; override: unknown }[]).find((c) => c.name === 'mac-test')!;
+  assert.ok('override' in clientRow, 'client rows carry their (active or null) override');
+});
+
+test('client override: pause blocks new grants (client_paused); clear restores', async () => {
+  // Make the feed fresh (busy) so the only question is the client's override.
+  entries.length = 0;
+  entries.push(...mkEntries([5], 'ip:10.0.0.9', Date.now()));
+  await det.poll(Date.now(), new Set());
+
+  const setRes = await fetch(`${base}/api/clients/mac-test/override`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ override: 'pause' }),
+  });
+  assert.equal(setRes.status, 200);
+  const setBody = (await setRes.json()) as { ok: boolean; client: string; override: { override: string } };
+  assert.equal(setBody.ok, true);
+  assert.equal(setBody.client, 'mac-test');
+
+  // /api/state exposes the override on the client row.
+  const st1 = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: { name: string; override: { override: string } | null }[];
+  };
+  assert.equal(st1.clients.find((c) => c.name === 'mac-test')!.override?.override, 'pause');
+
+  // A paused client's lease request → 409 client_paused.
+  const res = await fetch(`${base}/api/leases`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ client_id: clientId, project: 'career-ops', job_id: 'y' }),
+  });
+  assert.equal(res.status, 409);
+  assert.equal(((await res.json()) as { reason: string }).reason, 'client_paused');
+
+  // Clear (override: null) → state shows null again.
+  const clearRes = await fetch(`${base}/api/clients/mac-test/override`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ override: null }),
+  });
+  assert.equal(clearRes.status, 200);
+  const st2 = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: { name: string; override: { override: string } | null }[];
+  };
+  assert.equal(st2.clients.find((c) => c.name === 'mac-test')!.override, null);
+});
+
+test('client override: force grants while the box is busy; 404/400 validation', async () => {
+  // Feed is fresh (busy) from the previous test; re-anchor just in case.
+  entries.length = 0;
+  entries.push(...mkEntries([5], 'ip:10.0.0.9', Date.now()));
+  await det.poll(Date.now(), new Set());
+
+  const setRes = await fetch(`${base}/api/clients/mac-test/override`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ override: 'force' }),
+  });
+  assert.equal(setRes.status, 200);
+
+  // Forced client gets a lease despite the busy box.
+  const res = await fetch(`${base}/api/leases`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ client_id: clientId, project: 'career-ops', job_id: 'forced-job' }),
+  });
+  assert.equal(res.status, 201, `force grants a lease despite a busy box, got ${await res.clone().text()}`);
+  const leaseBody = (await res.json()) as { lease_id: string };
+
+  // Tidy up: finish the forced lease + clear the override so later tests
+  // see a clean slate.
+  const use = await fetch(`${base}/api/leases/${leaseBody.lease_id}/usage`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ ok: true, tokens_out: 100 }),
+  });
+  assert.equal(use.status, 200);
+  const clear = await fetch(`${base}/api/clients/mac-test/override`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ override: null }),
+  });
+  assert.equal(clear.status, 200);
+
+  // Unknown client → 404; invalid override → 400.
+  const bad = await fetch(`${base}/api/clients/nope/override`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ override: 'pause' }),
+  });
+  assert.equal(bad.status, 404);
+  const bad2 = await fetch(`${base}/api/clients/mac-test/override`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ override: 'banana' }),
+  });
+  assert.equal(bad2.status, 400);
 });
 
 test('WS handshake: good token connects, bad token is 401', async () => {

@@ -20,6 +20,7 @@ export interface StateStoreOpts {
 export function emptyState(): ArbiterState {
   return {
     clients: [],
+    overrides: {},
     leases: [],
     budgets: {},
     events: [],
@@ -53,6 +54,8 @@ export class StateStore {
         ...base,
         ...raw,
         clients: Array.isArray(raw.clients) ? raw.clients : base.clients,
+        // Tolerate state files from before client overrides existed.
+        overrides: raw.overrides && typeof raw.overrides === 'object' ? raw.overrides : base.overrides,
         leases: Array.isArray(raw.leases) ? raw.leases : base.leases,
         budgets: raw.budgets && typeof raw.budgets === 'object' ? raw.budgets : base.budgets,
         events: Array.isArray(raw.events) ? raw.events : base.events,

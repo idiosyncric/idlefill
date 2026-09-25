@@ -74,6 +74,25 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     return reply.code(200).send({ client_id: res.client_id, created: res.created });
   });
 
+  /**
+   * Operator override for a client: { override: "pause" | "force" | null,
+   * until?: epoch_ms }. `null` clears it. `until` (future) makes it auto-expire.
+   * Addressed by client name or client_id. 404 for an unknown client.
+   */
+  app.post('/api/clients/:ref/override', async (req, reply) => {
+    const ref = decodeURIComponent((req.params as { ref: string }).ref);
+    const body = (req.body ?? {}) as { override?: 'pause' | 'force' | null; until?: number };
+    if (!ref.trim()) return reply.code(400).send({ error: 'client reference required' });
+    const ov = body.override;
+    if (ov !== 'pause' && ov !== 'force' && ov !== null) {
+      return reply.code(400).send({ error: 'override must be "pause", "force", or null (clear)' });
+    }
+    const until = typeof body.until === 'number' && Number.isFinite(body.until) ? body.until : undefined;
+    const res = arbiter.setClientOverride(ref.trim(), ov, until);
+    if (!res.ok) return reply.code(404).send({ error: res.reason ?? 'unknown_client' });
+    return { ok: true, client: res.client_name, override: res.override ?? null };
+  });
+
   // ------------------------------------------------------------------
   // Leases
   // ------------------------------------------------------------------
@@ -186,7 +205,9 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       },
       leases: arbiter.recentLeases(50),
       active_leases: active,
-      clients: s.clients,
+      // Client rows carry their active operator override (if any), so the
+      // dashboard and clients can see pause/force state without a second call.
+      clients: s.clients.map((c) => ({ ...c, override: arbiter.activeOverride(c.client_id, now) })),
       projects: cfg.projects.map((p) => ({ ...p, budget_today: arbiter.projectBudget(p.name, day) })),
       events: s.events.slice(s.events.length > 50 ? s.events.length - 50 : 0).reverse(),
     };

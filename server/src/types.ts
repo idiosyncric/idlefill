@@ -35,6 +35,28 @@ export interface ClientRecord {
   registered_at: string;
 }
 
+/**
+ * Operator override for a client (set via POST /api/clients/:id/override).
+ *
+ *   - 'pause' : refuse NEW lease grants for this client (active leases are
+ *               not revoked — pausing a client does not tear down running
+ *               work).
+ *   - 'force' : allow NEW lease grants for this client even when the system
+ *               is not idle (bypasses the idle verdict and the post-revocation
+ *               reidle gate). Deliberately does NOT bypass: degraded signal
+ *               (no reliable activity data ⇒ never grant), the
+ *               max-concurrent limit, project pause, or the daily budget.
+ *
+ * `until: null` means the override stays until cleared; otherwise it expires
+ * when now >= until (checked at grant time, trimmed on each tick).
+ */
+export interface ClientOverride {
+  client_id: string;
+  override: 'pause' | 'force';
+  until: number | null;
+  set_at: number;
+}
+
 export type LeaseStatus = 'active' | 'finished' | 'revoked' | 'expired';
 
 export interface Lease {
@@ -102,7 +124,10 @@ export type EventKind =
   | 'project_paused'
   | 'project_resumed'
   | 'signal_degraded'
-  | 'signal_recovered';
+  | 'signal_recovered'
+  | 'client_paused'
+  | 'client_forced'
+  | 'client_override_cleared';
 
 export interface EventRecord {
   ts: number;
@@ -114,6 +139,13 @@ export interface EventRecord {
 
 export interface ArbiterState {
   clients: ClientRecord[];
+  /**
+   * Operator overrides (pause/force), keyed by client_id. A client that
+   * unregisters is re-registered under the SAME name with a NEW client_id,
+   * so an override never "sticks" to a different client — and the orphaned
+   * entry is trimmed on the next tick (client not found).
+   */
+  overrides: Record<string, ClientOverride>;
   leases: Lease[];
   /** Project name -> UTC date -> usage. */
   budgets: Record<string, Record<UtcDate, BudgetEntry>>;
