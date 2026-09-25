@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>idlefill — arbiter</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --dim: #8b949e;
+    --ok: #3fb950;
+    --warn: #d29922;
+    --err: #f85149;
+    --accent: #58a6ff;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: var(--mono); font-size: 13px; line-height: 1.5;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 16px;
+    padding: 14px 20px; border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: 0.5px; }
+  header .sub { color: var(--dim); font-size: 12px; }
+  .status-pill {
+    margin-left: auto; padding: 2px 10px; border-radius: 10px;
+    border: 1px solid var(--border); font-size: 12px;
+  }
+  .status-pill.idle { color: var(--ok); border-color: var(--ok); }
+  .status-pill.busy { color: var(--warn); border-color: var(--warn); }
+  .status-pill.degraded { color: var(--err); border-color: var(--err); }
+  main { padding: 16px 20px; display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 14px; }
+  section {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; padding: 12px 14px;
+  }
+  section h2 {
+    margin: 0 0 8px; font-size: 11px; text-transform: uppercase;
+    letter-spacing: 1px; color: var(--dim); font-weight: 600;
+  }
+  .kv { display: flex; justify-content: space-between; padding: 2px 0; }
+  .kv .k { color: var(--dim); }
+  .big { font-size: 22px; }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .err { color: var(--err); } .accent { color: var(--accent); }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { text-align: left; color: var(--dim); font-weight: 600; padding: 3px 6px; border-bottom: 1px solid var(--border); }
+  td { padding: 3px 6px; border-bottom: 1px solid rgba(48,54,61,0.5); }
+  tr:last-child td { border-bottom: none; }
+  .tag { display: inline-block; padding: 0 6px; border-radius: 8px; font-size: 11px; border: 1px solid var(--border); }
+  .tag.active { color: var(--ok); border-color: var(--ok); }
+  .tag.finished { color: var(--accent); border-color: var(--accent); }
+  .tag.revoked, .tag.expired { color: var(--warn); border-color: var(--warn); }
+  .bar { height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; margin-top: 3px; }
+  .bar > div { height: 100%; background: var(--accent); }
+  .bar > div.hot { background: var(--warn); }
+  .empty { color: var(--dim); font-style: italic; padding: 6px 0; }
+  footer { padding: 10px 20px; color: var(--dim); font-size: 11px; border-top: 1px solid var(--border); margin-top: 10px; }
+  a { color: var(--accent); text-decoration: none; }
+  code { background: rgba(110,118,129,0.2); padding: 0 4px; border-radius: 3px; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>idlefill · arbiter</h1>
+  <span class="sub">background-work gate for the local LLM server</span>
+  <span class="status-pill busy" id="pill">…</span>
+</header>
+
+<main>
+  <section>
+    <h2>Idle signal</h2>
+    <div class="kv"><span class="k">now</span><span id="now">—</span></div>
+    <div class="kv"><span class="k">idle for</span><span class="big" id="idle-for">—</span></div>
+    <div class="kv"><span class="k">threshold</span><span id="threshold">—</span></div>
+    <div class="kv"><span class="k">last activity</span><span id="last-act">—</span></div>
+    <div class="kv"><span class="k">log mtime</span><span id="log-sig">—</span></div>
+    <div class="kv"><span class="k">signal health</span><span id="degraded">—</span></div>
+    <div class="kv"><span class="k">re-idle gate</span><span id="reidle">—</span></div>
+  </section>
+
+  <section>
+    <h2>Current lease</h2>
+    <div id="lease-box"><div class="empty">no active lease</div></div>
+  </section>
+
+  <section>
+    <h2>Clients</h2>
+    <div id="clients"><div class="empty">none registered</div></div>
+  </section>
+
+  <section>
+    <h2>Projects (today, UTC)</h2>
+    <div id="projects"><div class="empty">none configured</div></div>
+  </section>
+
+  <section style="grid-column: 1 / -1;">
+    <h2>Recent events <span class="sub">(last 50)</span></h2>
+    <table>
+      <thead><tr><th>time</th><th>kind</th><th>project</th><th>detail</th></tr></thead>
+      <tbody id="events"><tr><td colspan="4" class="empty">no events yet</td></tr></tbody>
+    </table>
+  </section>
+
+  <section style="grid-column: 1 / -1;">
+    <h2>Leases <span class="sub">(active + last 50 terminal)</span></h2>
+    <table>
+      <thead><tr><th>lease</th><th>client</th><th>project</th><th>job</th><th>state</th><th>granted</th><th>age</th><th>ttl left</th><th>tokens out</th><th>reason</th></tr></thead>
+      <tbody id="leases"><tr><td colspan="10" class="empty">no leases yet</td></tr></tbody>
+    </table>
+  </section>
+</main>
+
+<footer>
+  phase 1: dashboard is unauthenticated read-only on a LAN/tailnet port — acceptable by design;
+  phase 2 puts <code>middleware-local-ip-range</code> + basic-auth in front via traefik.
+  Auto-refreshes every 5s (<code>GET /api/state</code>).
+</footer>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+
+function ago(ms) {
+  if (ms === null || ms === undefined) return "—";
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return s + "s ago";
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + "m " + (s % 60) + "s ago";
+  const h = Math.floor(m / 60);
+  return h + "h " + (m % 60) + "m ago";
+}
+
+function esc(x) {
+  return String(x ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+async function refresh() {
+  let st;
+  try {
+    const res = await fetch("/api/state", { cache: "no-store" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    st = await res.json();
+  } catch (err) {
+    $("pill").textContent = "state unreachable";
+    $("pill").className = "status-pill degraded";
+    return;
+  }
+
+  const now = new Date(st.now);
+  $("now").textContent = now.toISOString().replace("T", " ").slice(0, 19) + "Z";
+  $("threshold").textContent = st.idle.idle_for_s === null ? "—" : (st.idle.degraded ? "degraded" : (st.idle.idle ? "IDLE" : "busy"));
+
+  // idle countdown
+  const ifor = st.idle.idle_for_s;
+  $("idle-for").textContent = ifor === null ? "unknown" : Math.floor(ifor / 60) + "m " + (ifor % 60) + "s";
+  $("idle-for").className = st.idle.idle ? "big ok" : "big warn";
+
+  const act = st.idle.last_activity;
+  $("last-act").textContent = act
+    ? ago(st.now - act.ts) + " · " + esc(act.model) + " · " + esc(act.src)
+    : "none seen";
+
+  $("log-sig").textContent = st.idle.last_log_write_age_s === null ? "disabled" : ago(st.now - (st.idle.last_log_write));
+
+  $("degraded").textContent = st.idle.degraded ? ("DEGRADED " + (st.idle.degraded_reason ?? "")) : "ok";
+  $("degraded").className = st.idle.degraded ? "err" : "ok";
+
+  $("reidle").textContent = st.idle.reidle_gated ? "armed (wait for full idle)" : "clear";
+  $("reidle").className = st.idle.reidle_gated ? "warn" : "ok";
+
+  const pill = $("pill");
+  if (st.idle.degraded) { pill.textContent = "signal degraded"; pill.className = "status-pill degraded"; }
+  else if (st.idle.idle) { pill.textContent = "idle — grants open"; pill.className = "status-pill idle"; }
+  else { pill.textContent = "busy — grants blocked"; pill.className = "status-pill busy"; }
+
+  // lease
+  const box = $("lease-box");
+  if (st.active_leases && st.active_leases.length > 0) {
+    const l = st.active_leases[0];
+    const ageS = Math.max(0, Math.floor((st.now - l.granted_at) / 1000));
+    const leftS = Math.max(0, Math.floor((l.expires_at - st.now) / 1000));
+    box.innerHTML =
+      '<div class="kv"><span class="k">project</span><span class="ok">' + esc(l.project) + "</span></div>" +
+      '<div class="kv"><span class="k">job</span><span>' + esc(l.job_id) + "</span></div>" +
+      '<div class="kv"><span class="k">client</span><span>' + esc(l.client_name) + "</span></div>" +
+      '<div class="kv"><span class="k">age</span><span>' + Math.floor(ageS / 60) + "m " + (ageS % 60) + "s</span></div>" +
+      '<div class="kv"><span class="k">ttl remaining</span><span class="' + (leftS < 120 ? "warn" : "ok") + '">' + Math.floor(leftS / 60) + "m " + (leftS % 60) + "s</span></div>";
+  } else {
+    box.innerHTML = '<div class="empty">no active lease</div>';
+  }
+
+  // clients
+  const cbox = $("clients");
+  if (st.clients.length === 0) {
+    cbox.innerHTML = '<div class="empty">none registered</div>';
+  } else {
+    cbox.innerHTML = "<table><thead><tr><th>name</th><th>id</th><th>ip</th><th>registered</th></tr></thead><tbody>" +
+      st.clients.map((c) =>
+        "<tr><td>" + esc(c.name) + "</td><td>" + esc(c.client_id) + "</td><td>" + esc(c.ip) +
+        "</td><td>" + ago(st.now - new Date(c.registered_at).getTime()) + "</td></tr>"
+      ).join("") + "</tbody></table>";
+  }
+
+  // projects
+  const pbox = $("projects");
+  if (!st.projects || st.projects.length === 0) {
+    pbox.innerHTML = '<div class="empty">none configured</div>';
+  } else {
+    pbox.innerHTML = st.projects.map((p) => {
+      const b = p.budget_today || { tokens_out: 0, tokens_in: 0, cap: 0 };
+      const pct = b.cap > 0 ? Math.min(100, (b.tokens_out / b.cap) * 100) : 0;
+      return '<div style="margin-bottom:8px">' +
+        '<div class="kv"><span class="k">' + esc(p.name) + (p.paused ? ' <span class="warn">[paused]</span>' : "") + "</span>" +
+        "<span>" + b.tokens_out.toLocaleString() + " / " + (b.cap === Number.MAX_SAFE_INTEGER ? "∞" : b.cap.toLocaleString()) + " out</span></div>" +
+        '<div class="bar"><div class="' + (pct > 80 ? "hot" : "") + '" style="width:' + pct.toFixed(1) + '%"></div></div></div>';
+    }).join("");
+  }
+
+  // events
+  const et = $("events");
+  if (!st.events || st.events.length === 0) {
+    et.innerHTML = '<tr><td colspan="4" class="empty">no events yet</td></tr>';
+  } else {
+    et.innerHTML = st.events.map((e) => {
+      const t = new Date(e.ts).toISOString().replace("T", " ").slice(11, 19);
+      return "<tr><td>" + t + "Z</td><td class=\"accent\">" + esc(e.kind) + "</td><td>" + esc(e.project ?? "") + "</td><td>" + esc(e.detail ?? "") + "</td></tr>";
+    }).join("");
+  }
+
+  // leases table
+  const lt = $("leases");
+  if (!st.leases || st.leases.length === 0) {
+    lt.innerHTML = '<tr><td colspan="10" class="empty">no leases yet</td></tr>';
+  } else {
+    lt.innerHTML = st.leases.map((l) => {
+      const ageS = Math.max(0, Math.floor((st.now - (l.ended_at ?? l.granted_at)) / 1000));
+      const ttlS = l.status === "active" ? Math.max(0, Math.floor((l.expires_at - st.now) / 1000)) : null;
+      return "<tr>" +
+        "<td>" + esc(l.lease_id) + "</td>" +
+        "<td>" + esc(l.client_name) + "</td>" +
+        "<td>" + esc(l.project) + "</td>" +
+        "<td>" + esc(l.job_id) + "</td>" +
+        '<td><span class="tag ' + esc(l.status) + '">' + esc(l.status) + "</span></td>" +
+        "<td>" + ago(st.now - l.granted_at) + "</td>" +
+        "<td>" + ageS + "s</td>" +
+        "<td>" + (ttlS === null ? "—" : ttlS + "s") + "</td>" +
+        "<td>" + l.tokens_out.toLocaleString() + "</td>" +
+        "<td>" + esc(l.end_reason ?? (l.partial ? "partial" : "")) + "</td>" +
+        "</tr>";
+    }).join("");
+  }
+}
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
