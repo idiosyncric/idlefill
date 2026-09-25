@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  idlefill client — PHASE 2 launchd agent (UNTESTED until deployed)
+
+  Installs to: ~/Library/LaunchAgents/com.sam.idlefill.client.plist
+  Config:      ~/Software/idlefill/client/config.json  (token + tailnet IP)
+
+  load:   launchctl load  ~/Library/LaunchAgents/com.sam.idlefill.client.plist
+  unload: launchctl unload ~/Library/LaunchAgents/com.sam.idlefill.client.plist
+  logs:   ~/Software/idlefill/client/logs/client.log
+
+  KeepAlive=true restarts the daemon on crash; the arbiter's TTL revokes any
+  lease the dead client held, so a crash cannot hold the LLM box hostage.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.sam.idlefill.client</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/npx</string>
+        <!-- npx resolves tsx from the repo's hoisted node_modules
+             (WorkingDirectory is inside the workspace) -->
+        <string>tsx</string>
+        <string>/Users/sam/Software/idlefill/client/src/index.ts</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/sam/Software/idlefill/client</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>NODE_ENV</key>
+        <string>production</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/sam/Software/idlefill/client/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/sam/Software/idlefill/client/logs/launchd.err.log</string>
+</dict>
+</plist>

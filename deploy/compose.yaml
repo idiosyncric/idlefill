@@ -1,0 +1,66 @@
+# idlefill — PHASE 2 deployment (UNTESTED until deployed)
+#
+# House conventions (mirroring the other urza compose files):
+#   - no published ports: traefik fronts the container (docker labels)
+#   - attaches to the t3-proxy network (traefik) AND the llama-swap_default
+#     network (to reach the LLM gateway directly at llama-swap:8080)
+#   - NInfer's request logs are ro-mounted so the arbiter's second idle
+#     signal (log mtime) works — the mount point must be readable by the
+#     non-root appuser (uid 10001)
+#   - state persists on a named volume
+#
+# Run from /mnt/docker/idlefill after `deploy.sh` copies the built image.
+
+name: idlefill
+
+services:
+  idlefill:
+    image: idlefill-server:dev
+    # Rebuild locally from the repo before `compose up`:
+    #   docker build -t idlefill-server:dev /mnt/docker/idlefill/server
+    container_name: idlefill
+    restart: unless-stopped
+    environment:
+      IDLEFILL_CONFIG: |
+        {
+          "listen": 8787,
+          "api_tokens": ["${IDLEFILL_API_TOKEN}"],
+          "llama_swap_url": "http://llama-swap:8080",
+          "activity_path": "/api/metrics/activity",
+          "log_glob": "/ninfer-logs/req-*.jsonl",
+          "idle_seconds": 300,
+          "poll_ms": 15000,
+          "lease_ttl_seconds": 1800,
+          "max_concurrent_leases": 1,
+          "projects": [
+            { "name": "career-ops", "paused": false, "daily_token_cap": 500000 }
+          ]
+        }
+      IDLEFILL_STATE: /data/state.json
+    volumes:
+      - idlefill-state:/data
+      # Read-only NInfer request logs (second idle signal).
+      # NOTE: ro-mount; if the host path's group/permissions block uid 10001,
+      # the arbiter degrades gracefully (log signal disabled, feed only).
+      - /mnt/docker/llama-swap/ninfer/logs:/ninfer-logs:ro
+    networks:
+      - t3-proxy
+      - llama-swap_default
+    labels:
+      # traefik (see deploy/traefik/idlefill.yml)
+      traefik.enable: "true"
+      traefik.http.routers.idlefill.rule: "Host(`idlefill.samwarth.com`)"
+      traefik.http.routers.idlefill.entrypoints: websecure
+      traefik.http.routers.idlefill.tls.certresolver: letsencrypt
+      traefik.http.routers.idlefill.middlewares: middleware-local-ip-range@docker,basic-auth@file
+      traefik.http.services.idlefill.loadbalancer.server.port: "8787"
+    # No ports published — traefik is the only way in.
+
+networks:
+  t3-proxy:
+    external: true
+  llama-swap_default:
+    external: true
+
+volumes:
+  idlefill-state:

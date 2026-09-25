@@ -1,0 +1,33 @@
+# idlefill — PHASE 2 traefik route (UNTESTED until deployed)
+#
+# House pattern (from /mnt/docker/traefik): the basic-auth middleware lives
+# in the docker-compose `file` providers; the IP-range middleware is the
+# shared `middleware-local-ip-range`. This file documents the EXACT route
+# that must be reachable; in the current house layout the equivalent labels
+# are set in compose.yaml (see there). If your traefik uses a static file
+# provider instead, drop this into /mnt/docker/traefik/dynamic/ and keep the
+# docker labels only for the service definition.
+#
+# Secrets: IDLEFILL_BASIC_AUTH is generated with:
+#   htpasswd -nb user "$(openssl rand -hex 16)"   (bcrypt)
+# and exported in /mnt/docker/idlefill/.env — never committed.
+
+http:
+  routers:
+    idlefill:
+      rule: "Host(`idlefill.samwarth.com`)"
+      entryPoints:
+        - websecure
+      tls:
+        certResolver: letsencrypt
+      middlewares:
+        - middleware-local-ip-range
+        - basic-auth@file
+
+  middlewares:
+    # (defined in the docker provider's .env / dynamic file — shown here for
+    # completeness of the phase-2 artifact)
+    basic-auth:
+      basicAuth:
+        users:
+          - "${IDLEFILL_BASIC_AUTH}"
