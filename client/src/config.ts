@@ -56,12 +56,22 @@ export function loadClientConfig(
   env: NodeJS.ProcessEnv = process.env,
 ): ClientConfig {
   const repoRoot = resolve(clientDir, '..');
+  // dev (tsx src/index.ts) vs packaged (dist/index.ts): the config lives in
+  // the client package dir, which is `clientDir` when running from dist and
+  // its PARENT when running the source directly. Check both.
+  const pkgDir = clientDir;
+  const srcParent = dirname(clientDir);
   let raw: Record<string, unknown> | null = null;
 
   if (env.IDLEFILL_CLIENT_CONFIG?.trim()) {
     raw = JSON.parse(env.IDLEFILL_CLIENT_CONFIG);
   } else {
-    for (const cand of [join(clientDir, 'config.json'), join(clientDir, 'config.client.json')]) {
+    for (const cand of [
+      join(pkgDir, 'config.json'),
+      join(pkgDir, 'config.client.json'),
+      join(srcParent, 'config.json'),
+      join(srcParent, 'config.client.json'),
+    ]) {
       if (existsSync(cand)) {
         raw = JSON.parse(readFileSync(cand, 'utf-8'));
         break;
