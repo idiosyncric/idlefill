@@ -1,0 +1,14 @@
+{
+  "listen": 8787,
+  "api_tokens": ["REPLACE_WITH_A_REAL_TOKEN"],
+  "llama_swap_url": "http://100.105.225.1:11434",
+  "activity_path": "/api/metrics/activity",
+  "log_glob": "",
+  "idle_seconds": 300,
+  "poll_ms": 15000,
+  "lease_ttl_seconds": 1800,
+  "max_concurrent_leases": 1,
+  "projects": [
+    { "name": "career-ops", "paused": false, "daily_token_cap": 500000 }
+  ]
+}

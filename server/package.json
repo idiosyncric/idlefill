@@ -1,0 +1,24 @@
+{
+  "name": "idlefill-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "idlefill arbiter: idle detection + lease state machine + dashboard",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "test": "tsx --test test/idle.test.ts test/arbiter.test.ts test/api.test.ts"
+  },
+  "dependencies": {
+    "fastify": "^5.4.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/ws": "^8.18.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0"
+  }
+}
