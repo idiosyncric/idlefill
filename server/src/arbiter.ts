@@ -1,0 +1,355 @@
+/**
+ * Arbiter — the lease state machine on top of the IdleDetector.
+ *
+ * States per lease: active → finished | revoked | expired.
+ *
+ * Grant (requestLease):
+ *   - system idle (detector verdict; the detector never reports idle while
+ *     degraded, so "no grants while degraded" falls out of the same check)
+ *   - active lease count < max_concurrent_leases
+ *   - project exists, not paused
+ *   - project's UTC-day output tokens < daily_token_cap
+ *   - no post-revocation reidle gate armed (see below)
+ *
+ * Revoke (on each idle poll):
+ *   - TTL expiry (status expired, reason ttl_expired)
+ *   - preempt: NOT idle, not degraded, and the newest NON-EXEMPT activity
+ *     entry post-dates the lease's grant. Exempt = the active leases'
+ *     owner IPs, so the lease holder's own traffic can never preempt it.
+ *
+ * After ANY revocation the system must go idle again (full idle_seconds)
+ * before the next grant: `reidleAfter` arms on revocation and disarms only
+ * when a later poll reports a full idle — no burst of re-grants.
+ *
+ * Usage accounting: the FIRST usage/finish report for a lease adds the
+ * reported tokens to the project's UTC-day counter (day = the report day);
+ * later reports keep the max on the lease record but never add again. A
+ * preempted lease's teardown report therefore still counts its partial
+ * tokens exactly once.
+ */
+
+import { randomBytes } from 'node:crypto';
+import type { IdleDetector } from './idle.js';
+import { activeLeaseExemptIps } from './idle.js';
+import type { IdleSignal } from './types.js';
+import type { StateStore } from './state.js';
+import type { Lease, ProjectConfig, ServerConfig, UtcDate } from './types.js';
+
+export type LeaseRejectionReason =
+  | 'not_idle'
+  | 'busy'
+  | 'project_paused'
+  | 'budget_exhausted'
+  | 'unknown_project'
+  | 'unknown_client';
+
+export interface LeaseGrantResult {
+  ok: boolean;
+  lease?: Lease;
+  reason?: LeaseRejectionReason;
+}
+
+export interface TickResult {
+  /** Leases revoked/expired this tick — push WS events for these. */
+  revoked: { lease: Lease; reason: string }[];
+  signal: IdleSignal;
+}
+
+export class Arbiter {
+  private readonly store: StateStore;
+  private readonly cfg: ServerConfig;
+  /** Armed after any revocation; disarmed by the next full-idle verdict. */
+  private reidleAfter: number | null = null;
+
+  constructor(store: StateStore, cfg: ServerConfig, private detector: IdleDetector) {
+    this.store = store;
+    this.cfg = cfg;
+  }
+
+  // ------------------------------------------------------------------
+  // Clients
+  // ------------------------------------------------------------------
+
+  /** Register (idempotent on name). Returns the client record. */
+  registerClient(
+    name: string,
+    reportedIp: string | undefined,
+    observedIp: string,
+  ): { client_id: string; created: boolean } {
+    const s = this.store.state;
+    const existing = s.clients.find((c) => c.name === name);
+    if (existing) {
+      if (reportedIp) existing.ip = reportedIp;
+      else if (!existing.ip) existing.ip = observedIp;
+      if (observedIp) existing.observed_ip = observedIp;
+      this.store.save();
+      return { client_id: existing.client_id, created: false };
+    }
+    const client_id = `c-${randomBytes(4).toString('hex')}`;
+    s.clients.push({
+      name,
+      client_id,
+      ip: reportedIp ?? observedIp,
+      observed_ip: observedIp,
+      registered_at: new Date().toISOString(),
+    });
+    this.store.appendEvent({ kind: 'client_registered', detail: `${name} (${client_id})` });
+    this.store.trim();
+    this.store.save();
+    return { client_id, created: true };
+  }
+
+  clientIp(clientId: string): string | null {
+    const c = this.store.state.clients.find((x) => x.client_id === clientId);
+    return c ? c.ip : null;
+  }
+
+  // ------------------------------------------------------------------
+  // Grants
+  // ------------------------------------------------------------------
+
+  requestLease(params: {
+    client_id: string;
+    project: string;
+    job_id: string;
+    estimated_seconds: number;
+    now?: number;
+    signal?: IdleSignal;
+  }): LeaseGrantResult {
+    const now = params.now ?? Date.now();
+    const s = this.store.state;
+
+    const client = s.clients.find((c) => c.client_id === params.client_id);
+    if (!client) return { ok: false, reason: 'unknown_client' };
+
+    const sig = params.signal ?? this.detector.signal(now);
+    // `sig.idle` is false while degraded (detector invariant), so this single
+    // check enforces both "system idle" and "no grants while degraded".
+    if (!sig.idle) return { ok: false, reason: 'not_idle' };
+    // Post-revocation reidle rule: after any revocation, require a fresh full
+    // idle before the next grant (a regrant in the same poll would let a burst
+    // of backfill follow a preempt).
+    if (this.reidleAfter !== null) return { ok: false, reason: 'not_idle' };
+
+    const active = this.activeLeases(now);
+    if (active.length >= this.cfg.max_concurrent_leases) return { ok: false, reason: 'busy' };
+
+    const project = this.cfg.projects.find((p) => p.name === params.project);
+    if (!project) return { ok: false, reason: 'unknown_project' };
+    if (project.paused) return { ok: false, reason: 'project_paused' };
+
+    const used = this.projectTokensOut(params.project, utcDay(now));
+    if (used >= project.daily_token_cap) return { ok: false, reason: 'budget_exhausted' };
+
+    const lease: Lease = {
+      lease_id: `l-${randomBytes(4).toString('hex')}`,
+      client_id: client.client_id,
+      client_name: client.name,
+      exempt_ip: client.ip,
+      project: project.name,
+      job_id: String(params.job_id ?? ''),
+      estimated_seconds: Math.max(0, params.estimated_seconds || 0),
+      status: 'active',
+      granted_at: now,
+      expires_at: now + this.cfg.lease_ttl_seconds * 1000,
+      tokens_out: 0,
+      tokens_in: 0,
+    };
+    s.leases.push(lease);
+    this.store.appendEvent({ kind: 'lease_granted', project: lease.project, lease_id: lease.lease_id, detail: `${client.name}: ${lease.job_id}` });
+    this.store.trim();
+    this.store.save();
+    return { ok: true, lease };
+  }
+
+  // ------------------------------------------------------------------
+  // Tick (called once per idle poll by the main loop)
+  // ------------------------------------------------------------------
+
+  async tick(now?: number): Promise<TickResult> {
+    const nowMs = now ?? Date.now();
+    const exempt = activeLeaseExemptIps(this.store.state.leases, nowMs);
+    const signal = await this.detector.poll(nowMs, exempt);
+
+    // Mirror the detector's degraded transition into state + events.
+    const s = this.store.state;
+    if (signal.signal_degraded !== s.signal_degraded) {
+      s.signal_degraded = signal.signal_degraded;
+      s.degraded_reason = signal.degraded_reason;
+      this.store.appendEvent({
+        kind: signal.signal_degraded ? 'signal_degraded' : 'signal_recovered',
+        detail: signal.degraded_reason ?? undefined,
+      });
+    }
+    s.last_activity = signal.last_activity;
+    s.last_log_write = signal.last_log_write;
+
+    const revoked: { lease: Lease; reason: string }[] = [];
+
+    for (const lease of s.leases) {
+      if (lease.status !== 'active') continue;
+
+      // 1. TTL expiry.
+      if (nowMs >= lease.expires_at) {
+        this.endLease(lease, 'expired', 'ttl_expired', nowMs);
+        revoked.push({ lease, reason: 'ttl_expired' });
+        continue;
+      }
+
+      // 2. Preempt: system is NOT idle because of FOREIGN (non-exempt)
+      //    activity that appeared after this lease was granted.
+      //    - degraded: don't judge from stale signals (skip).
+      //    - if idle: nothing preempts.
+      //    - a non-exempt entry OLDER than the grant (stale) does not revoke.
+      if (!signal.signal_degraded && !signal.idle && signal.last_activity) {
+        if (signal.last_activity.ts >= lease.granted_at) {
+          this.endLease(lease, 'revoked', 'preempted', nowMs);
+          revoked.push({ lease, reason: 'preempted' });
+        }
+      }
+    }
+
+    // Reidle bookkeeping: any revocation (preempt or TTL) arms the gate;
+    // a later full-idle verdict disarms it.
+    if (revoked.length > 0) {
+      this.reidleAfter = nowMs;
+    } else if (signal.idle && this.reidleAfter !== null) {
+      this.reidleAfter = null;
+    }
+
+    this.store.trim();
+    this.store.save();
+    return { revoked, signal };
+  }
+
+  /** True when a grant is currently blocked by the post-revocation reidle rule. */
+  reidleGated(): boolean {
+    return this.reidleAfter !== null;
+  }
+
+  // ------------------------------------------------------------------
+  // Finishing + usage
+  // ------------------------------------------------------------------
+
+  /**
+   * Finish a lease with reported usage.
+   *
+   * Idempotency is per-lease, not per-status: the FIRST usage report adds
+   * the reported tokens to the project's UTC-day counter (day of the
+   * report); repeated finishes keep the max on the lease record and add
+   * nothing (no double count). A preempted lease therefore counts its
+   * partial teardown report exactly once — at the moment the client sends
+   * it, which is the "client reports partial usage at teardown" path.
+   */
+  finishLease(params: {
+    lease_id: string;
+    tokens_out?: number;
+    tokens_in?: number;
+    ok: boolean;
+    error?: string;
+    now?: number;
+  }): { ok: boolean; reason?: string; lease?: Lease } {
+    const nowMs = params.now ?? Date.now();
+    const s = this.store.state;
+    const lease = s.leases.find((l) => l.lease_id === params.lease_id);
+    if (!lease) return { ok: false, reason: 'unknown_lease' };
+
+    const to = Math.max(0, params.tokens_out ?? 0);
+    const ti = Math.max(0, params.tokens_in ?? 0);
+
+    // Keep the max ever reported (duplicate/partial reports never shrink it).
+    lease.tokens_out = Math.max(lease.tokens_out, to);
+    lease.tokens_in = Math.max(lease.tokens_in, ti);
+    lease.partial = params.ok === false;
+
+    if (!lease.usage_counted) {
+      this.addBudget(lease.project, utcDay(nowMs), lease.tokens_out, lease.tokens_in);
+      lease.usage_counted = true;
+    }
+
+    if (lease.status === 'active') {
+      // First terminal transition.
+      lease.status = params.ok ? 'finished' : 'revoked';
+      if (!params.ok) lease.end_reason = params.error ?? 'failed';
+      lease.ended_at = nowMs;
+      this.store.appendEvent({
+        kind: 'lease_finished',
+        project: lease.project,
+        lease_id: lease.lease_id,
+        detail: `${lease.client_name}: ${lease.job_id} ok=${params.ok} out=${lease.tokens_out}${params.error ? ` err=${params.error}` : ''}`,
+      });
+    }
+    // (already terminal: usage recorded above; status/end_reason stay as-is)
+
+    this.store.trim();
+    this.store.save();
+    return { ok: true, lease };
+  }
+
+  // ------------------------------------------------------------------
+  // Projects
+  // ------------------------------------------------------------------
+
+  setProjectPaused(name: string, paused: boolean): { ok: boolean; reason?: string } {
+    const p = this.cfg.projects.find((x) => x.name === name);
+    if (!p) return { ok: false, reason: 'unknown_project' };
+    p.paused = paused;
+    this.store.appendEvent({ kind: paused ? 'project_paused' : 'project_resumed', project: name });
+    this.store.trim();
+    this.store.save();
+    return { ok: true };
+  }
+
+  // ------------------------------------------------------------------
+  // Queries
+  // ------------------------------------------------------------------
+
+  activeLeases(now?: number): Lease[] {
+    const n = now ?? Date.now();
+    return this.store.state.leases.filter((l) => l.status === 'active' && l.expires_at > n);
+  }
+
+  /** Active leases + the last `limit` finished/revoked/expired, newest last. */
+  recentLeases(limit = 50): Lease[] {
+    const active = this.activeLeases();
+    const terminal = this.store.state.leases.filter((l) => l.status !== 'active');
+    return [...terminal.slice(terminal.length > limit ? terminal.length - limit : 0), ...active];
+  }
+
+  /** Output tokens consumed by a project on a UTC day. */
+  projectTokensOut(project: string, day: UtcDate): number {
+    return this.store.state.budgets[project]?.[day]?.tokens_out ?? 0;
+  }
+
+  projectBudget(project: string, day: UtcDate) {
+    const e = this.store.state.budgets[project]?.[day] ?? { tokens_out: 0, tokens_in: 0 };
+    const cap = this.cfg.projects.find((p) => p.name === project)?.daily_token_cap ?? 0;
+    return { ...e, cap };
+  }
+
+  // ------------------------------------------------------------------
+
+  private addBudget(project: string, day: UtcDate, tokensOut: number, tokensIn: number): void {
+    const per = (this.store.state.budgets[project] ??= {});
+    const e = (per[day] ??= { tokens_out: 0, tokens_in: 0 });
+    e.tokens_out += tokensOut;
+    e.tokens_in += tokensIn;
+  }
+
+  private endLease(lease: Lease, status: 'revoked' | 'expired', reason: string, now: number): void {
+    lease.status = status;
+    lease.end_reason = reason;
+    lease.ended_at = now;
+    this.store.appendEvent({
+      kind: 'lease_revoked',
+      project: lease.project,
+      lease_id: lease.lease_id,
+      detail: `${lease.client_name}: ${reason} (job ${lease.job_id})`,
+    });
+  }
+}
+
+/** UTC day key for an epoch-ms timestamp: "2026-09-25". */
+export function utcDay(ms: number): UtcDate {
+  return new Date(ms).toISOString().slice(0, 10);
+}
