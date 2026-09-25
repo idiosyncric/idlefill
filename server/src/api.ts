@@ -32,7 +32,7 @@ export function isValidToken(cfg: ServerConfig, token: string | null | undefined
 }
 
 /**
- * Parse a `limit` query param (1..500, default 10) for history windows.
+ * Parse the `limit` query param (1..500, default 10) for history windows.
  * Tolerates both Fastify query shapes (parsed object or raw query string).
  */
 function queryLimit(req: { query: unknown }): number {
@@ -61,12 +61,16 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
 
   // --- auth guard for /api/* (except the documented public read paths) ---
   app.addHook('onRequest', async (req, reply) => {
+    // req.url carries the query string (e.g. "/api/state?limit=10") — strip it
+    // for the exact-path check, or the anonymous public read of /api/state
+    // would 401 the moment the dashboard appends ?limit=N.
+    const path = (req.url ?? '').split('?')[0];
     if (!req.raw.url?.startsWith('/api/')) return;
     const token = bearer(req);
     // Public read paths: none by design, EXCEPT /api/state when the caller
     // presents no token at all (anonymous dashboard poll). A wrong token on
     // ANY /api/* path is a 401.
-    const isAnonymousState = req.url === '/api/state' && req.method === 'GET' && token === null;
+    const isAnonymousState = path === '/api/state' && req.method === 'GET' && token === null;
     if (isAnonymousState) return;
     if (!isValidToken(cfg, token)) {
       await reply.code(401).send({ error: 'unauthorized', hint: 'present a valid token (Authorization: Bearer or ?token=)' });

@@ -129,6 +129,11 @@ test('bad token is rejected on every API route (401)', async () => {
 test('anonymous GET /api/state is the documented public read; wrong token is not', async () => {
   const anon = await fetch(`${base}/api/state`);
   assert.equal(anon.status, 200, 'anonymous state read is the phase-1 documented exception');
+  // The dashboard appends ?limit=N — with a query string the anonymous read
+  // must still be 200 (req.url carries the query; the exact-path check needs
+  // it stripped or the dashboard would silently go "state unreachable").
+  const anonQs = await fetch(`${base}/api/state?limit=5`);
+  assert.equal(anonQs.status, 200, 'anonymous /api/state?limit=N stays a public read');
   const bad = await fetch(`${base}/api/state`, { headers: { authorization: 'Bearer NOPE' } });
   assert.equal(bad.status, 401, 'but if a token IS presented, it must be a good one');
 });
