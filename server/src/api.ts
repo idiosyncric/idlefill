@@ -167,20 +167,22 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     const now = Date.now();
     const active = arbiter.activeLeases();
     const day = new Date().toISOString().slice(0, 10);
+    const sig = arbiter['detector'].signal(now);
     const lastAct = s.last_activity;
     const lastActAgo = lastAct ? Math.max(0, Math.round((now - lastAct.ts) / 1000)) : null;
 
     return {
       now,
       idle: {
-        idle: arbiter['detector'].signal(now).idle,
+        idle: sig.idle,
+        idle_seconds: cfg.idle_seconds,
         degraded: s.signal_degraded,
         degraded_reason: s.degraded_reason,
         reidle_gated: arbiter.reidleGated(),
         last_activity: lastAct ? { ...lastAct, age_s: lastActAgo } : null,
         last_log_write: s.last_log_write,
         last_log_write_age_s: s.last_log_write ? Math.max(0, Math.round((now - s.last_log_write) / 1000)) : null,
-        idle_for_s: arbiter['detector'].signal(now).idle_for_s,
+        idle_for_s: sig.idle_for_s,
       },
       leases: arbiter.recentLeases(50),
       active_leases: active,

@@ -156,7 +156,7 @@ async function refresh() {
 
   const now = new Date(st.now);
   $("now").textContent = now.toISOString().replace("T", " ").slice(0, 19) + "Z";
-  $("threshold").textContent = st.idle.idle_for_s === null ? "—" : (st.idle.degraded ? "degraded" : (st.idle.idle ? "IDLE" : "busy"));
+  $("threshold").textContent = st.idle.idle_seconds !== undefined ? st.idle.idle_seconds + "s quiet" : "—";
 
   // idle countdown
   const ifor = st.idle.idle_for_s;
