@@ -1,0 +1,10 @@
+{
+  "name": "idlefill-adapter-career-ops",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "idlefill adapter for the career-ops pipeline queue (read-only against career-ops)",
+  "scripts": {
+    "build-queue": "node queue.mjs"
+  }
+}
