@@ -1,0 +1,134 @@
+/**
+ * Fake arbiter for client tests: an in-process HTTP server on an ephemeral
+ * 127.0.0.1 port implementing the minimal arbiter API surface the client
+ * uses, plus a WS endpoint that can push `revoked` events. No network
+ * access — everything is loopback.
+ */
+
+import http from 'node:http';
+import { AddressInfo } from 'node:net';
+import { WebSocketServer, WebSocket } from 'ws';
+
+export interface UsageReport {
+  lease_id: string;
+  body: Record<string, unknown>;
+}
+
+export interface FakeArbiter {
+  url: string;
+  /** Flip idle/busy (drives the client's grant decisions). */
+  idle: boolean;
+  /** Leases the client has requested. */
+  leaseRequests: { project: string; job_id: string; client_id: string }[];
+  /** Usage/finish reports in order. */
+  usageReports: UsageReport[];
+  /** Currently active lease ids (mirrors what GET /api/state reports). */
+  activeLeases: string[];
+  grant(leaseId: string): void;
+  revoke(leaseId: string, reason: string): void;
+  nextLeaseId(): string;
+  close(): Promise<void>;
+}
+
+export function startFakeArbiter(): Promise<FakeArbiter> {
+  const state = {
+    idle: true,
+    leaseRequests: [] as { project: string; job_id: string; client_id: string }[],
+    usageReports: [] as UsageReport[],
+    activeLeases: [] as string[],
+    n: 0,
+    clients: new Set<WebSocket>(),
+  };
+
+  const wss = new WebSocketServer({ noServer: true });
+  wss.on('connection', (ws) => {
+    state.clients.add(ws);
+    ws.on('close', () => state.clients.delete(ws));
+    ws.on('error', () => {});
+  });
+
+  const server = http.createServer((req, res) => {
+    const send = (status: number, obj: unknown) => {
+      res.writeHead(status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(obj));
+    };
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      const url = new URL(req.url ?? '/', 'http://x');
+      const j = body ? JSON.parse(body) : {};
+
+      if (req.method === 'POST' && url.pathname === '/api/clients/register') {
+        return send(200, { client_id: 'c-test', created: true });
+      }
+      if (req.method === 'GET' && url.pathname === '/api/state') {
+        return send(200, {
+          now: Date.now(),
+          idle: { idle: state.idle, degraded: false, reidle_gated: false },
+          active_leases: state.activeLeases.map((id) => ({ lease_id: id })),
+        });
+      }
+      if (req.method === 'POST' && url.pathname === '/api/leases') {
+        state.leaseRequests.push({ project: j.project, job_id: j.job_id, client_id: j.client_id });
+        if (!state.idle) return send(409, { reason: 'not_idle' });
+        const lease_id = `l-fake-${++state.n}`;
+        state.activeLeases.push(lease_id);
+        return send(201, { lease_id, client_id: j.client_id, project: j.project, job_id: j.job_id, granted_at: Date.now(), expires_at: Date.now() + 1800_000, ttl_seconds: 1800 });
+      }
+      const m = url.pathname.match(/^\/api\/leases\/([^/]+)\/usage$/);
+      if (req.method === 'POST' && m) {
+        state.usageReports.push({ lease_id: m[1]!, body: j });
+        const id = m[1]!;
+        state.activeLeases = state.activeLeases.filter((x) => x !== id);
+        return send(200, { ok: true });
+      }
+      return send(404, { error: `no route ${req.method} ${url.pathname}` });
+    });
+  });
+
+  server.on('upgrade', (req, socket, head) => {
+    const url = new URL(req.url ?? '/', 'http://x');
+    if (url.pathname !== '/api/leases/events') {
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+  });
+
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      const port = (server.address() as AddressInfo).port;
+      resolve({
+        url: `http://127.0.0.1:${port}`,
+        get idle() {
+          return state.idle;
+        },
+        set idle(v: boolean) {
+          state.idle = v;
+        },
+        leaseRequests: state.leaseRequests,
+        usageReports: state.usageReports,
+        activeLeases: state.activeLeases,
+        grant(id) {
+          state.activeLeases.push(id);
+        },
+        revoke(id, reason) {
+          state.activeLeases = state.activeLeases.filter((x) => x !== id);
+          const msg = JSON.stringify({ type: 'revoked', lease_id: id, reason });
+          for (const ws of state.clients) {
+            if (ws.readyState === WebSocket.OPEN) ws.send(msg);
+          }
+        },
+        nextLeaseId() {
+          return `l-fake-${state.n + 1}`;
+        },
+        close: () =>
+          new Promise<void>((r) => {
+            for (const ws of state.clients) ws.terminate();
+            wss.close();
+            server.close(() => r());
+          }),
+      });
+    });
+  });
+}
