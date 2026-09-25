@@ -31,6 +31,19 @@ export function isValidToken(cfg: ServerConfig, token: string | null | undefined
   return cfg.api_tokens.includes(token);
 }
 
+/**
+ * Parse a `limit` query param (1..500, default 10) for history windows.
+ * Tolerates both Fastify query shapes (parsed object or raw query string).
+ */
+function queryLimit(req: { query: unknown }): number {
+  let v: unknown = null;
+  const q = req.query;
+  if (typeof q === 'string') v = new URLSearchParams(q).get('limit');
+  else if (q !== null && typeof q === 'object') v = (q as Record<string, unknown>).limit;
+  const n = typeof v === 'string' ? Number.parseInt(v, 10) : Number.NaN;
+  return Number.isInteger(n) && n >= 1 ? Math.min(500, n) : 10;
+}
+
 function bearer(req: { headers: Record<string, unknown>; query: unknown }): string | null {
   const h = req.headers['authorization'];
   if (typeof h === 'string' && h.toLowerCase().startsWith('bearer ')) return h.slice(7).trim();
@@ -189,6 +202,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     const sig = arbiter['detector'].signal(now);
     const lastAct = s.last_activity;
     const lastActAgo = lastAct ? Math.max(0, Math.round((now - lastAct.ts) / 1000)) : null;
+    const limit = queryLimit(req);
 
     return {
       now,
@@ -203,13 +217,13 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
         last_log_write_age_s: s.last_log_write ? Math.max(0, Math.round((now - s.last_log_write) / 1000)) : null,
         idle_for_s: sig.idle_for_s,
       },
-      leases: arbiter.recentLeases(50),
+      leases: arbiter.recentLeases(limit),
       active_leases: active,
       // Client rows carry their active operator override (if any), so the
       // dashboard and clients can see pause/force state without a second call.
       clients: s.clients.map((c) => ({ ...c, override: arbiter.activeOverride(c.client_id, now) })),
       projects: cfg.projects.map((p) => ({ ...p, budget_today: arbiter.projectBudget(p.name, day) })),
-      events: s.events.slice(s.events.length > 50 ? s.events.length - 50 : 0).reverse(),
+      events: s.events.slice(Math.max(0, s.events.length - limit)).reverse(),
     };
   });
 

@@ -45,6 +45,19 @@
     margin: 0 0 8px; font-size: 11px; text-transform: uppercase;
     letter-spacing: 1px; color: var(--dim); font-weight: 600;
   }
+  section h2 .sub { text-transform: none; letter-spacing: 0; }
+  .sec-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+  .sec-head h2 { margin: 0; flex: 1 1 auto; min-width: 120px; }
+  .sec-head select {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 4px; font: inherit; font-size: 11px; padding: 2px 4px;
+  }
+  .sec-head label.tgl {
+    display: inline-flex; align-items: center; gap: 5px; cursor: pointer;
+    color: var(--dim); font-size: 11px; user-select: none;
+  }
+  .sec-head label.tgl input { accent-color: var(--accent); margin: 0; }
+  .collapse table { display: none; }
   .kv { display: flex; justify-content: space-between; padding: 2px 0; }
   .kv .k { color: var(--dim); }
   .big { font-size: 22px; }
@@ -101,16 +114,34 @@
   </section>
 
   <section style="grid-column: 1 / -1;">
-    <h2>Recent events <span class="sub">(last 50)</span></h2>
-    <table>
+    <div class="sec-head">
+      <h2>Recent events</h2>
+      <select id="events-limit" title="records to show" aria-label="records to show">
+        <option value="10" selected>10</option>
+        <option value="25">25</option>
+        <option value="50">50</option>
+        <option value="100">100</option>
+      </select>
+      <label class="tgl" title="toggle table"><input type="checkbox" id="events-collapsed" checked>hide</label>
+    </div>
+    <table class="collapse">
       <thead><tr><th>time</th><th>kind</th><th>project</th><th>detail</th></tr></thead>
       <tbody id="events"><tr><td colspan="4" class="empty">no events yet</td></tr></tbody>
     </table>
   </section>
 
   <section style="grid-column: 1 / -1;">
-    <h2>Leases <span class="sub">(active + last 50 terminal)</span></h2>
-    <table>
+    <div class="sec-head">
+      <h2>Leases <span class="sub">(active + last N terminal)</span></h2>
+      <select id="leases-limit" title="records to show" aria-label="records to show">
+        <option value="10" selected>10</option>
+        <option value="25">25</option>
+        <option value="50">50</option>
+        <option value="100">100</option>
+      </select>
+      <label class="tgl" title="toggle table"><input type="checkbox" id="leases-collapsed" checked>hide</label>
+    </div>
+    <table class="collapse">
       <thead><tr><th>lease</th><th>client</th><th>project</th><th>job</th><th>state</th><th>granted</th><th>age</th><th>ttl left</th><th>tokens out</th><th>reason</th></tr></thead>
       <tbody id="leases"><tr><td colspan="10" class="empty">no leases yet</td></tr></tbody>
     </table>
@@ -143,9 +174,10 @@ function esc(x) {
 }
 
 async function refresh() {
+  const limit = $("events-limit").value;
   let st;
   try {
-    const res = await fetch("/api/state", { cache: "no-store" });
+    const res = await fetch("/api/state?limit=" + encodeURIComponent(limit), { cache: "no-store" });
     if (!res.ok) throw new Error("HTTP " + res.status);
     st = await res.json();
   } catch (err) {
@@ -269,6 +301,28 @@ async function refresh() {
 
 refresh();
 setInterval(refresh, 5000);
+
+// shared records-to-show combo (events + leases stay in sync; one window
+// size drives both tables via /api/state?limit=)
+const limitSels = Array.from(document.querySelectorAll("select[id$='-limit']"));
+limitSels.forEach((sel) =>
+  sel.addEventListener("change", () => {
+    limitSels.forEach((o) => { if (o !== sel && o.value !== sel.value) o.value = sel.value; });
+    refresh();
+  })
+);
+// collapse toggles (collapsed by default; persist the operator's choice)
+[["events-collapsed", "idlefill.eventsCollapsed"], ["leases-collapsed", "idlefill.leasesCollapsed"]].forEach(
+  ([id, key]) => {
+    const cb = $(id);
+    const tbl = cb.closest("section").querySelector("table");
+    const collapsed = () => cb.checked;
+    const apply = () => tbl.classList.toggle("collapse", collapsed());
+    try { cb.checked = localStorage.getItem(key) !== "0"; } catch { cb.checked = true; }
+    cb.addEventListener("change", () => { apply(); try { localStorage.setItem(key, collapsed() ? "1" : "0"); } catch {} });
+    apply();
+  }
+);
 </script>
 </body>
 </html>

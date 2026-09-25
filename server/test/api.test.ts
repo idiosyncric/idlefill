@@ -251,6 +251,24 @@ test('/api/state shape', async () => {
   assert.ok('override' in clientRow, 'client rows carry their (active or null) override');
 });
 
+test('/api/state limit: window is honored (default 10, explicit wins, clamped to >=1)', async () => {
+  type Shaped = { events: unknown[]; leases: unknown[] };
+  const get = async (qs?: string) =>
+    (await (await fetch(`${base}/api/state${qs ?? ''}`, { headers: auth })).json()) as Shaped;
+
+  const def = await get();
+  assert.ok(def.events.length <= 10, `default window is 10, got ${def.events.length}`);
+
+  const big = await get('?limit=500');
+  assert.ok(big.events.length >= def.events.length, 'bigger window returns no fewer events');
+
+  const small = await get('?limit=1');
+  assert.equal(small.events.length, Math.min(1, big.events.length), 'limit=1 shows exactly one event when any exist');
+
+  const bad = await get('?limit=banana');
+  assert.ok(bad.events.length <= 10, 'invalid limit falls back to the default window');
+});
+
 test('client override: pause blocks new grants (client_paused); clear restores', async () => {
   // Make the feed fresh (busy) so the only question is the client's override.
   entries.length = 0;
