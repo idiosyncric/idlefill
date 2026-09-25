@@ -1,0 +1,22 @@
+{
+  "name": "idlefill-client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "idlefill client daemon: register, lease loop, loopback proxy, executor supervision",
+  "main": "src/index.ts",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "dev": "tsx src/index.ts",
+    "test": "tsx --test test/proxy.test.ts test/lease-loop.test.ts test/sigint.test.ts"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/ws": "^8.18.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "server_url": "http://127.0.0.1:8787",
+  "token": "REPLACE_WITH_A_REAL_TOKEN",
+  "client_name": "mac-sam",
+  "ip": "100.94.165.102",
+  "proxy_port": 11435,
+  "llm_target": "http://100.105.225.1:11434",
+  "projects": [
+    {
+      "name": "career-ops",
+      "queue_file": "../data/queue.jsonl",
+      "results_file": "../data/results.jsonl",
+      "model": "Qwen3.8-27B",
+      "cwd": "/Users/sam/Software/career-ops",
+      "executor": "node {repo}/adapters/career-ops/eval.mjs {payload_file} {result_file}",
+      "estimated_seconds": 900
+    }
+  ]
+}
