@@ -256,6 +256,61 @@ test('/api/state shape', async () => {
   assert.ok('override' in clientRow, 'client rows carry their (active or null) override');
 });
 
+test('projects in /api/state carry allocated workers + scheduling; register validates project rows', async () => {
+  // A client that reports project allocations.
+  const reg = await fetch(`${base}/api/clients/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({
+      name: 'worker-b',
+      ip: '100.94.165.200',
+      projects: [{ name: 'career-ops', model: 'Qwen3.8-27B', estimated_seconds: 900, queue_depth: 4 }],
+    }),
+  });
+  assert.equal(reg.status, 200);
+
+  // A client with malformed project entries (garbage rows are filtered out).
+  const regBad = await fetch(`${base}/api/clients/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({
+      name: 'worker-c',
+      projects: [{ model: 'no-name' }, { name: '', queue_depth: 1 }, 'not-an-object'],
+    }),
+  });
+  assert.equal(regBad.status, 200, 'malformed project rows are dropped, not rejected');
+
+  const st = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    projects: {
+      name: string;
+      workers: { client: string; model: string; estimated_seconds: number; queue_depth: number; online: boolean }[];
+      scheduling: { paused: boolean; idle_seconds: number; max_concurrent_leases: number; lease_ttl_seconds: number; daily_token_cap: number };
+    }[];
+    clients: { name: string; last_seen: number; projects: Record<string, unknown>[] }[];
+  };
+
+  const proj = st.projects.find((p) => p.name === 'career-ops')!;
+  assert.equal(proj.workers.length, 1, 'only a client that REPORTS the project is a worker');
+  assert.equal(proj.workers[0]!.client, 'worker-b');
+  assert.equal(proj.workers[0]!.model, 'Qwen3.8-27B');
+  assert.equal(proj.workers[0]!.estimated_seconds, 900);
+  assert.equal(proj.workers[0]!.queue_depth, 4);
+  assert.equal(proj.workers[0]!.online, true, 'a client that just registered is online');
+
+  assert.equal(proj.scheduling.paused, false);
+  assert.equal(proj.scheduling.idle_seconds, cfg.idle_seconds);
+  assert.equal(proj.scheduling.max_concurrent_leases, cfg.max_concurrent_leases);
+  assert.equal(proj.scheduling.lease_ttl_seconds, cfg.lease_ttl_seconds);
+
+  // Client rows expose last_seen + the stored allocations.
+  const rowB = st.clients.find((c) => c.name === 'worker-b')!;
+  assert.equal(typeof rowB.last_seen, 'number');
+  assert.equal(rowB.projects.length, 1);
+  assert.equal(rowB.projects[0]!.name, 'career-ops');
+  const rowC = st.clients.find((c) => c.name === 'worker-c')!;
+  assert.deepEqual(rowC.projects, [], 'malformed rows filtered to an empty list');
+});
+
 test('/api/state limit: window is honored (default 10, explicit wins, clamped to >=1)', async () => {
   type Shaped = { events: unknown[]; leases: unknown[] };
   const get = async (qs?: string) =>

@@ -424,3 +424,45 @@ test('setClientOverride: unknown client rejected; idempotent re-registration kee
   assert.equal(h.arbiter.activeOverride(h.client.client_id)?.override, 'force', 'idempotent re-register keeps the same client_id ⇒ override persists');
   rmSync(h.dir, { recursive: true, force: true });
 });
+
+test('registerClient: first registration records allocations + last_seen; re-registration refreshes both', () => {
+  const h = makeHarness();
+  const allocs = [
+    { name: 'career-ops', model: 'Qwen3.8-27B', estimated_seconds: 900, queue_depth: 12 },
+    { name: 'other', model: 'Qwen3.8-27B', estimated_seconds: 600, queue_depth: 0 },
+  ];
+
+  // A new client with allocations.
+  const r1 = h.arbiter.registerClient('worker-b', '10.0.0.7', '127.0.0.1', allocs, T0);
+  assert.equal(r1.created, true);
+  const b = h.store.state.clients.find((c) => c.name === 'worker-b')!;
+  assert.deepEqual(b.projects, allocs, 'reported allocations stored');
+  assert.equal(b.last_seen, T0, 'last_seen recorded at first registration');
+  assert.equal(b.registered_at, new Date(T0).toISOString());
+
+  // Re-registration (heartbeat): same id, refreshed last_seen + updated depths.
+  const allocs2 = [
+    { name: 'career-ops', model: 'Qwen3.8-27B', estimated_seconds: 900, queue_depth: 7 },
+    { name: 'other', model: 'Qwen3.8-27B', estimated_seconds: 600, queue_depth: 3 },
+  ];
+  const r2 = h.arbiter.registerClient('worker-b', '10.0.0.7', '127.0.0.1', allocs2, T0 + 60_000);
+  assert.equal(r2.created, false);
+  assert.equal(r2.client_id, b.client_id, 'idempotent on name');
+  const b2 = h.store.state.clients.find((c) => c.name === 'worker-b')!;
+  assert.equal(b2.last_seen, T0 + 60_000, 'last_seen advanced on re-registration');
+  assert.deepEqual(b2.projects, allocs2, 'allocations replaced (queue depths are live)');
+  assert.equal(b2.registered_at, new Date(T0).toISOString(), 'registered_at stays at first registration');
+
+  // A re-registration WITHOUT projects keeps the stored ones (no clobber).
+  const r3 = h.arbiter.registerClient('worker-b', undefined, '127.0.0.1', undefined, T0 + 120_000);
+  assert.equal(r3.created, false);
+  const b3 = h.store.state.clients.find((c) => c.name === 'worker-b')!;
+  assert.deepEqual(b3.projects, allocs2, 'no projects ⇒ stored allocations untouched');
+  assert.equal(b3.last_seen, T0 + 120_000, 'last_seen still advances');
+
+  // Legacy client registered without allocations gets an empty list.
+  h.arbiter.registerClient('legacy', undefined, '127.0.0.1');
+  const legacy = h.store.state.clients.find((c) => c.name === 'legacy')!;
+  assert.deepEqual(legacy.projects, []);
+  rmSync(h.dir, { recursive: true, force: true });
+});

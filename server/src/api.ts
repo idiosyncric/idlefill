@@ -16,7 +16,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import fastify, { type FastifyInstance } from 'fastify';
 import { WebSocketServer } from 'ws';
 import type { Arbiter } from './arbiter.js';
-import type { ServerConfig } from './types.js';
+import type { ProjectAllocation, ServerConfig } from './types.js';
 
 export interface ApiDeps {
   arbiter: Arbiter;
@@ -52,6 +52,48 @@ function bearer(req: { headers: Record<string, unknown>; query: unknown }): stri
   return null;
 }
 
+/**
+ * Project view for the dashboard: the project config + today's budget, the
+ * connected workers allocated to it (clients that report this project), and
+ * the scheduling knobs that govern its grants. Workers are ordered
+ * online-first, then by name.
+ */
+function projectView(
+  arbiter: Arbiter,
+  cfg: ServerConfig,
+  clients: { name: string; last_seen: number; projects: { name: string; model: string; estimated_seconds: number; queue_depth: number }[] }[],
+  day: string,
+  now: number,
+) {
+  return cfg.projects.map((p) => {
+    const workers = clients
+      .filter((c) => (c.projects ?? []).some((x) => x.name === p.name))
+      .map((c) => {
+        const alloc = (c.projects ?? []).find((x) => x.name === p.name);
+        return {
+          client: c.name,
+          model: alloc?.model ?? '',
+          estimated_seconds: alloc?.estimated_seconds ?? 0,
+          queue_depth: alloc?.queue_depth ?? 0,
+          online: now - c.last_seen < 90_000,
+        };
+      })
+      .sort((a, b) => Number(b.online) - Number(a.online) || a.client.localeCompare(b.client));
+    return {
+      ...p,
+      budget_today: arbiter.projectBudget(p.name, day),
+      workers,
+      scheduling: {
+        paused: p.paused,
+        idle_seconds: cfg.idle_seconds,
+        max_concurrent_leases: cfg.max_concurrent_leases,
+        lease_ttl_seconds: cfg.lease_ttl_seconds,
+        daily_token_cap: p.daily_token_cap,
+      },
+    };
+  });
+}
+
 /** Attach the API routes (authed) and the dashboard (public read). */
 export function buildApi(deps: ApiDeps): FastifyInstance {
   const { arbiter, cfg, publicDir } = deps;
@@ -83,11 +125,21 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   // ------------------------------------------------------------------
 
   app.post('/api/clients/register', async (req, reply) => {
-    const body = (req.body ?? {}) as { name?: string; ip?: string };
+    const body = (req.body ?? {}) as { name?: string; ip?: string; projects?: ProjectAllocation[] };
     const name = typeof body.name === 'string' ? body.name.trim() : '';
     if (!name) return reply.code(400).send({ error: 'name required' });
     const remote = (req.ip ?? '').split(':').pop() ?? 'unknown';
-    const res = arbiter.registerClient(name, typeof body.ip === 'string' && body.ip.trim() ? body.ip.trim() : undefined, remote);
+    const projects = Array.isArray(body.projects)
+      ? body.projects
+          .filter((p) => p && typeof p.name === 'string' && p.name.trim() !== '')
+          .map((p) => ({
+            name: p.name.trim(),
+            model: typeof p.model === 'string' ? p.model : '',
+            estimated_seconds: typeof p.estimated_seconds === 'number' && Number.isFinite(p.estimated_seconds) ? p.estimated_seconds : 0,
+            queue_depth: typeof p.queue_depth === 'number' && Number.isFinite(p.queue_depth) ? p.queue_depth : 0,
+          }))
+      : undefined;
+    const res = arbiter.registerClient(name, typeof body.ip === 'string' && body.ip.trim() ? body.ip.trim() : undefined, remote, projects);
     return reply.code(200).send({ client_id: res.client_id, created: res.created });
   });
 
@@ -178,7 +230,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   app.get('/api/projects', async () => {
     const day = new Date().toISOString().slice(0, 10);
     return {
-      projects: cfg.projects.map((p) => ({ ...p, budget_today: arbiter.projectBudget(p.name, day) })),
+      projects: projectView(arbiter, cfg, arbiter['store'].state.clients, day, Date.now()),
     };
   });
 
@@ -226,7 +278,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       // Client rows carry their active operator override (if any), so the
       // dashboard and clients can see pause/force state without a second call.
       clients: s.clients.map((c) => ({ ...c, override: arbiter.activeOverride(c.client_id, now) })),
-      projects: cfg.projects.map((p) => ({ ...p, budget_today: arbiter.projectBudget(p.name, day) })),
+      projects: projectView(arbiter, cfg, s.clients, day, now),
       events: s.events.slice(Math.max(0, s.events.length - limit)).reverse(),
     };
   });

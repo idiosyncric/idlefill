@@ -118,6 +118,11 @@ export function nextJob(file: string): QueueJob | null {
   return readQueue(file)[0] ?? null;
 }
 
+/** Number of jobs currently in the queue file (0 when missing/corrupt-free empty). */
+export function queueDepth(file: string): number {
+  return readQueue(file).length;
+}
+
 export function removeJob(file: string, jobId: string): boolean {
   const jobs = readQueue(file);
   const next = jobs.filter((j) => j.job_id !== jobId);
@@ -277,6 +282,7 @@ export class ClientDaemon {
     this.running = true;
     this.log.info(`client starting: server=${this.cfg.server_url} name=${this.cfg.client_name} ip=${this.cfg.ip || '(not set — using observed)'} projects=${this.cfg.projects.map((p) => p.name).join(',')}`);
     await this.register();
+    this.log.info(`registered as ${this.clientId}`);
     this.connectWs();
     this.loop();
   }
@@ -298,15 +304,40 @@ export class ClientDaemon {
   // ------------------------------------------------------------------
 
   private async register(): Promise<void> {
-    const { status, body } = await api<{ client_id: string }>(this.cfg, 'POST', '/api/clients/register', {
+    const { status, body } = await api<{ client_id: string; created?: boolean }>(this.cfg, 'POST', '/api/clients/register', {
       name: this.cfg.client_name,
       ip: this.cfg.ip || undefined,
+      // The arbiter stores this per-project view for the dashboard
+      // (Projects → workers allocated). Re-registration is a heartbeat:
+      // last_seen refreshes and queue depths update on every tick.
+      projects: this.cfg.projects.map((p) => ({
+        name: p.name,
+        model: p.model,
+        estimated_seconds: p.estimated_seconds ?? 900,
+        queue_depth: queueDepth(p.queue_file),
+      })),
     });
     if (status !== 200 || !body.client_id) {
       throw new Error(`register failed: HTTP ${status} ${JSON.stringify(body).slice(0, 200)}`);
     }
     this.clientId = body.client_id;
-    this.log.info(`registered as ${this.clientId}`);
+    // Log once per client (first registration) — the daemon re-registers on
+    // every poll tick as a heartbeat, and that would flood the visible log.
+    if (body.created) this.log.info(`registered as ${this.clientId}`);
+  }
+
+  /**
+   * Re-send the registration (idempotent by name) with fresh queue depths.
+   * Keeps the dashboard's `last_seen` liveness and per-project backlog views
+   * current without a second API surface. Never throws — a failure just
+   * means the next tick's register/health path retries.
+   */
+  private async refreshRegistration(): Promise<void> {
+    try {
+      await this.register();
+    } catch (err) {
+      this.log.info(`registration refresh failed: ${err instanceof Error ? err.message : err}`);
+    }
   }
 
   private connectWs(): void {
@@ -350,16 +381,11 @@ export class ClientDaemon {
   }
 
   private async tickOnce(): Promise<void> {
-    // Re-register lazily if we lost the server (restart on the other side).
-    if (!this.clientId || !this.ws) {
-      try {
-        await this.register();
-        this.connectWs();
-      } catch (err) {
-        this.log.info(`register failed: ${err instanceof Error ? err.message : err}`);
-        return;
-      }
-    }
+    // Heartbeat: re-register with fresh queue depths every tick (idempotent
+    // by name). Also restores us after a server restart (the re-register
+    // returns a new client_id) and reconnects a dropped WS.
+    await this.refreshRegistration();
+    if (!this.ws) this.connectWs();
 
     const { status, body } = await api<{
       idle: { idle: boolean; degraded: boolean; reidle_gated: boolean };

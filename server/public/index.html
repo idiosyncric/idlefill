@@ -100,6 +100,24 @@
   .bar > div { height: 100%; background: var(--accent); }
   .bar > div.hot { background: var(--warn); }
   .empty { color: var(--dim); font-style: italic; padding: 6px 0; }
+  /* Projects panel: one block per project. Header row = name + state tag;
+     budget bar; one line per allocated worker (name · model · ~est · queued);
+     schedule line = the knobs that gate its grants. */
+  .proj { padding: 8px 0; border-bottom: 1px solid rgba(48,54,61,0.5); }
+  .proj:last-child { border-bottom: none; }
+  .proj-head { display: flex; align-items: baseline; gap: 8px; }
+  .proj-head .name { font-weight: 600; }
+  .proj-head .cnt { margin-left: auto; color: var(--dim); font-size: 11px; }
+  .proj .kv { padding: 1px 0; }
+  .workers { margin: 4px 0 2px; }
+  .worker { display: flex; gap: 8px; padding: 1px 0; font-size: 12px; }
+  .worker .dot { width: 7px; height: 7px; border-radius: 50%; margin-top: 5px; flex: none; }
+  .worker .dot.on { background: var(--ok); }
+  .worker .dot.off { background: var(--dim); }
+  .worker .wname { min-width: 84px; font-weight: 600; }
+  .worker .wmeta { color: var(--dim); }
+  .worker .wqueue { margin-left: auto; white-space: nowrap; }
+  .schedule { margin-top: 4px; color: var(--dim); font-size: 11px; }
   footer { padding: 10px 20px; color: var(--dim); font-size: 11px; border-top: 1px solid var(--border); margin-top: 10px; }
   a { color: var(--accent); text-decoration: none; }
   code { background: rgba(110,118,129,0.2); padding: 0 4px; border-radius: 3px; font-size: 12px; }
@@ -143,7 +161,7 @@
   </section>
 
   <section>
-    <h2>Projects (today, UTC)</h2>
+    <h2>Projects — workers, queue, schedule</h2>
     <div id="projects"><div class="empty">none configured</div></div>
   </section>
 
@@ -206,6 +224,64 @@ function ago(ms) {
 
 function esc(x) {
   return String(x ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// Duration as "~Xh Ym" (the estimate passed to the arbiter at grant time).
+function durFmt(s) {
+  if (!s || s <= 0) return "";
+  if (s < 60) return "~" + s + "s";
+  const m = Math.round(s / 60);
+  if (m < 60) return "~" + m + "m";
+  const h = Math.floor(m / 60);
+  return "~" + h + "h" + (m % 60 ? " " + (m % 60) + "m" : "");
+}
+
+// One project block: header (name + state + worker count), the daily token
+// budget (used today / cap, with a bar), the allocated workers (one line each:
+// online dot, name, model, ~estimate, queued count), and the schedule line
+// (the knobs that gate this project's grants — from the server config).
+// `now` is the server clock from the same state payload (ms).
+function projBlock(p, now) {
+  const b = p.budget_today || { tokens_out: 0, tokens_in: 0, cap: 0 };
+  const cap = b.cap ?? p.scheduling?.daily_token_cap ?? 0;
+  const pct = cap > 0 ? Math.min(100, (b.tokens_out / cap) * 100) : 0;
+  const capTxt = cap >= Number.MAX_SAFE_INTEGER || cap === 0 ? "∞" : cap.toLocaleString();
+  const sched = p.scheduling || {};
+  const workers = p.workers || [];
+  const totalQueued = workers.reduce((s, w) => s + (w.queue_depth || 0), 0);
+  const onlineCnt = workers.filter((w) => w.online).length;
+
+  let headTag;
+  if (p.paused) headTag = '<span class="tag" style="color:var(--warn);border-color:var(--warn)">paused</span>';
+  else if (b.tokens_out >= cap && cap > 0) headTag = '<span class="tag" style="color:var(--warn);border-color:var(--warn)">budget full</span>';
+  else headTag = '<span class="tag active">scheduling</span>';
+
+  const workersHtml = workers.length
+    ? '<div class="workers">' + workers.map((w) =>
+        '<div class="worker">' +
+        '<span class="dot ' + (w.online ? "on" : "off") + '" title="' + (w.online ? "online (saw a heartbeat within 90s)" : "offline (no recent heartbeat)") + '"></span>' +
+        '<span class="wname">' + esc(w.client) + (w.online ? "" : ' <span class="wmeta">(offline)</span>') + "</span>" +
+        '<span class="wmeta">' + esc(w.model || "—") + (w.estimated_seconds ? " · " + durFmt(w.estimated_seconds) : "") + "</span>" +
+        '<span class="wqueue">' + (w.queue_depth || 0).toLocaleString() + ' queued</span>' +
+        "</div>"
+      ).join("") + "</div>"
+    : '<div class="empty">no workers connected for this project</div>';
+
+  const schedule = "runs when idle ≥" + (sched.idle_seconds ?? "—") + "s" +
+    " · max " + (sched.max_concurrent_leases ?? "—") + " lease" + (sched.max_concurrent_leases === 1 ? "" : "s") +
+    " · ttl " + durFmt(sched.lease_ttl_seconds).replace("~", "") +
+    " · cap " + capTxt + " tok/day (UTC)";
+
+  return '<div class="proj">' +
+    '<div class="proj-head"><span class="name">' + esc(p.name) + "</span>" + headTag +
+    '<span class="cnt">' + workers.length + " worker" + (workers.length === 1 ? "" : "s") +
+    (workers.length ? " · " + onlineCnt + " online · " + totalQueued.toLocaleString() + " queued" : "") + "</span></div>" +
+    '<div class="kv"><span class="k">tokens today (UTC)</span><span>' + (b.tokens_out || 0).toLocaleString() + " / " + capTxt +
+    " out" + (b.tokens_in ? " · " + (b.tokens_in || 0).toLocaleString() + " in" : "") + "</span></div>" +
+    '<div class="bar"><div class="' + (pct > 80 ? "hot" : "") + '" style="width:' + pct.toFixed(1) + '%"></div></div>' +
+    workersHtml +
+    '<div class="schedule">' + schedule + "</div>" +
+    "</div>";
 }
 
 // Header: the live-state word (#status, left) + the two-option Engine gate
@@ -319,19 +395,14 @@ async function refresh() {
       }).join("") + "</tbody></table>";
   }
 
-  // projects
+  // projects — each block: name + state, today's token budget, the workers
+  // allocated to the project (from their heartbeat: model, est, queue depth,
+  // online dot), and the schedule line (the knobs that gate its grants).
   const pbox = $("projects");
   if (!st.projects || st.projects.length === 0) {
     pbox.innerHTML = '<div class="empty">none configured</div>';
   } else {
-    pbox.innerHTML = st.projects.map((p) => {
-      const b = p.budget_today || { tokens_out: 0, tokens_in: 0, cap: 0 };
-      const pct = b.cap > 0 ? Math.min(100, (b.tokens_out / b.cap) * 100) : 0;
-      return '<div style="margin-bottom:8px">' +
-        '<div class="kv"><span class="k">' + esc(p.name) + (p.paused ? ' <span class="warn">[paused]</span>' : "") + "</span>" +
-        "<span>" + b.tokens_out.toLocaleString() + " / " + (b.cap === Number.MAX_SAFE_INTEGER ? "∞" : b.cap.toLocaleString()) + " out</span></div>" +
-        '<div class="bar"><div class="' + (pct > 80 ? "hot" : "") + '" style="width:' + pct.toFixed(1) + '%"></div></div></div>';
-    }).join("");
+    pbox.innerHTML = st.projects.map((p) => projBlock(p, st.now)).join("");
   }
 
   // events

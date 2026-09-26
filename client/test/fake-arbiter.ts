@@ -31,6 +31,10 @@ export interface FakeArbiter {
   activeLeases: string[];
   /** Operator override reported in GET /api/state clients[] (null = none). */
   override: { override: string; until: number | null } | null;
+  /** The most recent POST /api/clients/register body (heartbeat with queue depths). */
+  lastRegister: Record<string, unknown>;
+  /** Every register body received, in order. */
+  registers: Record<string, unknown>[];
   /** Steer the override directly (the POST /api/clients/:id/override route does this too). */
   setOverride(kind: 'pause' | 'force' | null, until?: number): void;
   grant(leaseId: string): void;
@@ -47,6 +51,8 @@ export function startFakeArbiter(): Promise<FakeArbiter> {
     usageReports: [] as UsageReport[],
     activeLeases: [] as string[],
     n: 0,
+    registered: false,
+    registers: [] as Record<string, unknown>[],
     clients: new Set<WebSocket>(),
   };
 
@@ -69,7 +75,9 @@ export function startFakeArbiter(): Promise<FakeArbiter> {
       const j = body ? JSON.parse(body) : {};
 
       if (req.method === 'POST' && url.pathname === '/api/clients/register') {
-        return send(200, { client_id: 'c-test', created: true });
+        state.registers.push(j);
+        state.registered = true;
+        return send(200, { client_id: 'c-test', created: state.registered && state.registers.length === 1 });
       }
       const ov = url.pathname.match(/^\/api\/clients\/[^/]+\/override$/);
       if (req.method === 'POST' && ov) {
@@ -132,6 +140,10 @@ export function startFakeArbiter(): Promise<FakeArbiter> {
         leaseRequests: state.leaseRequests,
         usageReports: state.usageReports,
         activeLeases: state.activeLeases,
+        registers: state.registers,
+        get lastRegister() {
+          return state.registers[state.registers.length - 1] ?? {};
+        },
         grant(id) {
           state.activeLeases.push(id);
         },

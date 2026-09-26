@@ -33,7 +33,7 @@ import type { IdleDetector } from './idle.js';
 import { activeLeaseExemptIps } from './idle.js';
 import type { IdleSignal } from './types.js';
 import type { StateStore } from './state.js';
-import type { ClientOverride, Lease, ProjectConfig, ServerConfig, UtcDate } from './types.js';
+import type { ClientOverride, Lease, ProjectAllocation, ServerConfig, UtcDate } from './types.js';
 
 export type LeaseRejectionReason =
   | 'not_idle'
@@ -71,18 +71,28 @@ export class Arbiter {
   // Clients
   // ------------------------------------------------------------------
 
-  /** Register (idempotent on name). Returns the client record. */
+  /**
+   * Register (idempotent on name). Re-registration refreshes `last_seen`
+   * (the client's liveness heartbeat — the dashboard shows it) and replaces
+   * the reported project allocations (the client re-sends its queue depths
+   * every poll tick, so the dashboard's per-project worker view stays fresh).
+   */
   registerClient(
     name: string,
     reportedIp: string | undefined,
     observedIp: string,
+    projects?: ProjectAllocation[],
+    now?: number,
   ): { client_id: string; created: boolean } {
     const s = this.store.state;
+    const seen = now ?? Date.now();
     const existing = s.clients.find((c) => c.name === name);
     if (existing) {
       if (reportedIp) existing.ip = reportedIp;
       else if (!existing.ip) existing.ip = observedIp;
       if (observedIp) existing.observed_ip = observedIp;
+      existing.last_seen = seen;
+      if (projects) existing.projects = projects;
       this.store.save();
       return { client_id: existing.client_id, created: false };
     }
@@ -92,7 +102,9 @@ export class Arbiter {
       client_id,
       ip: reportedIp ?? observedIp,
       observed_ip: observedIp,
-      registered_at: new Date().toISOString(),
+      registered_at: new Date(seen).toISOString(),
+      last_seen: seen,
+      projects: projects ?? [],
     });
     this.store.appendEvent({ kind: 'client_registered', detail: `${name} (${client_id})` });
     this.store.trim();

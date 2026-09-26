@@ -191,6 +191,28 @@ test('client-pause override: daemon stops requesting leases', async () => {
   arb.setOverride(null);
 });
 
+test('registration heartbeat: reports project allocations with live queue depths', async () => {
+  mkQueue([{ id: 'job-h1' }, { id: 'job-h2' }]);
+  const before = arb.registers.length;
+  const d = makeDaemon();
+  await d.start();
+  const deadline = Date.now() + 4000;
+  while (Date.now() < deadline) {
+    if (arb.registers.length > before + 1) break; // start() + at least one tick refresh
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  await d.stop();
+
+  assert.ok(arb.registers.length >= 2, `daemon heartbeats: start() + ≥1 tick, got ${arb.registers.length} registers`);
+  const last = arb.lastRegister;
+  assert.equal(last.name, 'test-client');
+  const projects = last.projects as { name: string; model: string; estimated_seconds: number; queue_depth: number }[];
+  assert.ok(Array.isArray(projects) && projects.length === 1, 'one project reported');
+  assert.equal(projects[0]!.name, 'test-proj');
+  assert.equal(projects[0]!.model, 'm');
+  assert.equal(projects[0]!.queue_depth, 2, 'queue depth reflects the queue file at report time');
+});
+
 test('force override: daemon requests a lease while the box is busy', async () => {
   cfg.projects = [
     {

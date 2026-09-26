@@ -8,7 +8,7 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { ArbiterState } from './types.js';
+import type { ArbiterState, ClientRecord } from './types.js';
 
 export interface StateStoreOpts {
   /** Cap for the lease history kept in memory/file. */
@@ -53,7 +53,15 @@ export class StateStore {
       return {
         ...base,
         ...raw,
-        clients: Array.isArray(raw.clients) ? raw.clients : base.clients,
+        // Tolerate older state files: client rows gain fields over time
+        // (last_seen, projects) — normalize any row that predates them.
+        clients: Array.isArray(raw.clients)
+          ? (raw.clients as ClientRecord[]).map((c) => ({
+              ...c,
+              last_seen: typeof c.last_seen === 'number' ? c.last_seen : Date.parse(c.registered_at) || 0,
+              projects: Array.isArray(c.projects) ? c.projects : [],
+            }))
+          : base.clients,
         // Tolerate state files from before client overrides existed.
         overrides: raw.overrides && typeof raw.overrides === 'object' ? raw.overrides : base.overrides,
         leases: Array.isArray(raw.leases) ? raw.leases : base.leases,

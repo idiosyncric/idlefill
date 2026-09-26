@@ -157,6 +157,38 @@ field accepts a clear by emptying it). *Engine Paused* sets the `pause`
 override; *Engine Running* clears it and clients run their normal
 idle-gated schedule.
 
+## Projects: workers & scheduling (dashboard)
+
+The dashboard's **Projects** panel is the operator view of *who runs what*.
+For every project configured in the server's `projects[]` it shows:
+
+- **workers** — the connected clients that reported they are allocated to the
+  project (one line each: online dot, name, model, per-job estimate, queued
+  jobs),
+- **tokens today (UTC)** — the project's output against its `daily_token_cap`,
+  with a bar (amber past 80%),
+- **schedule** — the knobs that gate the project's grants: the global idle
+  threshold (`idle_seconds`), `max_concurrent_leases`, lease TTL, and the
+  daily cap.
+
+Workers are **self-reported by the clients** (the arbiter does not infer
+allocations): each client daemon re-registers on every poll tick (~20s) with
+its project list — `name`, `model`, `estimated_seconds`, and a **live queue
+depth** (the arbiter never reads the queue files). The server stores this in
+the state file and refreshes `last_seen` on every heartbeat; a worker is
+**online** when its heartbeat is <90s old (≈5 daemon polls). Re-registration
+stays idempotent by name: same `client_id`, so client overrides (pause/force)
+keep sticking across daemon restarts.
+
+In the API: `POST /api/clients/register` accepts an optional
+`projects: [{name, model, estimated_seconds, queue_depth}]` (malformed rows
+are dropped), and `GET /api/state` / `GET /api/projects` return per-project
+`workers: [{client, model, estimated_seconds, queue_depth, online}]` plus a
+`scheduling` object (`paused`, `idle_seconds`, `max_concurrent_leases`,
+`lease_ttl_seconds`, `daily_token_cap`). A project with no connected workers
+shows "no workers connected" — a scheduling row with no executor behind it
+tells you the queue will not drain.
+
 ## Conventions
 
 See `AGENTS.md`. Short version: Node 22, ESM, `node --test` (run via tsx for
