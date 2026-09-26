@@ -145,53 +145,119 @@ HTTP equivalent (token-authed): `POST /api/clients/:ref/override` with body
 `{"override":"pause"|"force"|null, "until":<epoch_ms>}` — `null` clears.
 
 The dashboard also drives this: the right side of the header is split into
-two elements — a color-coded live-state word (`Idle` green / `Busy` amber /
+three elements — a color-coded live-state word (`Idle` green / `Busy` amber /
 `Running Idle Tasks` blue / `Degraded` red, or `unreachable` when the poll
-fails), and to its right the **Engine gate** combobox (`Engine Paused` /
-`Engine Running`, one global gate across all clients); each Workers-panel row
-has a small per-client one. The state word refreshes every 5s alongside the
-rest of the dashboard. Writes are token-authed — paste the arbiter token into
-the "gate token" field under the Workers panel once per browser (stored in
-`localStorage`, same LAN/tailnet trust posture as the phase-1 dashboard; the
-field accepts a clear by emptying it). *Engine Paused* sets the `pause`
-override; *Engine Running* clears it and clients run their normal
-idle-gated schedule.
+fails), the **Engine gate** combobox (`Engine Paused` / `Engine Running`, one
+global gate across all clients), and the **gate token** field (paste the
+arbiter token once per browser — it lives next to the gates it enables, is
+stored in `localStorage`, and accepts a clear by emptying it). *Engine
+Paused* sets the `pause` override on every registered worker; *Engine
+Running* clears it and clients run their normal idle-gated schedule.
 
-## Dashboard panels (the work flow)
+## Project-level controls (pause + grant knobs)
+
+Beyond the global gate and per-worker overrides, each project configured in
+the server's `projects[]` has its own controls, persisted in the state file
+(surviving restarts) and visible in the dashboard's Projects pane:
+
+- **Project pause** — `POST /api/projects/:name` with `{"paused":true|false}`
+  (also the per-project gate combobox in the dashboard). Same semantics as a
+  client pause: no NEW leases for the project, active leases keep running.
+- **Per-project grant knobs** — `POST /api/projects/:name/settings` with any
+  of `idle_seconds`, `max_concurrent_leases`, `lease_ttl_seconds` (positive
+  numbers), or `{"clear":true}` to drop all of them. A set value overrides
+  the global knob for that project only; an unset knob inherits the global.
+  `GET /api/state` / `GET /api/projects` expose both: `scheduling` carries
+  the EFFECTIVE values plus `scheduling.overrides` (the raw per-project
+  values, `null` = inherit).
+
+```bash
+node scripts/idlefill-control.mjs projects
+node scripts/idlefill-control.mjs project career-ops set [--idle 600] [--max 2] [--ttl 900]
+node scripts/idlefill-control.mjs project career-ops clear
+```
+
+## Inference-server inventory
+
+The arbiter watches exactly one activity feed today (the configured
+`llama_swap_url` + `activity_path`). The state file also keeps a
+**declared-server inventory** — one row per inference server the box is
+connected to, seeded from config (`server_name`, `server_models`,
+`server_peers`) on first load and then operator-managed:
+
+- `GET /api/servers` (and the `servers` key of `GET /api/state`) — one row
+  per declared server: `name`, `url`, `models` (each with `running` /
+  `queued`, computed from the live leases and the clients' self-reported
+  queue depths), `peers`, and — for the watched row only — `watched: true`
+  plus the live `signal` (the idle signal object: `idle_for_s`,
+  `last_activity`, `degraded`, `reidle_gated`, …). A declared-but-unwatched
+  row carries `signal: null` — it is inventory, not a live feed.
+- `POST /api/servers` — add (no `id`) or patch-update (by `id`) a declared
+  connection: `{name, url, activity_path?, models?, peers?}`. Create
+  requires a valid http(s) `url` and rejects a duplicate
+  (url + activity path). This is **config + display only**: the arbiter
+  keeps watching its single configured feed; a declared row is where a
+  future multi-feed core will point the watcher. `peer:` backends (e.g.
+  `peer:gpu2`) are plain-words metadata — the entry point fronts them; the
+  arbiter never routes to them.
+
+```bash
+node scripts/idlefill-control.mjs servers
+node scripts/idlefill-control.mjs server add box-two http://192.168.9.9:11434 [--models a,b] [--peers peer:gpu2]
+node scripts/idlefill-control.mjs server set <id> [--name N] [--url U] [--models a,b] [--peers p1]
+```
+
+## Dashboard layout (the work flow)
 
 The dashboard reads top-to-bottom as the operator's work flow: the header
-state word answers *is the box doing what it should*, then four panels —
-**Idle signal**, **Running now**, **Queued**, **Workers** — and the fixed
-bottom **logs** tray (Events/Leases tabs, shared records-to-show).
+state word answers *is the box doing what it should* (`Idle` green /
+`Busy` amber / `Running Idle Tasks` blue / `Degraded` red, or `unreachable`
+when the poll fails), then **two panes** — **Inference Servers** and
+**Projects** — and the fixed bottom **logs** tray (Events/Leases tabs,
+shared records-to-show).
 
-- **Idle signal** — the countdown (the page's one display number) plus the
-  server's clock and last activity; the diagnostics that explain a contested
-  verdict surface only when contested (log write while not idle, signal
-  health when degraded, the re-idle gate when armed).
-- **Running now** — one block per **active lease** (all of them; with
-  `max_concurrent_leases > 1` the second lease is not hidden): project, job,
-  worker, how long it has been running, and when it auto-cancels.
-- **Queued** — the per-project view of the work that is waiting. For every
-  project configured in the server's `projects[]`:
-  - **jobs waiting** — the sum of the connected workers' queue depths, shown
-    only when non-zero (a quiet queue shows nothing),
+- **Inference Servers** — one block per declared inference server (today:
+  the one watched feed). The watched block carries the live signal: the
+  countdown (`idle for`, the page's one display number), the last activity
+  (model · source · how long ago), and the exception-only diagnostics
+  (the log write age while the box is judged not idle, signal health when
+  degraded, the re-idle gate when armed). Below that, the server's **model
+  resources** — one row per declared model with its running state (blue
+  dot), the self-reported queued depth, and the per-job estimate when a
+  connected worker uses that model. `peer:` backends show as a plain-words
+  line when configured. A declared-but-unwatched server reads "declared —
+  not watched yet".
+- **Projects** — one block per project configured in the server's
+  `projects[]`, absorbing the running/queued/workers views:
+  - **head** — the project name, exception tags (`paused`, `budget full`),
+    the per-project **gate** combobox (pause/resume this project), and the
+    **jobs waiting** count (the sum of the connected workers' queue
+    depths, shown only when non-zero),
+  - **running jobs** — one row per active lease for this project (all of
+    them; with `max_concurrent_leases > 1` the second lease is not
+    hidden): job, worker, how long it has been running, and when it
+    auto-cancels,
   - **tokens today (UTC)** — the project's output against its
     `daily_token_cap`, with a bar (amber past 80%),
-  - **workers** — the connected clients that reported they are allocated to
-    the project (one line each: online dot, name, model, per-job estimate,
-    queued jobs),
+  - **workers** — a **collapsible list** (expanded by default; per-project
+    collapse state in `localStorage`) of the connected clients that
+    reported they are allocated to the project: online dot, name (+ a
+    `paused` badge when a client-pause override is active), model,
+    per-job estimate, queued jobs, and the **per-worker gate** (pause/
+    resume this worker — a worker paused from any project block is paused
+    from all of them, the scope being a worker-level override). Under each
+    row, the worker's **published stats** (client-computed key/values the
+    client daemon reports at registration: finished/failed today, last
+    job, queue) — rendered verbatim; the arbiter shows them, it never
+    computes them, and the section is absent when nothing is published,
   - **exception notes** — why nothing is running right now (`project
     paused`, `budget full`, `no workers online`), and **today's results**
     (jobs finished / failed today, UTC — counted from the lease end-records
     the arbiter already keeps: a lease that terminated as `finished` counts
     finished; any other terminal lease counts failed),
-  - **schedule** — the knobs that gate the project's grants: the global idle
-    threshold (`idle_seconds`), `max_concurrent_leases`, lease TTL, and the
-    daily cap.
-- **Workers** — the machine inventory: liveness (heartbeat <90s dot; stale
-  rows read amber), what the worker is allocated to, and the per-client
-  gate. `id`/`ip`/`registered` live in the row's tooltip. The gate-token
-  field (token-authed writes; `localStorage`) sits under it.
+  - **schedule** — the EFFECTIVE knobs that gate the project's grants
+    (idle threshold, max concurrent, lease TTL — per-project overrides
+    win; a dim mark appears only when this project overrides the globals).
 
 Workers are **self-reported by the clients** (the arbiter does not infer
 allocations): each client daemon re-registers on every poll tick (~20s) with
@@ -203,14 +269,18 @@ stays idempotent by name: same `client_id`, so client overrides (pause/force)
 keep sticking across daemon restarts.
 
 In the API: `POST /api/clients/register` accepts an optional
-`projects: [{name, model, estimated_seconds, queue_depth}]` (malformed rows
-are dropped), and `GET /api/state` / `GET /api/projects` return per-project
-`workers: [{client, model, estimated_seconds, queue_depth, online}]`, a
-`today: {finished, failed}` results row (UTC day of each lease's end), and a
-`scheduling` object (`paused`, `idle_seconds`, `max_concurrent_leases`,
-`lease_ttl_seconds`, `daily_token_cap`). A project with no connected workers
-shows "no workers connected" — a scheduling row with no executor behind it
-tells you the queue will not drain.
+`projects: [{name, model, estimated_seconds, queue_depth, stats?}]`
+(malformed rows are dropped; `stats` is a small object of number/short-
+string values the client computed itself — the arbiter stores and displays
+them verbatim), and `GET /api/state` / `GET /api/projects` return per-project
+`workers: [{client, model, estimated_seconds, queue_depth, online, stats}]`,
+a `today: {finished, failed}` results row (UTC day of each lease's end), and
+a `scheduling` object (the EFFECTIVE `idle_seconds`,
+`max_concurrent_leases`, `lease_ttl_seconds`, `daily_token_cap`, plus
+`overrides` for the raw per-project values). `GET /api/state` also carries
+the `servers` inventory (see Inference-server inventory above). A project
+with no connected workers shows "no workers connected" — a scheduling row
+with no executor behind it tells you the queue will not drain.
 
 ## Conventions
 

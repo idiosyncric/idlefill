@@ -63,6 +63,7 @@ before(async () => {
     llm_target: 'http://127.0.0.1:1',
     repo_root: here,
     state_dir: join(dir, 'state'),
+    state_file: join(dir, 'state.json'),
     projects: [
       {
         name: 'test-proj',
@@ -211,6 +212,31 @@ test('registration heartbeat: reports project allocations with live queue depths
   assert.equal(projects[0]!.name, 'test-proj');
   assert.equal(projects[0]!.model, 'm');
   assert.equal(projects[0]!.queue_depth, 2, 'queue depth reflects the queue file at report time');
+});
+
+test('heartbeat publishes client-computed project stats (finished/failed/last_job/queue), not arbiter-computed', async () => {
+  mkQueue([{ id: 'job-s1' }, { id: 'job-s2' }]);
+  const d = makeDaemon();
+  await d.start();
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline) {
+    const s = (arb.lastRegister?.projects as { stats?: Record<string, unknown> }[] | undefined)?.[0]?.stats;
+    if (s && typeof s.queue === 'number') break;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  await d.stop();
+
+  const projects = arb.lastRegister.projects as {
+    name: string;
+    stats?: Record<string, unknown>;
+  }[];
+  assert.ok(Array.isArray(projects) && projects.length === 1, 'one project reported');
+  const st = projects[0]!.stats;
+  assert.ok(st && typeof st === 'object', 'the client publishes a per-project stats object');
+  assert.equal(st!.queue, 2, 'queue depth is computed by the CLIENT from its queue file');
+  assert.equal(typeof st!.finished, 'number', 'finished is client-computed from its results file');
+  assert.equal(typeof st!.failed, 'number', 'failed is client-computed from its results file');
+  assert.equal(typeof st!.last_job, 'string', 'last_job is the client\'s most recent result job');
 });
 
 test('force override: daemon requests a lease while the box is busy', async () => {

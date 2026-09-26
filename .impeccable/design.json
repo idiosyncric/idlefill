@@ -1,0 +1,238 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-09-26T14:25:05Z",
+  "title": "Design System: idlefill",
+  "extensions": {
+    "colorMeta": {
+      "bg": {
+        "role": "neutral",
+        "displayName": "Midnight Canvas",
+        "canonical": "#0d1117",
+        "tonalRamp": [
+          "oklch(15% 0.01 260)", "oklch(26% 0.01 260)", "oklch(37% 0.01 260)", "oklch(48% 0.01 260)",
+          "oklch(59% 0.01 260)", "oklch(70% 0.01 260)", "oklch(81% 0.01 260)", "oklch(92% 0.01 260)"
+        ]
+      },
+      "panel": {
+        "role": "neutral",
+        "displayName": "Console Slate",
+        "canonical": "#161b22",
+        "tonalRamp": [
+          "oklch(15% 0.008 260)", "oklch(26% 0.008 260)", "oklch(37% 0.008 260)", "oklch(48% 0.008 260)",
+          "oklch(59% 0.008 260)", "oklch(70% 0.008 260)", "oklch(81% 0.008 260)", "oklch(92% 0.008 260)"
+        ]
+      },
+      "border": {
+        "role": "neutral",
+        "displayName": "Hairline",
+        "canonical": "#30363d",
+        "tonalRamp": [
+          "oklch(15% 0.008 258)", "oklch(26% 0.008 258)", "oklch(37% 0.008 258)", "oklch(48% 0.008 258)",
+          "oklch(59% 0.008 258)", "oklch(70% 0.008 258)", "oklch(81% 0.008 258)", "oklch(92% 0.008 258)"
+        ]
+      },
+      "text": {
+        "role": "neutral",
+        "displayName": "Console Text",
+        "canonical": "#c9d1d9",
+        "tonalRamp": [
+          "oklch(15% 0.006 248)", "oklch(26% 0.006 248)", "oklch(37% 0.006 248)", "oklch(48% 0.006 248)",
+          "oklch(59% 0.006 248)", "oklch(70% 0.006 248)", "oklch(81% 0.006 248)", "oklch(92% 0.006 248)"
+        ]
+      },
+      "dim": {
+        "role": "neutral",
+        "displayName": "Muted Gray",
+        "canonical": "#8b949e",
+        "tonalRamp": [
+          "oklch(15% 0.005 248)", "oklch(26% 0.005 248)", "oklch(37% 0.005 248)", "oklch(48% 0.005 248)",
+          "oklch(59% 0.005 248)", "oklch(70% 0.005 248)", "oklch(81% 0.005 248)", "oklch(92% 0.005 248)"
+        ]
+      },
+      "ok": {
+        "role": "secondary",
+        "displayName": "Signal Green",
+        "canonical": "#3fb950",
+        "tonalRamp": [
+          "oklch(15% 0.19 145)", "oklch(26% 0.19 145)", "oklch(37% 0.19 145)", "oklch(48% 0.19 145)",
+          "oklch(59% 0.19 145)", "oklch(70% 0.19 145)", "oklch(81% 0.19 145)", "oklch(92% 0.19 145)"
+        ]
+      },
+      "warn": {
+        "role": "secondary",
+        "displayName": "Signal Amber",
+        "canonical": "#d29922",
+        "tonalRamp": [
+          "oklch(15% 0.14 83)", "oklch(26% 0.14 83)", "oklch(37% 0.14 83)", "oklch(48% 0.14 83)",
+          "oklch(59% 0.14 83)", "oklch(70% 0.14 83)", "oklch(81% 0.14 83)", "oklch(92% 0.14 83)"
+        ]
+      },
+      "err": {
+        "role": "secondary",
+        "displayName": "Signal Red",
+        "canonical": "#f85149",
+        "tonalRamp": [
+          "oklch(15% 0.21 26)", "oklch(26% 0.21 26)", "oklch(37% 0.21 26)", "oklch(48% 0.21 26)",
+          "oklch(59% 0.21 26)", "oklch(70% 0.21 26)", "oklch(81% 0.21 26)", "oklch(92% 0.21 26)"
+        ]
+      },
+      "accent": {
+        "role": "primary",
+        "displayName": "Signal Blue",
+        "canonical": "#58a6ff",
+        "tonalRamp": [
+          "oklch(15% 0.13 241)", "oklch(26% 0.13 241)", "oklch(37% 0.13 241)", "oklch(48% 0.13 241)",
+          "oklch(59% 0.13 241)", "oklch(70% 0.13 241)", "oklch(81% 0.13 241)", "oklch(92% 0.13 241)"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "display": { "displayName": "Display", "purpose": "The one 22px number on the page: the idle countdown, colored by verdict." },
+      "headline": { "displayName": "Headline", "purpose": "The page title in the header." },
+      "body": { "displayName": "Body", "purpose": "Base reading size: kv values, table data." },
+      "aux": { "displayName": "Aux", "purpose": "Tables, the status word, gates, header subtitle." },
+      "label": { "displayName": "Label", "purpose": "Panel heads and the logs-tray toggle: 11px / 600 / +1px tracking, uppercase." },
+      "micro": { "displayName": "Micro", "purpose": "Schedule lines, tags, tray metadata, footer, per-client gates." }
+    },
+    "motion": [
+      {
+        "name": "tray-chevron",
+        "value": "transform 150ms ease",
+        "purpose": "The page's only motion: the logs-tray chevron rotates when the dock expands. The 5s redraw must stay motion-free."
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "State Word",
+      "kind": "custom",
+      "description": "The color-coded live state (Idle / Busy / Running Idle Tasks / Degraded) — the page's hero; sits left of the Engine gate.",
+      "html": "<div class=\"ds-state-row\"><span class=\"ds-state ds-state--ok\">Idle</span><span class=\"ds-state ds-state--warn\">Busy</span><span class=\"ds-state ds-state--accent\">Running Idle Tasks</span><span class=\"ds-state ds-state--err\">Degraded</span></div>",
+      "css": ".ds-state-row { display: flex; align-items: center; gap: 16px; } .ds-state { font-family: var(--mono); font-size: 12px; font-weight: 600; } .ds-state--ok { color: var(--ok); } .ds-state--warn { color: var(--warn); } .ds-state--accent { color: var(--accent); } .ds-state--err { color: var(--err); }"
+    },
+    {
+      "name": "Engine Gate (global)",
+      "kind": "custom",
+      "refersTo": "gate",
+      "description": "The header kill-switch combobox; two fixed options (Engine Paused / Engine Running); disabled at 0.55 opacity when no client is registered.",
+      "html": "<select class=\"ds-gate\" aria-label=\"engine gate\"><option>Engine Paused</option><option>Engine Running</option></select>",
+      "css": ".ds-gate { padding: 2px 8px; border-radius: 10px; border: 1px solid var(--border); font-family: var(--mono); font-size: 12px; background: var(--bg); color: var(--text); cursor: pointer; } .ds-gate:disabled { opacity: 0.55; cursor: not-allowed; } .ds-gate:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }"
+    },
+    {
+      "name": "Gate (per-client)",
+      "kind": "custom",
+      "refersTo": "gate-small",
+      "description": "The small per-client gate in the Clients table rows.",
+      "html": "<select class=\"ds-gate ds-gate--small\" aria-label=\"client gate\"><option>Engine Paused</option><option>Engine Running</option></select>",
+      "css": ".ds-gate { padding: 2px 8px; border-radius: 10px; border: 1px solid var(--border); font-family: var(--mono); font-size: 12px; background: var(--bg); color: var(--text); cursor: pointer; } .ds-gate--small { font-size: 11px; padding: 1px 4px; border-radius: 8px; } .ds-gate:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }"
+    },
+    {
+      "name": "Section Panel",
+      "kind": "card",
+      "refersTo": "section-panel",
+      "description": "The slate data panel with an 11px uppercase head; the quiet workhorse of the grid.",
+      "html": "<section class=\"ds-panel\"><h2 class=\"ds-panel-head\">Idle signal</h2><div class=\"ds-kv\"><span class=\"ds-kv-k\">threshold</span><span class=\"ds-kv-v\">60s quiet</span></div><div class=\"ds-kv\"><span class=\"ds-kv-k\">signal health</span><span class=\"ds-kv-v ds-kv-v--ok\">ok</span></div><div class=\"ds-empty\">no active lease</div></section>",
+      "css": ".ds-panel { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px; font-family: var(--mono); font-size: 13px; line-height: 1.5; color: var(--text); } .ds-panel-head { margin: 0 0 8px; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--dim); font-weight: 600; } .ds-kv { display: flex; justify-content: space-between; padding: 2px 0; } .ds-kv-k { color: var(--dim); } .ds-kv-v--ok { color: var(--ok); } .ds-empty { color: var(--dim); font-style: italic; padding: 6px 0; }"
+    },
+    {
+      "name": "Idle Countdown",
+      "kind": "custom",
+      "refersTo": "section-panel",
+      "description": "The single 22px display number: idle-for value, colored ok/warn by the live verdict.",
+      "html": "<div class=\"ds-kv\"><span class=\"ds-kv-k\">idle for</span><span class=\"ds-big ds-big--ok\">12m 04s</span></div>",
+      "css": ".ds-kv { display: flex; justify-content: space-between; padding: 2px 0; font-family: var(--mono); font-size: 13px; color: var(--text); } .ds-kv-k { color: var(--dim); } .ds-big { font-size: 22px; } .ds-big--ok { color: var(--ok); }"
+    },
+    {
+      "name": "State Tag",
+      "kind": "chip",
+      "refersTo": "tag",
+      "description": "Exception-only chips: the border takes the semantic color with the text; no tag is the healthy state.",
+      "html": "<span class=\"ds-tag\">active</span> <span class=\"ds-tag ds-tag--ok\">active</span> <span class=\"ds-tag ds-tag--accent\">finished</span> <span class=\"ds-tag ds-tag--warn\">paused</span> <span class=\"ds-tag ds-tag--warn\">budget full</span> <span class=\"ds-tag ds-tag--err\">paused</span>",
+      "css": ".ds-tag { display: inline-block; padding: 0 6px; border-radius: 8px; font-size: 11px; border: 1px solid var(--border); background: transparent; color: var(--text); font-family: var(--mono); } .ds-tag--ok { color: var(--ok); border-color: var(--ok); } .ds-tag--accent { color: var(--accent); border-color: var(--accent); } .ds-tag--warn { color: var(--warn); border-color: var(--warn); } .ds-tag--err { color: var(--err); border-color: var(--err); }"
+    },
+    {
+      "name": "Budget Bar",
+      "kind": "custom",
+      "refersTo": "budget-bar",
+      "description": "Daily token budget: 6px hairline track, blue fill; turns amber (hot) past 80% of the cap.",
+      "html": "<div class=\"ds-budget-row\"><div class=\"ds-budget\"><div class=\"ds-budget-fill\"></div></div><div class=\"ds-budget\"><div class=\"ds-budget-fill ds-budget-fill--hot\"></div></div></div>",
+      "css": ".ds-budget-row { display: flex; gap: 12px; } .ds-budget { height: 6px; width: 180px; background: var(--border); border-radius: 3px; overflow: hidden; } .ds-budget-fill { height: 100%; width: 42%; background: var(--accent); } .ds-budget-fill--hot { background: var(--warn); width: 91%; }"
+    },
+    {
+      "name": "Worker Row",
+      "kind": "custom",
+      "description": "One allocated worker: online dot (green/dim), bold name, dim meta (model, ~estimate), right-aligned queued count.",
+      "html": "<div class=\"ds-worker\"><span class=\"ds-worker-dot on\"></span><span class=\"ds-worker-name\">mac-mini</span><span class=\"ds-worker-meta\">qwen3 · ~4m/job</span><span class=\"ds-worker-queue\">3 queued</span></div><div class=\"ds-worker\"><span class=\"ds-worker-dot\"></span><span class=\"ds-worker-name\">urza (offline)</span><span class=\"ds-worker-meta\">llama3 · ~12m/job</span><span class=\"ds-worker-queue\">17 queued</span></div>",
+      "css": ".ds-worker { display: flex; align-items: center; gap: 8px; padding: 1px 0; font-size: 12px; font-family: var(--mono); color: var(--text); } .ds-worker-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--dim); } .ds-worker-dot.on { background: var(--ok); } .ds-worker-name { min-width: 84px; font-weight: 600; } .ds-worker-meta { color: var(--dim); } .ds-worker-queue { margin-left: auto; white-space: nowrap; }"
+    },
+    {
+      "name": "Data Table",
+      "kind": "custom",
+      "description": "The lease/event tables: 12px, dim 600 header with a hairline, rows divided at 50% hairline, no zebra.",
+      "html": "<table class=\"ds-table\"><thead><tr><th>lease</th><th>client</th><th>state</th></tr></thead><tbody><tr><td>l_9f31</td><td>mac-mini</td><td><span class=\"ds-tag ds-tag--accent\">active</span></td></tr><tr><td>l_8a02</td><td>urza</td><td><span class=\"ds-tag ds-tag--warn\">expired</span></td></tr></tbody></table>",
+      "css": ".ds-table { width: 100%; border-collapse: collapse; font-size: 12px; font-family: var(--mono); color: var(--text); } .ds-table th { text-align: left; color: var(--dim); font-weight: 600; padding: 3px 6px; border-bottom: 1px solid var(--border); } .ds-table td { padding: 3px 6px; border-bottom: 1px solid rgba(48, 54, 61, 0.5); } .ds-table tr:last-child td { border-bottom: none; } .ds-tag { display: inline-block; padding: 0 6px; border-radius: 8px; font-size: 11px; border: 1px solid var(--border); color: var(--text); } .ds-tag--accent { color: var(--accent); border-color: var(--accent); } .ds-tag--warn { color: var(--warn); border-color: var(--warn); }"
+    },
+    {
+      "name": "Logs Tray",
+      "kind": "custom",
+      "description": "The fixed bottom dock: uppercase toggle with chevron, Events/Leases tabs, records-to-show select, count pushed right.",
+      "html": "<div class=\"ds-tray\"><div class=\"ds-tray-head\"><button type=\"button\" class=\"ds-tray-toggle\"><span class=\"ds-tray-chev\">&#9650;</span>logs</button><div class=\"ds-tray-tabs\"><button type=\"button\" class=\"ds-tray-tab active\">Events</button><button type=\"button\" class=\"ds-tray-tab\">Leases</button></div><select class=\"ds-tray-select\" aria-label=\"records to show\"><option>10</option><option>25</option><option>50</option><option>100</option></select><span class=\"ds-tray-count\">events 10 · leases 3</span></div></div>",
+      "css": ".ds-tray { background: var(--panel); border-top: 1px solid var(--border); font-family: var(--mono); } .ds-tray-head { display: flex; align-items: center; gap: 10px; padding: 5px 16px; } .ds-tray-toggle { display: inline-flex; align-items: center; gap: 6px; background: none; border: none; padding: 2px 4px; cursor: pointer; color: var(--text); font-family: var(--mono); font-size: 11px; font-weight: 600; letter-spacing: 1px; text-transform: uppercase; } .ds-tray-toggle .ds-tray-chev { display: inline-block; transition: transform 0.15s ease; font-size: 13px; } .ds-tray-toggle:hover { color: var(--accent); } .ds-tray-tabs { display: flex; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; } .ds-tray-tabs button { background: var(--bg); border: none; color: var(--dim); font: inherit; font-size: 11px; padding: 2px 10px; cursor: pointer; } .ds-tray-tabs button.active { color: var(--text); background: var(--panel); } .ds-tray-select { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 4px; font: inherit; font-size: 11px; padding: 2px 4px; } .ds-tray-count { margin-left: auto; color: var(--dim); font-size: 12px; }"
+    },
+    {
+      "name": "Gate Token Input",
+      "kind": "input",
+      "refersTo": "input-token",
+      "description": "The arbiter API token field under the Clients panel; stored to localStorage, never rendered back.",
+      "html": "<input class=\"ds-input-token\" type=\"password\" placeholder=\"arbiter API token (enables gate changes)\" autocomplete=\"off\">",
+      "css": ".ds-input-token { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 4px; font-family: var(--mono); font-size: 11px; padding: 2px 6px; width: 240px; } .ds-input-token::placeholder { color: var(--dim); } .ds-input-token:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Quiet Control Room",
+    "overview": "The idlefill dashboard is an instrument panel, not a website. It sits on a dark canvas in one monospace family at a density an operator can read across the room in a single glance: a color-coded state word, a kill-switch combobox, four data panels, and a log dock pinned to the bottom edge. The page polls every 5 seconds and redraws itself; nothing animates, nothing floats, nothing asks for attention. The only saturated pixels on the page are live state.\n\nColor is scarce by doctrine. A single neutral ramp — the GitHub dark (Primer) palette, used unmodified — carries all structure: panels, hairlines, labels, empty states. Four signal colors (green, amber, red, blue) appear only where a live verdict needs them: the Idle/Busy/Running Idle Tasks/Degraded word, online dots, the budget bar, and exception tags. If a pixel is colored, something is happening.\n\nDepth is tonal, not lifted: the canvas sits darker than the slate panels, and 1px hairlines do the work shadows would. Radii are small and utilitarian (3–10px), borders always 1px. The result is a control room that stays quiet while the machine sleeps — and speaks plainly the moment it wakes.",
+    "keyCharacteristics": [
+      "One monospace family, 11–13px base, a single 22px display number",
+      "Four signal colors, state-only: green quiet, amber blocked, red failed, blue working",
+      "Zero shadows; tonal layering plus 1px hairlines",
+      "Fluid auto-fit panel grid (min 340px columns), no media queries",
+      "Exception-only tags: no tag is the healthy state",
+      "Fixed bottom logs tray (a dock) with a single 150ms chevron transition"
+    ],
+    "rules": [
+      {
+        "name": "The One Word Rule",
+        "body": "The state is the word, not the frame. Live state rides the color-coded status word; control frames around it — comboboxes, borders, default badges — stay neutral.",
+        "section": "colors"
+      },
+      {
+        "name": "The Exception-Only Rule",
+        "body": "Tags appear for exceptions only (paused, budget full, forced). No tag is the healthy state; a running or scheduling tag is noise.",
+        "section": "colors"
+      },
+      {
+        "name": "The One Typeface Rule",
+        "body": "There is one family on the page. Hierarchy comes from size, weight, and tracking — not from a display face.",
+        "section": "typography"
+      },
+      {
+        "name": "The Flat-By-Default Rule",
+        "body": "Surfaces are flat at rest and flat always; state is communicated with color and text, never lift.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do let one color-coded word carry the live state (Idle / Busy / Running Idle Tasks / Degraded) and keep every frame around it neutral.",
+      "Do divide with 1px hairlines: Hairline at panel edges, the 50% hairline inside tables and project blocks.",
+      "Do reflow panels with the auto-fit grid (repeat(auto-fit, minmax(340px, 1fr)), 14px gap) instead of adding breakpoints.",
+      "Do set every panel head at 11px / 600 / +1px tracking, uppercase, Muted Gray.",
+      "Do reserve the 22px display size for the idle countdown alone.",
+      "Do keep schedule lines in plain words: runs when idle ≥Ns · max N jobs at a time · auto-cancels after Xm."
+    ],
+    "donts": [
+      "Don't add shadows or gradient washes — depth is tonal layering plus 1px hairlines only (the page has zero box-shadow).",
+      "Don't render a tag for the healthy state: no tag means running, fine (no running, no scheduling).",
+      "Don't animate anything but the tray chevron (150ms ease); the page redraws every 5s, so motion is a defect."
+    ]
+  }
+}

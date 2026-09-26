@@ -16,7 +16,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import fastify, { type FastifyInstance } from 'fastify';
 import { WebSocketServer } from 'ws';
 import { utcDay, type Arbiter } from './arbiter.js';
-import type { ProjectAllocation, ServerConfig } from './types.js';
+import type { ProjectAllocation, ServerConfig, ServerConnection } from './types.js';
 
 export interface ApiDeps {
   arbiter: Arbiter;
@@ -54,19 +54,21 @@ function bearer(req: { headers: Record<string, unknown>; query: unknown }): stri
 
 /**
  * Project view for the dashboard: the project config + today's budget, the
- * connected workers allocated to it (clients that report this project), and
- * the scheduling knobs that govern its grants. Workers are ordered
- * online-first, then by name.
+ * connected workers allocated to it (clients that report this project, with
+ * their published stats), and the EFFECTIVE scheduling knobs (per-project
+ * overrides win; unset = the global). Workers are ordered online-first,
+ * then by name.
  */
 function projectView(
   arbiter: Arbiter,
   cfg: ServerConfig,
-  clients: { name: string; last_seen: number; projects: { name: string; model: string; estimated_seconds: number; queue_depth: number }[] }[],
+  clients: { name: string; last_seen: number; projects: { name: string; model: string; estimated_seconds: number; queue_depth: number; stats?: Record<string, number | string> }[] }[],
   day: string,
   now: number,
   today: Record<string, { finished: number; failed: number }>,
 ) {
   return cfg.projects.map((p) => {
+    const eff = arbiter.projectEffectiveSettings(p.name);
     const workers = clients
       .filter((c) => (c.projects ?? []).some((x) => x.name === p.name))
       .map((c) => {
@@ -77,6 +79,7 @@ function projectView(
           estimated_seconds: alloc?.estimated_seconds ?? 0,
           queue_depth: alloc?.queue_depth ?? 0,
           online: now - c.last_seen < 90_000,
+          stats: alloc?.stats ?? {},
         };
       })
       .sort((a, b) => Number(b.online) - Number(a.online) || a.client.localeCompare(b.client));
@@ -87,10 +90,17 @@ function projectView(
       today: today[p.name] ?? { finished: 0, failed: 0 },
       scheduling: {
         paused: p.paused,
-        idle_seconds: cfg.idle_seconds,
-        max_concurrent_leases: cfg.max_concurrent_leases,
-        lease_ttl_seconds: cfg.lease_ttl_seconds,
+        idle_seconds: eff.idle_seconds,
+        max_concurrent_leases: eff.max_concurrent_leases,
+        lease_ttl_seconds: eff.lease_ttl_seconds,
         daily_token_cap: p.daily_token_cap,
+        // The per-project overrides in effect (absent key = inherits the
+        // global value).
+        overrides: {
+          idle_seconds: p.idle_seconds ?? null,
+          max_concurrent_leases: p.max_concurrent_leases ?? null,
+          lease_ttl_seconds: p.lease_ttl_seconds ?? null,
+        },
       },
     };
   });
@@ -113,6 +123,48 @@ function todayTotals(leases: { project: string; status: string; ended_at?: numbe
     else e.failed += 1;
   }
   return per;
+}
+
+/**
+ * The declared inference-server connections with their models expanded into
+ * the queueable-resource rows the dashboard renders. The row whose url +
+ * activity_path match the watched feed carries `watched: true` and the live
+ * signal object (the arbiter watches exactly one feed today — other rows are
+ * declared inventory and carry no live signal).
+ */
+function serverView(arbiter: Arbiter, cfg: ServerConfig, now: number) {
+  const s = arbiter['store'].state;
+  const sig = arbiter['detector'].signal(now);
+  const lastAct = s.last_activity;
+  const signal = {
+    idle: sig.idle,
+    idle_for_s: sig.idle_for_s,
+    last_activity: lastAct ? { ...lastAct, age_s: Math.max(0, Math.round((now - lastAct.ts) / 1000)) } : null,
+    last_log_write_age_s: s.last_log_write ? Math.max(0, Math.round((now - s.last_log_write) / 1000)) : null,
+    degraded: s.signal_degraded,
+    degraded_reason: s.degraded_reason,
+    reidle_gated: arbiter.reidleGated(),
+  };
+  const activeClients = new Set(arbiter.activeLeases(now).map((l) => l.client_name));
+  const runningModels = new Set<string>();
+  const queuedByModel = new Map<string, number>();
+  for (const c of s.clients) {
+    const online = now - (c.last_seen ?? 0) < 90_000;
+    for (const a of c.projects ?? []) {
+      if (!a.model) continue;
+      if (online) queuedByModel.set(a.model, (queuedByModel.get(a.model) ?? 0) + (a.queue_depth ?? 0));
+      if (activeClients.has(c.name)) runningModels.add(a.model);
+    }
+  }
+  return s.servers.map((row: ServerConnection) => {
+    const watched = row.url === cfg.llama_swap_url && row.activity_path === cfg.activity_path;
+    return {
+      ...row,
+      watched,
+      signal: watched ? signal : null,
+      models: row.models.map((m) => ({ name: m, running: runningModels.has(m), queued: queuedByModel.get(m) ?? 0 })),
+    };
+  });
 }
 
 /** Attach the API routes (authed) and the dashboard (public read). */
@@ -150,6 +202,16 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     const name = typeof body.name === 'string' ? body.name.trim() : '';
     if (!name) return reply.code(400).send({ error: 'name required' });
     const remote = (req.ip ?? '').split(':').pop() ?? 'unknown';
+    const cleanStats = (raw: unknown): Record<string, number | string> | undefined => {
+      if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+      const out: Record<string, number | string> = {};
+      for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+        if (Object.keys(out).length >= 24) break; // a stat row is display data, not a dump
+        if (typeof v === 'number' && Number.isFinite(v)) out[k] = v;
+        else if (typeof v === 'string' && v.trim() !== '' && v.length <= 64) out[k] = v;
+      }
+      return Object.keys(out).length > 0 ? out : undefined;
+    };
     const projects = Array.isArray(body.projects)
       ? body.projects
           .filter((p) => p && typeof p.name === 'string' && p.name.trim() !== '')
@@ -158,6 +220,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
             model: typeof p.model === 'string' ? p.model : '',
             estimated_seconds: typeof p.estimated_seconds === 'number' && Number.isFinite(p.estimated_seconds) ? p.estimated_seconds : 0,
             queue_depth: typeof p.queue_depth === 'number' && Number.isFinite(p.queue_depth) ? p.queue_depth : 0,
+            stats: cleanStats((p as { stats?: unknown }).stats),
           }))
       : undefined;
     const res = arbiter.registerClient(name, typeof body.ip === 'string' && body.ip.trim() ? body.ip.trim() : undefined, remote, projects);
@@ -265,6 +328,82 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     return { ok: true, name, paused: p.paused };
   });
 
+  /**
+   * Project-level grant settings (the knobs that gate this project's grants,
+   * beyond the per-project pause): idle_seconds (runs when idle ≥ Ns),
+   * max_concurrent_leases (max N jobs at a time), lease_ttl_seconds
+   * (auto-cancels after Ns). A value of `null` CLEARS the per-project
+   * override — the project inherits the global value again.
+   */
+  app.post('/api/projects/:name/settings', async (req, reply) => {
+    const { name } = req.params as { name: string };
+    const body = (req.body ?? {}) as {
+      clear?: boolean;
+      idle_seconds?: number | null;
+      max_concurrent_leases?: number | null;
+      lease_ttl_seconds?: number | null;
+    };
+    const numOr = (v: unknown): number | null | undefined => (v === null ? null : typeof v === 'number' ? v : undefined);
+    // { clear: true } drops every override at once (CLI shorthand).
+    const settings = body.clear
+      ? { idle_seconds: null, max_concurrent_leases: null, lease_ttl_seconds: null }
+      : {
+          idle_seconds: numOr(body.idle_seconds),
+          max_concurrent_leases: numOr(body.max_concurrent_leases),
+          lease_ttl_seconds: numOr(body.lease_ttl_seconds),
+        };
+    if (settings.idle_seconds === undefined && settings.max_concurrent_leases === undefined && settings.lease_ttl_seconds === undefined) {
+      return reply.code(400).send({ error: 'provide idle_seconds, max_concurrent_leases, or lease_ttl_seconds (number, or null to clear the override)' });
+    }
+    for (const v of Object.values(settings)) {
+      if (v !== null && v !== undefined && (!Number.isFinite(v) || v <= 0)) {
+        return reply.code(400).send({ error: 'settings must be positive numbers (or null to clear)' });
+      }
+    }
+    const res = arbiter.setProjectSettings(name, settings);
+    if (!res.ok) return reply.code(404).send({ error: res.reason ?? 'unknown_project' });
+    const p = cfg.projects.find((x) => x.name === name)!;
+    return {
+      ok: true,
+      name,
+      overrides: {
+        idle_seconds: p.idle_seconds ?? null,
+        max_concurrent_leases: p.max_concurrent_leases ?? null,
+        lease_ttl_seconds: p.lease_ttl_seconds ?? null,
+      },
+    };
+  });
+
+  // ------------------------------------------------------------------
+  // Inference servers (declared connections + their model resources)
+  // ------------------------------------------------------------------
+
+  app.get('/api/servers', async (req) => {
+    return { servers: serverView(arbiter, cfg, Date.now()) };
+  });
+
+  /**
+   * Add (no id) or update (with id) a declared server connection:
+   * { name, url, activity_path?, models?, peers? }. Inventory only — the
+   * arbiter watches its single configured feed; a declared row is where a
+   * future multi-feed core will point the watcher.
+   */
+  app.post('/api/servers', async (req, reply) => {
+    const body = (req.body ?? {}) as {
+      id?: string;
+      name?: string;
+      url?: string;
+      activity_path?: string;
+      models?: string[];
+      peers?: string[];
+    };
+    const res = arbiter.upsertServerConnection(body);
+    if (!res.ok) {
+      return reply.code(res.reason === 'unknown_server' ? 404 : 400).send({ error: res.reason ?? 'invalid' });
+    }
+    return { ok: true, created: res.created, server: res.server };
+  });
+
   // ------------------------------------------------------------------
   // State (public read when anonymous; token-authed otherwise)
   // ------------------------------------------------------------------
@@ -300,6 +439,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       // dashboard and clients can see pause/force state without a second call.
       clients: s.clients.map((c) => ({ ...c, override: arbiter.activeOverride(c.client_id, now) })),
       projects: projectView(arbiter, cfg, s.clients, day, now, todayTotals(s.leases, day)),
+      servers: serverView(arbiter, cfg, now),
       events: s.events.slice(Math.max(0, s.events.length - limit)).reverse(),
     };
   });

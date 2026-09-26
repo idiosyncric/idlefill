@@ -131,6 +131,36 @@ export function removeJob(file: string, jobId: string): boolean {
   return true;
 }
 
+/**
+ * Today's (UTC) published stats for a project, computed by the CLIENT from
+ * its own ground truth (the results file it appends to on every success).
+ * The arbiter displays these verbatim — it never computes them. A result
+ * line with ts on the UTC day and ok=true counts finished; any other line
+ * counts failed (a failed job keeps its line for audit).
+ */
+export function projectStats(resultsFile: string, now = Date.now()): { finished: number; failed: number; last_job: string } {
+  const day = new Date(now).toISOString().slice(0, 10);
+  let finished = 0;
+  let failed = 0;
+  let lastJob = '';
+  if (existsSync(resultsFile)) {
+    const lines = readFileSync(resultsFile, 'utf-8').split('\n').filter((l) => l.trim());
+    for (const l of lines) {
+      try {
+        const r = JSON.parse(l) as { ok?: boolean; job_id?: string; ts?: string };
+        if (r && typeof r.job_id === 'string' && r.job_id) lastJob = r.job_id;
+        if (typeof r.ts === 'string' && r.ts.slice(0, 10) === day) {
+          if (r.ok === true) finished += 1;
+          else failed += 1;
+        }
+      } catch {
+        /* skip corrupt line */
+      }
+    }
+  }
+  return { finished, failed, last_job: lastJob };
+}
+
 export function appendResult(file: string, line: Record<string, unknown>): void {
   mkdirSync(dirname(file), { recursive: true });
   appendFileSync(file, JSON.stringify(line) + '\n');
@@ -309,12 +339,18 @@ export class ClientDaemon {
       ip: this.cfg.ip || undefined,
       // The arbiter stores this per-project view for the dashboard
       // (Projects → workers allocated). Re-registration is a heartbeat:
-      // last_seen refreshes and queue depths update on every tick.
+      // last_seen refreshes and queue depths update on every tick. `stats`
+      // are client-published (finished/failed today, last job) — the
+      // arbiter shows them, it never computes them.
       projects: this.cfg.projects.map((p) => ({
         name: p.name,
         model: p.model,
         estimated_seconds: p.estimated_seconds ?? 900,
         queue_depth: queueDepth(p.queue_file),
+        stats: {
+          ...projectStats(p.results_file),
+          queue: queueDepth(p.queue_file),
+        },
       })),
     });
     if (status !== 200 || !body.client_id) {

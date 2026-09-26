@@ -44,6 +44,7 @@ before(async () => {
     llm_target: 'http://127.0.0.1:1',
     repo_root: here,
     state_dir: join(dir, 'state'),
+    state_file: join(dir, 'state.json'),
     projects: [
       {
         name: 'test-proj',

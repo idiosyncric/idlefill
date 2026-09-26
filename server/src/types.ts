@@ -7,6 +7,15 @@ export interface ProjectConfig {
   paused: boolean;
   /** Output-token cap per UTC day for this project. */
   daily_token_cap: number;
+  /**
+   * Per-project overrides of the global grant knobs. Unset = inherit the
+   * global value (cfg.idle_seconds / max_concurrent_leases / lease_ttl_seconds).
+   * Set via POST /api/projects/:name/settings (persisted in the state file's
+   * project row — cfg is the live object the arbiter reads from).
+   */
+  idle_seconds?: number;
+  max_concurrent_leases?: number;
+  lease_ttl_seconds?: number;
 }
 
 export interface ServerConfig {
@@ -14,6 +23,12 @@ export interface ServerConfig {
   api_tokens: string[];
   llama_swap_url: string;
   activity_path: string;
+  /** Display name for the watched inference server (defaults to the URL's host:port). */
+  server_name?: string;
+  /** Models that can run concurrently on the watched server (queueable resources). */
+  server_models?: string[];
+  /** llama-swap `peer:` backends routed behind the single entry point (display metadata). */
+  server_peers?: string[];
   /** Glob of NInfer req-*.jsonl logs. Empty string disables the log-mtime signal. */
   log_glob: string;
   idle_seconds: number;
@@ -38,6 +53,34 @@ export interface ProjectAllocation {
   estimated_seconds: number;
   /** Jobs currently in the client's local queue for this project. */
   queue_depth: number;
+  /**
+   * Client-published stats for this project (the heartbeat carries them with
+   * every re-registration). String keys; number or short-string values. The
+   * arbiter stores and displays them — it never computes them.
+   */
+  stats?: Record<string, number | string>;
+}
+
+/**
+ * A declared inference-server connection. The arbiter watches ONE feed
+ * (cfg.llama_swap_url + cfg.activity_path); the connection list is the
+ * operator-managed inventory of the server(s) behind it — today exactly the
+ * watched one, seeded from config, and the `peer:` backends that llama-swap
+ * routes behind its single entry point. Multi-feed monitoring is future
+ * work; rows carry no live signal until the core catches up.
+ */
+export interface ServerConnection {
+  id: string;
+  name: string;
+  /** Inference-server (llama-swap) base URL. */
+  url: string;
+  activity_path: string;
+  /** Models that can run concurrently on this server (separate queueable resources). */
+  models: string[];
+  /** llama-swap `peer:` backends routed behind this entry point (display only). */
+  peers: string[];
+  configured_at: number;
+  updated_at: number;
 }
 
 export interface ClientRecord {
@@ -146,7 +189,10 @@ export type EventKind =
   | 'signal_recovered'
   | 'client_paused'
   | 'client_forced'
-  | 'client_override_cleared';
+  | 'client_override_cleared'
+  | 'project_settings_updated'
+  | 'server_connection_added'
+  | 'server_connection_updated';
 
 export interface EventRecord {
   ts: number;
@@ -156,7 +202,26 @@ export interface EventRecord {
   detail?: string;
 }
 
+/**
+ * The persisted project row: the project's operator state (pause + the
+ * per-project grant-knob overrides) as of the last write. Config is the
+ * declaration; these rows are the live truth and re-hydrate the config
+ * objects at boot.
+ */
+export interface ProjectStateRow {
+  name: string;
+  paused: boolean;
+  idle_seconds?: number;
+  max_concurrent_leases?: number;
+  lease_ttl_seconds?: number;
+  updated_at: number;
+}
+
 export interface ArbiterState {
+  /** Declared inference-server connections (seeded from config on first load). */
+  servers: ServerConnection[];
+  /** Persisted operator state for each configured project. */
+  projects: ProjectStateRow[];
   clients: ClientRecord[];
   /**
    * Operator overrides (pause/force), keyed by client_id. A client that

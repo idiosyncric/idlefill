@@ -61,6 +61,9 @@ before(async () => {
     api_tokens: [TOKEN],
     llama_swap_url: 'http://fake',
     activity_path: '/api/metrics/activity',
+    server_name: 'llama-swap',
+    server_models: ['Qwen3.8-27B'],
+    server_peers: [],
     log_glob: '',
     idle_seconds: 300,
     poll_ms: 60_000, // tests drive ticks manually; no background polling surprises
@@ -227,12 +230,14 @@ test('busy system returns 409 not_idle; unknown client 409 unknown_client', asyn
   assert.equal(((await res2.json()) as { reason: string }).reason, 'unknown_client');
 });
 
-test('dashboard HTML serves', async () => {
+test('dashboard HTML serves (two-pane dashboard: Inference Servers + Projects)', async () => {
   const res = await fetch(`${base}/`);
   assert.equal(res.status, 200);
   const html = await res.text();
   assert.match(html, /<html/);
   assert.match(html, /idlefill/);
+  assert.match(html, /Inference Servers/);
+  assert.match(html, /Projects/);
   assert.match(html, /api\/state/);
   assert.ok((res.headers.get('content-type') ?? '').includes('text/html'));
 });
@@ -254,6 +259,110 @@ test('/api/state shape', async () => {
   assert.ok((st.clients as unknown[]).length >= 1, 'registered client visible');
   const clientRow = (st.clients as { name: string; override: unknown }[]).find((c) => c.name === 'mac-test')!;
   assert.ok('override' in clientRow, 'client rows carry their (active or null) override');
+});
+
+test('per-project grant knobs: override + effective values + persistence', async () => {
+  const get = () =>
+    fetch(`${base}/api/state`, { headers: auth }).then((r) =>
+      r.json() as Promise<{
+        projects: {
+          name: string;
+          scheduling: {
+            idle_seconds: number;
+            max_concurrent_leases: number;
+            lease_ttl_seconds: number;
+            overrides: { idle_seconds: number | null; max_concurrent_leases: number | null; lease_ttl_seconds: number | null };
+          };
+        }[];
+      }>,
+    );
+
+  const set = (body: Record<string, unknown>) =>
+    fetch(`${base}/api/projects/career-ops/settings`, { method: 'POST', headers: auth, body: JSON.stringify(body) }).then(async (r) => ({
+      status: r.status,
+      body: (await r.json().catch(() => ({}))) as Record<string, unknown>,
+    }));
+
+  // bad shapes are rejected
+  assert.equal((await set({ idle_seconds: 'soon' })).status, 400, 'non-numeric idle_seconds rejected');
+  assert.equal((await set({ lease_ttl_seconds: -5 })).status, 400, 'non-positive ttl rejected');
+
+  // a partial override updates only what is provided
+  const upd = await set({ idle_seconds: 600, lease_ttl_seconds: 900 });
+  assert.equal(upd.status, 200);
+  assert.ok('overrides' in upd.body, 'the response echoes the raw overrides');
+
+  const st1 = await get();
+  const p1 = st1.projects.find((p) => p.name === 'career-ops')!;
+  assert.equal(p1.scheduling.idle_seconds, 600, 'effective idle = the override');
+  assert.equal(p1.scheduling.max_concurrent_leases, cfg.max_concurrent_leases, 'unset knob inherits the global');
+  assert.equal(p1.scheduling.lease_ttl_seconds, 900);
+  assert.deepEqual(p1.scheduling.overrides, { idle_seconds: 600, max_concurrent_leases: null, lease_ttl_seconds: 900 }, 'the raw overrides are visible');
+
+  // clear removes them all
+  const clr = await set({ clear: true });
+  assert.equal(clr.status, 200);
+  const st2 = await get();
+  const p2 = st2.projects.find((p) => p.name === 'career-ops')!;
+  assert.deepEqual(p2.scheduling.overrides, { idle_seconds: null, max_concurrent_leases: null, lease_ttl_seconds: null });
+  assert.equal(p2.scheduling.idle_seconds, cfg.idle_seconds, 'effective back to the global');
+
+  // unknown project → 404
+  const bad = await fetch(`${base}/api/projects/nope/settings`, { method: 'POST', headers: auth, body: JSON.stringify({ idle_seconds: 60 }) });
+  assert.equal(bad.status, 404);
+});
+
+test('server connections: seeded from config; add / update / guard rails', async () => {
+  type ServerRow = {
+    id: string;
+    name: string;
+    url: string;
+    models: { name: string; running: boolean; queued: number }[];
+    peers: string[];
+    watched: boolean;
+    signal: Record<string, unknown> | null;
+  };
+  const getState = () =>
+    fetch(`${base}/api/state`, { headers: auth }).then((r) => r.json() as Promise<{ servers: ServerRow[] }>);
+
+  const st0 = await getState();
+  // The arbiter seeds the config-declared connection on construction.
+  assert.equal(st0.servers.length, 1, 'exactly one connection seeded from config');
+  assert.equal(st0.servers[0]!.name, 'llama-swap');
+  assert.equal(st0.servers[0]!.watched, true, 'the seeded row is the watched feed');
+  assert.ok(st0.servers[0]!.signal, 'the watched row carries the live signal');
+  assert.equal(st0.servers[0]!.models.length, 1);
+  assert.equal(st0.servers[0]!.models[0]!.name, 'Qwen3.8-27B', 'models from config');
+  assert.equal(st0.servers[0]!.models[0]!.running, false, 'nothing is running yet');
+
+  // guard rails
+  const badUrl = await fetch(`${base}/api/servers`, { method: 'POST', headers: auth, body: JSON.stringify({ name: 'x', url: 'not a url' }) });
+  assert.equal(badUrl.status, 400, 'non-http url rejected');
+  const dup = await fetch(`${base}/api/servers`, { method: 'POST', headers: auth, body: JSON.stringify({ name: 'same', url: cfg.llama_swap_url, activity_path: cfg.activity_path }) });
+  assert.equal(dup.status, 400, 'duplicate connection (same url + path) rejected');
+
+  const add = await fetch(`${base}/api/servers`, { method: 'POST', headers: auth, body: JSON.stringify({ name: 'box-two', url: 'http://192.168.9.9:11434', models: ['a', 'b'], peers: ['peer:gpu2'] }) });
+  assert.equal(add.status, 200, 'add a declared (unwatched) connection');
+  const added = (await add.json()) as { ok: boolean; created: boolean; server: { id: string } };
+  assert.equal(added.created, true);
+
+  const st1 = await getState();
+  assert.equal(st1.servers.length, 2);
+  const two = st1.servers.find((s) => s.id === added.server.id)!;
+  assert.equal(two.watched, false, 'a declared (unwatched) connection is not the live feed');
+  assert.equal(two.signal, null, 'unwatched rows carry no live signal');
+  assert.deepEqual(two.models.map((m) => m.name), ['a', 'b']);
+  assert.ok(two.models.every((m) => m.running === false), 'declared models are not running');
+
+  // update by id (patch semantics)
+  const upd = await fetch(`${base}/api/servers`, { method: 'POST', headers: auth, body: JSON.stringify({ id: added.server.id, peers: [] }) });
+  assert.equal(upd.status, 200);
+  const st2 = await getState();
+  assert.deepEqual(st2.servers.find((s) => s.id === added.server.id)!.peers, [], 'patch updates only the provided fields');
+
+  // unknown id → 404
+  const miss = await fetch(`${base}/api/servers`, { method: 'POST', headers: auth, body: JSON.stringify({ id: 'srv-nope', name: 'x' }) });
+  assert.equal(miss.status, 404);
 });
 
 test('projects in /api/state carry allocated workers + scheduling; register validates project rows', async () => {

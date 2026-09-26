@@ -14,11 +14,19 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { ServerConfig } from './types.js';
 
-export const DEFAULTS: Omit<ServerConfig, 'state_file'> & { state_file: string } = {
+export const DEFAULTS: Omit<ServerConfig, 'state_file'> & {
+  state_file: string;
+  server_name: string;
+  server_models: string[];
+  server_peers: string[];
+} = {
   listen: 8787,
   api_tokens: [],
   llama_swap_url: 'http://100.105.225.1:11434',
   activity_path: '/api/metrics/activity',
+  server_name: 'llama-swap',
+  server_models: [],
+  server_peers: [],
   log_glob: '',
   idle_seconds: 300,
   poll_ms: 15000,
@@ -36,6 +44,13 @@ export function applyDefaults(raw: Partial<ServerConfig> | null | undefined): Se
     api_tokens: Array.isArray(r.api_tokens) ? r.api_tokens.filter((t) => typeof t === 'string') : [],
     llama_swap_url: str(r.llama_swap_url, DEFAULTS.llama_swap_url),
     activity_path: str(r.activity_path, DEFAULTS.activity_path),
+    server_name: str(r.server_name, DEFAULTS.server_name),
+    server_models: Array.isArray(r.server_models)
+      ? r.server_models.filter((m): m is string => typeof m === 'string' && m.trim() !== '')
+      : DEFAULTS.server_models,
+    server_peers: Array.isArray(r.server_peers)
+      ? r.server_peers.filter((m): m is string => typeof m === 'string' && m.trim() !== '')
+      : DEFAULTS.server_peers,
     log_glob: str(r.log_glob, DEFAULTS.log_glob),
     idle_seconds: num(r.idle_seconds, DEFAULTS.idle_seconds),
     poll_ms: num(r.poll_ms, DEFAULTS.poll_ms),

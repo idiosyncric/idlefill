@@ -40,6 +40,8 @@ export interface ClientConfig {
   projects: ClientProjectConfig[];
   repo_root: string;
   state_dir: string;
+  /** Crash-safe operator-state file (last lease + overrides); lives outside state_dir. */
+  state_file: string;
 }
 
 const DEFAULTS = {
@@ -100,6 +102,7 @@ export function loadClientConfig(
       : [],
     repo_root: repoRoot,
     state_dir: resolve(repoRoot, 'data'),
+    state_file: resolve(repoRoot, 'data', 'idlefill-client-state.json'),
   };
 }
 

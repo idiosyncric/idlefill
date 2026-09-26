@@ -33,7 +33,7 @@ import type { IdleDetector } from './idle.js';
 import { activeLeaseExemptIps } from './idle.js';
 import type { IdleSignal } from './types.js';
 import type { StateStore } from './state.js';
-import type { ClientOverride, Lease, ProjectAllocation, ServerConfig, UtcDate } from './types.js';
+import type { ClientOverride, Lease, ProjectAllocation, ServerConfig, ServerConnection, UtcDate } from './types.js';
 
 export type LeaseRejectionReason =
   | 'not_idle'
@@ -65,6 +65,10 @@ export class Arbiter {
   constructor(store: StateStore, cfg: ServerConfig, private detector: IdleDetector) {
     this.store = store;
     this.cfg = cfg;
+    // A fresh Arbiter must see the seeded server inventory, not just one
+    // that went through index.ts: the API/tests construct the arbiter
+    // directly. Idempotent — a non-empty state file is left untouched.
+    this.ensureServersSeeded();
   }
 
   // ------------------------------------------------------------------
@@ -231,15 +235,18 @@ export class Arbiter {
     }
 
     const active = this.activeLeases(now);
-    if (active.length >= this.cfg.max_concurrent_leases) return { ok: false, reason: 'busy' };
-
     const project = this.cfg.projects.find((p) => p.name === params.project);
     if (!project) return { ok: false, reason: 'unknown_project' };
     if (project.paused) return { ok: false, reason: 'project_paused' };
 
+    // Per-project grant knobs override the globals (unset = inherit).
+    const maxLeases = project.max_concurrent_leases ?? this.cfg.max_concurrent_leases;
+    if (active.length >= maxLeases) return { ok: false, reason: 'busy' };
+
     const used = this.projectTokensOut(params.project, utcDay(now));
     if (used >= project.daily_token_cap) return { ok: false, reason: 'budget_exhausted' };
 
+    const ttlSeconds = project.lease_ttl_seconds ?? this.cfg.lease_ttl_seconds;
     const lease: Lease = {
       lease_id: `l-${randomBytes(4).toString('hex')}`,
       client_id: client.client_id,
@@ -250,7 +257,7 @@ export class Arbiter {
       estimated_seconds: Math.max(0, params.estimated_seconds || 0),
       status: 'active',
       granted_at: now,
-      expires_at: now + this.cfg.lease_ttl_seconds * 1000,
+      expires_at: now + ttlSeconds * 1000,
       tokens_out: 0,
       tokens_in: 0,
     };
@@ -403,9 +410,164 @@ export class Arbiter {
     if (!p) return { ok: false, reason: 'unknown_project' };
     p.paused = paused;
     this.store.appendEvent({ kind: paused ? 'project_paused' : 'project_resumed', project: name });
+    this.syncProjectRows();
     this.store.trim();
     this.store.save();
     return { ok: true };
+  }
+
+  /**
+   * Project-level grant settings (idle_seconds / max_concurrent_leases /
+   * lease_ttl_seconds). A value of null CLEARS the per-project override —
+   * the project inherits the global knob again. Persisted on the live project
+   * config object (survives restarts via the state file's project rows).
+   */
+  setProjectSettings(
+    name: string,
+    settings: { idle_seconds?: number | null; max_concurrent_leases?: number | null; lease_ttl_seconds?: number | null },
+  ): { ok: boolean; reason?: string } {
+    const p = this.cfg.projects.find((x) => x.name === name);
+    if (!p) return { ok: false, reason: 'unknown_project' };
+    const setKnob = (key: 'idle_seconds' | 'max_concurrent_leases' | 'lease_ttl_seconds', v: number | null | undefined) => {
+      if (v === null) delete p[key];
+      else if (typeof v === 'number' && Number.isFinite(v) && v > 0) p[key] = v;
+    };
+    setKnob('idle_seconds', settings.idle_seconds);
+    setKnob('max_concurrent_leases', settings.max_concurrent_leases);
+    setKnob('lease_ttl_seconds', settings.lease_ttl_seconds);
+    const changed =
+      settings.idle_seconds !== undefined ||
+      settings.max_concurrent_leases !== undefined ||
+      settings.lease_ttl_seconds !== undefined;
+    if (!changed) return { ok: true };
+    this.store.appendEvent({
+      kind: 'project_settings_updated',
+      project: name,
+      detail: [
+        p.idle_seconds != null ? `idle≥${p.idle_seconds}s` : '',
+        p.max_concurrent_leases != null ? `max ${p.max_concurrent_leases}` : '',
+        p.lease_ttl_seconds != null ? `ttl ${p.lease_ttl_seconds}s` : '',
+      ]
+        .filter(Boolean)
+        .join(' · ') || 'inheriting globals',
+    });
+    this.syncProjectRows();
+    this.store.trim();
+    this.store.save();
+    return { ok: true };
+  }
+
+  /**
+   * Mirror the live project config rows (pause + per-project knobs) into the
+   * state file's persisted project rows; rows for projects removed from
+   * config are dropped. Called after every project mutation and once at
+   * boot (after the re-hydration) so the persisted rows are truth.
+   */
+  syncProjectRows(): void {
+    const nowMs = Date.now();
+    const prev = new Map(this.store.state.projects.map((r) => [r.name, r]));
+    this.store.state.projects = this.cfg.projects.map((p) => ({
+      name: p.name,
+      paused: p.paused,
+      idle_seconds: p.idle_seconds,
+      max_concurrent_leases: p.max_concurrent_leases,
+      lease_ttl_seconds: p.lease_ttl_seconds,
+      updated_at: prev.get(p.name)?.updated_at ?? nowMs,
+    }));
+  }
+
+  // ------------------------------------------------------------------
+  // Inference-server connections
+  // ------------------------------------------------------------------
+
+  /**
+   * Seed the declared-server inventory from config on first load (old state
+   * files have no `servers` key). Once rows exist they are operator-managed
+   * via the API and are NOT re-seeded — config is the initial declaration,
+   * the state file is the live truth.
+   */
+  ensureServersSeeded(): void {
+    const s = this.store.state;
+    if (s.servers.length > 0) return;
+    const nowMs = Date.now();
+    s.servers.push({
+      id: 'srv-watched',
+      name: this.cfg.server_name ?? 'llama-swap',
+      url: this.cfg.llama_swap_url,
+      activity_path: this.cfg.activity_path,
+      models: [...(this.cfg.server_models ?? [])],
+      peers: [...(this.cfg.server_peers ?? [])],
+      configured_at: nowMs,
+      updated_at: nowMs,
+    });
+    this.store.save();
+  }
+
+  /**
+   * Add (no `id`) or patch-update (with `id`) a declared server connection.
+   * Create requires name + url; an update patches only the fields provided
+   * (at least one must change). Pure inventory: the arbiter keeps watching
+   * its single configured feed — a declared row is where a future
+   * multi-feed core will point the watcher.
+   */
+  upsertServerConnection(input: {
+    id?: string;
+    name?: string;
+    url?: string;
+    activity_path?: string;
+    models?: string[];
+    peers?: string[];
+  }): { ok: boolean; reason?: string; created: boolean; server?: ServerConnection } {
+    const s = this.store.state;
+    const strList = (v: unknown): string[] | undefined =>
+      Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && x.trim() !== '') : undefined;
+    const models = strList(input.models);
+    const peers = strList(input.peers);
+    const nowMs = Date.now();
+    if (typeof input.id === 'string' && input.id.trim() !== '') {
+      const row = s.servers.find((x) => x.id === input.id!.trim());
+      if (!row) return { ok: false, reason: 'unknown_server', created: false };
+      let changed = false;
+      const touch = (apply: () => void) => {
+        apply();
+        changed = true;
+      };
+      if (typeof input.name === 'string' && input.name.trim() !== '') touch(() => void (row.name = input.name!.trim()));
+      if (typeof input.url === 'string' && input.url.trim() !== '') touch(() => void (row.url = input.url!.trim()));
+      if (typeof input.activity_path === 'string' && input.activity_path.trim() !== '')
+        touch(() => void (row.activity_path = input.activity_path!.trim()));
+      if (models) touch(() => void (row.models = models));
+      if (peers) touch(() => void (row.peers = peers));
+      if (!changed) return { ok: false, reason: 'nothing to update (provide name, url, activity_path, models, or peers)', created: false };
+      row.updated_at = nowMs;
+      this.store.appendEvent({ kind: 'server_connection_updated', detail: `${row.name} (${row.url})` });
+      this.store.trim();
+      this.store.save();
+      return { ok: true, created: false, server: row };
+    }
+    const name = typeof input.name === 'string' ? input.name.trim() : '';
+    const url = typeof input.url === 'string' ? input.url.trim() : '';
+    if (!name || !url) return { ok: false, reason: 'name and url required', created: false };
+    if (!/^https?:\/\//.test(url)) return { ok: false, reason: 'url must be an http(s) address', created: false };
+    const activityPath =
+      typeof input.activity_path === 'string' && input.activity_path.trim() !== '' ? input.activity_path.trim() : '/api/metrics/activity';
+    const dupe = s.servers.find((x) => x.url === url && x.activity_path === activityPath);
+    if (dupe) return { ok: false, reason: `duplicate connection: ${dupe.name} already declared at this url + activity path`, created: false };
+    const server: ServerConnection = {
+      id: `srv-${randomBytes(4).toString('hex')}`,
+      name,
+      url,
+      activity_path: activityPath,
+      models: models ?? [],
+      peers: peers ?? [],
+      configured_at: nowMs,
+      updated_at: nowMs,
+    };
+    s.servers.push(server);
+    this.store.appendEvent({ kind: 'server_connection_added', detail: `${name} (${url})` });
+    this.store.trim();
+    this.store.save();
+    return { ok: true, created: true, server };
   }
 
   // ------------------------------------------------------------------
@@ -427,6 +589,19 @@ export class Arbiter {
   /** Output tokens consumed by a project on a UTC day. */
   projectTokensOut(project: string, day: UtcDate): number {
     return this.store.state.budgets[project]?.[day]?.tokens_out ?? 0;
+  }
+
+  /**
+   * Effective grant knobs for a project (per-project overrides win; unset
+   * = inherit the globals). Also exposed on the state view's `scheduling`.
+   */
+  projectEffectiveSettings(name: string): { idle_seconds: number; max_concurrent_leases: number; lease_ttl_seconds: number } {
+    const p = this.cfg.projects.find((x) => x.name === name);
+    return {
+      idle_seconds: p?.idle_seconds ?? this.cfg.idle_seconds,
+      max_concurrent_leases: p?.max_concurrent_leases ?? this.cfg.max_concurrent_leases,
+      lease_ttl_seconds: p?.lease_ttl_seconds ?? this.cfg.lease_ttl_seconds,
+    };
   }
 
   projectBudget(project: string, day: UtcDate) {

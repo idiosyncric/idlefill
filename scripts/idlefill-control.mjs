@@ -1,11 +1,19 @@
 #!/usr/bin/env node
 /**
- * idlefill control CLI — operator overrides for registered clients.
+ * idlefill control CLI — operator controls for the arbiter.
  *
  *   node scripts/idlefill-control.mjs clients
  *   node scripts/idlefill-control.mjs pause  <client> [--for 30m]
  *   node scripts/idlefill-control.mjs force  <client> [--for 30m]
  *   node scripts/idlefill-control.mjs clear  <client>
+ *
+ *   node scripts/idlefill-control.mjs projects
+ *   node scripts/idlefill-control.mjs project <name> set [--idle N] [--max N] [--ttl N]
+ *   node scripts/idlefill-control.mjs project <name> clear
+ *
+ *   node scripts/idlefill-control.mjs servers
+ *   node scripts/idlefill-control.mjs server add <name> <url> [--models a,b,c] [--peers p1,p2]
+ *   node scripts/idlefill-control.mjs server set <id> [--name N] [--url U] [--models a,b] [--peers p1]
  *
  * <client> may be a client name or a client_id.
  * pause  — the arbiter refuses NEW leases for that client (active leases
@@ -14,6 +22,12 @@
  *          busy (still blocked by: degraded signal, max-concurrent, project
  *          pause, daily budget).
  * --for  — auto-expire the override (90s / 30m / 2h); default: until cleared.
+ * project set — per-project grant knobs (idle Ns / max N at a time /
+ *               auto-cancel after Ns); each flag is optional and independent.
+ * project clear — drop ALL per-project overrides (inherit the globals).
+ * servers    — the declared inference-server inventory (the arbiter watches
+ *              one feed; extra rows are where a future multi-feed core will
+ *              point the watcher).
  *
  * Auth: reads the arbiter token AT RUNTIME from the gitignored config
  * (IDLEFILL_CONFIG / IDLEFILL_CLIENT_CONFIG env, else server/config.json,
@@ -112,7 +126,12 @@ async function api(method, path, body) {
   return json ?? {};
 }
 
-const usage = () => fail('usage: idlefill-control.mjs clients | pause <client> [--for 30m] | force <client> [--for 30m] | clear <client>');
+const usage = () =>
+  fail(
+    'usage: idlefill-control.mjs clients | pause <client> [--for 30m] | force <client> [--for 30m] | clear <client> ' +
+      '| projects | project <name> set [--idle N] [--max N] [--ttl N] | project <name> clear ' +
+      '| servers | server add <name> <url> [--models a,b] [--peers p1] | server set <id> [--name N] [--url U] [--models a,b] [--peers p1]',
+  );
 
 if (cmd === 'clients') {
   const st = await api('GET', '/api/state');
@@ -127,6 +146,104 @@ if (cmd === 'clients') {
     console.log(`${c.name}\t${c.client_id}\t${c.ip}\t${ov}`);
   }
   process.exit(0);
+}
+
+// ---------------------------------------------------------------------------
+// Project-level grant knobs + the declared inference-server inventory.
+// (These take a project name / server id as their target, NOT a client.)
+// ---------------------------------------------------------------------------
+
+const listCsv = (v) => (v ? String(v).split(',').map((x) => x.trim()).filter(Boolean) : undefined);
+
+if (cmd === 'projects' || cmd === 'project') {
+  const st = await api('GET', '/api/state');
+  const printProj = (p) => {
+    const s = p.scheduling ?? {};
+    const o = s.overrides ?? {};
+    const mark = (v, g) => (v != null ? `${v} (global ${g})` : `— (global ${g})`);
+    console.log(`${p.name}${p.paused ? ' [paused]' : ''}  cap ${p.daily_token_cap === Number.MAX_SAFE_INTEGER ? '∞' : p.daily_token_cap}`);
+    console.log(`  idle ≥${s.idle_seconds}s   max ${s.max_concurrent_leases} at a time   auto-cancel after ${s.lease_ttl_seconds}s`);
+    console.log(`  overrides: idle ${mark(o.idle_seconds, st.idle?.idle_seconds ?? '—')} · max ${mark(o.max_concurrent_leases, 'global')} · ttl ${mark(o.lease_ttl_seconds, 'global')}`);
+  };
+  if (cmd === 'projects') {
+    if (!st.projects?.length) console.log('no projects configured');
+    for (const p of st.projects ?? []) printProj(p);
+    process.exit(0);
+  }
+  const name = argv[1];
+  const sub = argv[2];
+  const numFlag = (flag) => {
+    const i = argv.indexOf(flag);
+    if (i === -1) return undefined;
+    const n = Number(argv[i + 1]);
+    if (!Number.isFinite(n) || n <= 0) fail(`bad ${flag} value "${argv[i + 1]}" (positive number)`);
+    return n;
+  };
+  if (sub === 'set') {
+    const body = {
+      idle_seconds: numFlag('--idle') ?? null,
+      max_concurrent_leases: numFlag('--max') ?? null,
+      lease_ttl_seconds: numFlag('--ttl') ?? null,
+    };
+    const res = await api('POST', `/api/projects/${encodeURIComponent(name)}/settings`, body);
+    console.log(`ok: ${res.name} → ${JSON.stringify(res.overrides)} (null = inherits the global)`);
+    process.exit(0);
+  }
+  if (sub === 'clear') {
+    const res = await api('POST', `/api/projects/${encodeURIComponent(name)}/settings`, {
+      idle_seconds: null,
+      max_concurrent_leases: null,
+      lease_ttl_seconds: null,
+    });
+    console.log(`ok: ${res.name} → overrides cleared (inheriting the globals)`);
+    process.exit(0);
+  }
+  usage();
+}
+
+if (cmd === 'servers' || cmd === 'server') {
+  const servers = (await api('GET', '/api/servers')).servers ?? [];
+  const printServer = (s) => {
+    console.log(`${s.id}  ${s.watched ? '[watched]' : '[declared]'}  ${s.name}  ${s.url}  ${s.activity_path}`);
+    console.log(`  models: ${s.models.length ? s.models.map((m) => `${m.name}${m.running ? ' (running)' : ''}${m.queued ? ` (${m.queued} queued)` : ''}`).join(', ') : '—'}`);
+    if (s.peers?.length) console.log(`  peers (routed behind this entry point): ${s.peers.join(', ')}`);
+  };
+  if (cmd === 'servers') {
+    if (!servers.length) console.log('no servers declared');
+    for (const s of servers) printServer(s);
+    process.exit(0);
+  }
+  const sub = argv[1];
+  const nameOrId = argv[2];
+  const strFlag = (flag) => {
+    const i = argv.indexOf(flag);
+    return i === -1 ? undefined : argv[i + 1];
+  };
+  if (sub === 'add') {
+    const url = argv[3];
+    if (!nameOrId || !url) usage();
+    const res = await api('POST', '/api/servers', {
+      name: nameOrId,
+      url,
+      models: listCsv(strFlag('--models')),
+      peers: listCsv(strFlag('--peers')),
+    });
+    console.log(`ok: added ${res.server.id} (${res.server.name}) — declared inventory; the arbiter keeps watching its configured feed`);
+    process.exit(0);
+  }
+  if (sub === 'set') {
+    if (!nameOrId) usage();
+    const res = await api('POST', '/api/servers', {
+      id: nameOrId,
+      name: strFlag('--name'),
+      url: strFlag('--url'),
+      models: listCsv(strFlag('--models')),
+      peers: listCsv(strFlag('--peers')),
+    });
+    console.log(`ok: updated ${res.server.id} (${res.server.name})`);
+    process.exit(0);
+  }
+  usage();
 }
 
 const target = argv[1];

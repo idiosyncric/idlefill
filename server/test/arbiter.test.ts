@@ -135,6 +135,58 @@ test('paused project is refused (project_paused)', () => {
   rmSync(h.dir, { recursive: true, force: true });
 });
 
+test('per-project grant knobs: overrides the global knobs for that project only', () => {
+  const h = makeHarness({ maxLeases: 1 });
+  h.det.entries = mkEntries([400]);
+
+  const career = h.cfg.projects.find((p) => p.name === 'career-ops')!;
+
+  // Per-project max_concurrent_leases: career-ops allowed 2 concurrent while
+  // the global cap is 1.
+  h.arbiter.setProjectSettings('career-ops', { max_concurrent_leases: 2 });
+  assert.equal(
+    h.arbiter.projectEffectiveSettings('career-ops').max_concurrent_leases,
+    2,
+    'effective = the per-project override',
+  );
+  assert.equal(h.arbiter.projectEffectiveSettings('paused-proj').max_concurrent_leases, 1, 'other projects keep the global');
+
+  const g1 = grant(h, T0, 'a');
+  assert.equal(g1.ok, true);
+  const g2 = grant(h, T0 + 1000, 'b');
+  assert.equal(g2.ok, true, 'per-project max 2: a second concurrent lease fits');
+  const g3 = grant(h, T0 + 2000, 'c');
+  assert.equal(g3.ok, false);
+  assert.equal(g3.reason, 'busy');
+
+  // Per-project idle_seconds: the GLOBAL idle threshold still gates the
+  // signal (one watched feed), but the EFFECTIVE settings expose the
+  // per-project value.
+  h.arbiter.setProjectSettings('career-ops', { idle_seconds: 600 });
+  assert.equal(h.arbiter.projectEffectiveSettings('career-ops').idle_seconds, 600);
+  assert.equal(career.idle_seconds, 600, 'the live config row carries the override');
+
+  // clear → back to the globals (explicit nulls clear each override)
+  const cleared = h.arbiter.setProjectSettings('career-ops', { idle_seconds: null, max_concurrent_leases: null, lease_ttl_seconds: null });
+  assert.equal(cleared.ok, true);
+  const eff = h.arbiter.projectEffectiveSettings('career-ops');
+  assert.equal(eff.max_concurrent_leases, h.cfg.max_concurrent_leases, 'cleared → global');
+  assert.equal(eff.idle_seconds, h.cfg.idle_seconds, 'cleared → global');
+  assert.equal(career.max_concurrent_leases, undefined, 'the config row no longer carries overrides');
+
+  // persistence: the state file carries the project rows
+  h.arbiter.setProjectSettings('career-ops', { lease_ttl_seconds: 300 });
+  assert.equal(h.store.state.projects.length, 2, 'one persisted row per config project');
+  const row = h.store.state.projects.find((r) => r.name === 'career-ops')!;
+  assert.equal(row.lease_ttl_seconds, 300);
+  assert.equal(row.paused, false);
+
+  // unknown project
+  assert.equal(h.arbiter.setProjectSettings('nope', { idle_seconds: 60 }).ok, false);
+
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
 test('unknown project is refused', () => {
   const h = makeHarness();
   h.det.entries = mkEntries([400]);

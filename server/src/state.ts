@@ -19,6 +19,8 @@ export interface StateStoreOpts {
 
 export function emptyState(): ArbiterState {
   return {
+    servers: [],
+    projects: [],
     clients: [],
     overrides: {},
     leases: [],
@@ -67,6 +69,11 @@ export class StateStore {
         leases: Array.isArray(raw.leases) ? raw.leases : base.leases,
         budgets: raw.budgets && typeof raw.budgets === 'object' ? raw.budgets : base.budgets,
         events: Array.isArray(raw.events) ? raw.events : base.events,
+        // Tolerate state files from before server connections existed
+        // (seeded from config by the arbiter after load).
+        servers: Array.isArray(raw.servers) ? raw.servers : base.servers,
+        // Tolerate state files from before persisted project rows existed.
+        projects: Array.isArray(raw.projects) ? raw.projects : base.projects,
       };
     } catch (err) {
       // A corrupt state file must not crash the arbiter — start clean and say so.

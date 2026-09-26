@@ -28,6 +28,25 @@ async function main(): Promise<void> {
   });
   const arbiter = new Arbiter(store, cfg, detector);
 
+  // Persisted operator settings re-hydrate onto the live config objects:
+  //  - project rows (pause state + per-project grant-knob overrides) replace
+  //    the config-file rows (config is the declaration; state is the truth);
+  //  - declared server connections seed from config on first load.
+  const s = store.state;
+  const byName = new Map(s.projects.map((p) => [p.name, p]));
+  for (const p of cfg.projects) {
+    const row = byName.get(p.name);
+    if (row) {
+      p.paused = row.paused === true;
+      if (typeof row.idle_seconds === 'number') p.idle_seconds = row.idle_seconds;
+      if (typeof row.max_concurrent_leases === 'number') p.max_concurrent_leases = row.max_concurrent_leases;
+      if (typeof row.lease_ttl_seconds === 'number') p.lease_ttl_seconds = row.lease_ttl_seconds;
+    }
+  }
+  arbiter.syncProjectRows();
+  arbiter.ensureServersSeeded();
+  store.save();
+
   // Restore lease statuses across a server restart: any lease that was
   // `active` when the process died is expired (its TTL ran out while we
   // weren't here — a dead holder cannot hold the box hostage).
