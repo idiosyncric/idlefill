@@ -29,20 +29,19 @@
   }
   header h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: 0.5px; }
   header .sub { color: var(--dim); font-size: 12px; }
-  /* Gate control: the header pill is now a combobox styled like the old
-     status pill — the border keeps tracking the live status (idle/busy/
-     degraded) while the value is the client's mode. */
+  /* Gate control: right side of the header = [ <state> ] [ Engine Paused ▾ ]
+     — the color-coded live-state word sits to the LEFT of the two-option
+     "Engine" combobox. Colors reuse the page's .ok/.warn/.accent/.err
+     utilities; the combobox border stays neutral (state is the word, not
+     the frame). */
+  #status { margin-left: auto; font-size: 12px; font-weight: 600; }
   .gate {
-    margin-left: auto; padding: 2px 8px; border-radius: 10px;
+    padding: 2px 8px; border-radius: 10px;
     border: 1px solid var(--border); font-size: 12px; font-family: var(--mono);
     background: var(--bg); color: var(--text); cursor: pointer;
   }
-  .gate.idle { color: var(--ok); border-color: var(--ok); }
-  .gate.busy { color: var(--warn); border-color: var(--warn); }
-  .gate.running { color: var(--accent); border-color: var(--accent); }
-  .gate.degraded { color: var(--err); border-color: var(--err); }
   .gate:disabled { opacity: 0.55; cursor: not-allowed; }
-  .gate.small { font-size: 11px; padding: 1px 4px; border-radius: 8px; margin-left: 0; }
+  .gate.small { font-size: 11px; padding: 1px 4px; border-radius: 8px; }
   #gate-msg { margin-left: 10px; font-size: 11px; }
   main { padding: 16px 20px; display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 14px; }
   section {
@@ -110,7 +109,8 @@
 <header>
   <h1>idlefill · arbiter</h1>
   <span class="sub">background-work gate for the local LLM server</span>
-  <select id="gate" class="gate busy" disabled title="client gate">…</select>
+  <span id="status" class="warn">…</span>
+  <select id="gate" class="gate" disabled title="engine gate">…</select>
   <span id="gate-msg"></span>
 </header>
 
@@ -208,29 +208,32 @@ function esc(x) {
   return String(x ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
-// Header gate select: border/title track the live status; the VALUE is the
-// client's mode (set by the gate-control block below).
-function setGateStatus(cls, title) {
-  const gate = $("gate");
-  gate.className = "gate" + (gate.classList.contains("small") ? " small" : "") + " " + cls;
-  gate.title = gate.dataset.info ? title + "\n" + gate.dataset.info : title;
+// Header: the live-state word (#status, left) + the two-option Engine gate
+// combobox (right). The state word is color-coded with the page's
+// .ok/.warn/.accent/.err utilities; the combobox frame stays neutral — the
+// state is the word, not the border.
+function setStatus(cls, text, title) {
+  const el = $("status");
+  el.className = cls;
+  el.textContent = text;
+  el.title = title || "";
 }
 
-// The live state shown in the gate option labels. Priority:
+// The live state of the arbiter. Priority:
 //   Degraded            — signal failure (red; grants blocked)
-//   Running Idle Tasks  — a lease is in flight (background work running)
-//   Idle                — quiet, grants open
-//   Busy                — interactive traffic, grants blocked
+//   Running Idle Tasks  — a lease is in flight (blue; background work running)
+//   Idle                — quiet, grants open (green)
+//   Busy                — interactive traffic (amber; grants blocked)
 function liveStatus(st) {
-  if (st.idle.degraded) return { label: "Degraded", cls: "degraded", note: "signal degraded — grants blocked" };
-  if (st.active_leases && st.active_leases.length > 0) return { label: "Running Idle Tasks", cls: "running", note: "background work in progress" };
-  if (st.idle.idle) return { label: "Idle", cls: "idle", note: "grants open" };
-  return { label: "Busy", cls: "busy", note: "grants blocked" };
+  if (st.idle.degraded) return { label: "Degraded", cls: "err", note: "signal degraded — grants blocked" };
+  if (st.active_leases && st.active_leases.length > 0) return { label: "Running Idle Tasks", cls: "accent", note: "background work in progress" };
+  if (st.idle.idle) return { label: "Idle", cls: "ok", note: "grants open" };
+  return { label: "Busy", cls: "warn", note: "grants blocked" };
 }
 
-// Option text for a gate combobox: "<Mode> — <live state>".
-function gateLabelText(mode, liveLabel) {
-  return (mode === "paused" ? "Paused" : "Running Scheduled") + " — " + liveLabel;
+// Engine gate option text (fixed — the live state lives in the status word).
+function gateLabelText(mode) {
+  return mode === "paused" ? "Engine Paused" : "Engine Running";
 }
 
 async function refresh() {
@@ -241,12 +244,14 @@ async function refresh() {
     if (!res.ok) throw new Error("HTTP " + res.status);
     st = await res.json();
   } catch (err) {
-    setGateStatus("degraded", "state unreachable");
+    setStatus("err", "unreachable", "state unreachable");
+    $("gate").disabled = true;
     return;
   }
 
   const live = liveStatus(st);
-  syncGateOptions(st.clients, live.label);
+  setStatus(live.cls, live.label, live.note);
+  syncGateOptions(st.clients);
   // gate-token row: offer storage when the gate is actionable and no token
   // is stored yet; the input's change handler (below) persists it.
   $("gate-token-row").style.display = st.clients.length > 0 ? "flex" : "none";
@@ -273,11 +278,6 @@ async function refresh() {
 
   $("reidle").textContent = st.idle.reidle_gated ? "armed (wait for full idle)" : "clear";
   $("reidle").className = st.idle.reidle_gated ? "warn" : "ok";
-
-  setGateStatus(live.cls, live.note);
-  // (option-label refresh for the per-client gate selects runs at the END of
-  //  refresh(), after the Clients table renders; the header options already
-  //  carry the live label from syncGateOptions above.)
 
   // lease
   const box = $("lease-box");
@@ -312,9 +312,9 @@ async function refresh() {
         }
         return "<tr><td>" + esc(c.name) + "</td><td>" + esc(c.client_id) + "</td><td>" + esc(c.ip) +
         "</td><td>" + badge + "</td><td>" + ago(st.now - new Date(c.registered_at).getTime()) +
-        '</td><td><select class="gate small" data-client="' + esc(c.client_id) + '" title="set gate for ' + esc(c.name) + '">' +
-        '<option value="paused"' + (ov && ov.override === 'pause' ? ' selected' : '') + '>' + esc(gateLabelText('paused', live.label)) + '</option>' +
-        '<option value="scheduled"' + (!ov || ov.override !== 'pause' ? ' selected' : '') + '>' + esc(gateLabelText('scheduled', live.label)) + '</option>' +
+        '</td><td><select class="gate small" data-client="' + esc(c.client_id) + '" title="set engine gate for ' + esc(c.name) + '">' +
+        '<option value="paused"' + (ov && ov.override === 'pause' ? ' selected' : '') + '>' + esc(gateLabelText('paused')) + '</option>' +
+        '<option value="scheduled"' + (!ov || ov.override !== 'pause' ? ' selected' : '') + '>' + esc(gateLabelText('scheduled')) + '</option>' +
         '</select></td></tr>';
       }).join("") + "</tbody></table>";
   }
@@ -402,17 +402,16 @@ try {
 $("logs-limit").addEventListener("change", () => refresh());
 
 // ---------------------------------------------------------------------------
-// Gate control — the header pill is a combobox, and each client row carries
-// a small one. Mode is persisted per-client:
-//   "paused"    → operator override pause (POST /override; the daemon stops
-//                 asking for work; the arbiter refuses new grants)
-//   "scheduled" → default: clear the override, the client runs on its normal
-//                 schedule (idle gate + reidle gate + budgets still apply)
-// The trailing "<state>" in each label is the LIVE arbiter verdict, recomputed
-// every refresh (see liveStatus): Idle / Busy / Running Idle Tasks / Degraded —
-// e.g. "Paused — Busy", "Running Scheduled — Idle". The select's border also
-// colors it (green idle / amber busy / red degraded) and the tooltip explains
-// it, so the box stays a two-mode control.
+// Gate control — the header is split into two elements on the right:
+//   #status  — the live, color-coded state word (Idle / Busy / Running Idle
+//              Tasks / Degraded, or "unreachable")
+//   #gate    — the "Engine" combobox: Engine Paused / Engine Running
+//              (one global gate across all clients; each Clients-panel row
+//              also carries a small per-client one)
+// Engine Paused   → operator override pause (POST /override; the daemon stops
+//                   asking for work; the arbiter refuses new grants)
+// Engine Running  → default: clear the override, clients run on their normal
+//                   schedule (idle gate + reidle gate + budgets still apply)
 //
 // Writes need the arbiter token (the dashboard poll is anonymous). It is kept
 // in localStorage (key idlefill.token), the same posture as the LAN/tailnet
@@ -432,22 +431,22 @@ function gateModeFor(override) {
 }
 
 // Header combobox: one global gate across all registered clients — reads
-// "paused" only when EVERY client is paused. Rebuilt each refresh; its border
-// keeps tracking the live status (see setGateStatus in refresh()). Options
-// are built with the live state word so a refresh never shows "[status]".
-function syncGateOptions(clients, liveLabel) {
+// "paused" only when EVERY client is paused. Rebuilt each refresh; options
+// are fixed ("Engine Paused" / "Engine Running") — the live state lives in
+// the separate #status word next to it.
+function syncGateOptions(clients) {
   const names = clients.map((c) => c.name).join(", ") || "no client registered";
   const allPaused = clients.length > 0 && clients.every((c) => gateModeFor(c.override) === "paused");
   gateSel.length = 0;
-  gateSel.add(new Option(gateLabelText("paused", liveLabel), "paused"));
-  gateSel.add(new Option(gateLabelText("scheduled", liveLabel), "scheduled"));
+  gateSel.add(new Option(gateLabelText("paused"), "paused"));
+  gateSel.add(new Option(gateLabelText("scheduled"), "scheduled"));
   gateSel.value = allPaused ? "paused" : "scheduled";
   gateSel.disabled = clients.length === 0;
-  gateSel.dataset.info = clients.length === 0
+  gateSel.title = (clients.length === 0
     ? "no client registered — nothing to gate"
-    : "clients: " + names + (allPaused
-      ? "\nall clients paused — new grants refused (active leases keep running)"
-      : "\nscheduled clients run when idle — idle/reidle gates, budgets, project pauses still apply");
+    : "clients: " + names) + (allPaused
+    ? "\nall clients paused — new grants refused (active leases keep running)"
+    : "\nscheduled clients run when idle — idle/reidle gates, budgets, project pauses still apply");
 }
 
 function flashGateMsg(text, cls) {

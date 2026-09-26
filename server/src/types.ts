@@ -25,6 +25,21 @@ export interface ServerConfig {
   state_file: string;
 }
 
+/**
+ * A project allocation as reported by a client at (re)registration. The
+ * client knows its own config (model, estimate, queue depth) and reports it;
+ * the arbiter only stores and displays it.
+ */
+export interface ProjectAllocation {
+  name: string;
+  /** Model id the client's executor uses for this project. */
+  model: string;
+  /** Estimate the client passes to the arbiter at grant time. */
+  estimated_seconds: number;
+  /** Jobs currently in the client's local queue for this project. */
+  queue_depth: number;
+}
+
 export interface ClientRecord {
   name: string;
   client_id: string;
@@ -33,6 +48,10 @@ export interface ClientRecord {
   /** Fallback: req.ip seen at registration time, used when the client reported none. */
   observed_ip: string;
   registered_at: string;
+  /** Epoch-ms of the most recent successful (re)registration — liveness. */
+  last_seen: number;
+  /** Projects this client reports it is allocated to (from its own config). */
+  projects: ProjectAllocation[];
 }
 
 /**

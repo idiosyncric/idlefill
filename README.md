@@ -144,18 +144,18 @@ node scripts/idlefill-control.mjs clear  <name-or-id>
 HTTP equivalent (token-authed): `POST /api/clients/:ref/override` with body
 `{"override":"pause"|"force"|null, "until":<epoch_ms>}` — `null` clears.
 
-The dashboard also drives this: the header pill is a combobox
-(`Paused — <state>` / `Running Scheduled — <state>`, one global gate across
-all clients) and each Clients-panel row has a per-client one. `<state>` is
-filled live on every refresh (the border colors it too): *Idle* (grants
-open), *Busy* (interactive traffic), *Running Idle Tasks* (a lease is in
-flight), or *Degraded* (signal failure) — e.g. `Paused — Busy`,
-`Running Scheduled — Idle`. Writes are token-authed — paste the arbiter
-token into the "gate token" field under the Clients panel once per browser
-(stored in `localStorage`, same LAN/tailnet trust posture as the phase-1
-dashboard; the field accepts a clear by emptying it). *Paused* sets the
-`pause` override; *Running Scheduled* clears it and the client runs its
-normal idle-gated schedule.
+The dashboard also drives this: the right side of the header is split into
+two elements — a color-coded live-state word (`Idle` green / `Busy` amber /
+`Running Idle Tasks` blue / `Degraded` red, or `unreachable` when the poll
+fails), and to its right the **Engine gate** combobox (`Engine Paused` /
+`Engine Running`, one global gate across all clients); each Clients-panel row
+has a small per-client one. The state word refreshes every 5s alongside the
+rest of the dashboard. Writes are token-authed — paste the arbiter token into
+the "gate token" field under the Clients panel once per browser (stored in
+`localStorage`, same LAN/tailnet trust posture as the phase-1 dashboard; the
+field accepts a clear by emptying it). *Engine Paused* sets the `pause`
+override; *Engine Running* clears it and clients run their normal
+idle-gated schedule.
 
 ## Conventions
 
