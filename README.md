@@ -148,28 +148,50 @@ The dashboard also drives this: the right side of the header is split into
 two elements — a color-coded live-state word (`Idle` green / `Busy` amber /
 `Running Idle Tasks` blue / `Degraded` red, or `unreachable` when the poll
 fails), and to its right the **Engine gate** combobox (`Engine Paused` /
-`Engine Running`, one global gate across all clients); each Clients-panel row
+`Engine Running`, one global gate across all clients); each Workers-panel row
 has a small per-client one. The state word refreshes every 5s alongside the
 rest of the dashboard. Writes are token-authed — paste the arbiter token into
-the "gate token" field under the Clients panel once per browser (stored in
+the "gate token" field under the Workers panel once per browser (stored in
 `localStorage`, same LAN/tailnet trust posture as the phase-1 dashboard; the
 field accepts a clear by emptying it). *Engine Paused* sets the `pause`
 override; *Engine Running* clears it and clients run their normal
 idle-gated schedule.
 
-## Projects: workers & scheduling (dashboard)
+## Dashboard panels (the work flow)
 
-The dashboard's **Projects** panel is the operator view of *who runs what*.
-For every project configured in the server's `projects[]` it shows:
+The dashboard reads top-to-bottom as the operator's work flow: the header
+state word answers *is the box doing what it should*, then four panels —
+**Idle signal**, **Running now**, **Queued**, **Workers** — and the fixed
+bottom **logs** tray (Events/Leases tabs, shared records-to-show).
 
-- **workers** — the connected clients that reported they are allocated to the
-  project (one line each: online dot, name, model, per-job estimate, queued
-  jobs),
-- **tokens today (UTC)** — the project's output against its `daily_token_cap`,
-  with a bar (amber past 80%),
-- **schedule** — the knobs that gate the project's grants: the global idle
-  threshold (`idle_seconds`), `max_concurrent_leases`, lease TTL, and the
-  daily cap.
+- **Idle signal** — the countdown (the page's one display number) plus the
+  server's clock and last activity; the diagnostics that explain a contested
+  verdict surface only when contested (log write while not idle, signal
+  health when degraded, the re-idle gate when armed).
+- **Running now** — one block per **active lease** (all of them; with
+  `max_concurrent_leases > 1` the second lease is not hidden): project, job,
+  worker, how long it has been running, and when it auto-cancels.
+- **Queued** — the per-project view of the work that is waiting. For every
+  project configured in the server's `projects[]`:
+  - **jobs waiting** — the sum of the connected workers' queue depths, shown
+    only when non-zero (a quiet queue shows nothing),
+  - **tokens today (UTC)** — the project's output against its
+    `daily_token_cap`, with a bar (amber past 80%),
+  - **workers** — the connected clients that reported they are allocated to
+    the project (one line each: online dot, name, model, per-job estimate,
+    queued jobs),
+  - **exception notes** — why nothing is running right now (`project
+    paused`, `budget full`, `no workers online`), and **today's results**
+    (jobs finished / failed today, UTC — counted from the lease end-records
+    the arbiter already keeps: a lease that terminated as `finished` counts
+    finished; any other terminal lease counts failed),
+  - **schedule** — the knobs that gate the project's grants: the global idle
+    threshold (`idle_seconds`), `max_concurrent_leases`, lease TTL, and the
+    daily cap.
+- **Workers** — the machine inventory: liveness (heartbeat <90s dot; stale
+  rows read amber), what the worker is allocated to, and the per-client
+  gate. `id`/`ip`/`registered` live in the row's tooltip. The gate-token
+  field (token-authed writes; `localStorage`) sits under it.
 
 Workers are **self-reported by the clients** (the arbiter does not infer
 allocations): each client daemon re-registers on every poll tick (~20s) with
@@ -183,7 +205,8 @@ keep sticking across daemon restarts.
 In the API: `POST /api/clients/register` accepts an optional
 `projects: [{name, model, estimated_seconds, queue_depth}]` (malformed rows
 are dropped), and `GET /api/state` / `GET /api/projects` return per-project
-`workers: [{client, model, estimated_seconds, queue_depth, online}]` plus a
+`workers: [{client, model, estimated_seconds, queue_depth, online}]`, a
+`today: {finished, failed}` results row (UTC day of each lease's end), and a
 `scheduling` object (`paused`, `idle_seconds`, `max_concurrent_leases`,
 `lease_ttl_seconds`, `daily_token_cap`). A project with no connected workers
 shows "no workers connected" — a scheduling row with no executor behind it

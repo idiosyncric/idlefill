@@ -23,17 +23,15 @@
     font-family: var(--mono); font-size: 13px; line-height: 1.5;
   }
   header {
-    display: flex; align-items: baseline; gap: 16px;
+    display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
     padding: 14px 20px; border-bottom: 1px solid var(--border);
     background: var(--panel);
   }
   header h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: 0.5px; }
   header .sub { color: var(--dim); font-size: 12px; }
-  /* Gate control: right side of the header = [ <state> ] [ Engine Paused ▾ ]
-     — the color-coded live-state word sits to the LEFT of the two-option
-     "Engine" combobox. Colors reuse the page's .ok/.warn/.accent/.err
-     utilities; the combobox border stays neutral (state is the word, not
-     the frame). */
+  /* Header right = [ <state word> ] [ Engine Paused ▾ ]. The color-coded
+     live-state word sits LEFT of the two-option "Engine" combobox; the
+     combobox frame stays neutral (the state is the word, not the frame). */
   #status { margin-left: auto; font-size: 12px; font-weight: 600; }
   .gate {
     padding: 2px 8px; border-radius: 10px;
@@ -84,10 +82,12 @@
     padding: 10px 16px 12px; border-top: 1px solid var(--border); background: var(--bg);
   }
   #logs-tray.expanded .tray-body { display: block; }
-  .kv { display: flex; justify-content: space-between; padding: 2px 0; }
-  .kv .k { color: var(--dim); }
+  .kv { display: flex; justify-content: space-between; padding: 2px 0; gap: 12px; }
+  .kv .k { color: var(--dim); flex: none; }
+  .kv .v { overflow-wrap: anywhere; }
   .big { font-size: 22px; }
-  .ok { color: var(--ok); } .warn { color: var(--warn); } .err { color: var(--err); } .accent { color: var(--accent); }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .err { color: var(--err); }
+  .accent { color: var(--accent); } .dim { color: var(--dim); }
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
   th { text-align: left; color: var(--dim); font-weight: 600; padding: 3px 6px; border-bottom: 1px solid var(--border); }
   td { padding: 3px 6px; border-bottom: 1px solid rgba(48,54,61,0.5); }
@@ -100,24 +100,30 @@
   .bar > div { height: 100%; background: var(--accent); }
   .bar > div.hot { background: var(--warn); }
   .empty { color: var(--dim); font-style: italic; padding: 6px 0; }
-  /* Projects panel: one block per project. Header row = name + state tag;
-     budget bar; one line per allocated worker (name · model · ~est · queued);
-     schedule line = the knobs that gate its grants. */
+  /* Liveness dot — workers table + per-project worker rows. */
+  .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex: none; }
+  .dot.on { background: var(--ok); } .dot.off { background: var(--dim); }
+  .dot.cell { margin-right: 6px; vertical-align: baseline; }
+  /* Running now: one block per active lease (the panel shows ALL of them). */
+  .runcount { color: var(--dim); font-size: 11px; padding: 0 0 2px; }
+  .lease-run { padding: 6px 0; border-bottom: 1px solid rgba(48,54,61,0.5); }
+  .lease-run:last-child { border-bottom: none; }
+  /* Queued: one block per project. Head = name + exception tag + the
+     jobs-waiting count; budget bar; one line per allocated worker;
+     exception notes (why nothing runs / today's results); schedule line. */
   .proj { padding: 8px 0; border-bottom: 1px solid rgba(48,54,61,0.5); }
   .proj:last-child { border-bottom: none; }
   .proj-head { display: flex; align-items: baseline; gap: 8px; }
   .proj-head .name { font-weight: 600; }
-  .proj-head .cnt { margin-left: auto; color: var(--dim); font-size: 11px; }
+  .proj-head .cnt { margin-left: auto; color: var(--dim); font-size: 11px; white-space: nowrap; }
   .proj .kv { padding: 1px 0; }
   .workers { margin: 4px 0 2px; }
   .worker { display: flex; gap: 8px; padding: 1px 0; font-size: 12px; }
-  .worker .dot { width: 7px; height: 7px; border-radius: 50%; margin-top: 5px; flex: none; }
-  .worker .dot.on { background: var(--ok); }
-  .worker .dot.off { background: var(--dim); }
+  .worker .dot { margin-top: 5px; }
   .worker .wname { min-width: 84px; font-weight: 600; }
   .worker .wmeta { color: var(--dim); }
   .worker .wqueue { margin-left: auto; white-space: nowrap; }
-  .schedule { margin-top: 4px; color: var(--dim); font-size: 11px; }
+  .note { margin-top: 4px; color: var(--dim); font-size: 11px; }
   footer { padding: 10px 20px; color: var(--dim); font-size: 11px; border-top: 1px solid var(--border); margin-top: 10px; }
   a { color: var(--accent); text-decoration: none; }
   code { background: rgba(110,118,129,0.2); padding: 0 4px; border-radius: 3px; font-size: 12px; }
@@ -133,36 +139,41 @@
 </header>
 
 <main>
+  <!-- The page reads top-to-bottom as the work flow:
+       is the box idle → what is running → what is queued → which workers. -->
+
   <section>
     <h2>Idle signal</h2>
-    <div class="kv"><span class="k">now</span><span id="now">—</span></div>
-    <div class="kv"><span class="k">idle for</span><span class="big" id="idle-for">—</span></div>
-    <div class="kv"><span class="k">threshold</span><span id="threshold">—</span></div>
-    <div class="kv"><span class="k">last activity</span><span id="last-act">—</span></div>
-    <div class="kv"><span class="k">log mtime</span><span id="log-sig">—</span></div>
-    <div class="kv"><span class="k">signal health</span><span id="degraded">—</span></div>
-    <div class="kv"><span class="k">re-idle gate</span><span id="reidle">—</span></div>
+    <div class="kv"><span class="k">now</span><span class="v" id="now">—</span></div>
+    <div class="kv"><span class="k">idle for</span><span class="v big" id="idle-for">—</span></div>
+    <div class="kv"><span class="k">last activity</span><span class="v" id="last-act">—</span></div>
+    <!-- Exception-only diagnostics: each row appears only when the
+         operator needs it (log write while the verdict is contested,
+         signal health when degraded, re-idle gate when armed). -->
+    <div class="kv" id="log-sig-row" style="display:none"><span class="k">log write</span><span class="v" id="log-sig">—</span></div>
+    <div class="kv" id="degraded-row" style="display:none"><span class="k">signal health</span><span class="v err" id="degraded">—</span></div>
+    <div class="kv" id="reidle-row" style="display:none"><span class="k">re-idle gate</span><span class="v warn" id="reidle">—</span></div>
   </section>
 
   <section>
-    <h2>Current lease</h2>
-    <div id="lease-box"><div class="empty">no active lease</div></div>
+    <h2>Running now</h2>
+    <div id="running-box"><div class="empty">no work running</div></div>
   </section>
 
   <section>
-    <h2>Clients</h2>
-    <div id="clients"><div class="empty">none registered</div></div>
+    <h2>Queued</h2>
+    <div id="projects"><div class="empty">no projects configured</div></div>
+  </section>
+
+  <section>
+    <h2>Workers</h2>
+    <div id="workers"><div class="empty">no workers registered</div></div>
     <div id="gate-token-row" style="margin-top:8px;display:none">
       <label class="k" for="gate-token" style="color:var(--dim);margin-right:6px">gate token</label>
       <input id="gate-token" type="password" placeholder="arbiter API token (enables gate changes)" autocomplete="off"
         style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;font:inherit;font-size:11px;padding:2px 6px;flex:1">
       <span class="sub" id="gate-token-hint" style="margin-left:6px"></span>
     </div>
-  </section>
-
-  <section>
-    <h2>Projects</h2>
-    <div id="projects"><div class="empty">none configured</div></div>
   </section>
 
 </main>
@@ -223,7 +234,7 @@ function ago(ms) {
 }
 
 function esc(x) {
-  return String(x ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  return String(x ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
 
 // Duration as "~Xh Ym" (the estimate passed to the arbiter at grant time).
@@ -236,12 +247,13 @@ function durFmt(s) {
   return "~" + h + "h" + (m % 60 ? " " + (m % 60) + "m" : "");
 }
 
-// One project block: header (name + state + worker count), the daily token
-// budget (used today / cap, with a bar), the allocated workers (one line each:
-// online dot, name, model, ~estimate, queued count), and the schedule line
-// (the knobs that gate this project's grants — from the server config).
+// One project block in the Queued panel: head (name + exception tag + the
+// jobs-waiting count), the daily token budget (used today / cap, with a bar),
+// the allocated workers (one line each: online dot, name, model, ~estimate,
+// queued count), exception notes (why nothing runs, today's results), and the
+// schedule line (the knobs that gate this project's grants).
 // `now` is the server clock from the same state payload (ms).
-function projBlock(p, now) {
+function workBlock(p, now) {
   const b = p.budget_today || { tokens_out: 0, tokens_in: 0, cap: 0 };
   const cap = b.cap ?? p.scheduling?.daily_token_cap ?? 0;
   const pct = cap > 0 ? Math.min(100, (b.tokens_out / cap) * 100) : 0;
@@ -250,10 +262,20 @@ function projBlock(p, now) {
   const workers = p.workers || [];
   const totalQueued = workers.reduce((s, w) => s + (w.queue_depth || 0), 0);
   const onlineCnt = workers.filter((w) => w.online).length;
+  const tod = p.today || { finished: 0, failed: 0 };
 
   let headTag = "";
   if (p.paused) headTag = '<span class="tag" style="color:var(--warn);border-color:var(--warn)">paused</span>';
   else if (cap > 0 && b.tokens_out >= cap) headTag = '<span class="tag" style="color:var(--warn);border-color:var(--warn)">budget full</span>';
+
+  // The count of waiting work is the panel's point — but only when there IS
+  // waiting work; a quiet queue shows nothing (no tag = running fine).
+  const waiting = totalQueued > 0 ? '<span class="cnt">' + totalQueued.toLocaleString() + " job" + (totalQueued === 1 ? "" : "s") + " waiting</span>" : "";
+
+  const budgetRow =
+    '<div class="kv"><span class="k">output tokens today (UTC)</span><span class="v">' + (b.tokens_out || 0).toLocaleString() + " / " + capTxt +
+    (b.tokens_in ? " · " + (b.tokens_in || 0).toLocaleString() + " input" : "") + "</span></div>" +
+    '<div class="bar"><div class="' + (pct > 80 ? "hot" : "") + '" style="width:' + pct.toFixed(1) + '%"></div></div>';
 
   const workersHtml = workers.length
     ? '<div class="workers">' + workers.map((w) =>
@@ -261,25 +283,88 @@ function projBlock(p, now) {
         '<span class="dot ' + (w.online ? "on" : "off") + '" title="' + (w.online ? "online (saw a heartbeat within 90s)" : "offline (no recent heartbeat)") + '"></span>' +
         '<span class="wname">' + esc(w.client) + (w.online ? "" : ' <span class="wmeta">(offline)</span>') + "</span>" +
         '<span class="wmeta">' + esc(w.model || "—") + (w.estimated_seconds ? " · " + durFmt(w.estimated_seconds) + "/job" : "") + "</span>" +
-        '<span class="wqueue">' + (w.queue_depth || 0).toLocaleString() + ' queued</span>' +
+        '<span class="wqueue">' + (w.queue_depth || 0).toLocaleString() + " queued</span>" +
         "</div>"
       ).join("") + "</div>"
     : '<div class="empty">no workers connected for this project</div>';
+
+  // Exception notes: what is blocking this project's queue right now.
+  const blocks = [];
+  if (p.paused) blocks.push("project paused");
+  else if (cap > 0 && b.tokens_out >= cap) blocks.push("budget full");
+  if (workers.length > 0 && onlineCnt === 0) blocks.push("no workers online");
+  const blockNote = blocks.length ? '<div class="note">not running: ' + blocks.join(" · ") + "</div>" : "";
+
+  // Today's completed work (UTC) — shown once there is any.
+  const done = tod.finished + tod.failed;
+  const resultsNote = done > 0
+    ? '<div class="note">today: ' + tod.finished + " finished" +
+      (tod.failed ? ' · <span class="err">' + tod.failed + " failed</span>" : "") + "</div>"
+    : "";
 
   const schedule = "runs when idle ≥" + (sched.idle_seconds ?? "—") + "s" +
     " · max " + (sched.max_concurrent_leases ?? "—") + " job" + (sched.max_concurrent_leases === 1 ? "" : "s") + " at a time" +
     " · auto-cancels after " + durFmt(sched.lease_ttl_seconds).replace("~", "");
 
   return '<div class="proj">' +
-    '<div class="proj-head"><span class="name">' + esc(p.name) + "</span>" + headTag +
-    '<span class="cnt">' + workers.length + " worker" + (workers.length === 1 ? "" : "s") +
-    (workers.length ? " · " + onlineCnt + " online · " + totalQueued.toLocaleString() + " queued" : "") + "</span></div>" +
-    '<div class="kv"><span class="k">output tokens today (UTC)</span><span>' + (b.tokens_out || 0).toLocaleString() + " / " + capTxt +
-    (b.tokens_in ? " · " + (b.tokens_in || 0).toLocaleString() + " input" : "") + "</span></div>" +
-    '<div class="bar"><div class="' + (pct > 80 ? "hot" : "") + '" style="width:' + pct.toFixed(1) + '%"></div></div>' +
+    '<div class="proj-head"><span class="name">' + esc(p.name) + "</span>" + headTag + waiting + "</div>" +
+    budgetRow +
     workersHtml +
-    '<div class="schedule">' + schedule + "</div>" +
+    blockNote +
+    resultsNote +
+    '<div class="note">' + schedule + "</div>" +
     "</div>";
+}
+
+// Running now: one block per active lease. ALL of them — the panel must not
+// silently drop the second lease when max_concurrent_leases > 1.
+function runningBox(st) {
+  const actl = st.active_leases || [];
+  if (actl.length === 0) return '<div class="empty">no work running</div>';
+  const max = st.projects && st.projects.length > 0 ? st.projects[0].scheduling?.max_concurrent_leases : undefined;
+  const head = actl.length > 1
+    ? '<div class="runcount">' + actl.length + " running" + (max ? " · max " + max + " at a time" : "") + "</div>"
+    : "";
+  return head + actl.map((l) => {
+    const ageS = Math.max(0, Math.floor((st.now - l.granted_at) / 1000));
+    const leftS = Math.max(0, Math.floor((l.expires_at - st.now) / 1000));
+    return '<div class="lease-run">' +
+      '<div class="kv"><span class="k">project</span><span class="v accent">' + esc(l.project) + "</span></div>" +
+      '<div class="kv"><span class="k">job</span><span class="v">' + esc(l.job_id) + "</span></div>" +
+      '<div class="kv"><span class="k">worker</span><span class="v">' + esc(l.client_name) + "</span></div>" +
+      '<div class="kv"><span class="k">running</span><span class="v">' + Math.floor(ageS / 60) + "m " + (ageS % 60) + "s</span></div>" +
+      '<div class="kv"><span class="k">auto-cancels in</span><span class="v ' + (leftS < 120 ? "warn" : "ok") + '">' + Math.floor(leftS / 60) + "m " + (leftS % 60) + "s</span></div>" +
+      "</div>";
+  }).join("");
+}
+
+// Workers: the machine inventory — liveness first (heartbeat <90s), then what
+// the worker is allocated to, then the per-client gate. id/ip/registered
+// demote to the row's tooltip (still there, out of the scan path).
+function workersTable(st) {
+  if (st.clients.length === 0) return '<div class="empty">no workers registered</div>';
+  return "<table><thead><tr><th>worker</th><th>last seen</th><th>running for</th><th>gate</th></tr></thead><tbody>" +
+    st.clients.map((c) => {
+      const ov = c.override;
+      const online = st.now - (c.last_seen ?? 0) < 90_000;
+      let badge = "";
+      if (ov && ov.override === "pause") {
+        badge = ' <span class="tag" style="color:var(--err);border-color:var(--err)">paused</span>';
+      } else if (ov && ov.override === "force") {
+        const until = ov.until != null ? new Date(ov.until).toISOString().slice(11, 16) + "Z" : null;
+        badge = ' <span class="tag" style="color:var(--warn);border-color:var(--warn)" title="may run despite the idle gate">forced' + (until ? "→" + until : "") + "</span>";
+      }
+      const allocs = (c.projects ?? []).map((x) => esc(x.name)).join(", ");
+      const rowTitle = "registered " + new Date(c.registered_at).toISOString().replace("T", " ").slice(0, 19) + "Z · " + esc(c.client_id) + " · " + esc(c.ip);
+      return "<tr title=\"" + rowTitle + '">' +
+        "<td><span class=\"dot cell " + (online ? "on" : "off") + "\" title=\"" + (online ? "online — heartbeat within 90s" : "offline — no heartbeat within 90s") + '\"></span>' + esc(c.name) + badge + "</td>" +
+        '<td class="' + (online ? "" : "warn") + '">' + ago(st.now - (c.last_seen ?? 0)) + "</td>" +
+        "<td>" + (allocs ? allocs : '<span class="dim">—</span>') + "</td>" +
+        '<td><select class="gate small" data-client="' + esc(c.client_id) + '" title="set engine gate for ' + esc(c.name) + '">' +
+        '<option value="paused"' + (ov && ov.override === "pause" ? " selected" : "") + ">" + esc(gateLabelText("paused")) + "</option>" +
+        '<option value="scheduled"' + (!ov || ov.override !== "pause" ? " selected" : "") + ">" + esc(gateLabelText("scheduled")) + "</option>" +
+        "</select></td></tr>";
+    }).join("") + "</tbody></table>";
 }
 
 // Header: the live-state word (#status, left) + the two-option Engine gate
@@ -331,79 +416,59 @@ async function refresh() {
   $("gate-token-row").style.display = st.clients.length > 0 ? "flex" : "none";
   $("gate-token-hint").textContent = gateToken() ? "stored ✓" : "(not set)";
 
-  const now = new Date(st.now);
-  $("now").textContent = now.toISOString().replace("T", " ").slice(0, 19) + "Z";
-  $("threshold").textContent = st.idle.idle_seconds !== undefined ? st.idle.idle_seconds + "s quiet" : "—";
+  // --- Idle signal: the countdown is the number; the diagnostics that
+  // explain a contested verdict surface only while the verdict is contested.
+  const nowD = new Date(st.now);
+  $("now").textContent = nowD.toISOString().replace("T", " ").slice(0, 19) + "Z";
 
-  // idle countdown
   const ifor = st.idle.idle_for_s;
   $("idle-for").textContent = ifor === null ? "unknown" : Math.floor(ifor / 60) + "m " + (ifor % 60) + "s";
-  $("idle-for").className = st.idle.idle ? "big ok" : "big warn";
+  $("idle-for").className = "v big " + (st.idle.idle ? "ok" : "warn");
 
   const act = st.idle.last_activity;
   $("last-act").textContent = act
     ? ago(st.now - act.ts) + " · " + esc(act.model) + " · " + esc(act.src)
     : "none seen";
 
-  $("log-sig").textContent = st.idle.last_log_write_age_s === null ? "disabled" : ago(st.now - (st.idle.last_log_write));
-
-  $("degraded").textContent = st.idle.degraded ? ("DEGRADED " + (st.idle.degraded_reason ?? "")) : "ok";
-  $("degraded").className = st.idle.degraded ? "err" : "ok";
-
-  $("reidle").textContent = st.idle.reidle_gated ? "armed (wait for full idle)" : "clear";
-  $("reidle").className = st.idle.reidle_gated ? "warn" : "ok";
-
-  // lease
-  const box = $("lease-box");
-  if (st.active_leases && st.active_leases.length > 0) {
-    const l = st.active_leases[0];
-    const ageS = Math.max(0, Math.floor((st.now - l.granted_at) / 1000));
-    const leftS = Math.max(0, Math.floor((l.expires_at - st.now) / 1000));
-    box.innerHTML =
-      '<div class="kv"><span class="k">project</span><span class="ok">' + esc(l.project) + "</span></div>" +
-      '<div class="kv"><span class="k">job</span><span>' + esc(l.job_id) + "</span></div>" +
-      '<div class="kv"><span class="k">client</span><span>' + esc(l.client_name) + "</span></div>" +
-      '<div class="kv"><span class="k">age</span><span>' + Math.floor(ageS / 60) + "m " + (ageS % 60) + "s</span></div>" +
-      '<div class="kv"><span class="k">ttl remaining</span><span class="' + (leftS < 120 ? "warn" : "ok") + '">' + Math.floor(leftS / 60) + "m " + (leftS % 60) + "s</span></div>";
+  // The log mtime is part of the idle computation — show it while the box is
+  // judged NOT idle (when it might still be a request that hasn't completed).
+  const lwRow = $("log-sig-row");
+  if (st.idle.idle) {
+    lwRow.style.display = "none";
   } else {
-    box.innerHTML = '<div class="empty">no active lease</div>';
+    lwRow.style.display = "";
+    $("log-sig").textContent = st.idle.last_log_write_age_s === null ? "disabled" : ago(st.now - st.idle.last_log_write);
+  }
+  // Degraded signal health: the exception, in red, with the reason.
+  const dgRow = $("degraded-row");
+  if (st.idle.degraded) {
+    dgRow.style.display = "";
+    $("degraded").textContent = "DEGRADED " + (st.idle.degraded_reason ?? "");
+  } else {
+    dgRow.style.display = "none";
+  }
+  // The re-idle gate: armed only between a revocation and the next full idle.
+  const riRow = $("reidle-row");
+  if (st.idle.reidle_gated) {
+    riRow.style.display = "";
+    $("reidle").textContent = "armed (wait for full idle)";
+  } else {
+    riRow.style.display = "none";
   }
 
-  // clients
-  const cbox = $("clients");
-  if (st.clients.length === 0) {
-    cbox.innerHTML = '<div class="empty">none registered</div>';
-  } else {
-    cbox.innerHTML = "<table><thead><tr><th>name</th><th>id</th><th>ip</th><th>state</th><th>registered</th><th>gate</th></tr></thead><tbody>" +
-      st.clients.map((c) => {
-        const ov = c.override;
-        let badge = '<span class="tag" style="color:var(--dim)">active</span>';
-        if (ov && ov.override === 'pause') {
-          badge = '<span class="tag" style="color:var(--err);border-color:var(--err)">paused</span>';
-        } else if (ov && ov.override === 'force') {
-          const until = ov.until != null ? new Date(ov.until).toISOString().slice(11, 16) + 'Z' : null;
-          badge = '<span class="tag" style="color:var(--warn);border-color:var(--warn)" title="may run despite idle gate">' + 'forced' + (until ? '→' + until : '') + '</span>';
-        }
-        return "<tr><td>" + esc(c.name) + "</td><td>" + esc(c.client_id) + "</td><td>" + esc(c.ip) +
-        "</td><td>" + badge + "</td><td>" + ago(st.now - new Date(c.registered_at).getTime()) +
-        '</td><td><select class="gate small" data-client="' + esc(c.client_id) + '" title="set engine gate for ' + esc(c.name) + '">' +
-        '<option value="paused"' + (ov && ov.override === 'pause' ? ' selected' : '') + '>' + esc(gateLabelText('paused')) + '</option>' +
-        '<option value="scheduled"' + (!ov || ov.override !== 'pause' ? ' selected' : '') + '>' + esc(gateLabelText('scheduled')) + '</option>' +
-        '</select></td></tr>';
-      }).join("") + "</tbody></table>";
-  }
+  // --- Running now / Queued / Workers
+  $("running-box").innerHTML = runningBox(st);
 
-  // projects — each block: name + state, today's token budget, the workers
-  // allocated to the project (from their heartbeat: model, est, queue depth,
-  // online dot), and the schedule line (the knobs that gate its grants).
   const pbox = $("projects");
   if (!st.projects || st.projects.length === 0) {
-    pbox.innerHTML = '<div class="empty">none configured</div>';
+    pbox.innerHTML = '<div class="empty">no projects configured</div>';
   } else {
-    pbox.innerHTML = st.projects.map((p) => projBlock(p, st.now)).join("");
+    pbox.innerHTML = st.projects.map((p) => workBlock(p, st.now)).join("");
   }
 
-  // events
+  $("workers").innerHTML = workersTable(st);
+
+  // --- events
   const et = $("events");
   if (!st.events || st.events.length === 0) {
     et.innerHTML = '<tr><td colspan="4" class="empty">no events yet</td></tr>';
@@ -475,7 +540,7 @@ $("logs-limit").addEventListener("change", () => refresh());
 //   #status  — the live, color-coded state word (Idle / Busy / Running Idle
 //              Tasks / Degraded, or "unreachable")
 //   #gate    — the "Engine" combobox: Engine Paused / Engine Running
-//              (one global gate across all clients; each Clients-panel row
+//              (one global gate across all clients; each Workers-panel row
 //              also carries a small per-client one)
 // Engine Paused   → operator override pause (POST /override; the daemon stops
 //                   asking for work; the arbiter refuses new grants)
@@ -518,17 +583,25 @@ function syncGateOptions(clients) {
     : "\nscheduled clients run when idle — idle/reidle gates, budgets, project pauses still apply");
 }
 
-function flashGateMsg(text, cls) {
+function flashGateMsg(text, cls, sticky) {
   gateMsg.textContent = text;
   gateMsg.className = cls || "sub";
   clearTimeout(flashGateMsg._t);
-  flashGateMsg._t = setTimeout(() => { gateMsg.textContent = ""; }, 6000);
+  if (!sticky) flashGateMsg._t = setTimeout(() => { gateMsg.textContent = ""; }, 6000);
 }
 
 async function setOverride(clientId, mode) {
   const token = gateToken();
   if (!token) {
-    flashGateMsg("no API token — paste one into 'gate token' below the Clients panel to change the gate", "err");
+    // A gate change that can't be sent must stay visible (sticky) until the
+    // operator resolves it — a 6s flash on a critical control reads as
+    // "nothing happened". Point at the token field, don't just mention it.
+    flashGateMsg("gate needs the arbiter API token — paste it into 'gate token' below the Workers panel", "err", true);
+    const inp = $("gate-token");
+    if (inp) {
+      inp.scrollIntoView({ block: "center" });
+      inp.focus({ preventScroll: true });
+    }
     return false;
   }
   const body = mode === "paused" ? { override: "pause" } : { override: null };
@@ -563,15 +636,26 @@ gateSel.addEventListener("change", async () => {
   } catch { return; }
   if (!clients || clients.length === 0) return;
   const mode = gateSel.value;
-  await Promise.all(clients.map((c) => setOverride(c.client_id, mode)));
+  const results = await Promise.all(clients.map((c) => setOverride(c.client_id, mode)));
+  if (results.some((ok) => !ok)) {
+    // The appearance must tell the truth: a change that didn't land must not
+    // leave the combobox showing it. Re-sync from the server (the 5s
+    // auto-refresh would fix this too, but a failed gate click shouldn't
+    // look applied for 5 seconds).
+    try {
+      const res = await fetch("/api/state?limit=1", { cache: "no-store" });
+      syncGateOptions((await res.json()).clients);
+    } catch { syncGateOptions(clients); }
+  }
 });
 
-// Per-client comboboxes live in the Clients table (rebuilt each refresh), so
+// Per-client comboboxes live in the Workers table (rebuilt each refresh), so
 // the listener is delegated on the container.
-$("clients").addEventListener("change", (e) => {
-  const sel = e.target.closest('select.gate.small');
+$("workers").addEventListener("change", async (e) => {
+  const sel = e.target.closest("select.gate.small");
   if (!sel) return;
-  setOverride(sel.dataset.client, sel.value);
+  const ok = await setOverride(sel.dataset.client, sel.value);
+  if (!ok) refresh(); // failed change → re-render from server truth (row snaps back)
 });
 
 // gate token input: persist on blur/change (non-empty), clear on empty.

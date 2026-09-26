@@ -15,7 +15,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import fastify, { type FastifyInstance } from 'fastify';
 import { WebSocketServer } from 'ws';
-import type { Arbiter } from './arbiter.js';
+import { utcDay, type Arbiter } from './arbiter.js';
 import type { ProjectAllocation, ServerConfig } from './types.js';
 
 export interface ApiDeps {
@@ -64,6 +64,7 @@ function projectView(
   clients: { name: string; last_seen: number; projects: { name: string; model: string; estimated_seconds: number; queue_depth: number }[] }[],
   day: string,
   now: number,
+  today: Record<string, { finished: number; failed: number }>,
 ) {
   return cfg.projects.map((p) => {
     const workers = clients
@@ -83,6 +84,7 @@ function projectView(
       ...p,
       budget_today: arbiter.projectBudget(p.name, day),
       workers,
+      today: today[p.name] ?? { finished: 0, failed: 0 },
       scheduling: {
         paused: p.paused,
         idle_seconds: cfg.idle_seconds,
@@ -92,6 +94,25 @@ function projectView(
       },
     };
   });
+}
+
+/**
+ * Today's (UTC) completed work for a project, computed from lease
+ * end-records already in state — the dashboard's results row. A lease that
+ * terminated with status 'finished' counts as finished; any other terminal
+ * lease (revoked: client-reported failure / preemption, or expired) counts
+ * as failed. Active leases do not count.
+ */
+function todayTotals(leases: { project: string; status: string; ended_at?: number }[], day: string) {
+  const per: Record<string, { finished: number; failed: number }> = {};
+  for (const l of leases) {
+    if (l.status === 'active') continue;
+    if (!l.ended_at || utcDay(l.ended_at) !== day) continue;
+    const e = (per[l.project] ??= { finished: 0, failed: 0 });
+    if (l.status === 'finished') e.finished += 1;
+    else e.failed += 1;
+  }
+  return per;
 }
 
 /** Attach the API routes (authed) and the dashboard (public read). */
@@ -230,7 +251,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   app.get('/api/projects', async () => {
     const day = new Date().toISOString().slice(0, 10);
     return {
-      projects: projectView(arbiter, cfg, arbiter['store'].state.clients, day, Date.now()),
+      projects: projectView(arbiter, cfg, arbiter['store'].state.clients, day, Date.now(), todayTotals(arbiter['store'].state.leases, day)),
     };
   });
 
@@ -278,7 +299,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       // Client rows carry their active operator override (if any), so the
       // dashboard and clients can see pause/force state without a second call.
       clients: s.clients.map((c) => ({ ...c, override: arbiter.activeOverride(c.client_id, now) })),
-      projects: projectView(arbiter, cfg, s.clients, day, now),
+      projects: projectView(arbiter, cfg, s.clients, day, now, todayTotals(s.leases, day)),
       events: s.events.slice(Math.max(0, s.events.length - limit)).reverse(),
     };
   });

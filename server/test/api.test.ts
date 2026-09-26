@@ -303,12 +303,53 @@ test('projects in /api/state carry allocated workers + scheduling; register vali
   assert.equal(proj.scheduling.lease_ttl_seconds, cfg.lease_ttl_seconds);
 
   // Client rows expose last_seen + the stored allocations.
-  const rowB = st.clients.find((c) => c.name === 'worker-b')!;
-  assert.equal(typeof rowB.last_seen, 'number');
+  const rowB = st.clients.find((c) => c.name === "worker-b")!;
+  assert.equal(typeof rowB.last_seen, "number");
   assert.equal(rowB.projects.length, 1);
-  assert.equal(rowB.projects[0]!.name, 'career-ops');
-  const rowC = st.clients.find((c) => c.name === 'worker-c')!;
-  assert.deepEqual(rowC.projects, [], 'malformed rows filtered to an empty list');
+  assert.equal(rowB.projects[0]!.name, "career-ops");
+  const rowC = st.clients.find((c) => c.name === "worker-c")!;
+  assert.deepEqual(rowC.projects, [], "malformed rows filtered to an empty list");
+});
+
+test("projects in /api/state carry today's results (finished/failed from lease end-records)", async () => {
+  // The round-trip test finished one lease (ok=true → status 'finished').
+  const get = async () =>
+    (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+      projects: { name: string; today: { finished: number; failed: number } }[];
+    };
+
+  let st = await get();
+  assert.equal(st.projects[0]!.today.finished, 1, "the finished lease counts finished today");
+  assert.equal(st.projects[0]!.today.failed, 0, "no failed lease yet");
+
+  // A client-reported failure terminates as 'revoked' (end_reason 'failed')
+  // — it must count as failed, not finished. Quiet the feed so the grant is
+  // not rejected not_idle (the grant is the thing under test, not the box).
+  entries.length = 0;
+  entries.push(...mkEntries([400], "ip:10.0.0.9", Date.now()));
+  await det.poll(Date.now(), new Set());
+  const lease = await fetch(`${base}/api/leases`, {
+    method: "POST",
+    headers: auth,
+    body: JSON.stringify({ client_id: clientId, project: "career-ops", job_id: "job-fail" }),
+  });
+  assert.equal(lease.status, 201);
+  const leaseId = ((await lease.json()) as { lease_id: string }).lease_id;
+  const use = await fetch(`${base}/api/leases/${leaseId}/usage`, {
+    method: "POST",
+    headers: auth,
+    body: JSON.stringify({ ok: false, error: "boom", tokens_out: 10 }),
+  });
+  assert.equal(use.status, 200);
+  st = await get();
+  assert.equal(st.projects[0]!.today.failed, 1, "a client-reported failure counts failed today");
+  assert.equal(st.projects[0]!.today.finished, 1, "the finished count is unchanged");
+
+  // The /api/projects endpoint (token-authed) carries the same row.
+  const pj = await (await fetch(`${base}/api/projects`, { headers: auth })).json() as {
+    projects: { name: string; today: { finished: number; failed: number } }[];
+  };
+  assert.deepEqual(pj.projects[0]!.today, { finished: 1, failed: 1 });
 });
 
 test('/api/state limit: window is honored (default 10, explicit wins, clamped to >=1)', async () => {
