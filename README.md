@@ -257,7 +257,21 @@ shared records-to-show).
     finished; any other terminal lease counts failed),
   - **schedule** — the EFFECTIVE knobs that gate the project's grants
     (idle threshold, max concurrent, lease TTL — per-project overrides
-    win; a dim mark appears only when this project overrides the globals).
+    win; a dim mark appears only when this project overrides the globals),
+  - **settings** — a collapsed editor under each project block for the
+    grant knobs (`POST /api/projects/:name/settings`): one field per knob,
+    a filled value is the current override and an empty (dashed) field
+    shows the global it inherits. Save posts only the fields the operator
+    touched (an override emptied on purpose sends `null`); **Reset to
+    global** posts `{clear:true}`; token-gated like the gates.
+- **Inference Servers** additions — each server block also shows the
+  declared connection (url, activity path, declared/changed age) and an
+  **edit connection** editor (`POST /api/servers` by `id` — patch semantics:
+  only the changed fields are sent), and the pane head carries a **+ add
+  server** editor (create; name + an http(s) url required, a duplicate
+  url + activity path is a 400 shown in the form). All settings editors are
+  token-gated: with no gate token the write is refused and the header
+  points at the token field.
 
 Workers are **self-reported by the clients** (the arbiter does not infer
 allocations): each client daemon re-registers on every poll tick (~20s) with
@@ -277,7 +291,9 @@ them verbatim), and `GET /api/state` / `GET /api/projects` return per-project
 a `today: {finished, failed}` results row (UTC day of each lease's end), and
 a `scheduling` object (the EFFECTIVE `idle_seconds`,
 `max_concurrent_leases`, `lease_ttl_seconds`, `daily_token_cap`, plus
-`overrides` for the raw per-project values). `GET /api/state` also carries
+`overrides` for the raw per-project values and `global` for the global
+knobs an unset override falls back to — the dashboard's settings editors
+show those as the dashed "inherit" placeholders). `GET /api/state` also carries
 the `servers` inventory (see Inference-server inventory above). A project
 with no connected workers shows "no workers connected" — a scheduling row
 with no executor behind it tells you the queue will not drain.

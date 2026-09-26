@@ -101,6 +101,13 @@ function projectView(
           max_concurrent_leases: p.max_concurrent_leases ?? null,
           lease_ttl_seconds: p.lease_ttl_seconds ?? null,
         },
+        // The global knobs a knob falls back to while its override is unset
+        // — the dashboard's settings editor shows them as the placeholder.
+        global: {
+          idle_seconds: cfg.idle_seconds,
+          max_concurrent_leases: cfg.max_concurrent_leases,
+          lease_ttl_seconds: cfg.lease_ttl_seconds,
+        },
       },
     };
   });

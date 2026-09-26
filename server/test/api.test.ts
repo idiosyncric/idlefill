@@ -272,6 +272,7 @@ test('per-project grant knobs: override + effective values + persistence', async
             max_concurrent_leases: number;
             lease_ttl_seconds: number;
             overrides: { idle_seconds: number | null; max_concurrent_leases: number | null; lease_ttl_seconds: number | null };
+            global: { idle_seconds: number; max_concurrent_leases: number; lease_ttl_seconds: number };
           };
         }[];
       }>,
@@ -298,6 +299,7 @@ test('per-project grant knobs: override + effective values + persistence', async
   assert.equal(p1.scheduling.max_concurrent_leases, cfg.max_concurrent_leases, 'unset knob inherits the global');
   assert.equal(p1.scheduling.lease_ttl_seconds, 900);
   assert.deepEqual(p1.scheduling.overrides, { idle_seconds: 600, max_concurrent_leases: null, lease_ttl_seconds: 900 }, 'the raw overrides are visible');
+  assert.deepEqual(p1.scheduling.global, { idle_seconds: cfg.idle_seconds, max_concurrent_leases: cfg.max_concurrent_leases, lease_ttl_seconds: cfg.lease_ttl_seconds }, 'the globals an unset knob falls back to are exposed (the dashboard settings editor shows them as placeholders)');
 
   // clear removes them all
   const clr = await set({ clear: true });
