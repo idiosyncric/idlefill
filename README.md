@@ -143,8 +143,17 @@ node scripts/idlefill-control.mjs clear  <name-or-id>
 
 HTTP equivalent (token-authed): `POST /api/clients/:ref/override` with body
 `{"override":"pause"|"force"|null, "until":<epoch_ms>}` — `null` clears.
-The dashboard is read-only by design (phase 1); drive overrides via the
-script or curl.
+
+The dashboard also drives this: the header pill is a combobox
+(`Paused — [status]` / `Running Scheduled — [status]`, one global gate across
+all clients) and each Clients-panel row has a per-client one. Writes are
+token-authed — paste the arbiter token into the "gate token" field under the
+Clients panel once per browser (stored in `localStorage`, same LAN/tailnet
+trust posture as the phase-1 dashboard; the field accepts a clear by emptying
+it). The `[status]` in each label is the live arbiter verdict, shown in the
+select's border (green idle / amber busy / red degraded) and tooltip, not a
+third mode: *paused* sets the `pause` override; *running scheduled* clears it
+and the client runs its normal idle-gated schedule.
 
 ## Conventions
 

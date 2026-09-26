@@ -29,13 +29,20 @@
   }
   header h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: 0.5px; }
   header .sub { color: var(--dim); font-size: 12px; }
-  .status-pill {
-    margin-left: auto; padding: 2px 10px; border-radius: 10px;
-    border: 1px solid var(--border); font-size: 12px;
+  /* Gate control: the header pill is now a combobox styled like the old
+     status pill — the border keeps tracking the live status (idle/busy/
+     degraded) while the value is the client's mode. */
+  .gate {
+    margin-left: auto; padding: 2px 8px; border-radius: 10px;
+    border: 1px solid var(--border); font-size: 12px; font-family: var(--mono);
+    background: var(--bg); color: var(--text); cursor: pointer;
   }
-  .status-pill.idle { color: var(--ok); border-color: var(--ok); }
-  .status-pill.busy { color: var(--warn); border-color: var(--warn); }
-  .status-pill.degraded { color: var(--err); border-color: var(--err); }
+  .gate.idle { color: var(--ok); border-color: var(--ok); }
+  .gate.busy { color: var(--warn); border-color: var(--warn); }
+  .gate.degraded { color: var(--err); border-color: var(--err); }
+  .gate:disabled { opacity: 0.55; cursor: not-allowed; }
+  .gate.small { font-size: 11px; padding: 1px 4px; border-radius: 8px; margin-left: 0; }
+  #gate-msg { margin-left: 10px; font-size: 11px; }
   main { padding: 16px 20px; display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 14px; }
   section {
     background: var(--panel); border: 1px solid var(--border);
@@ -102,7 +109,8 @@
 <header>
   <h1>idlefill · arbiter</h1>
   <span class="sub">background-work gate for the local LLM server</span>
-  <span class="status-pill busy" id="pill">…</span>
+  <select id="gate" class="gate busy" disabled title="client gate">…</select>
+  <span id="gate-msg"></span>
 </header>
 
 <main>
@@ -125,6 +133,12 @@
   <section>
     <h2>Clients</h2>
     <div id="clients"><div class="empty">none registered</div></div>
+    <div id="gate-token-row" style="margin-top:8px;display:none">
+      <label class="k" for="gate-token" style="color:var(--dim);margin-right:6px">gate token</label>
+      <input id="gate-token" type="password" placeholder="arbiter API token (enables gate changes)" autocomplete="off"
+        style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;font:inherit;font-size:11px;padding:2px 6px;flex:1">
+      <span class="sub" id="gate-token-hint" style="margin-left:6px"></span>
+    </div>
   </section>
 
   <section>
@@ -193,6 +207,14 @@ function esc(x) {
   return String(x ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+// Header gate select: border/title track the live status; the VALUE is the
+// client's mode (set by the gate-control block below).
+function setGateStatus(cls, title) {
+  const gate = $("gate");
+  gate.className = "gate" + (gate.classList.contains("small") ? " small" : "") + " " + cls;
+  gate.title = gate.dataset.info ? title + "\n" + gate.dataset.info : title;
+}
+
 async function refresh() {
   const limit = $("logs-limit").value;
   let st;
@@ -201,10 +223,15 @@ async function refresh() {
     if (!res.ok) throw new Error("HTTP " + res.status);
     st = await res.json();
   } catch (err) {
-    $("pill").textContent = "state unreachable";
-    $("pill").className = "status-pill degraded";
+    setGateStatus("degraded", "state unreachable");
     return;
   }
+
+  syncGateOptions(st.clients);
+  // gate-token row: offer storage when the gate is actionable and no token
+  // is stored yet; the input's change handler (below) persists it.
+  $("gate-token-row").style.display = st.clients.length > 0 ? "flex" : "none";
+  $("gate-token-hint").textContent = gateToken() ? "stored ✓" : "(not set)";
 
   const now = new Date(st.now);
   $("now").textContent = now.toISOString().replace("T", " ").slice(0, 19) + "Z";
@@ -228,10 +255,10 @@ async function refresh() {
   $("reidle").textContent = st.idle.reidle_gated ? "armed (wait for full idle)" : "clear";
   $("reidle").className = st.idle.reidle_gated ? "warn" : "ok";
 
-  const pill = $("pill");
-  if (st.idle.degraded) { pill.textContent = "signal degraded"; pill.className = "status-pill degraded"; }
-  else if (st.idle.idle) { pill.textContent = "idle — grants open"; pill.className = "status-pill idle"; }
-  else { pill.textContent = "busy — grants blocked"; pill.className = "status-pill busy"; }
+  setGateStatus(
+    st.idle.degraded ? "degraded" : st.idle.idle ? "idle" : "busy",
+    st.idle.degraded ? "signal degraded — grants blocked" : st.idle.idle ? "idle — grants open" : "busy — grants blocked",
+  );
 
   // lease
   const box = $("lease-box");
@@ -254,7 +281,7 @@ async function refresh() {
   if (st.clients.length === 0) {
     cbox.innerHTML = '<div class="empty">none registered</div>';
   } else {
-    cbox.innerHTML = "<table><thead><tr><th>name</th><th>id</th><th>ip</th><th>state</th><th>registered</th></tr></thead><tbody>" +
+    cbox.innerHTML = "<table><thead><tr><th>name</th><th>id</th><th>ip</th><th>state</th><th>registered</th><th>gate</th></tr></thead><tbody>" +
       st.clients.map((c) => {
         const ov = c.override;
         let badge = '<span class="tag" style="color:var(--dim)">active</span>';
@@ -265,7 +292,11 @@ async function refresh() {
           badge = '<span class="tag" style="color:var(--warn);border-color:var(--warn)" title="may run despite idle gate">' + 'forced' + (until ? '→' + until : '') + '</span>';
         }
         return "<tr><td>" + esc(c.name) + "</td><td>" + esc(c.client_id) + "</td><td>" + esc(c.ip) +
-        "</td><td>" + badge + "</td><td>" + ago(st.now - new Date(c.registered_at).getTime()) + "</td></tr>";
+        "</td><td>" + badge + "</td><td>" + ago(st.now - new Date(c.registered_at).getTime()) +
+        '</td><td><select class="gate small" data-client="' + esc(c.client_id) + '" title="set gate for ' + esc(c.name) + '">' +
+        (ov && ov.override === 'pause' ? '<option value="paused" selected>Paused — [status]</option>' : '<option value="paused">Paused — [status]</option>') +
+        '<option value="scheduled"' + (!ov || ov.override !== 'pause' ? ' selected' : '') + '>Running Scheduled — [status]</option>' +
+        '</select></td></tr>';
       }).join("") + "</tbody></table>";
   }
 
@@ -320,9 +351,8 @@ async function refresh() {
   }
 }
 
-refresh();
-setInterval(refresh, 5000);
-
+// (refresh is invoked at the END of the script, after all render + gate
+// helpers are defined — see the bottom.)
 // Logs tray: expand/collapse toggle (bottom dock; collapsed by default,
 // persisted), Events/Leases tabs, and the shared records-to-show combo.
 const tray = $("logs-tray");
@@ -351,6 +381,124 @@ try {
   if (savedTab === "tab-leases") $("tab-leases").click();
 } catch {}
 $("logs-limit").addEventListener("change", () => refresh());
+
+// ---------------------------------------------------------------------------
+// Gate control — the header pill is a combobox, and each client row carries
+// a small one. Mode is persisted per-client:
+//   "paused"    → operator override pause (POST /override; the daemon stops
+//                 asking for work; the arbiter refuses new grants)
+//   "scheduled" → default: clear the override, the client runs on its normal
+//                 schedule (idle gate + reidle gate + budgets still apply)
+// "[status]" in both labels is the live status (green idle / amber busy /
+// red degraded) shown in the select's border + tooltip — the box itself
+// stays a two-option control.
+//
+// Writes need the arbiter token (the dashboard poll is anonymous). It is kept
+// in localStorage (key idlefill.token), the same posture as the LAN/tailnet
+// phase-1 dashboard: the browser that can read /api/state can hold the token.
+// ---------------------------------------------------------------------------
+
+const GATE_TOKEN_KEY = "idlefill.token";
+const gateSel = $("gate");
+const gateMsg = $("gate-msg");
+
+function gateToken() {
+  try { return localStorage.getItem(GATE_TOKEN_KEY) || ""; } catch { return ""; }
+}
+
+function gateModeFor(override) {
+  return override && override.override === "pause" ? "paused" : "scheduled";
+}
+
+// Header combobox: one global gate across all registered clients — reads
+// "paused" only when EVERY client is paused. Rebuilt each refresh; its border
+// keeps tracking the live status (see setGateStatus in refresh()).
+function syncGateOptions(clients) {
+  const names = clients.map((c) => c.name).join(", ") || "no client registered";
+  const allPaused = clients.length > 0 && clients.every((c) => gateModeFor(c.override) === "paused");
+  gateSel.length = 0;
+  gateSel.add(new Option("Paused — [status]", "paused"));
+  gateSel.add(new Option("Running Scheduled — [status]", "scheduled"));
+  gateSel.value = allPaused ? "paused" : "scheduled";
+  gateSel.disabled = clients.length === 0;
+  gateSel.dataset.info = clients.length === 0
+    ? "no client registered — nothing to gate"
+    : "clients: " + names + (allPaused
+      ? "\nall clients paused — new grants refused (active leases keep running)"
+      : "\nscheduled clients run when idle — idle/reidle gates, budgets, project pauses still apply");
+}
+
+function flashGateMsg(text, cls) {
+  gateMsg.textContent = text;
+  gateMsg.className = cls || "sub";
+  clearTimeout(flashGateMsg._t);
+  flashGateMsg._t = setTimeout(() => { gateMsg.textContent = ""; }, 6000);
+}
+
+async function setOverride(clientId, mode) {
+  const token = gateToken();
+  if (!token) {
+    flashGateMsg("no API token — paste one into 'gate token' below the Clients panel to change the gate", "err");
+    return false;
+  }
+  const body = mode === "paused" ? { override: "pause" } : { override: null };
+  try {
+    const res = await fetch("/api/clients/" + encodeURIComponent(clientId) + "/override?token=" + encodeURIComponent(token), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      let detail = "HTTP " + res.status;
+      try { detail += ": " + ((await res.json()).error ?? ""); } catch {}
+      flashGateMsg(detail, "err");
+      return false;
+    }
+    flashGateMsg(mode === "paused" ? "client paused — new grants refused (active leases keep running)" : "client on schedule — idle-gated", "ok");
+    refresh();
+    return true;
+  } catch (err) {
+    flashGateMsg("override failed: " + err.message, "err");
+    return false;
+  }
+}
+
+// Header combobox: applies the mode to EVERY registered client (it's the
+// single global gate the old pill represented).
+gateSel.addEventListener("change", async () => {
+  let clients;
+  try {
+    const res = await fetch("/api/state?limit=1", { cache: "no-store" });
+    clients = (await res.json()).clients;
+  } catch { return; }
+  if (!clients || clients.length === 0) return;
+  const mode = gateSel.value;
+  await Promise.all(clients.map((c) => setOverride(c.client_id, mode)));
+});
+
+// Per-client comboboxes live in the Clients table (rebuilt each refresh), so
+// the listener is delegated on the container.
+$("clients").addEventListener("change", (e) => {
+  const sel = e.target.closest('select.gate.small');
+  if (!sel) return;
+  setOverride(sel.dataset.client, sel.value);
+});
+
+// gate token input: persist on blur/change (non-empty), clear on empty.
+// The token never appears in a URL the dashboard polls — it only goes on the
+// override POST (same query-param pattern the client daemon uses).
+$("gate-token").addEventListener("change", () => {
+  const v = $("gate-token").value.trim();
+  try {
+    if (v) localStorage.setItem(GATE_TOKEN_KEY, v);
+    else localStorage.removeItem(GATE_TOKEN_KEY);
+  } catch {}
+  $("gate-token-hint").textContent = gateToken() ? "stored ✓" : "(not set)";
+  $("gate-token").value = ""; // clear the field; the hint shows the stored state
+});
+
+refresh();
+setInterval(refresh, 5000);
 </script>
 </body>
 </html>
