@@ -39,6 +39,7 @@
   }
   .gate.idle { color: var(--ok); border-color: var(--ok); }
   .gate.busy { color: var(--warn); border-color: var(--warn); }
+  .gate.running { color: var(--accent); border-color: var(--accent); }
   .gate.degraded { color: var(--err); border-color: var(--err); }
   .gate:disabled { opacity: 0.55; cursor: not-allowed; }
   .gate.small { font-size: 11px; padding: 1px 4px; border-radius: 8px; margin-left: 0; }
@@ -215,6 +216,23 @@ function setGateStatus(cls, title) {
   gate.title = gate.dataset.info ? title + "\n" + gate.dataset.info : title;
 }
 
+// The live state shown in the gate option labels. Priority:
+//   Degraded            — signal failure (red; grants blocked)
+//   Running Idle Tasks  — a lease is in flight (background work running)
+//   Idle                — quiet, grants open
+//   Busy                — interactive traffic, grants blocked
+function liveStatus(st) {
+  if (st.idle.degraded) return { label: "Degraded", cls: "degraded", note: "signal degraded — grants blocked" };
+  if (st.active_leases && st.active_leases.length > 0) return { label: "Running Idle Tasks", cls: "running", note: "background work in progress" };
+  if (st.idle.idle) return { label: "Idle", cls: "idle", note: "grants open" };
+  return { label: "Busy", cls: "busy", note: "grants blocked" };
+}
+
+// Option text for a gate combobox: "<Mode> — <live state>".
+function gateLabelText(mode, liveLabel) {
+  return (mode === "paused" ? "Paused" : "Running Scheduled") + " — " + liveLabel;
+}
+
 async function refresh() {
   const limit = $("logs-limit").value;
   let st;
@@ -227,7 +245,8 @@ async function refresh() {
     return;
   }
 
-  syncGateOptions(st.clients);
+  const live = liveStatus(st);
+  syncGateOptions(st.clients, live.label);
   // gate-token row: offer storage when the gate is actionable and no token
   // is stored yet; the input's change handler (below) persists it.
   $("gate-token-row").style.display = st.clients.length > 0 ? "flex" : "none";
@@ -255,10 +274,10 @@ async function refresh() {
   $("reidle").textContent = st.idle.reidle_gated ? "armed (wait for full idle)" : "clear";
   $("reidle").className = st.idle.reidle_gated ? "warn" : "ok";
 
-  setGateStatus(
-    st.idle.degraded ? "degraded" : st.idle.idle ? "idle" : "busy",
-    st.idle.degraded ? "signal degraded — grants blocked" : st.idle.idle ? "idle — grants open" : "busy — grants blocked",
-  );
+  setGateStatus(live.cls, live.note);
+  // (option-label refresh for the per-client gate selects runs at the END of
+  //  refresh(), after the Clients table renders; the header options already
+  //  carry the live label from syncGateOptions above.)
 
   // lease
   const box = $("lease-box");
@@ -294,8 +313,8 @@ async function refresh() {
         return "<tr><td>" + esc(c.name) + "</td><td>" + esc(c.client_id) + "</td><td>" + esc(c.ip) +
         "</td><td>" + badge + "</td><td>" + ago(st.now - new Date(c.registered_at).getTime()) +
         '</td><td><select class="gate small" data-client="' + esc(c.client_id) + '" title="set gate for ' + esc(c.name) + '">' +
-        (ov && ov.override === 'pause' ? '<option value="paused" selected>Paused — [status]</option>' : '<option value="paused">Paused — [status]</option>') +
-        '<option value="scheduled"' + (!ov || ov.override !== 'pause' ? ' selected' : '') + '>Running Scheduled — [status]</option>' +
+        '<option value="paused"' + (ov && ov.override === 'pause' ? ' selected' : '') + '>' + esc(gateLabelText('paused', live.label)) + '</option>' +
+        '<option value="scheduled"' + (!ov || ov.override !== 'pause' ? ' selected' : '') + '>' + esc(gateLabelText('scheduled', live.label)) + '</option>' +
         '</select></td></tr>';
       }).join("") + "</tbody></table>";
   }
@@ -389,9 +408,11 @@ $("logs-limit").addEventListener("change", () => refresh());
 //                 asking for work; the arbiter refuses new grants)
 //   "scheduled" → default: clear the override, the client runs on its normal
 //                 schedule (idle gate + reidle gate + budgets still apply)
-// "[status]" in both labels is the live status (green idle / amber busy /
-// red degraded) shown in the select's border + tooltip — the box itself
-// stays a two-option control.
+// The trailing "<state>" in each label is the LIVE arbiter verdict, recomputed
+// every refresh (see liveStatus): Idle / Busy / Running Idle Tasks / Degraded —
+// e.g. "Paused — Busy", "Running Scheduled — Idle". The select's border also
+// colors it (green idle / amber busy / red degraded) and the tooltip explains
+// it, so the box stays a two-mode control.
 //
 // Writes need the arbiter token (the dashboard poll is anonymous). It is kept
 // in localStorage (key idlefill.token), the same posture as the LAN/tailnet
@@ -412,13 +433,14 @@ function gateModeFor(override) {
 
 // Header combobox: one global gate across all registered clients — reads
 // "paused" only when EVERY client is paused. Rebuilt each refresh; its border
-// keeps tracking the live status (see setGateStatus in refresh()).
-function syncGateOptions(clients) {
+// keeps tracking the live status (see setGateStatus in refresh()). Options
+// are built with the live state word so a refresh never shows "[status]".
+function syncGateOptions(clients, liveLabel) {
   const names = clients.map((c) => c.name).join(", ") || "no client registered";
   const allPaused = clients.length > 0 && clients.every((c) => gateModeFor(c.override) === "paused");
   gateSel.length = 0;
-  gateSel.add(new Option("Paused — [status]", "paused"));
-  gateSel.add(new Option("Running Scheduled — [status]", "scheduled"));
+  gateSel.add(new Option(gateLabelText("paused", liveLabel), "paused"));
+  gateSel.add(new Option(gateLabelText("scheduled", liveLabel), "scheduled"));
   gateSel.value = allPaused ? "paused" : "scheduled";
   gateSel.disabled = clients.length === 0;
   gateSel.dataset.info = clients.length === 0

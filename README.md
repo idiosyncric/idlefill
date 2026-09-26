@@ -145,15 +145,17 @@ HTTP equivalent (token-authed): `POST /api/clients/:ref/override` with body
 `{"override":"pause"|"force"|null, "until":<epoch_ms>}` — `null` clears.
 
 The dashboard also drives this: the header pill is a combobox
-(`Paused — [status]` / `Running Scheduled — [status]`, one global gate across
-all clients) and each Clients-panel row has a per-client one. Writes are
-token-authed — paste the arbiter token into the "gate token" field under the
-Clients panel once per browser (stored in `localStorage`, same LAN/tailnet
-trust posture as the phase-1 dashboard; the field accepts a clear by emptying
-it). The `[status]` in each label is the live arbiter verdict, shown in the
-select's border (green idle / amber busy / red degraded) and tooltip, not a
-third mode: *paused* sets the `pause` override; *running scheduled* clears it
-and the client runs its normal idle-gated schedule.
+(`Paused — <state>` / `Running Scheduled — <state>`, one global gate across
+all clients) and each Clients-panel row has a per-client one. `<state>` is
+filled live on every refresh (the border colors it too): *Idle* (grants
+open), *Busy* (interactive traffic), *Running Idle Tasks* (a lease is in
+flight), or *Degraded* (signal failure) — e.g. `Paused — Busy`,
+`Running Scheduled — Idle`. Writes are token-authed — paste the arbiter
+token into the "gate token" field under the Clients panel once per browser
+(stored in `localStorage`, same LAN/tailnet trust posture as the phase-1
+dashboard; the field accepts a clear by emptying it). *Paused* sets the
+`pause` override; *Running Scheduled* clears it and the client runs its
+normal idle-gated schedule.
 
 ## Conventions
 
