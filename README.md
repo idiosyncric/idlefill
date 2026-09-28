@@ -109,6 +109,45 @@ deploy/     PHASE 2, UNTESTED: compose.yaml, traefik/idlefill.yml, deploy.sh,
 data/       gitignored; queue.jsonl, results.jsonl land here
 ```
 
+## The client (Mac daemon)
+
+The daemon registers, polls, claims leases, and runs the project's executor
+(`bash -c "<cmd>"`) under the loopback proxy.
+
+**The executor runs in its own process group.** The spawn is detached, so
+the bash wrapper leads a group that also contains everything it forks
+(the career-ops eval and Playwright). Preemption, timeouts, and shutdown
+all signal the WHOLE group (`SIGINT` → grace → `SIGKILL`). A signal to the
+bash pid alone would orphan the eval — and an orphaned eval keeps talking
+to the LLM, which the arbiter reads as interactive activity and stops
+granting work. Killing the group is what keeps the box honest.
+
+**Per-project timeout.** Each project config may carry `timeout_seconds`
+(default 1200 — the career-ops worst case is ~90s extract + 15min eval).
+When a run exceeds it, the daemon uses the same escalation as a
+preemption: `SIGINT`, the grace period, then `SIGKILL` — the job is
+reported `ok:false, error:"timeout"` and goes through the retry path.
+
+**Retry and quarantine.** A job is "done" only when its executor exits 0
+AND its result line says `ok:true`. Every other outcome — a clean
+`ok:false` result (a transient page failure), a crash, a preemption, a
+timeout — leaves the job in the queue with `attempts` bumped by one. When
+`attempts` reaches 3 the job moves to `data/quarantine.jsonl` (with its
+last error) and never runs again until you edit the files by hand. The
+dashboard shows the quarantine count next to the queue depth.
+
+**Token accounting.** On a successful finish the result file's
+`tokens_out`/`tokens_in` (the LLM's own numbers) are authoritative. The
+loopback proxy's byte count (bytes/4 — an overcount) is only the fallback
+when the result lacks them, or the only signal at all for a preempted/killed
+job that never wrote a result.
+
+**Self-traffic IP.** The exemption that keeps the arbiter from counting
+your own backfill traffic keys on the IP it OBSERVES on your connection —
+not the static `ip` in your client config. Tailscale reassigns addresses;
+the observed value tracks that, and the configured value is kept only for
+display/audit (`reported_ip` on the client row).
+
 ## Auth model
 
 - Every API call and the WS connection must present a token from the server's
