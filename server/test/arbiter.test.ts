@@ -17,7 +17,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Arbiter, utcDay } from '../src/arbiter.js';
@@ -97,7 +97,11 @@ function makeHarness(opts: { ttl?: number; cap?: number; maxLeases?: number; idl
   const det = new FakeDetector();
   det.idleSeconds = cfg.idle_seconds;
   const arbiter = new Arbiter(store, cfg, det as unknown as ConstructorParameters<typeof Arbiter>[2]);
-  arbiter.registerClient('mac', '100.94.165.102', '127.0.0.1');
+  // The client's REAL current IP is the OBSERVED connection IP (what the
+  // self-traffic exemption keys on). `127.0.0.1` stands in for the client's
+  // stale static config value — the old code trusted that one, which is
+  // exactly the bug Fix 5 removes.
+  arbiter.registerClient('mac', '127.0.0.1', '100.94.165.102');
   return { dir, store, cfg, det, arbiter, client: store.state.clients[0]! };
 }
 
@@ -474,6 +478,47 @@ test('setClientOverride: unknown client rejected; idempotent re-registration kee
   const re = h.arbiter.registerClient('mac', '100.94.165.102', '127.0.0.1');
   assert.equal(re.created, false);
   assert.equal(h.arbiter.activeOverride(h.client.client_id)?.override, 'force', 'idempotent re-register keeps the same client_id ⇒ override persists');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// Client IP rule (self-traffic exemption): the OBSERVED connection IP wins
+// over the client-reported one (a static config value goes stale when
+// Tailscale reassigns addresses); the reported value is kept for audit.
+// ---------------------------------------------------------------------------
+
+test('registerClient: observed IP wins over reported; reported-only fallback still works; reported_ip surfaces in state', () => {
+  const h = makeHarness();
+
+  // 1. First registration: reported AND observed are both present — the
+  // OBSERVED value is the exemption key; the reported one rides along.
+  h.arbiter.registerClient('worker-obs', '10.0.0.7', '10.10.99.44');
+  const obs = h.store.state.clients.find((c) => c.name === 'worker-obs')!;
+  assert.equal(obs.ip, '10.10.99.44', 'the OBSERVED IP is what the exemption keys on');
+  assert.equal(obs.reported_ip, '10.0.0.7', 'the reported IP is stored for display/audit');
+  assert.equal(obs.observed_ip, '10.10.99.44');
+
+  // 2. Re-registration: tailscale reassigned the address. The stale static
+  // value (10.0.0.7) must NOT clobber the exemption — observed wins again.
+  h.arbiter.registerClient('worker-obs', '10.0.0.7', '10.10.99.45');
+  const obs2 = h.store.state.clients.find((c) => c.name === 'worker-obs')!;
+  assert.equal(obs2.ip, '10.10.99.45', 're-registration refreshes the exemption to the NEW observed IP');
+  assert.equal(obs2.reported_ip, '10.0.0.7', 'reported_ip keeps the (stale) static value for audit');
+
+  // 3. A registration where the observed IP is the `unknown` placeholder
+  // (no readable request IP): the reported value is the fallback — the
+  // old reported-only behavior still works.
+  h.arbiter.registerClient('worker-fallback', '10.0.0.8', 'unknown');
+  const fb = h.store.state.clients.find((c) => c.name === 'worker-fallback')!;
+  assert.equal(fb.ip, '10.0.0.8', 'observed=unknown ⇒ the reported IP is used (older servers still work)');
+  assert.equal(fb.reported_ip, '10.0.0.8');
+
+  // 4. `reported_ip` is surfaced in the persisted state (the dashboard and
+  // /api/state expose the whole client row).
+  const raw = JSON.parse(readFileSync(join(h.dir, 'state.json'), 'utf-8'));
+  const row = raw.clients.find((c) => c.name === 'worker-obs');
+  assert.equal(row.ip, '10.10.99.45', 'state file: ip = the observed value');
+  assert.equal(row.reported_ip, '10.0.0.7', 'state file: reported_ip surfaces for audit');
   rmSync(h.dir, { recursive: true, force: true });
 });
 

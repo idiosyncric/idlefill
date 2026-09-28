@@ -86,9 +86,16 @@ export interface ServerConnection {
 export interface ClientRecord {
   name: string;
   client_id: string;
-  /** Tailnet IP reported by the client at registration (preferred for exemption). */
+  /**
+   * The client's REAL current IP — the observed connection IP, refreshed on
+   * every (re)registration. This is what the self-traffic exemption keys on
+   * (it tracks tailnet reassignments; the client's static config value does
+   * not). Falls back to the reported value until a valid observed IP arrives.
+   */
   ip: string;
-  /** Fallback: req.ip seen at registration time, used when the client reported none. */
+  /** The client-reported IP (its static config) — display/audit only. */
+  reported_ip?: string;
+  /** The observed connection IP, as captured at the most recent registration. */
   observed_ip: string;
   registered_at: string;
   /** Epoch-ms of the most recent successful (re)registration — liveness. */

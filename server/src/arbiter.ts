@@ -80,6 +80,12 @@ export class Arbiter {
    * (the client's liveness heartbeat — the dashboard shows it) and replaces
    * the reported project allocations (the client re-sends its queue depths
    * every poll tick, so the dashboard's per-project worker view stays fresh).
+   *
+   * IP rule (self-traffic exemption): the OBSERVED connection IP wins over
+   * the client-reported one. The client's config carries a static tailnet
+   * IP that goes stale when Tailscale reassigns addresses — a stale
+   * exemption key silently breaks the correctness story. The reported
+   * value is kept on `reported_ip` for display/audit only.
    */
   registerClient(
     name: string,
@@ -92,8 +98,8 @@ export class Arbiter {
     const seen = now ?? Date.now();
     const existing = s.clients.find((c) => c.name === name);
     if (existing) {
-      if (reportedIp) existing.ip = reportedIp;
-      else if (!existing.ip) existing.ip = observedIp;
+      if (validIp(observedIp)) existing.ip = observedIp; // observed wins
+      if (reportedIp) existing.reported_ip = reportedIp;
       if (observedIp) existing.observed_ip = observedIp;
       existing.last_seen = seen;
       if (projects) existing.projects = projects;
@@ -104,7 +110,10 @@ export class Arbiter {
     s.clients.push({
       name,
       client_id,
-      ip: reportedIp ?? observedIp,
+      // Observed wins on first contact too; the reported value is the
+      // fallback for an older client that never shows a real IP.
+      ip: validIp(observedIp) ? observedIp : (reportedIp ?? observedIp),
+      ...(reportedIp ? { reported_ip: reportedIp } : {}),
       observed_ip: observedIp,
       registered_at: new Date(seen).toISOString(),
       last_seen: seen,
@@ -635,4 +644,13 @@ export class Arbiter {
 /** UTC day key for an epoch-ms timestamp: "2026-09-25". */
 export function utcDay(ms: number): UtcDate {
   return new Date(ms).toISOString().slice(0, 10);
+}
+
+/**
+ * True when an observed-IP value is usable as the exemption key: non-empty
+ * and not the `unknown` placeholder api.ts substitutes when the request
+ * carries no readable IP.
+ */
+export function validIp(v: string | undefined): v is string {
+  return typeof v === 'string' && v.trim() !== '' && v.trim() !== 'unknown';
 }

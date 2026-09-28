@@ -422,6 +422,40 @@ test('projects in /api/state carry allocated workers + scheduling; register vali
   assert.deepEqual(rowC.projects, [], "malformed rows filtered to an empty list");
 });
 
+test('client IP: the observed connection IP wins over the reported one; reported_ip surfaces in /api/state', async () => {
+  // The real Fastify app sees the client at 127.0.0.1 (loopback test). The
+  // client REPORTS a (stale) static tailnet IP — the observed one must win,
+  // because the self-traffic exemption keys on it.
+  const reg = await fetch(`${base}/api/clients/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ name: 'worker-ip', ip: '100.94.165.99' }),
+  });
+  assert.equal(reg.status, 200);
+
+  const st = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: { name: string; ip: string; reported_ip?: string; observed_ip: string }[];
+  };
+  const row = st.clients.find((c) => c.name === 'worker-ip')!;
+  assert.equal(row.ip, '127.0.0.1', 'the OBSERVED connection IP is the exemption key');
+  assert.equal(row.reported_ip, '100.94.165.99', 'the reported IP is kept for display/audit');
+  assert.equal(row.observed_ip, '127.0.0.1');
+
+  // A re-registration (heartbeat) with the same stale reported value must
+  // not clobber the observed IP.
+  await fetch(`${base}/api/clients/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ name: 'worker-ip', ip: '100.94.165.99' }),
+  });
+  const st2 = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: { name: string; ip: string; reported_ip?: string }[];
+  };
+  const row2 = st2.clients.find((c) => c.name === 'worker-ip')!;
+  assert.equal(row2.ip, '127.0.0.1', 're-registration keeps the observed IP');
+  assert.equal(row2.reported_ip, '100.94.165.99');
+});
+
 test("projects in /api/state carry today's results (finished/failed from lease end-records)", async () => {
   // The round-trip test finished one lease (ok=true → status 'finished').
   const get = async () =>
