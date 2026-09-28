@@ -31,7 +31,7 @@
 import { randomBytes } from 'node:crypto';
 import type { IdleDetector } from './idle.js';
 import { activeLeaseExemptIps } from './idle.js';
-import type { IdleSignal } from './types.js';
+import type { IdleSignal, JobThrottle } from './types.js';
 import type { StateStore } from './state.js';
 import type { ClientOverride, Lease, ProjectAllocation, ServerConfig, ServerConnection, UtcDate } from './types.js';
 
@@ -42,7 +42,9 @@ export type LeaseRejectionReason =
   | 'budget_exhausted'
   | 'unknown_project'
   | 'unknown_client'
-  | 'client_paused';
+  | 'client_paused'
+  | 'job_throttled'
+  | 'job_cooldown';
 
 export interface LeaseGrantResult {
   ok: boolean;
@@ -61,6 +63,22 @@ export class Arbiter {
   private readonly cfg: ServerConfig;
   /** Armed after any revocation; disarmed by the next full-idle verdict. */
   private reidleAfter: number | null = null;
+  /**
+   * Per-(project, job_id) ok:false usage-report counts (anti-thrash).
+   * In-memory: TTL expirations never count here (a dead client is an
+   * unknown outcome, not a job failure — see endLease), and a restart
+   * resets them; the persisted `throttled_jobs` map plus the client's
+   * own quarantine are the restart-surviving backstops.
+   */
+  private jobFailCounts = new Map<string, number>();
+  /**
+   * Per-(project, job_id) grant cooldown: epoch-ms until which new grants
+   * for that job are refused (`job_cooldown`). Set on EVERY failed usage
+   * report (even below the threshold) — this is what breaks the ~20-second
+   * re-grant loop between client polls. In-memory (it is a burst gate, not
+   * operator state); the persisted throttle map survives restarts.
+   */
+  private jobCooldownUntil = new Map<string, number>();
 
   constructor(store: StateStore, cfg: ServerConfig, private detector: IdleDetector) {
     this.store = store;
@@ -224,6 +242,22 @@ export class Arbiter {
       return { ok: false, reason: 'client_paused' };
     }
 
+    // Anti-thrash (per-job): a job the operator must unthrottle is refused
+    // before the idle/busy checks — its denial reason must be the throttle,
+    // not a coincidental busy box. Then the per-job cooldown: after any
+    // failed lease for this job no new grant until the cooldown elapses
+    // (even below the throttle threshold) — this breaks the ~20-second
+    // re-grant loop of a client that keeps re-asking for the same crashed
+    // job. Both are independent of what the client does.
+    const jkey = this.jobKey(params.project, params.job_id);
+    if (this.store.state.throttled_jobs[jkey]) {
+      return { ok: false, reason: 'job_throttled' };
+    }
+    const cd = this.jobCooldownUntil.get(jkey);
+    if (cd !== undefined && now < cd) {
+      return { ok: false, reason: 'job_cooldown' };
+    }
+
     // `sig.idle` is false while degraded (detector invariant), so this single
     // check enforces both "system idle" and "no grants while degraded".
     // An active 'force' override bypasses ONLY the idle verdict and the
@@ -371,6 +405,12 @@ export class Arbiter {
     tokens_in?: number;
     ok: boolean;
     error?: string;
+    /**
+     * Client-reported failure detail (last ≤1000 chars of the executor's
+     * combined output; '' when it produced none). Stored on the lease
+     * record and rides the `lease_finished` event (truncated).
+     */
+    error_detail?: string;
     now?: number;
   }): { ok: boolean; reason?: string; lease?: Lease } {
     const nowMs = params.now ?? Date.now();
@@ -385,6 +425,9 @@ export class Arbiter {
     lease.tokens_out = Math.max(lease.tokens_out, to);
     lease.tokens_in = Math.max(lease.tokens_in, ti);
     lease.partial = params.ok === false;
+    if (params.error_detail !== undefined) {
+      lease.error_detail = String(params.error_detail).slice(0, 1000);
+    }
 
     if (!lease.usage_counted) {
       this.addBudget(lease.project, utcDay(nowMs), lease.tokens_out, lease.tokens_in);
@@ -396,18 +439,126 @@ export class Arbiter {
       lease.status = params.ok ? 'finished' : 'revoked';
       if (!params.ok) lease.end_reason = params.error ?? 'failed';
       lease.ended_at = nowMs;
+      const detailShort =
+        lease.error_detail && lease.error_detail.length > 300
+          ? `…${lease.error_detail.slice(-300)}`
+          : lease.error_detail;
       this.store.appendEvent({
         kind: 'lease_finished',
         project: lease.project,
         lease_id: lease.lease_id,
-        detail: `${lease.client_name}: ${lease.job_id} ok=${params.ok} out=${lease.tokens_out}${params.error ? ` err=${params.error}` : ''}`,
+        detail: `${lease.client_name}: ${lease.job_id} ok=${params.ok} out=${lease.tokens_out}${params.error ? ` err=${params.error}` : ''}${detailShort ? ` detail=${detailShort}` : ''}`,
       });
+      // Anti-thrash bookkeeping (first terminal transition only — a
+      // duplicate report must not re-count the job).
+      if (params.ok) {
+        this.recordJobSuccess(lease.project, lease.job_id, nowMs);
+      } else {
+        this.recordJobFailure(
+          lease.project,
+          lease.job_id,
+          params.error ?? 'failed',
+          lease.error_detail ?? '',
+          nowMs,
+        );
+      }
     }
     // (already terminal: usage recorded above; status/end_reason stay as-is)
 
     this.store.trim();
     this.store.save();
     return { ok: true, lease };
+  }
+
+  // ------------------------------------------------------------------
+  // Anti-thrash (per-job failure tracking)
+  // ------------------------------------------------------------------
+
+  private jobKey(project: string, jobId: string): string {
+    return `${project}::${jobId}`;
+  }
+
+  /**
+   * A successful (ok:true) report for (project, job_id): the failure count
+   * resets to 0 and the grant cooldown is cleared — the job is proven
+   * healthy again and the next idle poll may re-grant it.
+   */
+  private recordJobSuccess(project: string, jobId: string, nowMs: number): void {
+    const jkey = this.jobKey(project, jobId);
+    this.jobFailCounts.delete(jkey);
+    this.jobCooldownUntil.delete(jkey);
+    void nowMs;
+  }
+
+  /**
+   * A failed (ok:false) usage report for (project, job_id):
+   *   1. per-job grant cooldown arms (job_cooldown_seconds from now) —
+   *      refuses re-grants of the same job between polls even when the
+   *      count is far below the threshold;
+   *   2. the failure count bumps; when it reaches `job_fail_threshold` the
+   *      job is THROTTLED: a persisted `throttled_jobs` row (project,
+   *      job_id, count, last_error, last_error_detail ≤1000,
+   *      last_failed_at) — survives restarts and blocks every grant for
+   *      that job until the operator unthrottles it.
+   * TTL expirations never call this (see endLease) — a dead client is an
+   * unknown outcome, not a job failure.
+   */
+  private recordJobFailure(project: string, jobId: string, error: string, errorDetail: string, nowMs: number): void {
+    const jkey = this.jobKey(project, jobId);
+    const cooldownMs = Math.max(0, this.cfg.job_cooldown_seconds) * 1000;
+    this.jobCooldownUntil.set(jkey, nowMs + cooldownMs);
+    const count = (this.jobFailCounts.get(jkey) ?? 0) + 1;
+    this.jobFailCounts.set(jkey, count);
+    const threshold = Math.max(1, this.cfg.job_fail_threshold);
+    if (count >= threshold) {
+      const row: JobThrottle = {
+        project,
+        job_id: jobId,
+        count,
+        last_error: error,
+        last_error_detail: String(errorDetail).slice(0, 1000),
+        last_failed_at: nowMs,
+      };
+      this.store.state.throttled_jobs[jkey] = row;
+      this.store.appendEvent({
+        kind: 'job_throttled',
+        project,
+        detail: `${jobId}: ${count} failures (last: ${error}) — no more grants until unthrottled`,
+      });
+    }
+  }
+
+  /**
+   * Operator recovery: clear the job's throttle row (if any), its failure
+   * count, and its grant cooldown. Idempotent — clearing an unthrottled
+   * job succeeds. Unknown projects are 404-able; unknown (project, job)
+   * pairs that were never throttled still clear (a no-op that also resets
+   * the in-memory counters).
+   */
+  unthrottleJob(project: string, jobId: string): { ok: boolean; reason?: string; was_throttled: boolean } {
+    const p = this.cfg.projects.find((x) => x.name === project);
+    if (!p) return { ok: false, reason: 'unknown_project', was_throttled: false };
+    const jkey = this.jobKey(project, jobId);
+    const wasThrottled = Boolean(this.store.state.throttled_jobs[jkey]);
+    if (wasThrottled) {
+      const row = this.store.state.throttled_jobs[jkey]!;
+      delete this.store.state.throttled_jobs[jkey];
+      this.store.appendEvent({
+        kind: 'job_unthrottled',
+        project,
+        detail: `${jobId}: throttle cleared by operator (was ${row.count} failures, last: ${row.last_error})`,
+      });
+    }
+    this.jobFailCounts.delete(jkey);
+    this.jobCooldownUntil.delete(jkey);
+    this.store.trim();
+    this.store.save();
+    return { ok: true, was_throttled: wasThrottled };
+  }
+
+  /** All throttled jobs (persisted rows), newest last — for /api/state + the dashboard. */
+  throttledJobs(): JobThrottle[] {
+    return Object.values(this.store.state.throttled_jobs).sort((a, b) => a.last_failed_at - b.last_failed_at);
   }
 
   // ------------------------------------------------------------------

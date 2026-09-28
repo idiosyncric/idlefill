@@ -75,7 +75,7 @@ function mkEntries(secAgo: number[], src = 'ip:10.0.0.9', base = T0): ActivityEn
   }));
 }
 
-function makeHarness(opts: { ttl?: number; cap?: number; maxLeases?: number; idleSeconds?: number } = {}) {
+function makeHarness(opts: { ttl?: number; cap?: number; maxLeases?: number; idleSeconds?: number; jobFailThreshold?: number; jobCooldownSeconds?: number } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'idlefill-arbiter-'));
   const store = new StateStore(join(dir, 'state.json'));
   const cfg: ServerConfig = {
@@ -88,6 +88,8 @@ function makeHarness(opts: { ttl?: number; cap?: number; maxLeases?: number; idl
     poll_ms: 15000,
     lease_ttl_seconds: opts.ttl ?? 1800,
     max_concurrent_leases: opts.maxLeases ?? 1,
+    job_fail_threshold: opts.jobFailThreshold ?? 5,
+    job_cooldown_seconds: opts.jobCooldownSeconds ?? 300,
     projects: [
       { name: 'career-ops', paused: false, daily_token_cap: opts.cap ?? 1000 },
       { name: 'paused-proj', paused: true, daily_token_cap: 100 },
@@ -561,5 +563,225 @@ test('registerClient: first registration records allocations + last_seen; re-reg
   h.arbiter.registerClient('legacy', undefined, '127.0.0.1');
   const legacy = h.store.state.clients.find((c) => c.name === 'legacy')!;
   assert.deepEqual(legacy.projects, []);
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// Anti-thrash (per-job failure tracking, throttle + cooldown)
+//
+// The Sep 25-26 incident: one crashed job (broken executor template) was
+// re-granted ~902 times over 17 hours because the arbiter had no
+// job-level failure knowledge — a buggy/old client could always thrash.
+// These tests cover the backstop: per-(project, job_id) failure counts,
+// the throttle at job_fail_threshold, the per-job grant cooldown after
+// EVERY failure, ok:true resets, operator unthrottle, and restart
+// persistence of the throttle state.
+// ---------------------------------------------------------------------------
+
+const failLease = (h: ReturnType<typeof makeHarness>, job: string, at: number, error = 'executor_exit_1') => {
+  const g = grant(h, at, job);
+  if (!g.ok) throw new Error(`grant for ${job} at ${at} refused: ${JSON.stringify(g)}`);
+  h.arbiter.finishLease({ lease_id: g.lease!.lease_id, ok: false, error, now: at + 1000 });
+};
+
+test('anti-thrash: N ok:false reports for one job reach the threshold ⇒ subsequent grants denied job_throttled', () => {
+  const h = makeHarness({ jobCooldownSeconds: 50 });
+  h.det.entries = mkEntries([400]); // idle the whole time
+
+  // Four failures (spaced past the 50s cooldown): below the threshold (5) —
+  // the job may still be granted.
+  for (let i = 0; i < 4; i++) failLease(h, 'job-t', T0 + i * 60_000);
+  assert.equal(Object.keys(h.store.state.throttled_jobs).length, 0, 'no throttle below the threshold');
+
+  // The 5th failure crosses the threshold → throttled (persisted row).
+  failLease(h, 'job-t', T0 + 4 * 60_000);
+  const row = h.store.state.throttled_jobs['career-ops::job-t'];
+  assert.ok(row, 'the throttle row is persisted on threshold');
+  assert.equal(row.count, 5, 'count = the number of failures that crossed the threshold');
+  assert.equal(row.project, 'career-ops');
+  assert.equal(row.job_id, 'job-t');
+  assert.equal(row.last_error, 'executor_exit_1');
+  assert.ok(row.last_failed_at >= T0 + 4 * 60_000);
+  assert.ok(
+    h.store.state.events.some((e) => e.kind === 'job_throttled' && e.project === 'career-ops'),
+    'a job_throttled event is recorded',
+  );
+
+  // The box is idle and the last failure's cooldown has elapsed — yet the
+  // SAME job is denied job_throttled (the throttle, not the cooldown or a
+  // busy box) while another job still grants.
+  const denied = grant(h, T0 + 6 * 60_000, 'job-t');
+  assert.equal(denied.ok, false, `throttled job denied: ${JSON.stringify(denied)}`);
+  assert.equal(denied.reason, 'job_throttled');
+  const other = grant(h, T0 + 6 * 60_000, 'job-other');
+  assert.equal(other.ok, true, 'a different job is unaffected by the throttle');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('anti-thrash cooldown: right after a failed lease the same job is denied job_cooldown (even idle, even below threshold); other jobs grant; the cooldown elapses', () => {
+  const h = makeHarness();
+  h.det.entries = mkEntries([400]);
+
+  // One failure: far below the threshold (5) — no throttle…
+  failLease(h, 'job-c', T0);
+  assert.equal(Object.keys(h.store.state.throttled_jobs).length, 0, 'one failure does not throttle');
+
+  // …but the per-job cooldown (300s) is armed: the SAME job is denied
+  // job_cooldown even though the signal is fully idle — this is what
+  // breaks the ~20-second re-grant loop.
+  const blocked = grant(h, T0 + 1_000, 'job-c');
+  assert.equal(blocked.ok, false, `cooldown blocks the immediate re-grant: ${JSON.stringify(blocked)}`);
+  assert.equal(blocked.reason, 'job_cooldown', 'the denial reason is the cooldown, not not_idle');
+
+  // A DIFFERENT job is not cooled down.
+  const other = grant(h, T0 + 1_000, 'job-c2');
+  assert.equal(other.ok, true, 'the cooldown is per-job');
+  h.arbiter.finishLease({ lease_id: other.lease!.lease_id, ok: true, now: T0 + 2_000 });
+
+  // After the cooldown elapses (300s) the job is grantable again.
+  const later = grant(h, T0 + 301_000, 'job-c');
+  assert.equal(later.ok, true, 'after the cooldown elapses, the job can be granted again');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('anti-thrash: a successful ok:true report for a job resets its failure count and cooldown', () => {
+  const h = makeHarness({ jobCooldownSeconds: 50 });
+  h.det.entries = mkEntries([400]);
+
+  // Two failures for job-r (count at 2 < threshold 5).
+  failLease(h, 'job-r', T0); // finish T0+1s ⇒ cooldown to T0+51s
+  failLease(h, 'job-r', T0 + 60_000); // ⇒ cooldown to T0+111s
+  const blocked = grant(h, T0 + 62_000, 'job-r');
+  assert.equal(blocked.reason, 'job_cooldown', 'the job is in cooldown after its failures');
+
+  // After the cooldown elapses the job runs again; it FAILS (count 3) and
+  // then SUCCEEDS — the success resets the failure streak: the next
+  // failure sequence must need the FULL threshold again to throttle.
+  const g3 = grant(h, T0 + 112_000, 'job-r');
+  assert.equal(g3.ok, true, 'job-r is grantable after its cooldown');
+  h.arbiter.finishLease({ lease_id: g3.lease!.lease_id, ok: false, error: 'executor_exit_1', now: T0 + 113_000 }); // count 3
+  const g4 = grant(h, T0 + 164_000, 'job-r');
+  assert.equal(g4.ok, true, 'job-r is grantable after its second cooldown');
+  const fin4 = h.arbiter.finishLease({ lease_id: g4.lease!.lease_id, ok: true, now: T0 + 165_000 });
+  assert.equal(fin4.ok, true, 'the job SUCCEEDS this time');
+  // 4 more failures (each spaced past the cooldown) stay unthrottled —
+  // the count is 1..4 after the reset, not 4..5.
+  for (let i = 0; i < 4; i++) failLease(h, 'job-r', T0 + 220_000 + i * 60_000);
+  assert.equal(Object.keys(h.store.state.throttled_jobs).length, 0, 'a success reset the count: 4 fresh failures do not re-throttle');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('anti-thrash: unthrottleJob clears the throttle + cooldown + failure count (operator recovery)', () => {
+  const h = makeHarness({ jobCooldownSeconds: 50 });
+  h.det.entries = mkEntries([400]);
+  for (let i = 0; i < 5; i++) failLease(h, 'job-u', T0 + i * 60_000);
+  assert.ok(h.store.state.throttled_jobs['career-ops::job-u'], 'throttled at 5 failures');
+  assert.equal(grant(h, T0 + 5 * 60_000, 'job-u').reason, 'job_throttled');
+
+  const res = h.arbiter.unthrottleJob('career-ops', 'job-u');
+  assert.equal(res.ok, true);
+  assert.equal(res.was_throttled, true, 'it reports the job WAS throttled');
+  assert.equal(Object.keys(h.store.state.throttled_jobs).length, 0, 'the throttle row is gone');
+  assert.ok(h.store.state.events.some((e) => e.kind === 'job_unthrottled' && e.project === 'career-ops'), 'a job_unthrottled event is recorded');
+
+  // The cooldown is cleared too: the job is grantable immediately (idle,
+  // no active lease), not after another cooldown.
+  const g = grant(h, T0 + 5 * 60_000, 'job-u');
+  assert.equal(g.ok, true, `unthrottle clears the cooldown: immediate re-grant, got ${JSON.stringify(g)}`);
+  // Finish it ok:true (frees the box AND resets the count — the loop below
+  // then proves 4 fresh failures stay below the threshold).
+  h.arbiter.finishLease({ lease_id: g.lease!.lease_id, ok: true, now: T0 + 5 * 60_000 + 1000 });
+
+  // And the failure count is reset: 4 more failures stay below threshold.
+  for (let i = 0; i < 4; i++) failLease(h, 'job-u', T0 + 6 * 60_000 + i * 60_000);
+  assert.equal(Object.keys(h.store.state.throttled_jobs).length, 0, 'failure count reset by unthrottle');
+
+  // Idempotent: unthrottling again is a success (was_throttled=false).
+  const again = h.arbiter.unthrottleJob('career-ops', 'job-u');
+  assert.equal(again.ok, true);
+  assert.equal(again.was_throttled, false);
+  // Unknown project → not ok (the API maps this to 404).
+  const bad = h.arbiter.unthrottleJob('nope', 'job-u');
+  assert.equal(bad.ok, false);
+  assert.equal(bad.reason, 'unknown_project');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('anti-thrash: TTL expirations do NOT count as job failures (a dead client is an unknown outcome)', async () => {
+  const h = makeHarness({ ttl: 60 });
+  h.det.entries = mkEntries([400]);
+
+  // Five leases for the same job, each TTL-expired (the holder died without
+  // reporting usage). Grant one, tick past its TTL (60s), repeat.
+  let revokedTotal = 0;
+  for (let i = 0; i < 5; i++) {
+    const at = T0 + i * 200_000;
+    const g = grant(h, at, 'job-d');
+    assert.equal(g.ok, true, `grant ${i} for job-d (ttl 60s)`);
+    const { revoked } = await h.arbiter.tick(at + 61_000);
+    assert.equal(revoked.length, 1, `the tick expires lease ${i} by TTL`);
+    assert.equal(revoked[0]!.reason, 'ttl_expired');
+    revokedTotal += revoked.length;
+    // The revocation arms the post-revocation reidle gate; the NEXT tick
+    // (still fully idle) disarms it so the following grant can proceed.
+    await h.arbiter.tick(at + 120_000);
+  }
+  assert.equal(revokedTotal, 5, 'all five leases expired by TTL');
+  assert.equal(Object.keys(h.store.state.throttled_jobs).length, 0, 'TTL expirations never count as job failures');
+  // No cooldown was armed either (the holder died — the outcome is
+  // unknown): the job is immediately re-grantable.
+  const g = grant(h, T0 + 1000_000, 'job-d');
+  assert.equal(g.ok, true, 'no cooldown after TTL expirations');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('anti-thrash: throttle state survives a state-file reload (server restart)', () => {
+  const h = makeHarness({ jobCooldownSeconds: 50 });
+  h.det.entries = mkEntries([400]);
+  for (let i = 0; i < 5; i++) failLease(h, 'job-s', T0 + i * 60_000);
+  assert.ok(h.store.state.throttled_jobs['career-ops::job-s'], 'throttled before the restart');
+
+  // Simulate a restart: a FRESH store + arbiter over the SAME state file
+  // (state.save() already wrote it after each finishLease).
+  const freshStore = new StateStore(join(h.dir, 'state.json'));
+  const freshArbiter = new Arbiter(freshStore, h.cfg, h.det as unknown as ConstructorParameters<typeof Arbiter>[2]);
+  assert.ok(freshStore.state.throttled_jobs['career-ops::job-s'], 'the throttle row is in the reloaded state');
+  const denied = freshArbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'job-s', estimated_seconds: 60, now: T0 + 60_000 });
+  assert.equal(denied.ok, false, `the reloaded arbiter still denies the job: ${JSON.stringify(denied)}`);
+  assert.equal(denied.reason, 'job_throttled', 'throttling persists across a server restart (the persisted row, not the in-memory cooldown)');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('anti-thrash: error_detail round-trips usage → lease record → state file and appears in the lease_finished event (truncated)', () => {
+  const h = makeHarness({ jobCooldownSeconds: 50 });
+  h.det.entries = mkEntries([400]);
+  const g = grant(h, T0, 'job-ed');
+  assert.equal(g.ok, true);
+  const longDetail = 'x'.repeat(500) + 'MARKER-END';
+  h.arbiter.finishLease({ lease_id: g.lease!.lease_id, ok: false, error: 'executor_exit_1', error_detail: longDetail, now: T0 + 1000 });
+
+  const lease = h.store.state.leases.find((l) => l.lease_id === g.lease!.lease_id)!;
+  assert.equal(lease.error_detail, longDetail, 'the lease record carries the full (≤1000) error_detail');
+
+  // The state file carries it too (the dashboard /api/state reads the same
+  // records).
+  const raw = JSON.parse(readFileSync(join(h.dir, 'state.json'), 'utf-8'));
+  const rawLease = raw.leases.find((l: { lease_id: string }) => l.lease_id === g.lease!.lease_id)!;
+  assert.equal(rawLease.error_detail, longDetail, 'error_detail persists in the state file');
+
+  // The lease_finished event shows the LAST 300 chars, truncated with an
+  // ellipsis — not the full 524-char blob.
+  const ev = h.store.state.events.find((e) => e.kind === 'lease_finished' && e.lease_id === g.lease!.lease_id)!;
+  assert.ok(ev.detail?.includes('…') , 'the event detail is truncated with an ellipsis');
+  assert.ok(ev.detail?.includes('MARKER-END'), 'the event keeps the END of the detail (last 300 chars)');
+  assert.ok(!(ev.detail ?? '').includes(longDetail), 'the full detail is NOT in the event line');
+
+  // Short details ride through verbatim (no ellipsis for short strings).
+  const g2 = grant(h, T0 + 60_000, 'job-ed2');
+  assert.equal(g2.ok, true);
+  h.arbiter.finishLease({ lease_id: g2.lease!.lease_id, ok: false, error: 'executor_exit_1', error_detail: 'boom', now: T0 + 61_000 });
+  const ev2 = h.store.state.events.find((e) => e.kind === 'lease_finished' && e.lease_id === g2.lease!.lease_id)!;
+  assert.ok(ev2.detail?.includes('detail=boom'), 'short detail rides the event verbatim');
+  assert.ok(!(ev2.detail ?? '').includes('…'), 'no ellipsis for a short detail');
   rmSync(h.dir, { recursive: true, force: true });
 });

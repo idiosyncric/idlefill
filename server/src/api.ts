@@ -302,6 +302,8 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       tokens_in?: number;
       ok?: boolean;
       error?: string;
+      /** Last ≤1000 chars of the executor's combined output (crash stderr). */
+      error_detail?: string;
     };
     const res = arbiter.finishLease({
       lease_id: id,
@@ -309,6 +311,10 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       tokens_in: typeof body.tokens_in === 'number' ? body.tokens_in : 0,
       ok: body.ok !== false,
       error: typeof body.error === 'string' ? body.error : undefined,
+      // Client-reported failure detail (last ≤1000 chars of the executor's
+      // combined output). Truncated server-side in finishLease; stored on
+      // the lease record and the lease_finished event.
+      error_detail: typeof body.error_detail === 'string' ? body.error_detail : undefined,
     });
     if (!res.ok) return reply.code(404).send({ error: res.reason ?? 'unknown_lease' });
     return { ok: true, lease: { lease_id: id, tokens_out: res.lease?.tokens_out, tokens_in: res.lease?.tokens_in, status: res.lease?.status } };
@@ -381,6 +387,20 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     };
   });
 
+  /**
+   * Anti-thrash operator recovery: clear the (project, job_id) throttle,
+   * its failure count, and its grant cooldown so the job can be granted
+   * again (token-authed like the other admin routes). Idempotent —
+   * unthrottling a job that was never throttled succeeds. 404 for an
+   * unknown project.
+   */
+  app.post('/api/projects/:name/jobs/:job_id/unthrottle', async (req, reply) => {
+    const { name, job_id } = req.params as { name: string; job_id: string };
+    const res = arbiter.unthrottleJob(name, job_id);
+    if (!res.ok) return reply.code(404).send({ error: res.reason ?? 'unknown_project' });
+    return { ok: true, project: name, job_id, was_throttled: res.was_throttled };
+  });
+
   // ------------------------------------------------------------------
   // Inference servers (declared connections + their model resources)
   // ------------------------------------------------------------------
@@ -445,6 +465,10 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       // Client rows carry their active operator override (if any), so the
       // dashboard and clients can see pause/force state without a second call.
       clients: s.clients.map((c) => ({ ...c, override: arbiter.activeOverride(c.client_id, now) })),
+      // Anti-thrash: the jobs currently throttled (persisted; newest last).
+      // Empty list when nothing is throttled — the dashboard renders this
+      // as the exception-only "Throttled jobs" section.
+      throttled_jobs: arbiter.throttledJobs(),
       projects: projectView(arbiter, cfg, s.clients, day, now, todayTotals(s.leases, day)),
       servers: serverView(arbiter, cfg, now),
       events: s.events.slice(Math.max(0, s.events.length - limit)).reverse(),

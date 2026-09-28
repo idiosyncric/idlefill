@@ -35,6 +35,22 @@ export interface ServerConfig {
   poll_ms: number;
   lease_ttl_seconds: number;
   max_concurrent_leases: number;
+  /**
+   * Anti-thrash (per-job): a job that has reported this many `ok:false`
+   * usage results (per project+job_id) is THROTTLED — no further grants for
+   * it until the operator unthrottles it (POST /api/projects/:name/jobs/
+   * :job_id/unthrottle). The client's 3-attempt quarantine is the first line
+   * of defense; this is the arbiter-side backstop for old/buggy clients and
+   * multi-client scenarios (a Sep 25-26 incident: 902 re-grants of one
+   * crashed job over 17 hours).
+   */
+  job_fail_threshold: number;
+  /**
+   * Anti-thrash (per-job): after any failed lease for job X, no new grant
+   * for X for this many seconds — even below the failure threshold. This is
+   * what breaks the ~20-second re-grant loop between polls.
+   */
+  job_cooldown_seconds: number;
   projects: ProjectConfig[];
   /** State file path (env IDLEFILL_STATE overrides). */
   state_file: string;
@@ -149,6 +165,14 @@ export interface Lease {
   partial?: boolean;
   /** True once this lease's first usage report has been counted into the budget. */
   usage_counted?: boolean;
+  /**
+   * Last failure detail reported for this lease (the client's last ≤1000
+   * chars of the executor's combined output; empty string when the executor
+   * produced no output). Persisted so a failed job's WHY survives in the
+   * state file (a crashed executor with no stderr is otherwise
+   * indistinguishable from a kill).
+   */
+  error_detail?: string;
 }
 
 export interface ActivityEntry {
@@ -173,6 +197,27 @@ export interface BudgetEntry {
 
 /** UTC date key, e.g. "2026-09-25". */
 export type UtcDate = string;
+
+/**
+ * A throttled job (anti-thrash): the job's failures reached
+ * `job_fail_threshold`. While this row exists, the arbiter refuses new
+ * grants for (project, job_id) with reason `job_throttled`, independent of
+ * what any client does. `count` is the failure count at throttle time (it
+ * stays at the count when it crossed the threshold; the operator sees the
+ * number that triggered the stop).
+ */
+export interface JobThrottle {
+  project: string;
+  job_id: string;
+  /** Failure count when the threshold was crossed. */
+  count: number;
+  /** Last reported error string (e.g. `executor_exit_1`). */
+  last_error: string;
+  /** Last failure detail (client output tail, ≤1000 chars; '' when none). */
+  last_error_detail: string;
+  /** Epoch-ms of the failed report that crossed the threshold. */
+  last_failed_at: number;
+}
 
 export interface IdleSignal {
   now: number;
@@ -199,7 +244,9 @@ export type EventKind =
   | 'client_override_cleared'
   | 'project_settings_updated'
   | 'server_connection_added'
-  | 'server_connection_updated';
+  | 'server_connection_updated'
+  | 'job_throttled'
+  | 'job_unthrottled';
 
 export interface EventRecord {
   ts: number;
@@ -230,6 +277,14 @@ export interface ArbiterState {
   /** Persisted operator state for each configured project. */
   projects: ProjectStateRow[];
   clients: ClientRecord[];
+  /**
+   * Anti-thrash per-(project, job_id) throttle entries. A job reaches this
+   * map when its ok:false usage-report count hits `job_fail_threshold`;
+   * while present, requestLease for that job is denied `job_throttled`
+   * (HTTP 409) until the operator unthrottles it. Persists across restarts
+   * (the state file is the only persistence).
+   */
+  throttled_jobs: Record<string, JobThrottle>;
   /**
    * Operator overrides (pause/force), keyed by client_id. A client that
    * unregisters is re-registered under the SAME name with a NEW client_id,

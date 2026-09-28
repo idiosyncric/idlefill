@@ -11,6 +11,8 @@
   "poll_ms": 15000,
   "lease_ttl_seconds": 1800,
   "max_concurrent_leases": 1,
+  "job_fail_threshold": 5,
+  "job_cooldown_seconds": 300,
   "projects": [
     { "name": "career-ops", "paused": false, "daily_token_cap": 500000 }
   ]

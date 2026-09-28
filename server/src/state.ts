@@ -23,6 +23,7 @@ export function emptyState(): ArbiterState {
     projects: [],
     clients: [],
     overrides: {},
+    throttled_jobs: {},
     leases: [],
     budgets: {},
     events: [],
@@ -66,6 +67,9 @@ export class StateStore {
           : base.clients,
         // Tolerate state files from before client overrides existed.
         overrides: raw.overrides && typeof raw.overrides === 'object' ? raw.overrides : base.overrides,
+        // Tolerate state files from before per-job throttling (anti-thrash)
+        // existed.
+        throttled_jobs: raw.throttled_jobs && typeof raw.throttled_jobs === 'object' ? raw.throttled_jobs : base.throttled_jobs,
         leases: Array.isArray(raw.leases) ? raw.leases : base.leases,
         budgets: raw.budgets && typeof raw.budgets === 'object' ? raw.budgets : base.budgets,
         events: Array.isArray(raw.events) ? raw.events : base.events,

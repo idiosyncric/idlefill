@@ -69,6 +69,8 @@ before(async () => {
     poll_ms: 60_000, // tests drive ticks manually; no background polling surprises
     lease_ttl_seconds: 1800,
     max_concurrent_leases: 1,
+    job_fail_threshold: 5,
+    job_cooldown_seconds: 300,
     projects: [{ name: 'career-ops', paused: false, daily_token_cap: 10_000 }],
     state_file: join(dir, 'state.json'),
   };
@@ -115,6 +117,7 @@ test('bad token is rejected on every API route (401)', async () => {
     ['GET', '/api/projects'],
     ['POST', '/api/projects/career-ops'],
     ['GET', '/api/state'],
+    ['POST', '/api/projects/career-ops/jobs/job-x/unthrottle'],
   ] as const) {
     const res = await fetch(`${base}${path}`, {
       method,
@@ -650,4 +653,152 @@ test('WS handshake: good token connects, bad token is 401', async () => {
   } catch {
     /* already destroyed */
   }
+});
+
+// ---------------------------------------------------------------------------
+// Anti-thrash HTTP surface: error_detail round-trip, the unthrottle API,
+// and the throttled_jobs / lease error_detail exposure in /api/state.
+// (The arbiter-level throttle/cooldown logic is covered in arbiter.test.ts;
+// this block is the wire contract.)
+// ---------------------------------------------------------------------------
+
+test('usage error_detail round-trips: POST usage → lease record → /api/state lease + lease_finished event', async () => {
+  // Quiet the feed so the grant is clean.
+  entries.length = 0;
+  entries.push(...mkEntries([400], 'ip:10.0.0.9', Date.now()));
+  await det.poll(Date.now(), new Set());
+
+  const lease = await fetch(`${base}/api/leases`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ client_id: clientId, project: 'career-ops', job_id: 'job-edhttp' }),
+  });
+  assert.equal(lease.status, 201);
+  const leaseId = ((await lease.json()) as { lease_id: string }).lease_id;
+
+  const longDetail = 'x'.repeat(400) + 'CRASH-MARKER';
+  const use = await fetch(`${base}/api/leases/${leaseId}/usage`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ ok: false, error: 'executor_exit_1', error_detail: longDetail, tokens_out: 10 }),
+  });
+  assert.equal(use.status, 200, `the usage route accepts error_detail, got ${await use.clone().text()}`);
+
+  // /api/state: the lease record carries the full error_detail.
+  const st = (await (await fetch(`${base}/api/state?limit=50`, { headers: auth })).json()) as {
+    leases: { lease_id: string; error_detail?: string; end_reason?: string }[];
+    events: { kind: string; detail?: string; lease_id?: string }[];
+  };
+  const row = st.leases.find((l) => l.lease_id === leaseId)!;
+  assert.equal(row.error_detail, longDetail, '/api/state lease record carries the full error_detail');
+  assert.equal(row.end_reason, 'executor_exit_1');
+
+  // The lease_finished event shows the LAST 300 chars with an ellipsis.
+  const ev = st.events.find((e) => e.kind === 'lease_finished' && e.lease_id === leaseId);
+  assert.ok(ev, 'the lease_finished event is in the event log');
+  assert.ok(ev!.detail?.includes('…'), 'the event detail is truncated (last 300 chars + ellipsis)');
+  assert.ok(ev!.detail?.includes('CRASH-MARKER'), 'the event keeps the END of the detail');
+  assert.ok(!(ev!.detail ?? '').includes(longDetail), 'the full detail is NOT in the event line');
+
+  // A usage report WITHOUT error_detail leaves the field absent (no
+  // undefined riding the wire).
+  const lease2 = await fetch(`${base}/api/leases`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ client_id: clientId, project: 'career-ops', job_id: 'job-ednone' }),
+  });
+  assert.equal(lease2.status, 201);
+  const leaseId2 = ((await lease2.json()) as { lease_id: string }).lease_id;
+  await fetch(`${base}/api/leases/${leaseId2}/usage`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ ok: false, error: 'no_result_file' }),
+  });
+  const st2 = (await (await fetch(`${base}/api/state?limit=50`, { headers: auth })).json()) as {
+    leases: { lease_id: string; error_detail?: string }[];
+  };
+  assert.equal(st2.leases.find((l) => l.lease_id === leaseId2)!.error_detail, undefined, 'no error_detail ⇒ the field is absent');
+});
+
+test('unthrottle API: clears the throttle (was_throttled), is idempotent, 404s on unknown project', async () => {
+  // 5 failed usage reports for the same job, each on its own grant. The
+  // per-job grant cooldown (300s) would otherwise block attempts 2-5; zero
+  // it out for the loop (restored after) so the 5 failures land back-to-back
+  // and the failure count climbs 1..5.
+  entries.length = 0;
+  entries.push(...mkEntries([400], 'ip:10.0.0.9', Date.now()));
+  await det.poll(Date.now(), new Set());
+  const savedCooldown = cfg.job_cooldown_seconds;
+  cfg.job_cooldown_seconds = 0;
+  try {
+    for (let i = 0; i < 5; i++) {
+      const lease = await fetch(`${base}/api/leases`, {
+        method: 'POST',
+        headers: auth,
+        body: JSON.stringify({ client_id: clientId, project: 'career-ops', job_id: 'job-unthrottle' }),
+      });
+      assert.equal(lease.status, 201, `attempt ${i} grant, got ${lease.status} ${await lease.clone().text()}`);
+      const leaseId = ((await lease.json()) as { lease_id: string }).lease_id;
+      const use = await fetch(`${base}/api/leases/${leaseId}/usage`, {
+        method: 'POST',
+        headers: auth,
+        body: JSON.stringify({ ok: false, error: 'executor_exit_1', error_detail: `attempt ${i}` }),
+      });
+      assert.equal(use.status, 200, `attempt ${i} usage report`);
+    }
+  } finally {
+    cfg.job_cooldown_seconds = savedCooldown;
+  }
+
+  // Now the job is throttled (5th failure): /api/state shows it, and a new
+  // grant for it is denied job_throttled over HTTP.
+  const st = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    throttled_jobs: { project: string; job_id: string; count: number; last_error: string; last_error_detail: string; last_failed_at: number }[];
+  };
+  const row = st.throttled_jobs.find((x) => x.job_id === 'job-unthrottle');
+  assert.ok(row, 'the throttled job is in /api/state throttled_jobs');
+  assert.equal(row!.project, 'career-ops');
+  assert.equal(row!.count, 5);
+  assert.equal(row!.last_error, 'executor_exit_1');
+  assert.equal(row!.last_error_detail, 'attempt 4');
+  assert.ok(row!.last_failed_at > 0);
+
+  const denied = await fetch(`${base}/api/leases`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ client_id: clientId, project: 'career-ops', job_id: 'job-unthrottle' }),
+  });
+  assert.equal(denied.status, 409, 'a throttled job gets HTTP 409 like the other rejections');
+  assert.equal(((await denied.json()) as { reason: string }).reason, 'job_throttled');
+
+  // Unthrottle over HTTP: clears the throttle + count + cooldown.
+  const un = await fetch(`${base}/api/projects/career-ops/jobs/job-unthrottle/unthrottle`, { method: 'POST', headers: auth, body: '{}' });
+  assert.equal(un.status, 200);
+  const unBody = (await un.json()) as { ok: boolean; project: string; job_id: string; was_throttled: boolean };
+  assert.equal(unBody.ok, true);
+  assert.equal(unBody.was_throttled, true, 'it reports the job WAS throttled');
+
+  const st2 = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as { throttled_jobs: { job_id: string }[] };
+  assert.equal(st2.throttled_jobs.find((x) => x.job_id === 'job-unthrottle'), undefined, 'the throttle row is gone from /api/state');
+
+  // The grant works again (idle, no throttle, no cooldown).
+  const again = await fetch(`${base}/api/leases`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ client_id: clientId, project: 'career-ops', job_id: 'job-unthrottle' }),
+  });
+  assert.equal(again.status, 201, `unthrottled job is grantable again, got ${again.status} ${await again.clone().text()}`);
+  // Tidy up: finish that lease ok (it also proves the count reset — no
+  // immediate re-throttle on one success).
+  const againId = ((await again.json()) as { lease_id: string }).lease_id;
+  await fetch(`${base}/api/leases/${againId}/usage`, { method: 'POST', headers: auth, body: JSON.stringify({ ok: true, tokens_out: 5 }) });
+
+  // Idempotent: unthrottling an unthrottled job still succeeds.
+  const un2 = await fetch(`${base}/api/projects/career-ops/jobs/job-unthrottle/unthrottle`, { method: 'POST', headers: auth, body: '{}' });
+  assert.equal(un2.status, 200);
+  assert.equal(((await un2.json()) as { was_throttled: boolean }).was_throttled, false, 'no throttle left to clear');
+
+  // Unknown project → 404.
+  const bad = await fetch(`${base}/api/projects/nope/jobs/job-x/unthrottle`, { method: 'POST', headers: auth, body: '{}' });
+  assert.equal(bad.status, 404);
 });

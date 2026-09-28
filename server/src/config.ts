@@ -32,6 +32,8 @@ export const DEFAULTS: Omit<ServerConfig, 'state_file'> & {
   poll_ms: 15000,
   lease_ttl_seconds: 1800,
   max_concurrent_leases: 1,
+  job_fail_threshold: 5,
+  job_cooldown_seconds: 300,
   projects: [],
   state_file: './state.json',
 };
@@ -56,6 +58,8 @@ export function applyDefaults(raw: Partial<ServerConfig> | null | undefined): Se
     poll_ms: num(r.poll_ms, DEFAULTS.poll_ms),
     lease_ttl_seconds: num(r.lease_ttl_seconds, DEFAULTS.lease_ttl_seconds),
     max_concurrent_leases: num(r.max_concurrent_leases, DEFAULTS.max_concurrent_leases),
+    job_fail_threshold: num(r.job_fail_threshold, DEFAULTS.job_fail_threshold),
+    job_cooldown_seconds: num(r.job_cooldown_seconds, DEFAULTS.job_cooldown_seconds),
     projects: Array.isArray(r.projects)
       ? r.projects.map((p) => ({
           name: String(p.name ?? ''),
