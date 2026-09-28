@@ -138,6 +138,21 @@
   .runcount { color: var(--dim); font-size: 11px; padding: 0 0 2px; }
   .lease-run { padding: 4px 0; border-bottom: 1px solid rgba(48,54,61,0.5); }
   .lease-run:last-child { border-bottom: none; }
+  /* Throttled jobs (exception-only section — hidden while the list is
+     empty): one block per (project, job) the arbiter is refusing to
+     grant, the anti-thrash backstop's operator view. The unthrottle
+     button is the recovery control (token-gated like the gates). */
+  .throttled { padding: 8px 0; border-bottom: 1px solid rgba(48,54,61,0.5); }
+  .throttled:last-child { border-bottom: none; }
+  .throttled .kv { padding: 1px 0; }
+  .throttled .detail { color: var(--dim); font-size: 11px; margin: 2px 0 4px;
+    overflow-wrap: anywhere; white-space: pre-wrap; }
+  .unthrottle {
+    background: var(--panel); color: var(--text); border: 1px solid var(--border);
+    border-radius: 4px; font: inherit; font-size: 11px; padding: 2px 8px;
+    cursor: pointer; margin-top: 4px;
+  }
+  .unthrottle:hover { border-color: var(--accent); }
   /* The worker list collapses (the tray chevron's 150ms pattern, applied to
      a per-project toggle). Expanded by default; state per project in
      localStorage (idlefill.projWorkers.<name>). */
@@ -230,6 +245,14 @@
   <section>
     <h2>Projects</h2>
     <div id="projects"><div class="empty">no projects configured</div></div>
+  </section>
+
+  <!-- Throttled jobs — the anti-thrash backstop (exception-only: the
+       section is hidden while the list is empty; the unthrottle button
+       is the operator's recovery, token-gated like the gates). -->
+  <section id="throttled-section" style="display:none">
+    <h2>Throttled jobs</h2>
+    <div id="throttled"></div>
   </section>
 
 </main>
@@ -615,6 +638,28 @@ async function refresh() {
     }
   }
 
+  // --- Throttled jobs (the anti-thrash backstop — exception-only: the
+  //     section stays hidden while nothing is throttled, and each block
+  //     carries the recovery control).
+  const tbox = $("throttled");
+  const tjobs = st.throttled_jobs || [];
+  if (tjobs.length === 0) {
+    $("throttled-section").style.display = "none";
+  } else {
+    $("throttled-section").style.display = "";
+    tbox.innerHTML = tjobs.map((t) =>
+      '<div class="throttled">' +
+      '<div class="kv"><span class="k">job</span><span class="v err">' + esc(t.job_id) + "</span></div>" +
+      '<div class="kv"><span class="k">project</span><span class="v">' + esc(t.project) + "</span></div>" +
+      '<div class="kv"><span class="k">last error</span><span class="v">' + esc(t.last_error) + "</span></div>" +
+      '<div class="kv"><span class="k">failures</span><span class="v">' + (t.count ?? "—") + "</span></div>" +
+      '<div class="kv"><span class="k">since</span><span class="v">' + ago(st.now - t.last_failed_at) + "</span></div>" +
+      (t.last_error_detail ? '<div class="detail" title="last failure detail (client output tail, ≤1000 chars)">' + esc(t.last_error_detail) + "</div>" : "") +
+      '<button class="unthrottle" data-proj="' + esc(t.project) + '" data-job="' + esc(t.job_id) + '" type="button" title="clear the throttle + failure count + grant cooldown — the job can be granted again">' + "unthrottle</button>" +
+      "</div>"
+    ).join("");
+  }
+
   // --- events
   const et = $("events");
   if (!st.events || st.events.length === 0) {
@@ -869,6 +914,28 @@ $("gate-token").addEventListener("change", () => {
   } catch { }
   $("gate-token-hint").textContent = gateToken() ? "stored ✓" : "(not set)";
   $("gate-token").value = ""; // clear the field; the hint shows the stored state
+});
+
+// ---------------------------------------------------------------------------
+// Throttled jobs — the anti-thrash recovery control. The button lives in the
+// rebuilt #throttled pane, so the listener is delegated on the container;
+// the POST rides the same ?token= pattern the gates and settings writes use.
+// ---------------------------------------------------------------------------
+$("throttled").addEventListener("click", async (e) => {
+  const btn = e.target.closest("button.unthrottle");
+  if (!btn) return;
+  btn.disabled = true;
+  const proj = btn.dataset.proj;
+  const job = btn.dataset.job;
+  const r = await settingsPost("/api/projects/" + encodeURIComponent(proj) + "/jobs/" + encodeURIComponent(job) + "/unthrottle", {});
+  if (!r.ok) {
+    flashGateMsg("unthrottle failed: " + r.detail, "err");
+    btn.disabled = false;
+    refresh(); // re-render from server truth (the row snaps back, button re-enabled)
+    return;
+  }
+  flashGateMsg(proj + " / " + job + ": throttle cleared — the job can be granted again", "ok");
+  refresh();
 });
 
 // ---------------------------------------------------------------------------
