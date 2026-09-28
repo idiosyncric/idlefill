@@ -13,7 +13,8 @@
       "model": "Qwen3.8-27B",
       "cwd": "/Users/sam/Software/career-ops",
       "executor": "node {repo}/adapters/career-ops/eval.mjs {payload_file} {result_file}",
-      "estimated_seconds": 900
+      "estimated_seconds": 900,
+      "timeout_seconds": 1200
     }
   ]
 }

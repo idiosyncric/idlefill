@@ -10,6 +10,12 @@
  *   - busy arbiter (idle=false) → no lease request is even made
  *   - client-pause override → the daemon stops requesting leases
  *   - force override → the daemon requests a lease while the box is busy
+ *   - clean failure (exit 0, result ok:false) → usage ok:false, job KEPT in
+ *     the queue with attempts: 1
+ *   - retry policy: attempts 1 → 2 → 3; on the 3rd failure the job leaves
+ *     the queue and lands in quarantine.jsonl (published in stats too)
+ *   - tokens: the result file's LLM-reported counts WIN over the proxy byte
+ *     estimate; a result without them falls back to the estimate
  */
 
 import { test, after, before } from 'node:test';
@@ -84,7 +90,22 @@ after(async () => {
 
 function makeDaemon(): ClientDaemon {
   process.env.IDLEFILL_TEST_SLEEP_MS = '150';
-  return new ClientDaemon(cfg, { pollMs: 50, executorTimeoutMs: 10_000, log: undefined });
+  return new ClientDaemon(cfg, { pollMs: 50, log: undefined });
+}
+
+/** Swap in a different executor command for the test project. */
+function setExecutor(executor: string, timeoutSeconds?: number): void {
+  cfg.projects = [
+    {
+      name: 'test-proj',
+      queue_file: queueFile,
+      results_file: resultsFile,
+      model: 'm',
+      executor,
+      estimated_seconds: 10,
+      ...(timeoutSeconds ? { timeout_seconds: timeoutSeconds } : {}),
+    },
+  ];
 }
 
 test('grant → run → success → usage(ok) → result appended → queue shrinks', async () => {
@@ -267,4 +288,126 @@ test('force override: daemon requests a lease while the box is busy', async () =
   await d.stop();
   assert.ok(requested, 'force ⇒ the daemon asks for a lease despite a busy box (server is the final arbiter)');
   arb.setOverride(null);
+});
+
+// ---------------------------------------------------------------------------
+// Clean failures, retry policy, token accounting
+// ---------------------------------------------------------------------------
+
+test('clean failure (exit 0, result ok:false): usage ok:false, job KEPT in queue with attempts: 1', async () => {
+  arb.idle = true; // (the force test leaves it busy)
+  setExecutor(`${nodeBin} ${join(here, 'fixtures', 'fail-exec.mjs')} {payload_file} {result_file}`);
+  mkQueue([{ id: 'job-cf' }]);
+  const before = arb.usageReports.length; // usageReports is cumulative across tests
+  const d = makeDaemon();
+  await d.start();
+  // The daemon re-grants a failed job on the next tick — flip busy as soon
+  // as the failure report lands so the attempts count is stable at 1 while
+  // we assert (the retry path itself is covered by the retry-policy test).
+  const deadline = Date.now() + 8000;
+  let line: string | null = null;
+  let rep: Record<string, unknown> | null = null;
+  while (Date.now() < deadline) {
+    if (arb.usageReports.slice(before).some((u) => u.body.ok === false)) {
+      arb.idle = false; // block the immediate retry for a stable snapshot
+      await new Promise((r) => setTimeout(r, 30)); // let the attempts bump land
+      line = readQueueLines().find((l) => l.includes('job-cf')) ?? null;
+      rep = arb.usageReports.slice(before).find((u) => u.body.ok === false)!.body;
+      if (line && rep) break;
+    }
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  await d.stop();
+  assert.ok(line && rep, 'clean failure: usage reported and job still queued');
+  assert.equal(rep.ok, false);
+  assert.equal(rep.error, 'extract_failed', 'the result line\'s error rides along');
+  assert.equal(JSON.parse(line!).attempts, 1, 'job KEPT in the queue with attempts: 1');
+  const res = readResults().find((r) => r.job_id === 'job-cf');
+  assert.equal(res!.ok, false, 'the failed result line is appended (audit trail)');
+  assert.equal(res!.error, 'extract_failed');
+  assert.equal(typeof res!.error_detail, 'string', 'error_detail carries the output tail');
+  arb.idle = true;
+});
+
+test('retry policy: attempts 1 → 2 → 3, then the job is quarantined and leaves the queue', async () => {
+  arb.idle = true;
+  setExecutor(`${nodeBin} ${join(here, 'fixtures', 'fail-exec.mjs')} {payload_file} {result_file}`);
+  mkQueue([{ id: 'job-r1' }]);
+  const d = makeDaemon();
+  await d.start();
+  // Three clean failures = three appended result lines for the job. Each
+  // failure goes back to the queue (attempts 1, 2) and the 3rd quarantines
+  // it — after which the queue is empty and the daemon stands down.
+  const deadline = Date.now() + 15000;
+  let lines = 0;
+  while (Date.now() < deadline) {
+    lines = readResults().filter((r) => r.job_id === 'job-r1').length;
+    if (lines >= 3) break;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  assert.equal(lines, 3, `three attempts recorded, got ${lines}`);
+  assert.equal(readQueueLines().filter((l) => l.includes('job-r1')).length, 0, 'after the 3rd failure the job is OUT of the queue');
+  const qFile = join(dir, 'state', 'quarantine.jsonl');
+  assert.ok(existsSync(qFile), 'quarantine.jsonl exists in the state dir');
+  const q = JSON.parse(readFileSync(qFile, 'utf-8').split('\n').filter((l) => l.trim()).pop()!);
+  assert.equal(q.job_id, 'job-r1');
+  assert.equal(q.attempts, 3, 'quarantine line carries the attempts count it reached');
+  assert.equal(q.error, 'extract_failed', 'quarantine line carries the last error');
+
+  // Let one heartbeat land AFTER the quarantine, then read its published
+  // stats: quarantined rides next to the queue depth.
+  const hbDeadline = Date.now() + 2000;
+  while (Date.now() < hbDeadline) {
+    const st = (arb.lastRegister.projects as { stats?: Record<string, unknown> }[])[0]?.stats;
+    if (st && st.quarantined === 1) break;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  await d.stop();
+  const st = (arb.lastRegister.projects as { stats?: Record<string, unknown> }[])[0]!.stats;
+  assert.equal(st!.quarantined, 1, 'stats carry quarantined: <count> alongside queue');
+});
+
+test('tokens: the result file\'s LLM-reported counts WIN over the proxy byte estimate', async () => {
+  arb.idle = true;
+  // token-exec pushes 8 KiB through the daemon's loopback proxy (byte
+  // estimate ≈ 8192/4 = 2048) but reports tokens_out: 777 — the reported
+  // number must win.
+  setExecutor(`${nodeBin} ${join(here, 'fixtures', 'token-exec.mjs')} {payload_file} {result_file}`);
+  mkQueue([{ id: 'job-tok' }]);
+  const d = makeDaemon();
+  await d.start();
+  // wait until the result line + queue shrink confirm the success path ran
+  const deadline = Date.now() + 8000;
+  while (Date.now() < deadline) {
+    if (readResults().some((r) => r.job_id === 'job-tok') && readQueueLines().length === 0) break;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  await d.stop();
+
+  const use = arb.usageReports.find((u) => u.body.ok === true && u.body.tokens_out === 777);
+  assert.ok(use, `reported tokens_out 777 wins (below the ~2048 byte estimate); got ${JSON.stringify(arb.usageReports.map((u) => u.body))}`);
+  assert.equal(use!.body.tokens_in, 33, 'reported tokens_in wins too');
+});
+
+test('tokens: a result WITHOUT token counts falls back to the proxy estimate', async () => {
+  arb.idle = true;
+  // no-tokens-exec sends an 8 KiB body to the payload's proxy_base_url (the
+  // daemon's loopback proxy; the LLM target is down in the test, so the
+  // proxy answers 502 locally — the REQUEST bytes are still counted) and
+  // writes a success result with NO token fields: the proxy estimate is
+  // what flows through — tokens_in = round(8192/4) = 2048 exactly.
+  setExecutor(`${nodeBin} ${join(here, 'fixtures', 'no-tokens-exec.mjs')} {payload_file} {result_file}`);
+  mkQueue([{ id: 'job-tok2' }]);
+  const d = makeDaemon();
+  await d.start();
+  const deadline = Date.now() + 8000;
+  while (Date.now() < deadline) {
+    if (readResults().some((r) => r.job_id === 'job-tok2') && readQueueLines().length === 0) break;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  await d.stop();
+  const use = arb.usageReports.filter((u) => u.body.ok === true).pop();
+  assert.ok(use, 'a success usage report landed');
+  assert.equal(use!.body.tokens_in, 2048, 'no reported counts ⇒ the proxy byte estimate (8192 req bytes / 4) is used');
+  assert.equal(use!.body.tokens_out, 0, 'response bytes were never counted (local 502) ⇒ estimate 0');
 });

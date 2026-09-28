@@ -26,13 +26,25 @@ export interface ClientProjectConfig {
   executor: string;
   /** Estimate passed to the arbiter at grant time. */
   estimated_seconds?: number;
+  /**
+   * Wall-clock cap for one executor run, in seconds. When exceeded the
+   * daemon SIGINTs the process group, waits the grace period, then
+   * SIGKILLs. Default 1200 (20 min): the career-ops adapter's worst case is
+   * ~90s extract + 15min eval + overhead.
+   */
+  timeout_seconds?: number;
 }
 
 export interface ClientConfig {
   server_url: string;
   token: string;
   client_name: string;
-  /** Client's tailnet IP, reported to the server for self-traffic exemption. */
+  /**
+   * Client's tailnet IP. Sent to the server for display/audit only — the
+   * arbiter prefers the IP it OBSERVES on the connection (which tracks
+   * tailnet reassignments; a stale static value here would break the
+   * self-traffic exemption).
+   */
   ip: string;
   proxy_port: number;
   /** LLM target the loopback proxy forwards to. */
@@ -98,6 +110,7 @@ export function loadClientConfig(
           cwd: p.cwd ? resolve(String(p.cwd)) : undefined,
           executor: String(p.executor ?? ''),
           estimated_seconds: typeof p.estimated_seconds === 'number' ? p.estimated_seconds : 900,
+          timeout_seconds: typeof p.timeout_seconds === 'number' && Number.isFinite(p.timeout_seconds) && p.timeout_seconds > 0 ? p.timeout_seconds : undefined,
         }))
       : [],
     repo_root: repoRoot,

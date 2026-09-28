@@ -9,15 +9,41 @@
  *      degraded/re-idle-gated) take the NEXT job from the project queue and
  *      POST /api/leases.
  *   4. on grant: ensure the loopback proxy is up, write the payload file,
- *      spawn the executor (bash -c, cwd from project config), and watch.
- *      - revoked (WS or poll mismatch) → SIGINT, 10s grace, SIGKILL, then
- *        POST usage {ok:false, error:"preempted"} with the tokens the proxy
- *        saw. The job stays in the queue (no finish on a revoked lease is a
- *        terminal success — the arbiter keeps it for a future grant).
- *      - normal exit 0 → read the result file (one JSON line), POST usage
- *        {ok:true, tokens_out, tokens_in}, append the result line to the
- *        project's results_file, and atomically remove the job from the
- *        queue file. A job only leaves the queue after a successful finish.
+ *      spawn the executor (bash -c, DETACHED — the child becomes the leader
+ *      of its own process group, cwd from project config), and watch.
+ *      The adapter spawns node grandchildren (Playwright, the eval), so
+ *      every kill targets the WHOLE process group (`process.kill(-pid)`):
+ *      a signal to the bash pid alone would orphan the grandchildren, and
+ *      an orphaned eval's LLM traffic looks like interactive activity —
+ *      it wedges the idle signal after a preemption revokes the lease.
+ *      - revoked (WS or poll mismatch) → SIGINT the group, killGraceMs
+ *        grace, SIGKILL the group, then POST usage {ok:false,
+ *        error:"preempted"} with the tokens the proxy saw. The job stays in
+ *        the queue (no finish on a revoked lease is a terminal success —
+ *        the arbiter keeps it for a future grant).
+ *      - timeout (per-project `timeout_seconds`, default 1200s) → the SAME
+ *        escalation as preemption: SIGINT, grace, SIGKILL the group.
+ *        `timedOut` stays true whenever WE initiated the kill for a
+ *        timeout.
+ *      - clean failure: the executor exits 0 but its result line says
+ *        `ok:false` (e.g. a transient extract_failed) — or exits 0 with no
+ *        result file at all. Both are FAILED jobs: report
+ *        usage {ok:false, error:<the result's error|no_result_file>},
+ *        append the result line, and keep the job queued. A job is only
+ *        reported ok:true and removed from the queue when the result line
+ *        says ok:true.
+ *      - retry policy: every failed job (clean failure, crash/exit≠0,
+ *        preempt, timeout) goes back to the queue with `attempts: 1 + the
+ *        attempts it already had`. When `attempts` reaches 3 the job is
+ *        moved to <state_dir>/quarantine.jsonl (with its last error) and
+ *        removed from the queue — it never runs again until the operator
+ *        edits the files by hand.
+ *
+ * Usage tokens: on a SUCCESSFUL finish the result file's `tokens_out` /
+ * `tokens_in` (LLM-reported) are authoritative and win; the proxy byte
+ * count (bytes/4, an overestimate) is only the FALLBACK for a result that
+ * lacks them. For preempted/killed jobs there is no result file — the
+ * proxy estimate is the only signal and is reported as-is.
  *
  * Crash safety: the queue file is the source of truth. A restart re-registers
  * (idempotent) and resumes from the queue; a dead holder's lease is revoked
@@ -83,6 +109,13 @@ class RotatingLog {
 
 export interface QueueJob {
   job_id: string;
+  /**
+   * How many times this job has already failed (retry policy). Absent = 0.
+   * The line round-trips through readQueue/writeQueue with the field intact
+   * (whole-line JSON), so a queue rebuilt by the adapter starts fresh at 0
+   * while an in-flight queue accumulates the count.
+   */
+  attempts?: number;
   payload: {
     url: string;
     company: string;
@@ -91,6 +124,9 @@ export interface QueueJob {
     [k: string]: unknown;
   };
 }
+
+/** Retry cap: a job that fails this many times is quarantined. */
+export const MAX_ATTEMPTS = 3;
 
 export function readQueue(file: string): QueueJob[] {
   if (!existsSync(file)) return [];
@@ -129,6 +165,51 @@ export function removeJob(file: string, jobId: string): boolean {
   if (next.length === jobs.length) return false;
   writeQueue(file, next);
   return true;
+}
+
+/**
+ * Keep a failed job in the queue with its attempt counter bumped by one.
+ * Rewrites the queue file atomically (tmp + rename), preserving line order
+ * and every field on every line. Returns the new attempts count.
+ */
+export function bumpJobAttempts(file: string, jobId: string): number {
+  const jobs = readQueue(file);
+  const hit = jobs.find((j) => j.job_id === jobId);
+  if (!hit) return 0;
+  const attempts = (typeof hit.attempts === 'number' ? hit.attempts : 0) + 1;
+  writeQueue(
+    file,
+    jobs.map((j) => (j.job_id === jobId ? { ...j, attempts } : j)),
+  );
+  return attempts;
+}
+
+/**
+ * Move a job out of the queue into the quarantine file (one JSON line per
+ * quarantined job: job_id, attempts, error, ts). The queue rewrite and the
+ * quarantine append are both atomic enough for this use (single writer: the
+ * daemon, one job at a time). Returns the attempts count the job reached.
+ */
+export function quarantineJob(stateDir: string, queueFile: string, job: QueueJob, error: string): number {
+  const attempts = typeof job.attempts === 'number' ? job.attempts : 0;
+  writeQueue(
+    queueFile,
+    readQueue(queueFile).filter((j) => j.job_id !== job.job_id),
+  );
+  appendResult(join(stateDir, 'quarantine.jsonl'), {
+    job_id: job.job_id,
+    attempts,
+    error,
+    ts: new Date().toISOString(),
+  });
+  return attempts;
+}
+
+/** Line count of the quarantine file (0 when missing) — published in stats. */
+export function quarantineCount(stateDir: string): number {
+  const f = join(stateDir, 'quarantine.jsonl');
+  if (!existsSync(f)) return 0;
+  return readFileSync(f, 'utf-8').split('\n').filter((l) => l.trim()).length;
 }
 
 /**
@@ -197,38 +278,83 @@ export interface ExecOutcome {
   exitCode: number | null;
   signal: NodeJS.Signals | null;
   timedOut: boolean;
+  /**
+   * Last ~4000 chars of the child's combined stdout+stderr (the two streams
+   * are joined with a separator when BOTH produced output). Persisted to
+   * the client log for every job; the tail's last ≤1000 chars ride along as
+   * `error_detail` on failure result lines.
+   */
+  outputTail: string;
 }
 
 /**
- * Run the executor command (bash -c) with the given cwd. `onSignal` is called
- * with 'SIGINT'/'SIGTERM' when the monitor asks the child to stop. Returns
- * when the child exits (grace period handling is the caller's concern).
+ * Run the executor command (bash -c) with the given cwd. `onSignal` is
+ * called with 'SIGINT'/'SIGTERM' when the monitor asks the child to stop.
+ * Returns when the child exits (grace period handling is the caller's
+ * concern).
+ *
+ * The child is spawned DETACHED so it leads its own process group: the
+ * adapter command (`bash -c "node eval.mjs …"`) forks node grandchildren
+ * (Playwright, the eval), and a signal to the bash pid alone never reaches
+ * them. Every kill here therefore targets the WHOLE group —
+ * `process.kill(-pid)` — so a preemption or timeout cannot orphan a running
+ * eval whose LLM traffic would then wedge the idle signal.
+ *
+ * On `timeoutMs` the SAME escalation as preemption runs: SIGINT to the
+ * group, then `timeoutGraceMs` (default 10s), then SIGKILL to the group.
+ * `timedOut` is true whenever WE initiated the kill due to the timeout.
  */
 export function runExecutor(opts: {
   command: string;
   cwd?: string;
   timeoutMs: number;
+  /** SIGINT grace before SIGKILL on a timeout. Default 10s. */
+  timeoutGraceMs?: number;
   onExit: (o: ExecOutcome) => void;
 }): {
   child: import('node:child_process').ChildProcess;
   kill: (sig: 'SIGINT' | 'SIGTERM' | 'SIGKILL') => void;
   promise: Promise<ExecOutcome>;
 } {
+  const graceMs = opts.timeoutGraceMs ?? 10000;
+  // detached: the child becomes the leader of its own process group, so
+  // process.kill(-pid) reaches it AND everything it spawned.
   const child = spawn('bash', ['-c', opts.command], {
     cwd: opts.cwd,
     stdio: ['ignore', 'pipe', 'pipe'],
     env: { ...process.env },
+    detached: true,
   });
 
   let settled = false;
   let timer: NodeJS.Timeout | undefined;
-  let killedByUs: NodeJS.Signals | null = null;
+  let killTimer: NodeJS.Timeout | undefined;
+  let timedOut = false;
+
+  // Forward child output to our log (tail, so a long eval doesn't flood).
+  // Both streams are captured; the tail is returned in the outcome.
+  const out = { stdout: '', stderr: '' };
+  let both = false;
+  const fwd = (key: 'stdout' | 'stderr') => (data: Buffer) => {
+    const s = data.toString();
+    if (!s) return;
+    out[key] = (out[key] + s).slice(-4000);
+    both = out.stdout !== '' && out.stderr !== '';
+  };
+  const tailText = () =>
+    both ? `${out.stdout}\n----- stderr -----\n${out.stderr}` : out.stdout + out.stderr;
 
   const promise = new Promise<ExecOutcome>((resolveP) => {
     timer = setTimeout(() => {
-      if (!settled) {
+      if (settled) return;
+      timedOut = true;
+      // Same escalation as preemption: SIGINT the group, wait the grace,
+      // then SIGKILL the group (no instant kill on timeout).
+      kill('SIGINT');
+      killTimer = setTimeout(() => {
         kill('SIGKILL');
-      }
+      }, graceMs);
+      killTimer.unref?.();
     }, opts.timeoutMs);
     timer.unref?.();
 
@@ -236,31 +362,30 @@ export function runExecutor(opts: {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      opts.onExit({ exitCode: code, signal: sig, timedOut: killedByUs === 'SIGKILL' });
-      resolveP({ exitCode: code, signal: sig, timedOut: killedByUs === 'SIGKILL' });
+      clearTimeout(killTimer);
+      const o = { exitCode: code, signal: sig, timedOut, outputTail: tailText() };
+      opts.onExit(o);
+      resolveP(o);
     });
     child.on('error', (err) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      const out = { exitCode: null, signal: null, timedOut: false };
-      opts.onExit(out);
-      resolveP(out);
+      clearTimeout(killTimer);
+      const o = { exitCode: null, signal: null, timedOut: false, outputTail: tailText() };
+      opts.onExit(o);
+      resolveP(o);
     });
 
-    // Forward child output to our log (tail, so a long eval doesn't flood).
-    let tail = '';
-    const fwd = (data: Buffer) => {
-      tail = (tail + data.toString()).slice(-4000);
-    };
-    child.stdout?.on('data', fwd);
-    child.stderr?.on('data', fwd);
+    child.stdout?.on('data', fwd('stdout'));
+    child.stderr?.on('data', fwd('stderr'));
   });
 
   const kill = (sig: 'SIGINT' | 'SIGTERM' | 'SIGKILL') => {
-    killedByUs = sig;
+    // Kill the WHOLE process group (-pid): the bash wrapper and its node
+    // grandchildren alike. Already-dead groups throw ESRCH — ignore.
     try {
-      child.kill(sig);
+      process.kill(-child.pid!, sig);
     } catch {
       /* already dead */
     }
@@ -276,9 +401,7 @@ export function runExecutor(opts: {
 export interface DaemonHooks {
   /** Poll period for /api/state (tests shorten this). */
   pollMs?: number;
-  /** Executor wall-clock timeout (tests shorten this). Default 15 min. */
-  executorTimeoutMs?: number;
-  /** SIGINT grace before SIGKILL. Default 10s. */
+  /** SIGINT grace before SIGKILL on a timeout. Default 10s. */
   killGraceMs?: number;
   log?: RotatingLog;
 }
@@ -297,7 +420,6 @@ export class ClientDaemon {
     this.cfg = cfg;
     this.hooks = {
       pollMs: hooks.pollMs ?? 20000,
-      executorTimeoutMs: hooks.executorTimeoutMs ?? 15 * 60 * 1000,
       killGraceMs: hooks.killGraceMs ?? 10000,
       log: hooks.log ?? new RotatingLog(join(clientDir, 'logs')),
     };
@@ -350,6 +472,9 @@ export class ClientDaemon {
         stats: {
           ...projectStats(p.results_file),
           queue: queueDepth(p.queue_file),
+          // Jobs that burned all 3 attempts and were moved to
+          // quarantine.jsonl (the operator's eyes go there, not to the queue).
+          quarantined: quarantineCount(this.cfg.state_dir),
         },
       })),
     });
@@ -496,6 +621,24 @@ export class ClientDaemon {
     return this.proxy;
   }
 
+  /**
+   * One granted job: write the payload, run the executor, and settle.
+   *
+   * Token accounting (Fix 4): on a SUCCESSFUL finish the result file's
+   * `tokens_out` / `tokens_in` (LLM-reported) are authoritative and win;
+   * the proxy byte estimate (bytes/4 — an overcount from SSE framing and
+   * JSON wrapping) is only the FALLBACK for a result that lacks them.
+   * Preempted/killed jobs have no result file: the proxy estimate is the
+   * only signal and is reported as-is.
+   *
+   * Failure handling (Fix 2/3): a job is a SUCCESS only when the executor
+   * exits 0 AND its result line says `ok:true` (missing result line =
+   * failure `no_result_file`). Every other outcome — clean `ok:false`
+   * result, crash (exit ≠ 0), preempt, timeout — is a FAILED job: usage is
+   * reported ok:false with the cause, and the job goes through the retry
+   * path (attempts + 1 in the queue; at MAX_ATTEMPTS it is quarantined and
+   * never runs again until the operator edits the files by hand).
+   */
   private async runJob(proj: ClientProjectConfig, job: QueueJob, leaseId: string): Promise<void> {
     const dir = this.cfg.state_dir;
     mkdirSync(dir, { recursive: true });
@@ -528,49 +671,108 @@ export class ClientDaemon {
     const ex = runExecutor({
       command,
       cwd: proj.cwd,
-      timeoutMs: this.hooks.executorTimeoutMs,
+      // Per-project cap (config `timeout_seconds`, default 1200s = the
+      // adapter's worst case) mapped to the runExecutor hook.
+      timeoutMs: (proj.timeout_seconds ?? 1200) * 1000,
       onExit: () => {},
     });
     this.executor = ex;
 
     const outcome = await ex.promise;
+    this.logExecutorTail(job.job_id, outcome.outputTail);
 
+    // Preempted (or killed/timeout): the job stays in the queue. Report the
+    // partial usage the proxy saw so the arbiter's budget reflects reality
+    // (no result file exists — the byte estimate is the only signal).
     if (outcome.signal === 'SIGINT' || outcome.signal === 'SIGTERM' || outcome.signal === 'SIGKILL' || outcome.timedOut) {
-      // Preempted (or killed): the job stays in the queue. Report the partial
-      // usage the proxy saw so the arbiter's budget reflects reality.
       const partial = this.proxyStats();
-      this.log.info(`executor stopped (preempted/killed) — reporting partial usage out=${partial.tokens_out}`);
-      await this.reportUsage(leaseId, { ok: false, error: 'preempted', ...partial });
+      const cause = outcome.timedOut ? 'timeout' : 'preempted';
+      this.log.info(`executor stopped (${cause}) — reporting partial usage out=${partial.tokens_out}`);
+      await this.reportUsage(leaseId, { ok: false, error: cause, ...partial });
+      this.registerFailure(proj, job, cause);
       this.activeLease = null;
       return;
     }
 
+    // A crashed executor is NOT a successful finish: report the error and
+    // let the retry path decide (attempts+1, or quarantine at the cap).
     if (outcome.exitCode !== 0) {
-      // A crashed executor is NOT a successful finish: report the error,
-      // keep the job in the queue (a crash is retryable next grant).
-      this.log.info(`executor exit ${outcome.exitCode} — job stays in queue`);
-      await this.reportUsage(leaseId, { ok: false, error: `executor_exit_${outcome.exitCode}`, ...this.proxyStats() });
+      const error = `executor_exit_${outcome.exitCode}`;
+      this.log.info(`executor exit ${outcome.exitCode} — job failed: ${error}`);
+      await this.reportUsage(leaseId, { ok: false, error, ...this.proxyStats() });
+      this.registerFailure(proj, job, error);
       this.activeLease = null;
       return;
     }
 
-    // Success path: read the result line, report usage, append result, shrink queue.
+    // Exit 0: the result line is the verdict. ok:true → success (report
+    // ok:true, append the line, remove the job). ok:false (or a missing
+    // line) → a FAILED job that goes through the retry path.
     const result = this.readResultLine(resultFile);
-    const partial = this.proxyStats();
     const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
-    const tokensOut = Math.max(num(result?.tokens_out), partial.tokens_out);
-    const tokensIn = Math.max(num(result?.tokens_in), partial.tokens_in);
+    const partial = this.proxyStats();
 
-    await this.reportUsage(leaseId, { ok: true, tokens_out: tokensOut, tokens_in: tokensIn });
-    if (result) {
-      appendResult(proj.results_file, { ...result, job_id: job.job_id, ts: new Date().toISOString() });
-    } else {
-      this.log.info(`WARNING: no result file at ${resultFile} — recording a bare success`);
-      appendResult(proj.results_file, { ok: false, error: 'no_result_file', job_id: job.job_id, ts: new Date().toISOString() });
+    if (!result || result.ok !== true) {
+      const error = !result ? 'no_result_file' : typeof result.error === 'string' && result.error ? result.error : 'executor_reported_failure';
+      if (!result) {
+        this.log.info(`WARNING: exit 0 but no result line at ${resultFile} — recording a failed job (${error})`);
+      }
+      const line = result ?? { ok: false, error: 'no_result_file' };
+      appendResult(proj.results_file, {
+        ...line,
+        job_id: job.job_id,
+        error: line.error ?? error,
+        error_detail: outcome.outputTail.slice(-1000),
+        ts: new Date().toISOString(),
+      });
+      // Clean failure (exit 0): the proxy saw what the job did use —
+      // report it with the failure so the budget stays honest.
+      await this.reportUsage(leaseId, { ok: false, error, ...partial });
+      this.registerFailure(proj, job, error);
+      this.activeLease = null;
+      return;
     }
+
+    // Success: the LLM-reported tokens win; the proxy estimate is only the
+    // fallback when the result lacks them.
+    const tokensOut = num(result.tokens_out) > 0 ? num(result.tokens_out) : partial.tokens_out;
+    const tokensIn = num(result.tokens_in) > 0 ? num(result.tokens_in) : partial.tokens_in;
+    await this.reportUsage(leaseId, { ok: true, tokens_out: tokensOut, tokens_in: tokensIn });
+    appendResult(proj.results_file, { ...result, job_id: job.job_id, ts: new Date().toISOString() });
     removeJob(proj.queue_file, job.job_id);
-    this.log.info(`finished ${job.job_id} (score=${result?.score ?? 'n/a'}, out=${tokensOut}) — queue now ${readQueue(proj.queue_file).length} jobs`);
+    this.log.info(`finished ${job.job_id} (score=${result.score ?? 'n/a'}, out=${tokensOut}) — queue now ${readQueue(proj.queue_file).length} jobs`);
     this.activeLease = null;
+  }
+
+  /**
+   * Retry path for a FAILED job: attempts + 1 in the queue (line rewritten
+   * atomically, order and all fields preserved); when the count reaches
+   * MAX_ATTEMPTS the job is moved to quarantine.jsonl and logged loudly.
+   */
+  private registerFailure(proj: ClientProjectConfig, job: QueueJob, error: string): void {
+    const attempts = bumpJobAttempts(proj.queue_file, job.job_id);
+    if (attempts >= MAX_ATTEMPTS) {
+      const moved = quarantineJob(this.cfg.state_dir, proj.queue_file, { ...job, attempts }, error);
+      this.log.info(`QUARANTINED ${job.job_id} after ${moved} failed attempts (last error: ${error}) — job removed from the queue; see ${join(this.cfg.state_dir, 'quarantine.jsonl')}`);
+    } else {
+      this.log.info(`${job.job_id} failed (attempt ${attempts}/${MAX_ATTEMPTS}, ${error}) — stays in the queue for a retry`);
+    }
+  }
+
+  /**
+   * Persist the executor's output tail to the client log for EVERY job
+   * (success, clean failure, crash, preempt, timeout) — findable as the
+   * `executor output tail` block right after the outcome log line.
+   */
+  private logExecutorTail(jobId: string, tail: string): void {
+    const t = tail.trim();
+    if (!t) {
+      this.log.info(`executor output tail (${jobId}): <none>`);
+      return;
+    }
+    for (const line of t.split('\n')) {
+      this.log.info(`executor output tail (${jobId}): ${line}`);
+    }
   }
 
   // ------------------------------------------------------------------

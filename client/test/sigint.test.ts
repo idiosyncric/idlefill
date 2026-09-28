@@ -54,6 +54,7 @@ before(async () => {
         // sleep 30s — far longer than the revoke arrives
         executor: `IDLEFILL_TEST_SLEEP_MS=30000 ${nodeBin} ${join(here, 'fixtures', 'sleep-exec.mjs')} {payload_file} {result_file}`,
         estimated_seconds: 30,
+        timeout_seconds: 60,
       },
     ],
   };
@@ -76,7 +77,7 @@ function results(): Record<string, unknown>[] {
 
 test('revoke → SIGINT the child → finish {ok:false, error:"preempted"} → queue keeps the job', async () => {
   mkQueue('job-preempted');
-  const d = new ClientDaemon(cfg, { pollMs: 50, executorTimeoutMs: 60_000, killGraceMs: 1500 });
+  const d = new ClientDaemon(cfg, { pollMs: 50, killGraceMs: 1500 });
   await d.start();
 
   // Wait until the client actually holds a lease.
@@ -111,6 +112,12 @@ test('revoke → SIGINT the child → finish {ok:false, error:"preempted"} → q
 
   // Crash-safety: the job was NOT successful → it stays in the queue.
   assert.equal(queueLines().length, 1, 'revoked job stays in the queue (only success shrinks it)');
+  const line = JSON.parse(queueLines()[0]!);
+  // The daemon re-grants the job immediately (correct retry behavior); the
+  // test's own teardown may then bump the counter a second time, so only
+  // assert it went through the retry path (the count itself is covered by
+  // the deterministic retry-policy test in lease-loop.test.ts).
+  assert.ok(typeof line.attempts === 'number' && line.attempts >= 1, 'a preempted job goes through the retry path (attempts bumped)');
   assert.equal(results().length, 0, 'no result line for a preempted job');
 
   // And the client is no longer holding a lease locally.

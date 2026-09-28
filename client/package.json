@@ -8,7 +8,7 @@
   "scripts": {
     "start": "tsx src/index.ts",
     "dev": "tsx src/index.ts",
-    "test": "tsx --test test/proxy.test.ts test/lease-loop.test.ts test/sigint.test.ts"
+    "test": "tsx --test test/proxy.test.ts test/lease-loop.test.ts test/sigint.test.ts test/group-kill.test.ts"
   },
   "dependencies": {
     "ws": "^8.18.0"
