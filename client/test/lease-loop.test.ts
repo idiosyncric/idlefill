@@ -18,16 +18,24 @@
  *     the queue and lands in quarantine.jsonl (published in stats too)
  *   - tokens: the result file's LLM-reported counts WIN over the proxy byte
  *     estimate; a result without them falls back to the estimate
+ *   - every ok:false usage report (crash, preempt, timeout, clean failure,
+ *     no_result_file) carries error_detail
+ *   - fail fast: a missing executor script ⇒ FATAL logged, NO lease
+ *     requests (the client stays registered/heartbeating, online-but-
+ *     inactive)
+ *   - the {repo} placeholder resolves to the TRUE repo root in both the
+ *     source layout and the dist layout (the Sep 25-26 incident: it used
+ *     to resolve to the client package dir and every executor exited 1)
  */
 
 import { test, after, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ClientDaemon, type QueueJob } from '../src/index.js';
-import type { ClientConfig } from '../src/config.js';
+import { loadClientConfig, type ClientConfig } from '../src/config.js';
 import { startFakeArbiter, type FakeArbiter } from './fake-arbiter.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -427,4 +435,69 @@ test('tokens: a result WITHOUT token counts falls back to the proxy estimate', a
   assert.ok(use, 'a success usage report landed');
   assert.equal(use!.body.tokens_in, 2048, 'no reported counts ⇒ the proxy byte estimate (8192 req bytes / 4) is used');
   assert.equal(use!.body.tokens_out, 0, 'response bytes were never counted (local 502) ⇒ estimate 0');
+});
+
+// ---------------------------------------------------------------------------
+// Fail fast on a broken executor config (the {repo} placeholder incident)
+// ---------------------------------------------------------------------------
+
+class CaptureLog {
+  lines: string[] = [];
+  info(msg: string): void {
+    this.lines.push(msg);
+  }
+}
+
+test('missing executor script: FATAL logged at startup, no lease requests, registration still runs', async () => {
+  const log = new CaptureLog();
+  cfg.projects = [
+    {
+      name: 'test-proj',
+      queue_file: queueFile,
+      results_file: resultsFile,
+      model: 'm',
+      executor: `${nodeBin} ${join(dir, 'no-such-script.mjs')} {payload_file} {result_file}`,
+      estimated_seconds: 10,
+    },
+  ];
+  mkQueue([{ id: 'job-miss' }]);
+  arb.idle = true;
+  const regsBefore = arb.registers.length;
+  const d = new ClientDaemon(cfg, { pollMs: 50, log });
+  await d.start();
+  // A few poll cycles: every tick must skip the lease request (executor
+  // broken) while the heartbeat keeps running.
+  await new Promise((r) => setTimeout(r, 400));
+  const leaseReqs = arb.leaseRequests.filter((x) => x.job_id === 'job-miss');
+  assert.equal(leaseReqs.length, 0, 'a broken executor config must not request any leases');
+  await d.stop();
+
+  assert.ok(
+    log.lines.some((l) => l.startsWith('FATAL: executor script not found:')),
+    `FATAL logged with the missing path: ${JSON.stringify(log.lines)}`,
+  );
+  assert.ok(
+    log.lines.some((l) => l.includes('check the {repo} placeholder and your executor template')),
+    'the FATAL line points at the {repo} placeholder',
+  );
+  assert.ok(arb.registers.length > regsBefore, 'registration/heartbeat still runs (online-but-inactive)');
+  assert.equal(readQueueLines().length, 1, 'the job was never taken (no attempts burned)');
+});
+
+test('{repo} resolves to the TRUE repo root in the source layout (client/src → <root>)', async () => {
+  const repoRoot = resolve(here, '../..');
+  const devCfg = loadClientConfig(join(here, '..', 'src'));
+  assert.equal(devCfg.repo_root, repoRoot, 'dev layout: repo_root = the true repo root');
+  // The career-ops adapter path that {repo} expands to exists at the root.
+  assert.ok(existsSync(join(repoRoot, 'adapters', 'career-ops', 'eval.mjs')), 'the expanded executor script exists at <root>/adapters/career-ops/eval.mjs');
+  // Relative paths (state etc.) STILL resolve against the client package
+  // dir — the untracked config uses `../data/...` from there (unchanged).
+  assert.equal(devCfg.state_dir, join(repoRoot, 'client', 'data'), 'state_dir is unchanged (<client pkg dir>/data)');
+});
+
+test('{repo} resolves to the TRUE repo root in the dist layout (client/dist → <root>)', async () => {
+  const repoRoot = resolve(here, '../..');
+  const distCfg = loadClientConfig(join(here, '..', 'dist'));
+  assert.equal(distCfg.repo_root, repoRoot, 'dist layout: repo_root = the true repo root');
+  assert.equal(distCfg.state_dir, join(repoRoot, 'client', 'data'), 'state_dir is unchanged (<client pkg dir>/data)');
 });

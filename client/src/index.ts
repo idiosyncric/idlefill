@@ -63,6 +63,7 @@
 
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync, appendFileSync, openSync } from 'node:fs';
+import * as path from 'node:path';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
@@ -404,6 +405,29 @@ export function runExecutor(opts: {
 }
 
 // ---------------------------------------------------------------------------
+// Fail fast on a broken executor config
+// ---------------------------------------------------------------------------
+
+/**
+ * The script path an executor template expands to, or null when the template
+ * has no script to check (bare builtins like `node -e`, no `node` at all,
+ * empty). The first token is the interpreter; for a `node`/`deno` command the
+ * script is the next argument (relative to cwd when not absolute).
+ */
+export function executorScriptPath(template: string, cwd?: string): string | null {
+  const tokens = template.trim().split(/\s+/);
+  const interp = tokens[0];
+  if (!interp) return null;
+  const base = interp.split(/[\\/]/).pop();
+  if (base !== 'node' && base !== 'deno') return null;
+  const arg = tokens[1];
+  if (!arg || arg.startsWith('-')) return null;
+  if (path.isAbsolute(arg)) return arg;
+  if (cwd) return resolve(cwd, arg);
+  return arg;
+}
+
+// ---------------------------------------------------------------------------
 // The daemon
 // ---------------------------------------------------------------------------
 
@@ -412,18 +436,24 @@ export interface DaemonHooks {
   pollMs?: number;
   /** SIGINT grace before SIGKILL on a timeout. Default 10s. */
   killGraceMs?: number;
-  log?: RotatingLog;
+  /**
+   * Log sink (any `info(msg)` — RotatingLog in production, a capture
+   * stub in tests). Defaults to the rotating <client_dir>/logs/client.log.
+   */
+  log?: { info: (msg: string) => void };
 }
 
 export class ClientDaemon {
   private readonly cfg: ClientConfig;
-  private readonly hooks: Required<DaemonHooks>;
+  private readonly hooks: { pollMs: number; killGraceMs: number; log: { info: (msg: string) => void } };
   private proxy: LlmProxy | null = null;
   private ws: WebSocket | null = null;
   private clientId: string | null = null;
   private running = false;
   private activeLease: { lease_id: string; project: string; job_id: string } | null = null;
   private closed = false;
+  /** True when an executor template's script path is missing (see checkExecutorScript). */
+  private executorBroken = false;
 
   constructor(cfg: ClientConfig, hooks: DaemonHooks = {}) {
     this.cfg = cfg;
@@ -432,10 +462,34 @@ export class ClientDaemon {
       killGraceMs: hooks.killGraceMs ?? 10000,
       log: hooks.log ?? new RotatingLog(join(clientDir, 'logs')),
     };
+    this.checkExecutorScript();
+  }
+
+  /**
+   * Fail fast on a broken executor config: when the script an executor
+   * template expands to does not exist, the client must NOT request any
+   * leases — a broken executor config is a client fault, not a per-job
+   * failure: it must not burn job attempts or hit the arbiter at all (the
+   * Sep 25-26 thrash loop was a mis-expanded {repo} placeholder). The
+   * registration/heartbeat still runs so the operator sees the client
+   * online-but-inactive, with the reason in the log.
+   */
+  private checkExecutorScript(): void {
+    for (const proj of this.cfg.projects) {
+      const expanded = proj.executor.replaceAll('{repo}', this.cfg.repo_root);
+      const script = executorScriptPath(expanded, proj.cwd);
+      if (!script) continue; // no script to check (builtin command, non-node, …)
+      if (!existsSync(script)) {
+        this.executorBroken = true;
+        this.log.info(`FATAL: executor script not found: ${script} — check the {repo} placeholder and your executor template`);
+        return;
+      }
+    }
+    this.executorBroken = false;
   }
 
   get log(): RotatingLog {
-    return this.hooks.log;
+    return this.hooks.log as RotatingLog;
   }
 
   async start(): Promise<void> {
@@ -575,6 +629,10 @@ export class ClientDaemon {
     }
 
     if (this.activeLease) return; // busy: the executor loop owns the flow
+
+    // Broken executor config: stay online (the heartbeat above ran) but
+    // request NO leases — see checkExecutorScript().
+    if (this.executorBroken) return;
 
     // A client-pause override stops the daemon asking for work (server-side,
     // a paused client gets client_paused anyway — this just avoids the spam).

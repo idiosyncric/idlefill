@@ -5,6 +5,10 @@
   "ip": "100.94.165.102",
   "proxy_port": 11435,
   "llm_target": "http://100.105.225.1:11434",
+  "_docs": {
+    "config": "Copy this file to client/config.json (untracked/local). Relative paths (queue_file, results_file) resolve against the client/ package dir — e.g. '../data/queue.jsonl' → <repo>/data/queue.jsonl.",
+    "executor": "Command template run via bash -c. Placeholders: {payload_file}, {result_file}, and {repo} — expanded to the TRUE idlefill repo root in both layouts (dev: tsx client/src/index.ts; packaged: client/dist), so 'node {repo}/adapters/career-ops/eval.mjs …' finds the adapter at <repo>/adapters/career-ops/eval.mjs. At startup the client checks the expanded script path exists and refuses to request leases (staying registered/online-but-inactive, FATAL in the log) if it is missing — a broken executor template must not burn job attempts."
+  },
   "projects": [
     {
       "name": "career-ops",
