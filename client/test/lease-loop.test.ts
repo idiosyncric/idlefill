@@ -6,7 +6,9 @@
  *   - register → idle → grant → executor runs → usage(ok) → result appended
  *     → queue shrinks (the job leaves the queue ONLY after success)
  *   - queue is the source of truth: a failed (non-zero exit) job does NOT
- *     leave the queue and does NOT append a result
+ *     leave the queue; it DOES append a failed result line (with the
+ *     child's stderr tail as error_detail) and the usage report carries
+ *     error_detail
  *   - busy arbiter (idle=false) → no lease request is even made
  *   - client-pause override → the daemon stops requesting leases
  *   - force override → the daemon requests a lease while the box is busy
@@ -137,37 +139,52 @@ test('grant → run → success → usage(ok) → result appended → queue shri
   assert.match(readQueueLines()[0]!, /job-2/);
 });
 
-test('failed executor: job stays in the queue, no result line', async () => {
-  // executor that exits non-zero (node exits 1 on a throw)
+test('failed executor: job stays in the queue; a failed result line + error_detail are appended', async () => {
+  // executor that exits non-zero (node exits 1 on a throw) and prints a
+  // marker to stderr — the marker must ride along as error_detail.
   cfg.projects = [
     {
       name: 'test-proj',
       queue_file: queueFile,
       results_file: resultsFile,
       model: 'm',
-      executor: 'node -e "process.exit(3)"',
+      executor: 'node -e "console.error(\'CRASH-TAIL-MARKER\'); process.exit(3)"',
       estimated_seconds: 10,
     },
   ];
   mkQueue([{ id: 'job-3' }]);
+  const before = arb.usageReports.length; // usageReports is cumulative across tests
   const d = makeDaemon();
   await d.start();
   const deadline = Date.now() + 6000;
-  let sawUsage = false;
+  let rep: Record<string, unknown> | null = null;
   while (Date.now() < deadline) {
-    if (arb.usageReports.some((u) => u.lease_id && u.body.ok === false)) {
-      sawUsage = true;
+    const hit = arb.usageReports.slice(before).find((u) => u.lease_id && u.body.ok === false && /executor_exit_3/.test(String(u.body.error)));
+    if (hit) {
+      rep = hit.body;
       break;
     }
     await new Promise((r) => setTimeout(r, 50));
   }
   await d.stop();
 
-  assert.ok(sawUsage, 'a failed executor still reports usage (ok:false)');
-  const bad = arb.usageReports.find((u) => u.body.ok === false)!;
-  assert.match(String(bad.body.error), /executor_exit_3|preempted/);
+  assert.ok(rep, 'a failed executor still reports usage (ok:false, executor_exit_3)');
+  const bad = rep!;
+  assert.match(String(bad.error), /executor_exit_3|preempted/);
+  assert.equal(typeof bad.error_detail, 'string', 'the usage report carries error_detail (the child output tail)');
+  assert.ok(String(bad.error_detail).includes('CRASH-TAIL-MARKER'), 'error_detail is the child stderr tail');
   assert.equal(readQueueLines().length, 1, 'the job STAYS in the queue after a crash');
-  assert.equal(readResults().filter((r) => r.job_id === 'job-3').length, 0, 'no result line for a crashed job');
+
+  // The crash is findable in results.jsonl too (like a clean failure):
+  // the failed result line carries the child's stderr and the attempts
+  // count the retry path assigned.
+  const res = readResults().find((r) => r.job_id === 'job-3');
+  assert.ok(res, 'a failed result line is appended for a crashed job (audit trail)');
+  assert.equal(res!.ok, false);
+  assert.match(String(res!.error), /executor_exit_3/);
+  assert.ok(String(res!.error_detail).includes('CRASH-TAIL-MARKER'), 'the result line carries the stderr tail');
+  assert.equal(typeof res!.attempts, 'number', 'the result line carries the attempts count');
+  assert.equal(typeof res!.ts, 'string', 'the result line carries a timestamp');
 });
 
 test('busy arbiter: no lease request is made', async () => {

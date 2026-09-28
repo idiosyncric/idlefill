@@ -25,13 +25,22 @@
  *        escalation as preemption: SIGINT, grace, SIGKILL the group.
  *        `timedOut` stays true whenever WE initiated the kill for a
  *        timeout.
+ *      - crash (exit ≠ 0): report usage {ok:false, error:executor_exit_N,
+ *        error_detail:<last ≤1000 chars of the child's combined output>}
+ *        AND append a failed result line (the crash is findable in
+ *        results.jsonl with the child's stderr, like a clean failure); the
+ *        job goes through the retry path.
  *      - clean failure: the executor exits 0 but its result line says
- *        `ok:false` (e.g. a transient extract_failed) — or exits 0 with no
- *        result file at all. Both are FAILED jobs: report
- *        usage {ok:false, error:<the result's error|no_result_file>},
- *        append the result line, and keep the job queued. A job is only
- *        reported ok:true and removed from the queue when the result line
- *        says ok:true.
+ *      `ok:false` (e.g. a transient extract_failed) — or exits 0 with no
+ *      result file at all. Both are FAILED jobs: report
+ *      usage {ok:false, error:<the result's error|no_result_file>,
+ *      error_detail}, append the result line, and keep the job queued. A
+ *      job is only reported ok:true and removed from the queue when the
+ *      result line says ok:true.
+ *      Every ok:false usage report (crash, preempt, timeout, clean
+ *      failure, no_result_file) carries error_detail — the last ≤1000
+ *      chars of the executor's combined output ('' when it produced none)
+ *      — so a failed job's WHY survives on the arbiter.
  *      - retry policy: every failed job (clean failure, crash/exit≠0,
  *        preempt, timeout) goes back to the queue with `attempts: 1 + the
  *        attempts it already had`. When `attempts` reaches 3 the job is
@@ -688,19 +697,29 @@ export class ClientDaemon {
       const partial = this.proxyStats();
       const cause = outcome.timedOut ? 'timeout' : 'preempted';
       this.log.info(`executor stopped (${cause}) — reporting partial usage out=${partial.tokens_out}`);
-      await this.reportUsage(leaseId, { ok: false, error: cause, ...partial });
+      await this.reportUsage(leaseId, { ok: false, error: cause, error_detail: outcome.outputTail.slice(-1000), ...partial });
       this.registerFailure(proj, job, cause);
       this.activeLease = null;
       return;
     }
 
-    // A crashed executor is NOT a successful finish: report the error and
-    // let the retry path decide (attempts+1, or quarantine at the cap).
+    // A crashed executor is NOT a successful finish: report the error (with
+    // the child's output tail as error_detail) and append a failed result
+    // line — a crash is findable in results.jsonl like any other failure.
+    // Let the retry path decide (attempts+1, or quarantine at the cap).
     if (outcome.exitCode !== 0) {
       const error = `executor_exit_${outcome.exitCode}`;
       this.log.info(`executor exit ${outcome.exitCode} — job failed: ${error}`);
-      await this.reportUsage(leaseId, { ok: false, error, ...this.proxyStats() });
-      this.registerFailure(proj, job, error);
+      await this.reportUsage(leaseId, { ok: false, error, error_detail: outcome.outputTail.slice(-1000), ...this.proxyStats() });
+      const attempts = this.registerFailure(proj, job, error);
+      appendResult(proj.results_file, {
+        ok: false,
+        job_id: job.job_id,
+        error,
+        error_detail: outcome.outputTail.slice(-1000),
+        attempts,
+        ts: new Date().toISOString(),
+      });
       this.activeLease = null;
       return;
     }
@@ -726,8 +745,9 @@ export class ClientDaemon {
         ts: new Date().toISOString(),
       });
       // Clean failure (exit 0): the proxy saw what the job did use —
-      // report it with the failure so the budget stays honest.
-      await this.reportUsage(leaseId, { ok: false, error, ...partial });
+      // report it with the failure (and the child's output tail) so the
+      // budget stays honest and the failure's WHY survives on the arbiter.
+      await this.reportUsage(leaseId, { ok: false, error, error_detail: outcome.outputTail.slice(-1000), ...partial });
       this.registerFailure(proj, job, error);
       this.activeLease = null;
       return;
@@ -748,8 +768,10 @@ export class ClientDaemon {
    * Retry path for a FAILED job: attempts + 1 in the queue (line rewritten
    * atomically, order and all fields preserved); when the count reaches
    * MAX_ATTEMPTS the job is moved to quarantine.jsonl and logged loudly.
+   * Returns the attempts count the job reached (the next-attempts value
+   * recorded on the failure's result line).
    */
-  private registerFailure(proj: ClientProjectConfig, job: QueueJob, error: string): void {
+  private registerFailure(proj: ClientProjectConfig, job: QueueJob, error: string): number {
     const attempts = bumpJobAttempts(proj.queue_file, job.job_id);
     if (attempts >= MAX_ATTEMPTS) {
       const moved = quarantineJob(this.cfg.state_dir, proj.queue_file, { ...job, attempts }, error);
@@ -757,6 +779,7 @@ export class ClientDaemon {
     } else {
       this.log.info(`${job.job_id} failed (attempt ${attempts}/${MAX_ATTEMPTS}, ${error}) — stays in the queue for a retry`);
     }
+    return attempts;
   }
 
   /**
@@ -802,7 +825,7 @@ export class ClientDaemon {
         const partial = this.proxyStats();
         if (preempt) {
           this.log.info(`teardown complete (${reason}) — reporting usage {ok:false, error:"${reason}"} out=${partial.tokens_out}`);
-          await this.reportUsage(leaseId, { ok: false, error: reason, ...partial });
+          await this.reportUsage(leaseId, { ok: false, error: reason, error_detail: outcome.outputTail.slice(-1000), ...partial });
         }
         this.activeLease = null;
         this.executor = null;
@@ -835,7 +858,7 @@ export class ClientDaemon {
 
   private async reportUsage(
     leaseId: string,
-    body: { ok: boolean; error?: string; tokens_out?: number; tokens_in?: number },
+    body: { ok: boolean; error?: string; error_detail?: string; tokens_out?: number; tokens_in?: number },
   ): Promise<void> {
     try {
       const res = await api<{ ok?: boolean }>(this.cfg, 'POST', `/api/leases/${leaseId}/usage`, body);
