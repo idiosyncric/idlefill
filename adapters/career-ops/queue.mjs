@@ -14,7 +14,11 @@
  * Rules:
  *   - only `skip === false` entries
  *   - sorted by score desc (stable: ties keep pipeline order)
- *   - job_ids already present in results.jsonl are excluded (unless --force)
+ *   - a job_id is excluded only when its LAST line in results.jsonl has
+ *     `ok === true` (a job whose only lines are failures is RETRIABLE and
+ *     is rebuilt into the queue), or when it is quarantined (quarantine.jsonl
+ *     — a job that burned all 3 attempts; it never runs again until the
+ *     operator edits the files by hand). `--force` skips both exclusions.
  *   - the queue file is rewritten atomically (tmp + rename)
  *
  * usage: node queue.mjs [--force] [CAREER_OPS_ROOT]
@@ -40,6 +44,7 @@ mkdirSync(idlefillData, { recursive: true });
 
 const queueFile = join(idlefillData, 'queue.jsonl');
 const resultsFile = join(idlefillData, 'results.jsonl');
+const quarantineFile = join(idlefillData, 'quarantine.jsonl');
 
 function slug(s) {
   return String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
@@ -61,16 +66,35 @@ if (!Array.isArray(pipeline)) {
   process.exit(1);
 }
 
-// --- results already handled (unless --force) ---
-const done = new Set();
-if (!force && existsSync(resultsFile)) {
-  for (const line of readFileSync(resultsFile, 'utf-8').split('\n')) {
-    if (!line.trim()) continue;
-    try {
-      const r = JSON.parse(line);
-      if (r && typeof r.job_id === 'string') done.add(r.job_id);
-    } catch {
-      /* skip corrupt line */
+// --- jobs already done / quarantined (unless --force) ---
+// lastResult: job_id → the LAST results line for that job. A job is excluded
+// only when its last line says ok:true — a job whose only lines are failures
+// is retriable and must be rebuilt into the queue.
+// quarantined: every job_id in quarantine.jsonl (burned all attempts; never
+// rebuilt until the operator edits the files by hand).
+const lastResult = new Map();
+const quarantined = new Set();
+if (!force) {
+  if (existsSync(resultsFile)) {
+    for (const line of readFileSync(resultsFile, 'utf-8').split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const r = JSON.parse(line);
+        if (r && typeof r.job_id === 'string') lastResult.set(r.job_id, r); // last line wins
+      } catch {
+        /* skip corrupt line */
+      }
+    }
+  }
+  if (existsSync(quarantineFile)) {
+    for (const line of readFileSync(quarantineFile, 'utf-8').split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const q = JSON.parse(line);
+        if (q && typeof q.job_id === 'string') quarantined.add(q.job_id);
+      } catch {
+        /* skip corrupt line */
+      }
     }
   }
 }
@@ -79,6 +103,7 @@ if (!force && existsSync(resultsFile)) {
 let kept = 0;
 let skippedSkipFlag = 0;
 let alreadyDone = 0;
+let skippedQuarantined = 0;
 const lines = [];
 for (const job of pipeline) {
   if (!job || job.skip === true) {
@@ -86,7 +111,12 @@ for (const job of pipeline) {
     continue;
   }
   const job_id = `${slug(job.company || 'unknown')}-${urlHash8(job.url)}`;
-  if (done.has(job_id)) {
+  if (quarantined.has(job_id)) {
+    skippedQuarantined++;
+    continue;
+  }
+  const last = lastResult.get(job_id);
+  if (last && last.ok === true) {
     alreadyDone++;
     continue;
   }
@@ -115,5 +145,5 @@ writeFileSync(tmp, lines.join('\n') + (lines.length ? '\n' : ''));
 renameSync(tmp, queueFile);
 
 console.log(
-  `queue: ${kept} jobs → ${queueFile} (source ${pipeline.length}, skip-flag ${skippedSkipFlag}, already-done ${alreadyDone}${force ? ', --force' : ''})`,
+  `queue: ${kept} jobs → ${queueFile} (source ${pipeline.length}, skip-flag ${skippedSkipFlag}, already-done ${alreadyDone}, quarantined ${skippedQuarantined}${force ? ', --force' : ''})`,
 );
