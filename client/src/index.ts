@@ -135,6 +135,45 @@ export interface QueueJob {
   };
 }
 
+/** Preview row the client publishes for the dashboard's queue page. */
+export interface QueuePreviewRow {
+  job_id: string;
+  /** Display title (payload.title or url when the job carries neither). */
+  title: string;
+  company: string;
+  score: number | null;
+  /** Failure-retry count so far (0 = fresh). */
+  attempts: number;
+}
+
+/**
+ * The first N lines of the queue file as display rows. Order in the file is
+ * priority order (highest score first, appended work last), so the preview
+ * IS the "next up" list the dashboard's queue page shows. Best-effort: a
+ * missing/corrupt file yields [] — the preview is display data and must
+ * never break registration.
+ */
+export function queuePreview(file: string, limit = 50): QueuePreviewRow[] {
+  try {
+    const jobs = readQueue(file).slice(0, Math.max(1, Math.min(500, limit)));
+    return jobs.map((j) => {
+      const pl = (j.payload ?? {}) as Record<string, unknown>;
+      const title = typeof pl.title === 'string' && pl.title.trim() !== ''
+        ? pl.title
+        : typeof pl.url === 'string' && pl.url !== '' ? pl.url : j.job_id;
+      return {
+        job_id: j.job_id,
+        title: title.slice(0, 200),
+        company: typeof pl.company === 'string' && pl.company.trim() !== '' ? pl.company : 'unknown',
+        score: typeof pl.score === 'number' && Number.isFinite(pl.score) ? pl.score : null,
+        attempts: typeof j.attempts === 'number' ? j.attempts : 0,
+      };
+    });
+  } catch {
+    return [];
+  }
+}
+
 /** Retry cap: a job that fails this many times is quarantined. */
 export const MAX_ATTEMPTS = 3;
 
@@ -532,6 +571,10 @@ export class ClientDaemon {
         model: p.model,
         estimated_seconds: p.estimated_seconds ?? 900,
         queue_depth: queueDepth(p.queue_file),
+        // The first queue rows (priority order) — the arbiter displays them
+        // verbatim on the dashboard's queue page ([project]/[worker]/queue);
+        // it never reads the queue file itself. Best-effort: never throws.
+        queue_preview: queuePreview(p.queue_file, 100),
         stats: {
           ...projectStats(p.results_file),
           queue: queueDepth(p.queue_file),

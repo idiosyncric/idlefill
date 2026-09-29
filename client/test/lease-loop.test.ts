@@ -253,11 +253,27 @@ test('registration heartbeat: reports project allocations with live queue depths
   assert.ok(arb.registers.length >= 2, `daemon heartbeats: start() + ≥1 tick, got ${arb.registers.length} registers`);
   const last = arb.lastRegister;
   assert.equal(last.name, 'test-client');
-  const projects = last.projects as { name: string; model: string; estimated_seconds: number; queue_depth: number }[];
+  const projects = last.projects as {
+    name: string;
+    model: string;
+    estimated_seconds: number;
+    queue_depth: number;
+    queue_preview: { job_id: string; title: string; company: string; score: number | null; attempts: number }[];
+  }[];
   assert.ok(Array.isArray(projects) && projects.length === 1, 'one project reported');
   assert.equal(projects[0]!.name, 'test-proj');
   assert.equal(projects[0]!.model, 'm');
   assert.equal(projects[0]!.queue_depth, 2, 'queue depth reflects the queue file at report time');
+  // The queue preview (the dashboard's queue page data) is client-published
+  // in priority order (file order) and best-effort — here, two rows.
+  const prev = projects[0]!.queue_preview;
+  assert.ok(Array.isArray(prev) && prev.length === 2, `queue_preview published: ${JSON.stringify(prev)}`);
+  assert.equal(prev[0]!.job_id, 'job-h1');
+  assert.equal(prev[0]!.title, 'T');
+  assert.equal(prev[0]!.company, 'C');
+  assert.equal(prev[0]!.score, 1);
+  assert.equal(prev[0]!.attempts, 0);
+  assert.equal(prev[1]!.job_id, 'job-h2');
 });
 
 test('heartbeat publishes client-computed project stats (finished/failed/last_job/queue), not arbiter-computed', async () => {
