@@ -6,6 +6,6 @@
   "description": "idlefill adapter for the career-ops pipeline queue (read-only against career-ops)",
   "scripts": {
     "build-queue": "node queue.mjs",
-    "test": "node --test queue.test.mjs"
+    "test": "node --test queue.test.mjs mcp.test.mjs"
   }
 }
