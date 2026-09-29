@@ -151,16 +151,33 @@ display/audit (`reported_ip` on the client row).
 
 ## The menu bar app (macOS)
 
-`menubar/IdlefillMenubar.swift` is a `MenuBarExtra` companion (macOS 14+,
-built with plain `swiftc` — no Xcode project) that shows the arbiter state
-at a glance and controls the local client daemon. It is a second *view* of
-the same daemon, not a different daemon: liveness is read from the arbiter
-(the client row's `last_seen`, within the arbiter's 90s window), so the
-daemon can be started from anywhere — the menu bar, an Orca tab, launchd —
-and the arbiter stays the ground truth. The panel shows the state word, this
-machine's status, queue depth, today's finished/failed, and the running
-lease, plus Open Dashboard · Show Logs · Start/Stop · Restart · Update
-code · Quit.
+`menubar/IdlefillMenubar.swift` is an AppKit `NSStatusItem` + `NSPopover`
+companion (macOS 14+, built with plain `swiftc` — no Xcode project; the
+SwiftUI `MenuBarExtra` exposes no click count, so the status item is built
+by hand and the existing panel view is hosted in a popover unchanged) that
+shows the arbiter state at a glance and controls the local client daemon.
+It is a second *view* of the same daemon, not a different daemon: liveness
+is read from the arbiter (the client row's `last_seen`, within the
+arbiter's 90s window), so the daemon can be started from anywhere — the
+menu bar, an Orca tab, launchd — and the arbiter stays the ground truth.
+The panel shows the state word, this machine's status, queue depth,
+today's finished/failed, and the running lease, plus Open Dashboard ·
+Show Logs · Start/Stop · Restart · Update code · Quit.
+
+- **Click routing:** a *single click* toggles the popover (the panel —
+  today's behavior, exactly). A *double click* opens the **desktop app**
+  (`idlefill://open` — the `State` view), falling back to
+  `open /Applications/Idlefill.app` if the URL-scheme open is not handled.
+  "Installed" = `/Applications/Idlefill.app` exists (the standard install
+  target of `desktop/update.sh`).
+- **Handoff rows:** **Open Dashboard** opens the desktop app's
+  **Projects** view (`idlefill://projects` — this client's project config);
+  if the desktop app is not installed it opens `server_url + "/"` in the
+  browser (today's behavior). **Show Logs** opens the desktop app on
+  **Logs** (`idlefill://logs`); if the desktop app is not installed it
+  opens the log dir in Finder (today's behavior). With the desktop app
+  installed the menu bar no longer opens the arbiter web dashboard — the
+  handoff goes to the desktop app.
 
 - **Build:** `menubar/build.sh` → `menubar/IdlefillMenubar`. It is **not**
   installed as a launchd job by default; `menubar/IdlefillMenubar.plist` is
@@ -212,8 +229,9 @@ ground truth.
 
 - **Build:** `desktop/build.sh` → `desktop/Idlefill.app` (ad-hoc signed).
   It assembles the bundle (`Contents/MacOS/Idlefill` + `Info.plist`,
-  `LSUIElement false` — it has a window), draws the dock icon at runtime
-  (the open-ring logo, no `.icns`), and `codesign --force -s -` signs it so
+  `LSUIElement false` — it has a window), registers the `idlefill://` URL
+  scheme (`CFBundleURLTypes`), draws the dock icon at runtime (the
+  open-ring logo, no `.icns`), and `codesign --force -s -` signs it so
   Gatekeeper-on-local is happy. Run it with `open desktop/Idlefill.app`.
   Install to Applications with `cp -R desktop/Idlefill.app /Applications/`,
   or just run **`desktop/update.sh`** — one command to update an installed
@@ -221,7 +239,16 @@ ground truth.
   leases; the daemon is a separate process), replaces the bundle in
   `/Applications` (or a target dir passed as the first argument), and
   relaunches.
-- **Three surfaces in the window**
+- **URL scheme `idlefill://`.** Hosts: `""` or `open` → **State** (the
+  default), `logs` → **Logs**, `projects` → **Projects**; any unknown host
+  → State. A URL that *launches* the app opens on the requested tab; a URL
+  delivered to a *running* app activates it, brings the window forward, and
+  switches tabs (extra restored windows are closed — the link targets one
+  window). Parsing is the pure `AppModel.route(for:)` (unit-tested by the
+  headless driver). This is how the menu bar's double-click and its
+  re-routed rows hand off to the desktop app.
+- **Four tabs in the window** (a tab strip; the deep links and the tab
+  buttons both set the active tab)
   - **State** — the color-coded state word, this machine's status, queue
     depth, today's finished/failed, and the running lease. Polls
     `GET /api/state` every 5s with the Bearer token.
@@ -230,6 +257,15 @@ ground truth.
     the entry log is missing). Refreshed on a ~2.5s timer, keeps the last
     ~2000 lines, auto-scrolls to the tail while you're at the bottom and
     pauses when you scroll up (the "follow tail" toggle resumes it).
+  - **Projects** — this client's project config (`<repo>/client/config.json`,
+    read at runtime — never baked in): `client_name` + `server_url`
+    read-only, then one row per `projects[]` entry with editable
+    `name`, `model`, `queue_file`, `estimated_seconds`,
+    `timeout_seconds`; `executor` and `cwd` read-only. **Save** validates
+    the rows and rewrites the file preserving every other key byte-for-byte
+    (the token included — it is never displayed anywhere) and keeps the
+    file's `0600` mode; afterwards a "daemon restart to apply" note offers a
+    Restart that uses the same launchd path as Settings.
   - **Settings** — opt-in launchd management (below) plus the repo-path
     field.
 - **launchd management model (opt-in).** Two toggles — **daemon** and
