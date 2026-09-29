@@ -149,6 +149,56 @@ not the static `ip` in your client config. Tailscale reassigns addresses;
 the observed value tracks that, and the configured value is kept only for
 display/audit (`reported_ip` on the client row).
 
+## The menu bar app (macOS)
+
+`menubar/IdlefillMenubar.swift` is a `MenuBarExtra` companion (macOS 14+,
+built with plain `swiftc` — no Xcode project) that shows the arbiter state
+at a glance and controls the local client daemon. It is a second *view* of
+the same daemon, not a different daemon: liveness is read from the arbiter
+(the client row's `last_seen`, within the arbiter's 90s window), so the
+daemon can be started from anywhere — the menu bar, an Orca tab, launchd —
+and the arbiter stays the ground truth. The panel shows the state word, this
+machine's status, queue depth, today's finished/failed, and the running
+lease, plus Open Dashboard · Show Logs · Start/Stop · Restart · Update
+code · Quit.
+
+- **Build:** `menubar/build.sh` → `menubar/IdlefillMenubar`. It is **not**
+  installed as a launchd job by default; `menubar/IdlefillMenubar.plist` is
+  the opt-in LaunchAgent if you want it at login.
+- **Repo discovery:** the binary ships at `<repo>/menubar/`, so it resolves
+  the repo from its own location (one level up), honoring
+  `IDLEFILL_CONFIG_FILE` when set. The token is read at runtime from the
+  gitignored `client/config.json` — never baked in.
+- **Starting the daemon** runs the repo's `node_modules/.bin/tsx` on
+  `client/src/index.ts` with the client dir as cwd and a real `PATH`
+  (a GUI-launched app inherits only `/usr/bin:/bin`, where `node` does not
+  live — the tsx shim resolves node via `#!/usr/bin/env node`). Stop sends
+  `SIGINT` to the whole tsx pair (clean, crash-safe shutdown).
+
+**The control CLI** — `scripts/idlefill-menubar.mjs` — drives and
+troubleshoots the app and the daemon from a terminal while developing
+either. Same repo discovery and the same daemon-identity rule the app
+uses: a `node` process whose command line carries this repo's path AND the
+client entry (`src/` or `dist/` `index.ts`). (A bare `pgrep -f src/index.ts`
+matches any shell that merely quotes the path — do not use it.)
+
+```
+node scripts/idlefill-menubar.mjs status              repo/config/tsx/daemon/app + arbiter view
+node scripts/idlefill-menubar.mjs start               launch the daemon (same command the app's Start runs)
+node scripts/idlefill-menubar.mjs stop                SIGINT the daemon (clean, crash-safe)
+node scripts/idlefill-menubar.mjs restart             stop, then start
+node scripts/idlefill-menubar.mjs logs [--lines N]    tail client/logs/client.log
+node scripts/idlefill-menubar.mjs diagnose            status + tsx/node checks + log tail + interpretation
+node scripts/idlefill-menubar.mjs app start|stop|status   control the menubar binary itself
+```
+
+`diagnose` is the troubleshooting entry point: it checks config, tsx, and
+node, then cross-references the local daemon process against the arbiter's
+`online` view and tells you which of "daemon is up but not heartbeating" /
+"arbiter says online but no local process" / "nothing running, arbiter down"
+you're in. The arbiter token is read at runtime from the gitignored client
+config and never printed.
+
 ## Auth model
 
 - Every API call and the WS connection must present a token from the server's

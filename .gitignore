@@ -7,3 +7,4 @@ client/config.json
 client/logs/
 .DS_Store
 *.tsbuildinfo
+menubar/IdlefillMenubar
