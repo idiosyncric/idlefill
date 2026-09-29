@@ -215,7 +215,12 @@ ground truth.
   `LSUIElement false` — it has a window), draws the dock icon at runtime
   (the open-ring logo, no `.icns`), and `codesign --force -s -` signs it so
   Gatekeeper-on-local is happy. Run it with `open desktop/Idlefill.app`.
-  Install to Applications with `cp -R desktop/Idlefill.app /Applications/`.
+  Install to Applications with `cp -R desktop/Idlefill.app /Applications/`,
+  or just run **`desktop/update.sh`** — one command to update an installed
+  copy: rebuilds, quits the running app (clean SIGTERM — the app holds no
+  leases; the daemon is a separate process), replaces the bundle in
+  `/Applications` (or a target dir passed as the first argument), and
+  relaunches.
 - **Three surfaces in the window**
   - **State** — the color-coded state word, this machine's status, queue
     depth, today's finished/failed, and the running lease. Polls
