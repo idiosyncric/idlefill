@@ -34,6 +34,18 @@ export interface ServerConfig {
   idle_seconds: number;
   poll_ms: number;
   lease_ttl_seconds: number;
+  /**
+   * Adaptive lease TTL (safety factor). When a client reports a per-job
+   * `estimated_seconds`, the lease is capped at
+   * `estimated_seconds * lease_ttl_safety_factor` (never above the effective
+   * `lease_ttl_seconds`, never below `lease_ttl_floor_seconds`). The estimate
+   * is a first-run guess, so the factor is never 1 — default 2. A missing or
+   * zero estimate leaves the lease at the full `lease_ttl_seconds` (today's
+   * behavior), so the adaptive TTL can only expire a lease SOONER, never later.
+   */
+  lease_ttl_safety_factor: number;
+  /** Floor (in seconds) for the adaptive lease TTL — the estimate-driven cap never drops below it. */
+  lease_ttl_floor_seconds: number;
   max_concurrent_leases: number;
   /**
    * Anti-thrash (per-job): a job that has reported this many `ok:false`

@@ -290,6 +290,19 @@ export class Arbiter {
     if (used >= project.daily_token_cap) return { ok: false, reason: 'budget_exhausted' };
 
     const ttlSeconds = project.lease_ttl_seconds ?? this.cfg.lease_ttl_seconds;
+    // Adaptive lease TTL: when the client reports a positive per-job estimate,
+    // the lease is capped at estimate × safety factor — floored at the
+    // lease_ttl_floor and capped at the effective global TTL, so it can only
+    // expire SOONER than today's behavior, never later. No/zero estimate ⇒
+    // the full TTL (today's behavior). The estimate is a first-run guess, so
+    // the factor is a config knob (default 2), never 1.
+    const est = Math.max(0, params.estimated_seconds || 0);
+    const leaseTtl = computeLeaseTtl(
+      est,
+      ttlSeconds,
+      this.cfg.lease_ttl_safety_factor,
+      this.cfg.lease_ttl_floor_seconds,
+    );
     const lease: Lease = {
       lease_id: `l-${randomBytes(4).toString('hex')}`,
       client_id: client.client_id,
@@ -297,15 +310,19 @@ export class Arbiter {
       exempt_ip: client.ip,
       project: project.name,
       job_id: String(params.job_id ?? ''),
-      estimated_seconds: Math.max(0, params.estimated_seconds || 0),
+      estimated_seconds: est,
       status: 'active',
       granted_at: now,
-      expires_at: now + ttlSeconds * 1000,
+      expires_at: now + leaseTtl * 1000,
       tokens_out: 0,
       tokens_in: 0,
     };
     s.leases.push(lease);
-    this.store.appendEvent({ kind: 'lease_granted', project: lease.project, lease_id: lease.lease_id, detail: `${client.name}: ${lease.job_id}` });
+    // The event detail records the effective TTL only when it differs from the
+    // global — so the dashboard's event feed shows WHY a lease expired early.
+    const ttlNote =
+      leaseTtl !== ttlSeconds ? ` (ttl ${leaseTtl}s from est ${est}s*${fmtNum(this.cfg.lease_ttl_safety_factor)})` : '';
+    this.store.appendEvent({ kind: 'lease_granted', project: lease.project, lease_id: lease.lease_id, detail: `${client.name}: ${lease.job_id}${ttlNote}` });
     this.store.trim();
     this.store.save();
     return { ok: true, lease };
@@ -804,4 +821,32 @@ export function utcDay(ms: number): UtcDate {
  */
 export function validIp(v: string | undefined): v is string {
   return typeof v === 'string' && v.trim() !== '' && v.trim() !== 'unknown';
+}
+
+/**
+ * Adaptive lease TTL (seconds).
+ *
+ *   - no estimate (est ≤ 0)  → the full `ttlSeconds` (today's behavior);
+ *   - est > 0                → `est * safetyFactor`, floored at `floorSeconds`
+ *                              and capped at `ttlSeconds`.
+ *
+ * The cap at the effective `ttlSeconds` means an estimate can only make a
+ * lease expire SOONER than the static TTL, never later — so preemption,
+ * budget, and anti-thrash see strictly less staleness, never more. The
+ * safety factor (default 2) never runs the lease below 2× the estimate
+ * because the client's `estimated_seconds` is a first-run guess.
+ */
+export function computeLeaseTtl(estSeconds: number, ttlSeconds: number, safetyFactor: number, floorSeconds: number): number {
+  const est = Number.isFinite(estSeconds) ? Math.max(0, estSeconds) : 0;
+  const ttl = Number.isFinite(ttlSeconds) && ttlSeconds > 0 ? ttlSeconds : 1800;
+  if (est <= 0) return ttl;
+  const factor = Number.isFinite(safetyFactor) && safetyFactor > 0 ? safetyFactor : 2;
+  const floor = Number.isFinite(floorSeconds) && floorSeconds > 0 ? floorSeconds : 0;
+  const capped = Math.floor(est * factor);
+  return Math.min(Math.max(capped, floor), ttl);
+}
+
+/** Render a config number for event detail without trailing noise (2, 1.5). */
+function fmtNum(n: number): string {
+  return Number.isInteger(n) ? String(n) : String(Number(n.toFixed(4)));
 }
