@@ -102,7 +102,8 @@ server/     arbiter (Docker image) — idle detection, lease state machine,
             Fastify API, WS events, static dashboard
 client/     Mac daemon — register, lease loop, loopback proxy, executor
             supervision, usage reporting, crash-safe queue handling
-adapters/   per-project executors (career-ops: queue builder + JD evaluator)
+adapters/   per-project executors (career-ops: queue builder + JD evaluator
+            + the idlefill MCP server, idlefill-mcp.mjs)
 scripts/    thin CLI wrappers (build-careerops-queue.mjs)
 deploy/     PHASE 2, UNTESTED: compose.yaml, traefik/idlefill.yml, deploy.sh,
             com.sam.idlefill.client.plist
@@ -311,6 +312,17 @@ shared records-to-show).
   url + activity path is a 400 shown in the form). All settings editors are
   token-gated: with no gate token the write is refused and the header
   points at the token field.
+- **queue detail page** — a worker row with queued jobs gets a **view**
+  link into `/[project]/[worker]/queue` (served by the arbiter as the SAME
+  single-file dashboard; the inline script switches views on the path):
+  the worker's published **queue preview** — the first rows of its queue
+  file in priority order (job, company, score, retries used) — plus model,
+  per-job estimate, full depth vs. rows shown, online state, and what is
+  running now. The preview is client-published: the heartbeat carries the
+  first 100 rows (sanitized at registration: bounded rows/fields), and the
+  arbiter displays it verbatim — it never reads queue files. A worker
+  running an older client that doesn't publish a preview degrades to the
+  depth number.
 
 Workers are **self-reported by the clients** (the arbiter does not infer
 allocations): each client daemon re-registers on every poll tick (~20s) with
@@ -322,11 +334,11 @@ stays idempotent by name: same `client_id`, so client overrides (pause/force)
 keep sticking across daemon restarts.
 
 In the API: `POST /api/clients/register` accepts an optional
-`projects: [{name, model, estimated_seconds, queue_depth, stats?}]`
+`projects: [{name, model, estimated_seconds, queue_depth, queue_preview?, stats?}]`
 (malformed rows are dropped; `stats` is a small object of number/short-
 string values the client computed itself — the arbiter stores and displays
 them verbatim), and `GET /api/state` / `GET /api/projects` return per-project
-`workers: [{client, model, estimated_seconds, queue_depth, online, stats}]`,
+`workers: [{client, model, estimated_seconds, queue_depth, queue_preview?, online, stats}]`,
 a `today: {finished, failed}` results row (UTC day of each lease's end), and
 a `scheduling` object (the EFFECTIVE `idle_seconds`,
 `max_concurrent_leases`, `lease_ttl_seconds`, `daily_token_cap`, plus
@@ -336,6 +348,38 @@ show those as the dashed "inherit" placeholders). `GET /api/state` also carries
 the `servers` inventory (see Inference-server inventory above). A project
 with no connected workers shows "no workers connected" — a scheduling row
 with no executor behind it tells you the queue will not drain.
+
+## Scheduling work: the idlefill MCP server
+
+`adapters/career-ops/idlefill-mcp.mjs` is an MCP (Model Context Protocol)
+server over stdio — no dependencies, plain `node` — that lets an agent
+(e.g. a Hermes profile) schedule idle work without touching the arbiter API
+or the queue files directly:
+
+| Tool | What it does |
+|---|---|
+| `idlefill_add_jobs` | Enqueue job openings `{url (required), company?, title?, score?, extra?}`; `dry_run=true` previews. A job is skipped (and the response names which skip: `skipped_in_queue` / `skipped_done` / `skipped_quarantined` / `skipped_duplicate`) when it is already queued, its last result is `ok:true`, or it was quarantined — the same ground-truth rules as the queue builder, re-read on every call. The daemon picks new lines up on its next idle grant — no restart. |
+| `idlefill_queue_status` | Queue depth + a preview of the first jobs (default 10, `limit` up to 200), plus — when the arbiter is reachable — the idle signal, project pause state, connected workers, and what is running now (the arbiter read is best-effort). |
+| `idlefill_results` | Recent results lines, newest first (`job_id`, `ok`, `score`, `error`, `tokens_out`, `report_path`). |
+
+Config is read at call time from the client config (`<client dir>/config.json`
+— `server_url`, `token`, and the per-project `queue_file`/`results_file`
+mapping; override the client dir with `IDLEFILL_CLIENT_DIR`, the repo data
+dir with `IDLEFILL_DATA`). Job identity is `<company-slug>-<sha256(url)[0:8]>`
+— identical to the queue builder — so a job added through the MCP is the same
+job the builder and the daemon know.
+
+The daemon is a single `node` process, so the Hermes profile configures it
+as an MCP server pointing at the file, e.g.:
+
+```json
+"mcpServers": {
+  "idlefill": { "command": "node", "args": ["/Users/sam/Software/idlefill/adapters/career-ops/idlefill-mcp.mjs"] }
+}
+```
+
+Test: `node --test adapters/career-ops/mcp.test.mjs` (drives the real
+process over stdio against scratch ground-truth files).
 
 ## Conventions
 
