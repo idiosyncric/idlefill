@@ -350,6 +350,34 @@ the server's `projects[]` has its own controls, persisted in the state file
   the EFFECTIVE values plus `scheduling.overrides` (the raw per-project
   values, `null` = inherit).
 
+**Adaptive lease TTL (the estimate lever).** Each lease also starts with a
+per-job cap on its lifetime: when the client reports a positive
+`estimated_seconds` for the job, the lease expires after
+`min(estimated_seconds × lease_ttl_safety_factor, lease_ttl_seconds)` —
+floored at `lease_ttl_floor_seconds` (default 60). The safety factor
+(default 2, server config `lease_ttl_safety_factor`) keeps a lease at ≥2×
+the estimate, because the client's estimate is a first-run guess; and the
+cap at the (per-project or global) `lease_ttl_seconds` means the estimate
+can only make a lease expire SOONER, never later — preemption, budget, and
+anti-thrash see strictly less staleness, never more. With no estimate (or
+≤0) the lease keeps the full static TTL, exactly as before. Today the
+client sends its per-project `estimated_seconds ?? 900` and the default
+TTL is 1800, so `min(900×2, 1800) = 1800` — zero behavior change until an
+operator tunes it: set `estimated_seconds` close to the job's real duration
+in the CLIENT config (`client/config.json` `projects[].estimated_seconds` —
+the dashboard's per-project settings editor exposes only the arbiter-side
+knobs, not this one) and a 2-minute job stops holding the box "running"
+for the full 30-minute static TTL after it finishes; a crashed or
+abandoned job frees the single lease slot at ~2× its estimate instead of
+the full TTL. The trade-off is that an estimate SHORTER than a job's real
+duration expires the lease early while the job is still working — the
+client's usage report on the expired lease is still counted once (no
+double-count, no failure attribution: a `ttl_expired` is never treated as
+a job failure), but the slot is free to re-grant sooner. When the effective
+TTL differs from the global, the `lease_granted` event records it
+(`… (ttl 1200s from est 600s*2)`) so the dashboard's event feed shows why
+a lease expired early.
+
 ```bash
 node scripts/idlefill-control.mjs projects
 node scripts/idlefill-control.mjs project career-ops set [--idle 600] [--max 2] [--ttl 900]

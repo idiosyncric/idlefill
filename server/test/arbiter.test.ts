@@ -20,7 +20,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Arbiter, utcDay } from '../src/arbiter.js';
+import { Arbiter, utcDay, computeLeaseTtl } from '../src/arbiter.js';
 import { srcKey } from '../src/idle.js';
 import { StateStore } from '../src/state.js';
 import type { ActivityEntry, IdleSignal, ServerConfig } from '../src/types.js';
@@ -75,7 +75,7 @@ function mkEntries(secAgo: number[], src = 'ip:10.0.0.9', base = T0): ActivityEn
   }));
 }
 
-function makeHarness(opts: { ttl?: number; cap?: number; maxLeases?: number; idleSeconds?: number; jobFailThreshold?: number; jobCooldownSeconds?: number } = {}) {
+function makeHarness(opts: { ttl?: number; cap?: number; maxLeases?: number; idleSeconds?: number; jobFailThreshold?: number; jobCooldownSeconds?: number; safetyFactor?: number; floorSeconds?: number } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'idlefill-arbiter-'));
   const store = new StateStore(join(dir, 'state.json'));
   const cfg: ServerConfig = {
@@ -87,6 +87,8 @@ function makeHarness(opts: { ttl?: number; cap?: number; maxLeases?: number; idl
     idle_seconds: opts.idleSeconds ?? 300,
     poll_ms: 15000,
     lease_ttl_seconds: opts.ttl ?? 1800,
+    lease_ttl_safety_factor: opts.safetyFactor ?? 2,
+    lease_ttl_floor_seconds: opts.floorSeconds ?? 60,
     max_concurrent_leases: opts.maxLeases ?? 1,
     job_fail_threshold: opts.jobFailThreshold ?? 5,
     job_cooldown_seconds: opts.jobCooldownSeconds ?? 300,
@@ -783,5 +785,174 @@ test('anti-thrash: error_detail round-trips usage → lease record → state fil
   const ev2 = h.store.state.events.find((e) => e.kind === 'lease_finished' && e.lease_id === g2.lease!.lease_id)!;
   assert.ok(ev2.detail?.includes('detail=boom'), 'short detail rides the event verbatim');
   assert.ok(!(ev2.detail ?? '').includes('…'), 'no ellipsis for a short detail');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// Adaptive lease TTL: the per-job estimate caps the lease — and can only
+// shorten it (never extend beyond the effective global TTL).
+// ---------------------------------------------------------------------------
+
+test('computeLeaseTtl: no/zero estimate keeps the full TTL; est*2 floors and caps at the global', () => {
+  // No estimate (0 or absent/NaN) → today's behavior exactly.
+  assert.equal(computeLeaseTtl(0, 1800, 2, 60), 1800, 'est 0 → full TTL');
+  assert.equal(computeLeaseTtl(600, 1800, 2, 60), 1200, 'est 600 → 600*2 = 1200');
+  assert.equal(computeLeaseTtl(900, 1800, 2, 60), 1800, 'est 900 → 900*2 = 1800 = cap at the global (never extends beyond it)');
+  assert.equal(computeLeaseTtl(1200, 1800, 2, 60), 1800, 'est 1200 → 2400 capped at the global 1800');
+  assert.equal(computeLeaseTtl(20, 1800, 2, 60), 60, 'est 20 → 20*2 = 40 floored at lease_ttl_floor_seconds (60)');
+  assert.equal(computeLeaseTtl(30, 1800, 2, 60), 60, 'est 30 → 60, exactly the floor (not floored up)');
+  // A per-project (effective) TTL that is LOWER than the global is the cap —
+  // the estimate can never extend past it.
+  assert.equal(computeLeaseTtl(900, 300, 2, 60), 300, 'cap is the EFFECTIVE ttl (300), not the global');
+  // Non-default safety factor (1.5) is honored.
+  assert.equal(computeLeaseTtl(100, 1800, 1.5, 60), 150, 'safetyFactor 1.5 → 100*1.5 = 150');
+  // Non-positive estimates (negative input) behave like no estimate.
+  assert.equal(computeLeaseTtl(-5, 1800, 2, 60), 1800, 'negative estimate → full TTL');
+});
+
+test('lease grant: est 0/absent → expires_at = grant + lease_ttl_seconds (today\u2019s behavior)', () => {
+  const h = makeHarness(); // ttl 1800, factor 2, floor 60
+  h.det.entries = mkEntries([400]);
+  // est 0 → no adaptive shortening.
+  const r0 = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'j0', estimated_seconds: 0, now: T0 });
+  assert.equal(r0.ok, true);
+  assert.equal(r0.lease!.expires_at, T0 + 1800 * 1000, 'est 0 → full TTL');
+  assert.equal(r0.lease!.estimated_seconds, 0);
+  // No estimate detail note on the grant event (effective TTL == global).
+  const ev0 = h.store.state.events.find((e) => e.kind === 'lease_granted' && e.lease_id === r0.lease!.lease_id)!;
+  assert.ok(ev0.detail === `mac: j0`, `no ttl note when the effective TTL equals the global (detail: ${JSON.stringify(ev0.detail)})`);
+  h.arbiter.finishLease({ lease_id: r0.lease!.lease_id, ok: true, now: T0 + 1000 });
+
+  // Absent (undefined) estimate → same: full TTL, no note.
+  const rAbs = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'j-abs', estimated_seconds: undefined as unknown as number, now: T0 + 2000 });
+  assert.equal(rAbs.ok, true);
+  assert.equal(rAbs.lease!.expires_at, T0 + 2000 + 1800 * 1000, 'absent est → full TTL');
+  const evAbs = h.store.state.events.find((e) => e.kind === 'lease_granted' && e.lease_id === rAbs.lease!.lease_id)!;
+  assert.ok(!/ttl \d+s from est/.test(evAbs.detail ?? ''), 'absent est → no ttl note');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('lease grant: est 600 with TTL 1800 → expires_at = grant + 1200s; the grant event carries the ttl note', () => {
+  const h = makeHarness();
+  h.det.entries = mkEntries([400]);
+  const r = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'j600', estimated_seconds: 600, now: T0 });
+  assert.equal(r.ok, true);
+  assert.equal(r.lease!.estimated_seconds, 600);
+  assert.equal(r.lease!.expires_at, T0 + 1200 * 1000, 'est 600 → 600*2 = 1200s lease');
+  const ev = h.store.state.events.find((e) => e.kind === 'lease_granted' && e.lease_id === r.lease!.lease_id)!;
+  assert.equal(ev.detail, 'mac: j600 (ttl 1200s from est 600s*2)', 'the event detail records the effective TTL and why');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('lease grant: est 900 → capped at the global 1800 (the adaptive TTL never extends a lease)', () => {
+  const h = makeHarness();
+  h.det.entries = mkEntries([400]);
+  const r = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'j900', estimated_seconds: 900, now: T0 });
+  assert.equal(r.ok, true);
+  assert.equal(r.lease!.expires_at, T0 + 1800 * 1000, 'est 900 → 900*2 = 1800 = the global cap (zero behavior change at the default estimate)');
+  const ev = h.store.state.events.find((e) => e.kind === 'lease_granted' && e.lease_id === r.lease!.lease_id)!;
+  assert.ok(!/from est/.test(ev.detail ?? ''), 'no ttl note when the cap equals the global (indistinguishable from today)');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('lease grant: est 20 → floored at lease_ttl_floor_seconds (20*2 = 40 → 60)', () => {
+  const h = makeHarness(); // floor 60
+  h.det.entries = mkEntries([400]);
+  const r = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'j20', estimated_seconds: 20, now: T0 });
+  assert.equal(r.ok, true);
+  assert.equal(r.lease!.expires_at, T0 + 60 * 1000, 'est 20 → 20*2 = 40 < floor 60 → floored to 60s');
+  const ev = h.store.state.events.find((e) => e.kind === 'lease_granted' && e.lease_id === r.lease!.lease_id)!;
+  assert.equal(ev.detail, 'mac: j20 (ttl 60s from est 20s*2)', 'the note shows the floored TTL');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('lease grant: lease_ttl_safety_factor: 1.5 config is honored (est 100 → 150s)', () => {
+  const h = makeHarness({ safetyFactor: 1.5 });
+  h.det.entries = mkEntries([400]);
+  const r = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'j150', estimated_seconds: 100, now: T0 });
+  assert.equal(r.ok, true);
+  assert.equal(r.lease!.expires_at, T0 + 150 * 1000, 'est 100 * 1.5 = 150s');
+  const ev = h.store.state.events.find((e) => e.kind === 'lease_granted' && e.lease_id === r.lease!.lease_id)!;
+  assert.equal(ev.detail, 'mac: j150 (ttl 150s from est 100s*1.5)', 'the note carries the non-integer factor');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('lease grant: an early (estimate-driven) TTL expiry does NOT count as a job failure', async () => {
+  // est 30 → 30*2 = 60s adaptive TTL (== the floor), so the lease expires at
+  // +60s even though the (global) lease_ttl_seconds is 1800.
+  const h = makeHarness({ ttl: 1800 });
+  h.det.entries = mkEntries([400]);
+
+  const g = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'job-e', estimated_seconds: 30, now: T0 });
+  assert.equal(g.ok, true);
+  assert.equal(g.lease!.expires_at, T0 + 60 * 1000, 'adaptive TTL: 30*2 = 60s');
+
+  // The lease expires early — the holder reported nothing.
+  const { revoked } = await h.arbiter.tick(T0 + 61_000);
+  assert.equal(revoked.length, 1, 'the adaptive TTL expired the lease');
+  assert.equal(revoked[0]!.reason, 'ttl_expired');
+
+  // Failure attribution is client-reported usage only: a ttl_expired never
+  // bumps the failure count and never arms job_throttled / job_cooldown.
+  assert.equal(Object.keys(h.store.state.throttled_jobs).length, 0, 'ttl_expired does not arm a throttle');
+  assert.ok(
+    !h.store.state.events.some((e) => e.kind === 'job_throttled'),
+    'no job_throttled event from a ttl_expired',
+  );
+  // The revocation arms the post-revocation reidle gate (unrelated to failure
+  // attribution); a later fully-idle tick disarms it…
+  await h.arbiter.tick(T0 + 120_000);
+  // …then the job is re-grantable. If the ttl_expired had armed the per-job
+  // grant cooldown (300s from the failure), this grant would be refused
+  // `job_cooldown` — it is not (the holder died: unknown outcome, not a
+  // failure).
+  const again = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'job-e', estimated_seconds: 30, now: T0 + 130_000 });
+  assert.equal(again.ok, true, `no job_cooldown after an early TTL expiry, got ${JSON.stringify(again)}`);
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('lease grant: a per-project lease_ttl_seconds override is the cap (estimate never extends past it)', () => {
+  const h = makeHarness(); // global ttl 1800
+  h.det.entries = mkEntries([400]);
+  // Operator sets a tighter per-project TTL (600s).
+  h.arbiter.setProjectSettings('career-ops', { lease_ttl_seconds: 600 });
+
+  // est 900 would be 900*2 = 1800s at the global — the per-project 600s is
+  // the cap: the lease expires at grant+600s, never extended by the estimate.
+  const r1 = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'j-cap', estimated_seconds: 900, now: T0 });
+  assert.equal(r1.ok, true);
+  assert.equal(r1.lease!.expires_at, T0 + 600 * 1000, 'cap is the per-project (effective) TTL, never extended by the estimate');
+  const ev1 = h.store.state.events.find((e) => e.kind === 'lease_granted' && e.lease_id === r1.lease!.lease_id)!;
+  assert.ok(!/from est/.test(ev1.detail ?? ''), 'cap == effective TTL ⇒ no note (indistinguishable from today for this project)');
+  h.arbiter.finishLease({ lease_id: r1.lease!.lease_id, ok: true, now: T0 + 1000 });
+
+  // est 200 → 200*2 = 400s < the effective 600s: the estimate shortens the
+  // lease, and the note records the effective TTL.
+  const r2 = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'j-short', estimated_seconds: 200, now: T0 + 2000 });
+  assert.equal(r2.ok, true);
+  assert.equal(r2.lease!.expires_at, T0 + 2000 + 400 * 1000, 'est 200 → 400s under the per-project cap of 600s');
+  const ev2 = h.store.state.events.find((e) => e.kind === 'lease_granted' && e.lease_id === r2.lease!.lease_id)!;
+  assert.equal(ev2.detail, 'mac: j-short (ttl 400s from est 200s*2)', 'the note reflects the effective (per-project) TTL');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('/api/state lease rows still carry expires_at + estimated_seconds (shape unchanged)', () => {
+  const h = makeHarness();
+  h.det.entries = mkEntries([400]);
+  const r = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'j-shape', estimated_seconds: 600, now: T0 });
+  assert.equal(r.ok, true);
+  const lease = h.store.state.leases.find((l) => l.lease_id === r.lease!.lease_id)!;
+  // The /api/state lease view passes lease records through verbatim — the
+  // adaptive TTL must not change their shape.
+  assert.equal(typeof lease.expires_at, 'number');
+  assert.equal(typeof lease.estimated_seconds, 'number');
+  assert.equal(lease.estimated_seconds, 600);
+  assert.equal(lease.expires_at - lease.granted_at, 1200 * 1000);
+  // The state file round-trips the same fields.
+  const raw = JSON.parse(readFileSync(join(h.dir, 'state.json'), 'utf-8'));
+  const rawLease = raw.leases.find((l: { lease_id: string }) => l.lease_id === r.lease!.lease_id)!;
+  assert.equal(rawLease.estimated_seconds, 600, 'estimated_seconds persists');
+  assert.equal(rawLease.expires_at, lease.expires_at, 'expires_at persists (the adaptive value)');
+  assert.ok(rawLease.granted_at && rawLease.granted_at < rawLease.expires_at, 'granted_at < expires_at');
   rmSync(h.dir, { recursive: true, force: true });
 });

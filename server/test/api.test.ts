@@ -68,6 +68,8 @@ before(async () => {
     idle_seconds: 300,
     poll_ms: 60_000, // tests drive ticks manually; no background polling surprises
     lease_ttl_seconds: 1800,
+    lease_ttl_safety_factor: 2,
+    lease_ttl_floor_seconds: 60,
     max_concurrent_leases: 1,
     job_fail_threshold: 5,
     job_cooldown_seconds: 300,
@@ -165,7 +167,11 @@ test('register → lease → usage round-trip', async () => {
   assert.equal(lease.status, 201, `expected 201, got ${lease.status} ${await lease.clone().text()}`);
   const leaseBody = (await lease.json()) as { lease_id: string; expires_at: number; ttl_seconds: number };
   assert.ok(leaseBody.lease_id.startsWith('l-'));
-  assert.ok(leaseBody.ttl_seconds === 1800);
+  // Adaptive lease TTL: the client's estimate caps the lease — est 60 *
+  // safety(2) = 120s, capped at the global 1800 (and floored at 60). So the
+  // lease now expires in 120s, not the full static 1800s. (A no/zero estimate
+  // would still yield the full 1800s — today's behavior.)
+  assert.ok(leaseBody.ttl_seconds === 120, `adaptive ttl est60*2=120, got ${leaseBody.ttl_seconds}`);
 
   // second concurrent lease → 409 busy
   const busy = await fetch(`${base}/api/leases`, {
