@@ -199,6 +199,54 @@ node, then cross-references the local daemon process against the arbiter's
 you're in. The arbiter token is read at runtime from the gitignored client
 config and never printed.
 
+## The desktop app (macOS)
+
+`desktop/IdlefillDesktop.swift` is a windowed companion (macOS 14+, built
+with plain `swiftc` into a real `.app` bundle — no Xcode project) that shows
+the arbiter state at a glance and manages the two LaunchAgents on this
+machine. Like the menu bar app it is a *view* of the daemon, not a second
+one: liveness and the state word come from the arbiter's `/api/state`
+(client row `last_seen`, 90s window), so the daemon can be started from
+anywhere — launchd, an Orca tab, the menu bar — and the arbiter stays the
+ground truth.
+
+- **Build:** `desktop/build.sh` → `desktop/Idlefill.app` (ad-hoc signed).
+  It assembles the bundle (`Contents/MacOS/Idlefill` + `Info.plist`,
+  `LSUIElement false` — it has a window), draws the dock icon at runtime
+  (the open-ring logo, no `.icns`), and `codesign --force -s -` signs it so
+  Gatekeeper-on-local is happy. Run it with `open desktop/Idlefill.app`.
+  Install to Applications with `cp -R desktop/Idlefill.app /Applications/`.
+- **Three surfaces in the window**
+  - **State** — the color-coded state word, this machine's status, queue
+    depth, today's finished/failed, and the running lease. Polls
+    `GET /api/state` every 5s with the Bearer token.
+  - **Logs** — the client daemon log (`client/<entry>/logs/client.log`,
+    `src` in dev / `dist` after a build; falls back to `client/logs/` if
+    the entry log is missing). Refreshed on a ~2.5s timer, keeps the last
+    ~2000 lines, auto-scrolls to the tail while you're at the bottom and
+    pauses when you scroll up (the "follow tail" toggle resumes it).
+  - **Settings** — opt-in launchd management (below) plus the repo-path
+    field.
+- **launchd management model (opt-in).** Two toggles — **daemon** and
+  **menu bar** — each manage a LaunchAgent in the user's `gui/<uid>` domain
+  (no root, no system domain). **ON** writes the agent's plist and runs
+  `launchctl bootstrap gui/<uid>`; **OFF** runs `launchctl bootout`. The
+  daemon plist points the repo's `node_modules/.bin/tsx` at
+  `client/src/index.ts` (working dir `client/`, `KeepAlive SuccessfulExit=false`,
+  `ThrottleInterval 30`, a real `PATH`); the menu-bar plist points at
+  `<repo>/menubar/IdlefillMenubar` (building it first via
+  `menubar/build.sh` if the binary is missing). **The plist carries no
+  token** — the daemon reads `client/config.json` itself at startup. The
+  toggles reflect **real launchctl state** (`launchctl print gui/<uid>/<label>`
+  exit 0 = loaded), re-checked every 5s, so a failed bootstrap shows an
+  error note and leaves the toggle OFF rather than a stale "on".
+- **Repo path resolution:** defaults to `~/Software/idlefill`, overridable
+  by the `IDLEFILL_REPO_PATH` env var or the Settings field (persisted to
+  `~/Library/Application Support/Idlefill/config.json`). All plist paths,
+  the log path, and the token source derive from it. The token is read at
+  runtime from the gitignored `client/config.json` — never baked into the
+  plist, the bundle, or the binary.
+
 ## Auth model
 
 - Every API call and the WS connection must present a token from the server's

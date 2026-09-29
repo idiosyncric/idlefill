@@ -8,3 +8,4 @@ client/logs/
 .DS_Store
 *.tsbuildinfo
 menubar/IdlefillMenubar
+desktop/Idlefill.app
