@@ -2,7 +2,7 @@
 //  IdlefillDesktop.swift — the idlefill desktop app (macOS 14+).
 //
 //  A windowed companion (WindowGroup, NOT a MenuBarExtra) built with bare
-//  swiftc (no Xcode project). Three surfaces in one window:
+//  swiftc (no Xcode project). Four tabs in one window:
 //
 //    state     — color-coded state word, this machine's status, queue depth,
 //                today finished/failed, the running lease (polls /api/state
@@ -11,16 +11,33 @@
 //                refreshed on a ~2.5s timer, last ~2000 lines kept, auto-scroll
 //                to the tail while at the bottom, "follow tail" toggle to
 //                resume after scrolling up
+//    projects  — this client's project config (client/config.json):
+//                client_name + server_url read-only, one editable row per
+//                project (name, model, queue_file, estimated_seconds,
+//                timeout_seconds; executor + cwd read-only). Save rewrites the
+//                file preserving every other key (the token included) and the
+//                0600 mode; a successful save shows a "daemon restart to apply"
+//                note with a Restart affordance (the same launchd path the
+//                Settings toggle uses).
 //    settings  — opt-in launchd management of the two LaunchAgents (daemon +
 //                menu bar) in the user's gui/<uid> domain; the toggles reflect
 //                REAL launchctl state, re-checked on every poll
+//
+//  Deep links: the bundle registers the `idlefill://` URL scheme
+//  (CFBundleURLTypes in the generated Info.plist). Hosts: "" or "open" →
+//  State (the default), "logs" → Logs, "projects" → Projects; any unknown
+//  host → State. A URL that launches the app opens on the requested tab; a
+//  URL delivered to a RUNNING app activates it, brings the window forward,
+//  and switches tabs. Parsing lives in the pure `AppModel.route(for:)` so it
+//  is testable headlessly.
 //
 //  Design: quiet control room (DESIGN.md). Neutral canvas (#0d1117), hairline
 //  dividers (#30363d), one mono family, four signal colors used ONLY for live
 //  state (green idle, amber busy, blue working, red degraded).
 //
 //  The token is read at runtime from <repo>/client/config.json — it is never
-//  baked into this file, the bundle, or the binary, and never printed.
+//  baked into this file, the bundle, or the binary, never printed, and never
+//  displayed in any view or written to any log line.
 //
 
 import AppKit
@@ -67,6 +84,13 @@ enum Conn: String {
   }
 }
 
+/// The main window's tabs — and the deep-link target type.
+enum MainTab: String, CaseIterable {
+  case state, logs, projects, settings
+
+  var title: String { rawValue.uppercased() }
+}
+
 // MARK: - model
 
 struct LogLine: Identifiable, Equatable {
@@ -75,6 +99,9 @@ struct LogLine: Identifiable, Equatable {
 }
 
 final class AppModel: ObservableObject {
+  // active tab (the tab strip binds to it; deep links set it)
+  @Published var activeTab: MainTab = .state
+
   // state panel
   @Published var conn: Conn = .off
   @Published var daemonRunning = false
@@ -87,6 +114,13 @@ final class AppModel: ObservableObject {
   @Published var logLines: [LogLine] = []
   @Published var logPath: String = ""
   @Published var followTail = true
+
+  // projects (this client's config.json)
+  @Published var projClientName: String = ""
+  @Published var projServerURL: String = ""
+  @Published var projRows: [ProjectRow] = []
+  @Published var projNote: String? = nil
+  @Published var projSavedPendingRestart = false
 
   // settings
   @Published var repoPath: String = ""
@@ -105,6 +139,7 @@ final class AppModel: ObservableObject {
   init() {
     loadConfig()
     refreshLaunchdState()
+    loadProjects()
     pollLogs()
     // Self-driving timers (main runloop — App init runs on the main thread).
     Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
@@ -188,9 +223,46 @@ final class AppModel: ObservableObject {
     pollLogs()
     poll()
     refreshLaunchdState()
+    loadProjects()
   }
 
   var clientPkgDir: String { (repoRoot as NSString).appendingPathComponent("client") }
+
+  // MARK: deep-link routing (pure — testable headlessly)
+
+  /** Map a URL to the tab it should open on. Hosts: "" or "open" → State
+   *  (the default), "logs" → Logs, "projects" → Projects; any other host —
+   *  or a non-idlefill scheme — → State. */
+  static func route(for url: URL) -> MainTab {
+    guard url.scheme == "idlefill" else { return .state }
+    switch url.host {
+    case "logs": return .logs
+    case "projects": return .projects
+    default: return .state
+    }
+  }
+
+  /** Apply a deep link: bring the app forward and switch to the tab the URL
+   *  names. Safe from both launch-time (.onOpenURL) and a running app —
+   *  activating an already-active app is a no-op. A WindowGroup app can end
+   *  up with more than one window (e.g. a URL-opened window alongside a
+   *  restored one); the deep link targets ONE window, so any extras are
+   *  closed and the first visible one is kept + focused. */
+  func handleDeepLink(_ url: URL) {
+    DispatchQueue.main.async {
+      NSApp.activate(ignoringOtherApps: true)
+      let visible = NSApp.windows.filter { $0.isVisible }
+      if visible.count > 1 {
+        for extra in visible.dropFirst() {
+          extra.close()
+        }
+      }
+      if let win = visible.first {
+        win.makeKeyAndOrderFront(nil)
+      }
+      self.activeTab = AppModel.route(for: url)
+    }
+  }
 
   // MARK: config (token + server url, read at runtime — never baked in)
 
@@ -332,6 +404,159 @@ final class AppModel: ObservableObject {
         logLines.removeFirst(logLines.count - maxLogLines)
       }
     } catch {}
+  }
+
+  // MARK: projects (this client's config.json)
+
+  /** One editable row of the Projects view. The fields map 1:1 onto the
+   *  project keys in client/config.json (see client/src/config.ts). */
+  struct ProjectRow: Identifiable {
+    let id: Int
+    var name: String
+    var model: String
+    var queueFile: String
+    var estimatedSeconds: String
+    var timeoutSeconds: String
+    let executor: String
+    let cwd: String
+  }
+
+  private var clientConfigPath: String {
+    (repoRoot as NSString).appendingPathComponent("client/config.json")
+  }
+
+  /** Read this client's config at runtime (the same pattern as token()/
+   *  serverURL() — never baked in) and fill the Projects view. The token is
+   *  parsed but NEVER copied into a view-facing property. */
+  func loadProjects() {
+    let path = clientConfigPath
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+          let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+      projClientName = ""
+      projServerURL = ""
+      projRows = []
+      projNote = "no client config found at \(path)"
+      projSavedPendingRestart = false
+      return
+    }
+    projNote = nil
+    projClientName = (o["client_name"] as? String) ?? ""
+    projServerURL = (o["server_url"] as? String) ?? ""
+    var rows: [ProjectRow] = []
+    for (i, p) in ((o["projects"] as? [[String: Any]]) ?? []).enumerated() {
+      rows.append(ProjectRow(
+        id: i,
+        name: (p["name"] as? String) ?? "",
+        model: (p["model"] as? String) ?? "",
+        queueFile: (p["queue_file"] as? String) ?? "",
+        estimatedSeconds: numText(p["estimated_seconds"]),
+        timeoutSeconds: numText(p["timeout_seconds"]),
+        executor: (p["executor"] as? String) ?? "",
+        cwd: (p["cwd"] as? String) ?? ""
+      ))
+    }
+    projRows = rows
+  }
+
+  private func numText(_ v: Any?) -> String {
+    if let n = v as? NSNumber {
+      let d = n.doubleValue
+      return d == d.rounded() ? String(Int(d)) : String(d)
+    }
+    return ""
+  }
+
+  /** Validate the edited rows: per row, name / model / queue_file are
+   *  required, and the numeric fields are positive numbers when non-empty.
+   *  Returns an error message, or nil when clean. */
+  func validateProjects() -> String? {
+    for r in projRows {
+      if r.name.trimmingCharacters(in: .whitespaces).isEmpty {
+        return "row \(r.id + 1): name is required"
+      }
+      if r.model.trimmingCharacters(in: .whitespaces).isEmpty {
+        return "row \(r.id + 1): model is required"
+      }
+      if r.queueFile.trimmingCharacters(in: .whitespaces).isEmpty {
+        return "row \(r.id + 1): queue_file is required"
+      }
+      for (label, text) in [("estimated_seconds", r.estimatedSeconds), ("timeout_seconds", r.timeoutSeconds)] {
+        let t = text.trimmingCharacters(in: .whitespaces)
+        if !t.isEmpty {
+          guard let d = Double(t), d.isFinite, d > 0 else {
+            return "row \(r.id + 1): \(label) must be a positive number"
+          }
+        }
+      }
+    }
+    return nil
+  }
+
+  /** Rewrite client/config.json with the edited project rows, preserving
+   *  EVERY other key (the token included) and the file's existing mode
+   *  (read before, chmod'd back after). Only the project-row fields the view
+   *  edits are mutated; all other keys pass through untouched. On success:
+   *  the "daemon restart to apply" note with a Restart affordance. */
+  func saveProjects() {
+    let path = clientConfigPath
+    if let err = validateProjects() {
+      projNote = err
+      projSavedPendingRestart = false
+      return
+    }
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
+      projNote = "save failed: could not read \(path)"
+      projSavedPendingRestart = false
+      return
+    }
+    guard let parsed = (try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])) as? [String: Any] else {
+      projNote = "save failed: could not read \(path)"
+      projSavedPendingRestart = false
+      return
+    }
+    var o = parsed
+    let fm = FileManager.default
+    // Capture the existing mode BEFORE writing — it must be restored after.
+    let existingMode = (try? fm.attributesOfItem(atPath: path)[.posixPermissions] as? NSNumber)?.int16Value
+
+    var newProjects: [[String: Any]] = []
+    for (i, p) in ((o["projects"] as? [[String: Any]]) ?? []).enumerated() {
+      guard i < projRows.count else { continue }
+      let r = projRows[i]
+      var np = p
+      np["name"] = r.name.trimmingCharacters(in: .whitespaces)
+      np["model"] = r.model.trimmingCharacters(in: .whitespaces)
+      np["queue_file"] = r.queueFile.trimmingCharacters(in: .whitespaces)
+      let est = r.estimatedSeconds.trimmingCharacters(in: .whitespaces)
+      if est.isEmpty {
+        np.removeValue(forKey: "estimated_seconds")
+      } else if let d = Double(est) {
+        np["estimated_seconds"] = d == d.rounded() ? Int(d) : d
+      }
+      let to = r.timeoutSeconds.trimmingCharacters(in: .whitespaces)
+      if to.isEmpty {
+        np.removeValue(forKey: "timeout_seconds")
+      } else if let d = Double(to) {
+        np["timeout_seconds"] = d == d.rounded() ? Int(d) : d
+      }
+      newProjects.append(np)
+    }
+    o["projects"] = newProjects
+
+    let out = (try? JSONSerialization.data(withJSONObject: o, options: [.prettyPrinted, .sortedKeys]))
+    do {
+      guard let out else { throw CocoaError(.fileWriteUnknown) }
+      try out.write(to: URL(fileURLWithPath: path), options: .atomic)
+      if let m = existingMode {
+        try? fm.setAttributes([.posixPermissions: NSNumber(value: m)], ofItemAtPath: path)
+      }
+      projNote = nil
+      projSavedPendingRestart = true
+      loadProjects()
+    } catch {
+      projNote = "save failed: \(error.localizedDescription)"
+      projSavedPendingRestart = false
+    }
   }
 
   // MARK: launchd management (opt-in, gui/<uid>, real state only)
@@ -524,6 +749,23 @@ final class AppModel: ObservableObject {
     } else {
       uninstall(label: daemonLabel, note: \.daemonNote)
     }
+  }
+
+  /** Restart the daemon through the SAME launchd path the Settings toggle
+   *  uses (kickstart -k = kill + relaunch under the agent's KeepAlive). The
+   *  Projects view's "restart to apply" affordance calls this after a config
+   *  save; a successful kickstart clears the pending-restart note — the
+   *  daemon now runs with the saved config. In a test/scratch context the
+   *  test-hook label applies. */
+  func restartDaemon() {
+    let (st, out) = runCmd("/bin/launchctl", ["kickstart", "-k", "gui/\(uid)/\(daemonLabel)"])
+    if st == 0 {
+      daemonNote = nil
+      projSavedPendingRestart = false
+    } else {
+      daemonNote = "restart failed: \(out)"
+    }
+    refreshLaunchdState()
   }
 
   // MARK: menu bar agent
@@ -800,6 +1042,104 @@ struct LogViewer: View {
   }
 }
 
+// MARK: projects
+
+struct ProjectsPanel: View {
+  @ObservedObject var m: AppModel
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 0) {
+      PanelHead(title: "projects")
+      VStack(alignment: .leading, spacing: 8) {
+        KVRow(k: "client_name", v: m.projClientName)
+        KVRow(k: "server_url", v: m.projServerURL)
+
+        ForEach(m.projRows) { r in
+          projectBlock(r)
+        }
+
+        if m.projRows.isEmpty {
+          Text(m.projNote ?? "no projects configured")
+            .font(.system(.caption, design: .monospaced))
+            .foregroundStyle(Pal.dim)
+        }
+
+        HStack(spacing: 8) {
+          Button("save") { m.saveProjects() }
+            .font(.system(.body, design: .monospaced))
+            .buttonStyle(.plain)
+            .foregroundStyle(Pal.accent)
+          if m.projSavedPendingRestart {
+            Text("saved — daemon restart to apply").font(.system(.caption, design: .monospaced)).foregroundStyle(Pal.warn)
+            Button("restart daemon") { m.restartDaemon() }
+              .font(.system(.body, design: .monospaced))
+              .buttonStyle(.plain)
+              .foregroundStyle(Pal.accent)
+          }
+        }
+
+        if let note = m.projNote {
+          Text(note).font(.system(.caption, design: .monospaced)).foregroundStyle(Pal.err)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+
+        Text("edits rewrite client/config.json — every other key (including the token) is preserved and the file keeps its 0600 mode; the daemon picks changes up on its next start.")
+          .font(.system(size: 11, design: .monospaced))
+          .foregroundStyle(Pal.dim)
+          .frame(maxWidth: .infinity, alignment: .leading)
+      }
+      .padding(14).padding(.vertical, 8)
+    }
+  }
+
+  @ViewBuilder
+  private func projectBlock(_ r: AppModel.ProjectRow) -> some View {
+    VStack(alignment: .leading, spacing: 4) {
+      Text(r.name.isEmpty ? "project" : r.name)
+        .font(.system(.body, design: .monospaced).weight(.semibold))
+        .foregroundStyle(Pal.text)
+      editField("name", text: binding(\.name, r.id))
+      editField("model", text: binding(\.model, r.id))
+      editField("queue_file", text: binding(\.queueFile, r.id))
+      editField("estimated_seconds", text: binding(\.estimatedSeconds, r.id))
+      editField("timeout_seconds", text: binding(\.timeoutSeconds, r.id))
+      KVRow(k: "executor", v: r.executor)
+      KVRow(k: "cwd", v: r.cwd)
+    }
+    .padding(10)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .background(Pal.panel)
+    .clipShape(RoundedRectangle(cornerRadius: 6))
+  }
+
+  private func editField(_ label: String, text: Binding<String>) -> some View {
+    HStack(spacing: 8) {
+      Text(label).font(.system(.body, design: .monospaced)).foregroundStyle(Pal.dim)
+        .frame(width: 150, alignment: .leading)
+      TextField("", text: text)
+        .font(.system(.body, design: .monospaced))
+        .textFieldStyle(.plain)
+        .foregroundStyle(Pal.text)
+        .background(Pal.canvas)
+        .clipShape(RoundedRectangle(cornerRadius: 4))
+        .padding(4)
+    }
+  }
+
+  private func binding(_ kp: WritableKeyPath<AppModel.ProjectRow, String>, _ id: Int) -> Binding<String> {
+    Binding(
+      get: {
+        guard let i = m.projRows.firstIndex(where: { $0.id == id }) else { return "" }
+        return m.projRows[i][keyPath: kp]
+      },
+      set: { nv in
+        guard let i = m.projRows.firstIndex(where: { $0.id == id }) else { return }
+        m.projRows[i][keyPath: kp] = nv
+      }
+    )
+  }
+}
+
 // MARK: settings
 
 struct SettingsPanel: View {
@@ -885,17 +1225,46 @@ struct ContentView: View {
 
       DividerLine()
 
-      StatePanel(m: m)
+      // tab strip (deep links set m.activeTab; the buttons set it too)
+      HStack(spacing: 0) {
+        ForEach(MainTab.allCases, id: \.self) { tab in
+          Button(action: { m.activeTab = tab }) {
+            Text(tab.title)
+              .font(.system(size: 11, weight: .semibold, design: .monospaced))
+              .tracking(1)
+              .foregroundStyle(m.activeTab == tab ? Pal.text : Pal.dim)
+              .padding(.horizontal, 14).padding(.vertical, 7)
+              .overlay(alignment: .bottom) {
+                if m.activeTab == tab {
+                  Rectangle().fill(Pal.accent).frame(height: 2)
+                }
+              }
+              .contentShape(Rectangle())
+          }
+          .buttonStyle(.plain)
+        }
+        Spacer()
+      }
+
       DividerLine()
 
-      LogViewer(m: m)
-        .frame(maxHeight: .infinity)
-
-      DividerLine()
-      SettingsPanel(m: m)
+      Group {
+        switch m.activeTab {
+        case .state:
+          StatePanel(m: m)
+        case .logs:
+          LogViewer(m: m)
+            .frame(maxHeight: .infinity)
+        case .projects:
+          ProjectsPanel(m: m)
+        case .settings:
+          SettingsPanel(m: m)
+        }
+      }
+      .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
     .background(Pal.canvas)
-    .frame(minWidth: 520, minHeight: 560)
+    .frame(minWidth: 560, minHeight: 560)
   }
 }
 
@@ -910,6 +1279,9 @@ struct IdlefillApp: App {
     WindowGroup {
       ContentView(m: model)
         .preferredColorScheme(.dark)
+        .onOpenURL { url in
+          model.handleDeepLink(url)
+        }
     }
     .windowResizability(.contentMinSize)
   }

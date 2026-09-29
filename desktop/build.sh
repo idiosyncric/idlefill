@@ -45,6 +45,17 @@ cat > "$PLIST" <<'EOF'
 	<false/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.sam.idlefill.desktop</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>idlefill</string>
+			</array>
+		</dict>
+	</array>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<!-- The arbiter is a local/tailnet server on plain HTTP. A bundled
