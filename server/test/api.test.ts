@@ -245,6 +245,22 @@ test('dashboard HTML serves (two-pane dashboard: Inference Servers + Projects)',
   assert.ok((res.headers.get('content-type') ?? '').includes('text/html'));
 });
 
+test('queue detail page serves the same dashboard at /[project]/[worker]/queue', async () => {
+  // The queue page is the SAME single-file dashboard (the inline script
+  // switches views on location.pathname). Public read, like `/` (phase 1).
+  for (const path of ['/career-ops/mac-sam/queue', '/career-ops/any-worker/queue']) {
+    const res = await fetch(`${base}${path}`);
+    assert.equal(res.status, 200, `${path} → 200`);
+    const html = await res.text();
+    assert.match(html, /queue-section/, 'queue section present');
+    assert.match(html, /api\/state/);
+    assert.ok((res.headers.get('content-type') ?? '').includes('text/html'));
+  }
+  // A non-queue two-segment path is NOT the dashboard (falls to 404).
+  const res404 = await fetch(`${base}/career-ops/mac-sam/other`);
+  assert.equal(res404.status, 404, 'only the /queue segment maps to the dashboard');
+});
+
 test('/api/state shape', async () => {
   const res = await fetch(`${base}/api/state`);
   assert.equal(res.status, 200);
@@ -371,14 +387,29 @@ test('server connections: seeded from config; add / update / guard rails', async
 });
 
 test('projects in /api/state carry allocated workers + scheduling; register validates project rows', async () => {
-  // A client that reports project allocations.
+  // A client that reports project allocations (incl. a queue preview — the
+  // data the dashboard's /[project]/[worker]/queue page renders).
   const reg = await fetch(`${base}/api/clients/register`, {
     method: 'POST',
     headers: auth,
     body: JSON.stringify({
       name: 'worker-b',
       ip: '100.94.165.200',
-      projects: [{ name: 'career-ops', model: 'Qwen3.8-27B', estimated_seconds: 900, queue_depth: 4 }],
+      projects: [
+        {
+          name: 'career-ops',
+          model: 'Qwen3.8-27B',
+          estimated_seconds: 900,
+          queue_depth: 4,
+          queue_preview: [
+            { job_id: 'acme-1', title: 'Staff Engineer', company: 'Acme', score: 9, attempts: 0 },
+            { job_id: 'globex-2', title: 'Backend', company: 'Globex', score: 7, attempts: 1 },
+            // malformed row (no job_id) — dropped by cleanPreview
+            { title: 'no id' },
+            { job_id: 'x'.repeat(500), title: 'y'.repeat(500), company: 'z'.repeat(500), score: NaN, attempts: -3 },
+          ],
+        },
+      ],
     }),
   });
   assert.equal(reg.status, 200);
@@ -397,7 +428,14 @@ test('projects in /api/state carry allocated workers + scheduling; register vali
   const st = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
     projects: {
       name: string;
-      workers: { client: string; model: string; estimated_seconds: number; queue_depth: number; online: boolean }[];
+      workers: {
+        client: string;
+        model: string;
+        estimated_seconds: number;
+        queue_depth: number;
+        queue_preview: { job_id: string; title: string; company: string; score: number | null; attempts: number }[];
+        online: boolean;
+      }[];
       scheduling: { paused: boolean; idle_seconds: number; max_concurrent_leases: number; lease_ttl_seconds: number; daily_token_cap: number };
     }[];
     clients: { name: string; last_seen: number; projects: Record<string, unknown>[] }[];
@@ -410,6 +448,18 @@ test('projects in /api/state carry allocated workers + scheduling; register vali
   assert.equal(proj.workers[0]!.estimated_seconds, 900);
   assert.equal(proj.workers[0]!.queue_depth, 4);
   assert.equal(proj.workers[0]!.online, true, 'a client that just registered is online');
+  // The queue preview (the /[project]/[worker]/queue page data) is stored
+  // verbatim, sanitized: malformed rows dropped, long fields truncated,
+  // bad score/attempts coerced.
+  const prev = proj.workers[0]!.queue_preview;
+  assert.equal(prev.length, 3, `cleanPreview kept the 3 valid rows, got ${prev.length}`);
+  assert.deepEqual(prev[0], { job_id: 'acme-1', title: 'Staff Engineer', company: 'Acme', score: 9, attempts: 0 });
+  assert.equal(prev[1]!.attempts, 1);
+  assert.equal(prev[2]!.job_id.length, 128, 'job_id truncated to 128 chars');
+  assert.equal(prev[2]!.title.length, 200, 'title truncated to 200 chars');
+  assert.equal(prev[2]!.company.length, 64, 'company truncated to 64 chars');
+  assert.equal(prev[2]!.score, null, 'NaN score coerced to null');
+  assert.equal(prev[2]!.attempts, 0, 'negative attempts coerced to 0');
 
   assert.equal(proj.scheduling.paused, false);
   assert.equal(proj.scheduling.idle_seconds, cfg.idle_seconds);

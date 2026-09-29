@@ -16,7 +16,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import fastify, { type FastifyInstance } from 'fastify';
 import { WebSocketServer } from 'ws';
 import { utcDay, type Arbiter } from './arbiter.js';
-import type { ProjectAllocation, ServerConfig, ServerConnection } from './types.js';
+import type { ProjectAllocation, QueuePreviewRow, ServerConfig, ServerConnection } from './types.js';
 
 export interface ApiDeps {
   arbiter: Arbiter;
@@ -62,7 +62,7 @@ function bearer(req: { headers: Record<string, unknown>; query: unknown }): stri
 function projectView(
   arbiter: Arbiter,
   cfg: ServerConfig,
-  clients: { name: string; last_seen: number; projects: { name: string; model: string; estimated_seconds: number; queue_depth: number; stats?: Record<string, number | string> }[] }[],
+  clients: { name: string; last_seen: number; projects: { name: string; model: string; estimated_seconds: number; queue_depth: number; queue_preview?: QueuePreviewRow[]; stats?: Record<string, number | string> }[] }[],
   day: string,
   now: number,
   today: Record<string, { finished: number; failed: number }>,
@@ -78,6 +78,9 @@ function projectView(
           model: alloc?.model ?? '',
           estimated_seconds: alloc?.estimated_seconds ?? 0,
           queue_depth: alloc?.queue_depth ?? 0,
+          // The client's queue rows (priority order) for the queue detail
+          // page — published verbatim, never computed by the arbiter.
+          queue_preview: alloc?.queue_preview ?? [],
           online: now - c.last_seen < 90_000,
           stats: alloc?.stats ?? {},
         };
@@ -219,6 +222,29 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       }
       return Object.keys(out).length > 0 ? out : undefined;
     };
+    // The queue preview (the dashboard's queue page data) is display-only, so
+    // bound it hard: ≤100 rows, job_id ≤128 chars, title ≤200 chars,
+    // company ≤64 chars, finite score / non-negative integer attempts.
+    // Unbounded client text would bloat the arbiter's state file on every
+    // save — the same reason stats are capped above.
+    const cleanPreview = (raw: unknown): QueuePreviewRow[] | undefined => {
+      if (!Array.isArray(raw)) return undefined;
+      const out: QueuePreviewRow[] = [];
+      for (const r of raw as Record<string, unknown>[]) {
+        if (out.length >= 100) break;
+        if (!r || typeof r !== 'object' || Array.isArray(r)) continue;
+        const job_id = typeof r.job_id === 'string' && r.job_id.trim() !== '' ? r.job_id.slice(0, 128) : '';
+        if (!job_id) continue;
+        out.push({
+          job_id,
+          title: typeof r.title === 'string' && r.title.trim() !== '' ? r.title.slice(0, 200) : job_id,
+          company: typeof r.company === 'string' && r.company.trim() !== '' ? r.company.slice(0, 64) : 'unknown',
+          score: typeof r.score === 'number' && Number.isFinite(r.score) ? r.score : null,
+          attempts: typeof r.attempts === 'number' && Number.isInteger(r.attempts) && r.attempts >= 0 ? r.attempts : 0,
+        });
+      }
+      return out.length > 0 ? out : undefined;
+    };
     const projects = Array.isArray(body.projects)
       ? body.projects
           .filter((p) => p && typeof p.name === 'string' && p.name.trim() !== '')
@@ -227,6 +253,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
             model: typeof p.model === 'string' ? p.model : '',
             estimated_seconds: typeof p.estimated_seconds === 'number' && Number.isFinite(p.estimated_seconds) ? p.estimated_seconds : 0,
             queue_depth: typeof p.queue_depth === 'number' && Number.isFinite(p.queue_depth) ? p.queue_depth : 0,
+            queue_preview: cleanPreview((p as { queue_preview?: unknown }).queue_preview),
             stats: cleanStats((p as { stats?: unknown }).stats),
           }))
       : undefined;
@@ -480,6 +507,16 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   // ------------------------------------------------------------------
 
   app.get('/', async (_req, reply) => {
+    const file = `${publicDir}/index.html`;
+    if (!existsSync(file)) return reply.code(500).send('dashboard missing (public/index.html)');
+    return reply.type('text/html; charset=utf-8').send(readFileSync(file, 'utf-8'));
+  });
+
+  // Queue detail page — /[project]/[worker]/queue. The SAME single-file
+  // dashboard: the inline script switches on location.pathname and renders
+  // this worker's published queue preview (the arbiter never reads queue
+  // files; the data rides on /api/state). Public read, like `/` (phase 1).
+  app.get('/:project/:worker/queue', async (_req, reply) => {
     const file = `${publicDir}/index.html`;
     if (!existsSync(file)) return reply.code(500).send('dashboard missing (public/index.html)');
     return reply.type('text/html; charset=utf-8').send(readFileSync(file, 'utf-8'));

@@ -57,6 +57,22 @@ export interface ServerConfig {
 }
 
 /**
+ * One queue row as the client publishes it for the dashboard's queue page
+ * (`/[project]/[worker]/queue`). The arbiter stores and displays it verbatim
+ * — it never reads the client's queue files. Bounded at registration:
+ * ≤100 rows, title ≤200 chars, job_id ≤128 chars.
+ */
+export interface QueuePreviewRow {
+  job_id: string;
+  /** Display title (payload title, falling back to url or job_id client-side). */
+  title: string;
+  company: string;
+  score: number | null;
+  /** Failure-retry count so far (0 = fresh). */
+  attempts: number;
+}
+
+/**
  * A project allocation as reported by a client at (re)registration. The
  * client knows its own config (model, estimate, queue depth) and reports it;
  * the arbiter only stores and displays it.
@@ -69,6 +85,12 @@ export interface ProjectAllocation {
   estimated_seconds: number;
   /** Jobs currently in the client's local queue for this project. */
   queue_depth: number;
+  /**
+   * The first rows of the client's queue file (priority order), published
+   * with the heartbeat for the dashboard's queue page. Absent on older
+   * clients — the page degrades to the depth number.
+   */
+  queue_preview?: QueuePreviewRow[];
   /**
    * Client-published stats for this project (the heartbeat carries them with
    * every re-registration). String keys; number or short-string values. The
