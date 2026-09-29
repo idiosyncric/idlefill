@@ -1,15 +1,37 @@
 //
 //  IdlefillMenubar.swift — the idlefill menu bar companion (macOS 14+).
 //
-//  A MenuBarExtra icon (the idlefill circular-loading-bar logo: an open ring
-//  with a rounded leading cap) that shows the arbiter state at a glance and
-//  controls the local client daemon:
+//  A status-bar icon (AppKit NSStatusItem + NSPopover hosting the SwiftUI
+//  panel — MenuBarExtra exposes no click count, which the double-click
+//  routing below needs) showing the arbiter state at a glance and
+//  controlling the local client daemon:
 //
 //    status   — color-coded state word + this machine's live status row
 //    stats    — queue depth, today finished/failed, tokens out (UTC), the
 //               running lease (job · auto-cancels-in)
 //    actions  — Open Dashboard · Show Logs · Start/Stop · Restart ·
 //               Update code (git pull + npm ci + restart) · Quit
+//
+//  Click routing (decided by the pure MenuBarRouter — testable headlessly):
+//    single click  — toggle the popover (today's behavior, exactly)
+//    double click  — open the DESKTOP app on its State view:
+//                    NSWorkspace.open of idlefill://open, falling back to
+//                    `open /Applications/Idlefill.app` when the URL-scheme
+//                    open is not handled (the desktop app not registered
+//                    yet). A double click ALWAYS attempts the desktop app —
+//                    only the two panel rows below fall back.
+//
+//  Re-routed panel rows (same button-row style; the desktop app is
+//  "installed" when /Applications/Idlefill.app exists — the standard
+//  install target per desktop/update.sh):
+//    Show Logs      — installed: idlefill://logs (the desktop app's Logs
+//                     view); not installed: open the daemon log dir in
+//                     Finder (today's behavior).
+//    Open Dashboard — installed: idlefill://projects (the desktop app's
+//                     Projects view — this client's project config); not
+//                     installed: open server_url/ in the browser (today's
+//                     behavior). With the desktop app installed, the menu
+//                     bar no longer opens the arbiter web dashboard.
 //
 //  Design: quiet control room (DESIGN.md). Neutral canvas (#0d1117), hairline
 //  dividers (#30363d), one mono family, four signal colors used ONLY for
@@ -67,6 +89,39 @@ enum Conn: String {
     case .idle: return "idle"
     case .degraded: return "degraded"
     case .unreachable: return "unreachable"
+    }
+  }
+}
+
+// MARK: - click routing (pure — testable headlessly)
+
+/** What a status-item click should do. */
+enum MenuBarClickAction: Equatable {
+  /// Toggle the popover (today's behavior for a single click).
+  case togglePanel
+  /// Open the desktop app on its State view — `idlefill://open`, falling
+  /// back to `open /Applications/Idlefill.app` when the URL-scheme open is
+  /// not handled.
+  case openDesktopApp
+}
+
+/** The desktop app's install target (per desktop/update.sh) and the
+ *  URL scheme it registers. */
+enum DesktopApp {
+  static let appPath = "/Applications/Idlefill.app"
+  static let scheme = "idlefill"
+}
+
+/** Pure routing decision: click count + desktop-app-installed → action.
+ *  A double click ALWAYS attempts the desktop app (whether or not it is
+ *  installed — the fallback is `open` of the app path itself); only the two
+ *  panel rows (Show Logs / Open Dashboard) fall back to their legacy
+ *  behavior when the desktop app is NOT installed. */
+enum MenuBarRouter {
+  static func action(clickCount: Int, desktopInstalled: Bool) -> MenuBarClickAction {
+    switch clickCount {
+    case 2: return .openDesktopApp
+    default: return .togglePanel
     }
   }
 }
@@ -505,16 +560,27 @@ struct ContentView: View {
     Button(action: {
       switch label {
       case "Open Dashboard":
-        if let url = URL(string: m.serverURL() + "/") { NSWorkspace.shared.open(url) }
+        // Desktop app installed → its Projects view (this client's project
+        // config). Not installed → today's behavior: the arbiter web
+        // dashboard in the browser.
+        if MenuBarAppState.desktopInstalled() {
+          MenuBarAppState.openDesktopURL("idlefill://projects")
+        } else if let url = URL(string: m.serverURL() + "/") { NSWorkspace.shared.open(url) }
       case "Show Logs":
-        // The daemon anchors its log to the ENTRY dir (client/src in dev,
-        // client/dist after a build), so <client>/<entry>/logs/client.log.
-        let pkg = m.clientPkgDir
-        let logsBase = (pkg as NSString).appendingPathComponent("logs")
-        let entry = FileManager.default.fileExists(atPath: (pkg as NSString).appendingPathComponent("dist/index.ts")) ? "dist" : "src"
-        let logDir = ((pkg as NSString).appendingPathComponent(entry) as NSString).appendingPathComponent("logs")
-        let target = FileManager.default.fileExists(atPath: logDir) ? logDir : logsBase
-        NSWorkspace.shared.open(URL(fileURLWithPath: target))
+        // Desktop app installed → its Logs view. Not installed → today's
+        // behavior: open the daemon log dir in Finder.
+        if MenuBarAppState.desktopInstalled() {
+          MenuBarAppState.openDesktopURL("idlefill://logs")
+        } else {
+          // The daemon anchors its log to the ENTRY dir (client/src in dev,
+          // client/dist after a build), so <client>/<entry>/logs/client.log.
+          let pkg = m.clientPkgDir
+          let logsBase = (pkg as NSString).appendingPathComponent("logs")
+          let entry = FileManager.default.fileExists(atPath: (pkg as NSString).appendingPathComponent("dist/index.ts")) ? "dist" : "src"
+          let logDir = ((pkg as NSString).appendingPathComponent(entry) as NSString).appendingPathComponent("logs")
+          let target = FileManager.default.fileExists(atPath: logDir) ? logDir : logsBase
+          NSWorkspace.shared.open(URL(fileURLWithPath: target))
+        }
       case "Start": m.start()
       case "Stop": m.stop()
       case "Restart": m.restart()
@@ -537,26 +603,101 @@ struct ContentView: View {
   }
 }
 
-// MARK: - app
+// MARK: - app (AppKit host — NSStatusItem + NSPopover)
+
+/** Shared state for the status-item host and the panel rows: the
+ *  desktop-app-installed check (a FileManager test — no side effects) and
+ *  the URL-scheme open with the app-path fallback. */
+enum MenuBarAppState {
+  /** The desktop app is "installed" when its standard install target
+   *  (per desktop/update.sh) exists. */
+  static func desktopInstalled() -> Bool {
+    FileManager.default.fileExists(atPath: DesktopApp.appPath)
+  }
+
+  /** Open an `idlefill://` URL in the desktop app. When the URL-scheme open
+   *  is not handled (the scheme not registered yet), fall back to `open`
+   *  of the app path itself. */
+  static func openDesktopURL(_ string: String) {
+    guard let url = URL(string: string) else { return }
+    let opened = NSWorkspace.shared.open(url)
+    if !opened {
+      NSWorkspace.shared.open(URL(fileURLWithPath: DesktopApp.appPath))
+    }
+  }
+}
 
 @main
 struct IdlefillApp: App {
   @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
-  @StateObject private var model = AppModel()
 
   var body: some Scene {
-    MenuBarExtra {
-      ContentView(m: model)
-    } label: {
-      Image(nsImage: MenuIcon.image(spinning: model.lease.1 > 0))
-    }
-    .menuBarExtraStyle(.window)
+    // No window of its own — the status item + popover ARE the app.
+    Settings { EmptyView() }
   }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+  private var statusItem: NSStatusItem?
+  private var popover: NSPopover?
+  private var model: AppModel?
+
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSApp.setActivationPolicy(.accessory)
+    let model = AppModel()
+    self.model = model
+
+    let popover = NSPopover()
+    popover.behavior = .transient
+    popover.appearance = NSAppearance(named: .darkAqua)
+    // The panel view, hosted as-is (NSHostingController sizes the popover
+    // to the SwiftUI content, like the old MenuBarExtra window did).
+    popover.contentViewController = NSHostingController(rootView: ContentView(m: model))
+    self.popover = popover
+
+    let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    if let button = item.button {
+      button.image = MenuIcon.image(spinning: false)
+      button.target = self
+      button.action = #selector(statusItemClicked(_:))
+    }
+    self.statusItem = item
+
+    // Keep the icon's spinning state in step with the model (a lease
+    // running → the arc rotates) — the MenuBarExtra label used to do this
+    // for free; re-render on a slow timer instead.
+    Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+      guard let self, let button = self.statusItem?.button else { return }
+      button.image = MenuIcon.image(spinning: (self.model?.lease.1 ?? 0) > 0)
+    }
+  }
+
+  /** The click routing decision comes from the pure MenuBarRouter (click
+   *  count + desktop-installed → action) — the handler only executes it.
+   *  NSStatusBarButton exposes no clickCount (AppKit), so it comes off the
+   *  event that drove the action — `NSApp.currentEvent`. */
+  @objc private func statusItemClicked(_ sender: NSStatusBarButton) {
+    let clickCount = NSApp.currentEvent?.clickCount ?? 1
+    let action = MenuBarRouter.action(clickCount: clickCount,
+                                      desktopInstalled: MenuBarAppState.desktopInstalled())
+    switch action {
+    case .togglePanel:
+      togglePopover(sender)
+    case .openDesktopApp:
+      // A double click ALWAYS attempts the desktop app (the fallback to
+      // `open` of the app path is inside openDesktopURL).
+      MenuBarAppState.openDesktopURL("\(DesktopApp.scheme)://open")
+    }
+  }
+
+  private func togglePopover(_ button: NSStatusBarButton) {
+    guard let popover else { return }
+    if popover.isShown {
+      popover.performClose(nil)
+    } else {
+      popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+      popover.contentViewController?.view.window?.makeKey()
+    }
   }
 }
 
