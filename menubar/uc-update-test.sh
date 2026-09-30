@@ -300,7 +300,7 @@ SWIFT
 sed -e "s|__T__|$T|" \
     -e "s|__PROD_REPO__|$PROD_REPO|" \
     -e "s|__PROD_PIDS__|$PROD_PIDS|" \
-    -e "s|__WORKTREE__|$REPO|" \
+    -e "s|__WORKTREE__|$T/repoA|" \
     "$T/main.swift" > "$T/main.baked.swift"
 mv "$T/main.baked.swift" "$T/main.swift"
 
