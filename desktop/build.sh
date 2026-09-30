@@ -11,9 +11,12 @@
 #
 # Environment (all optional; the release script sets the first two):
 #   IDLEFILL_VERSION        -> CFBundleShortVersionString AND CFBundleVersion
-#                              (default 1.0). Sparkle compares CFBundleVersion,
-#                              so release.sh passes e.g. 1.0.0 so the appcast's
-#                              <sparkle:version> equals the release version.
+#                              (default 1). Sparkle compares CFBundleVersion
+#                              numerically (segment-wise, zero-padded), so
+#                              release.sh passes the release number (e.g. 2)
+#                              and the appcast's <sparkle:version> equals the
+#                              release version; a number sorts above the
+#                              pre-numbering semver (2 > 0.0.2).
 #   IDLEFILL_SUPUBLICEDKEY  -> base64 32-byte ed25519 PUBLIC key written as
 #                              SUPublicEDKey (the key that signs the appcast).
 #                              Omit the key on a dev build (Sparkle will refuse

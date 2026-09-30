@@ -2,10 +2,11 @@
  * The daemon's version string.
  *
  * Single version source: the ROOT package.json (the repo root) — the release
- * tag `v<X.Y.Z>` is cut from it and the desktop release pipeline treats it as
- * the version authority, so the daemon and the published releases always
- * agree. (client/package.json's own `version` is NOT the source — the issue
- * said so, but the root package is the one that tags come from.)
+ * tag `v<number>` (the release number) is cut from it and the desktop
+ * release pipeline treats it as the version authority, so the daemon and the
+ * published releases always agree. (client/package.json's own `version` is
+ * NOT the source — the issue said so, but the root package is the one that
+ * tags come from.)
  *
  * Resolution follows the same {repo} discipline as config.ts: anchor on
  * `import.meta.url` (the module dir — client/src in dev, client/dist after a

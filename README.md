@@ -200,11 +200,13 @@ Show Logs · Start/Stop · Restart · Update code · Quit.
   the menubar label, never the daemon's.
 - **Update check:** on launch and every 6h the app GETs the Forgejo
   releases list **anonymously** (the repo is public — the arbiter token is
-  never sent to Forgejo), picks the newest `v<maj>.<min>.<patch>` tag, and
+  never sent to Forgejo), picks the newest release — a release number
+  (`v1`, `v2`, …; the pre-numbering semver tags `v0.0.1`/`v0.0.2` are still
+  understood and sort below any number) — and
   compares it against its own baked version. Strictly newer → an
   exception-only `Install Update <version>` row appears in the panel
   (hidden while no update is available); the install downloads the
-  `IdlefillMenubar-<v>.app.zip` release asset **and its `.sha256` sidecar**,
+  `IdlefillMenubar-<version>.app.zip` release asset **and its `.sha256` sidecar**,
   verifies the hash before touching anything (a mismatch or missing
   sidecar refuses and keeps the current bundle), swaps
   `menubar/IdlefillMenubar.app` in place, and `launchctl kickstart -k`s
@@ -355,21 +357,21 @@ into the build.
 
 **Releasing** — `scripts/release.sh` runs the whole pipeline:
 
-1. build the app (`IDLEFILL_VERSION=x.y.z`, with the `SUPublicEDKey`);
-2. zip the bundle (`Idlefill x.y.z.zip`);
+1. build the app (`IDLEFILL_VERSION=<release number>`, with the `SUPublicEDKey`);
+2. zip the bundle (`Idlefill <n>.zip`);
 3. `generate_appcast` with `--maximum-deltas 0` (zips only, no `.delta`)
    against a **persistent staging dir** (`~/idlefill-release-staging`) so
    the feed carries the full history — old zips are carried forward;
 4. parse the feed and collect every referenced enclosure;
 5. **publish** to Forgejo: delete any existing release named
-   `Idlefill x.y.z`, create release `Idlefill x.y.z` tagged `vX.Y.Z`, and
+   `Release #<n>`, create release `Release #<n>` tagged `v<n>`, and
    attach `appcast.xml` + every referenced zip (idempotent re-runs);
 6. **verify the live feed** (authed GET): it parses as XML, the newest
-   `sparkle:version` is `x.y.z`, every zip enclosure GETs `200` with a
+   `sparkle:version` is `<n>`, every zip enclosure GETs `200` with a
    zip-ish `Content-Type`, and the ed25519 signature is present.
 
 ```bash
-IDLEFILL_VERSION=1.0.0 FORGEJO_TOKEN=<forgejo token> scripts/release.sh
+IDLEFILL_VERSION=2 FORGEJO_TOKEN=<forgejo token> scripts/release.sh
 # FORGEJO_TOKEN is read at runtime from the gitignored credential — it is
 # never written into the feed or the repo.
 ```
@@ -409,17 +411,25 @@ artifacts (the desktop `.app` Sparkle feed + the menubar `.app` zip and
 sha256 sidecar) — the arbiter, daemon, and MCP server run from each
 machine's local checkout and are not distributed. Publishing on every
 merge would push a possibly-broken build to every user's machine on every
-push, even when nothing changed. Tagging `vX.Y.Z` on `main` is the
-deliberate "this version is a release" bump.
+push, even when nothing changed. Tagging `v<number>` (the release number) on
+`main` is the deliberate "this version is a release" bump.
 
 ### Versions & releases
 
+Releases are **numbered** — release #1, #2, #3, … — not semver. The release
+number is the version: the root `package.json` holds the next release number,
+the tag is `v<number>`, and the Forgejo release is named `Release #<number>`.
+(The pre-numbering releases `v0.0.1`/`v0.0.2` are the one-off semver
+exceptions; they stay in the signed feed and every consumer keeps
+understanding them — they sort below any release number, so an installed
+`0.0.2` app picks up release #1 as an update.)
+
 The root `package.json` is the single version source: the release tag
-`v<X.Y.Z>` is cut from it, and the release artifacts are stamped with it —
+`v<number>` is cut from it, and the release artifacts are stamped with it —
 the desktop feed's `sparkle:version` and the menubar bundle's
 `CFBundleShortVersionString` + baked `--version` string (the menubar's
 `build.sh` reads the root version with `node` by default;
-`scripts/release.sh` takes `IDLEFILL_VERSION` = the tag's version). The
+`scripts/release.sh` takes `IDLEFILL_VERSION` = the release number). The
 daemon resolves it the same way at runtime — its registration carries
 `version` + `protocol` (the version handshake), echoed on `/api/state`
 per worker row and shown on the dashboard's per-worker row when present.
@@ -431,8 +441,12 @@ The daemon does not self-update — it reports its version and the
 operator sees which revision each worker speaks; the menu bar is the
 self-updating artifact (update check + sha256-verified install, above).
 
+To cut a release: bump the root `package.json` version to the next release
+number, commit, and tag (the tag is the version with a `v`):
+
 ```bash
-git tag v0.0.2 main && git push origin v0.0.2   # runs release.yml; gate then publish
+# bump root package.json to the next number (e.g. "2"), commit, then:
+git tag v2 main && git push origin v2     # runs release.yml; gate then publish
 ```
 
 The runner injects `FORGEJO_TOKEN` (write:releases on this repo) into the

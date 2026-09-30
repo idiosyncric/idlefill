@@ -36,23 +36,26 @@ printf '<?xml version="1.0"?><plist version="1.0"><dict></dict></plist>' > "$T/r
 # ---- the new release's artifact: a fake .app bundle zipped (the .app dir at
 # ---- the zip root — the release convention) + sidecars ----------------------
 mkdir -p "$T/fakeapp/IdlefillMenubar.app/Contents/MacOS"
-echo "NEW-BUNDLE-2.0.0" > "$T/fakeapp/IdlefillMenubar.app/Contents/MacOS/IdlefillMenubar"
+echo "NEW-BUNDLE-1" > "$T/fakeapp/IdlefillMenubar.app/Contents/MacOS/IdlefillMenubar"
 printf '<?xml version="1.0"?><plist version="1.0"><dict></dict></plist>' > "$T/fakeapp/IdlefillMenubar.app/Contents/Info.plist"
-GOOD="$T/IdlefillMenubar-2.0.0.app.zip"
+# The published menubar zip is named after the BARE release version
+# (release.sh: IdlefillMenubar-$V.app.zip) — the release number, no "v".
+GOOD="$T/IdlefillMenubar-1.app.zip"
 ( cd "$T/fakeapp" && zip -qr "$GOOD" IdlefillMenubar.app )
-( cd "$T" && shasum -a 256 "IdlefillMenubar-2.0.0.app.zip" | awk '{print $1}' ) > "$T/good.sidecar"
-# a TAMPERED sidecar (valid 64-hex shape, wrong hash) for the v3.0.0 route
-( cd "$T" && shasum -a 256 "IdlefillMenubar-2.0.0.app.zip" | awk '{print $1}' | sed 's/./0/g' ) > "$T/bad.sidecar"
+( cd "$T" && shasum -a 256 "IdlefillMenubar-1.app.zip" | awk '{print $1}' ) > "$T/good.sidecar"
+# a TAMPERED sidecar (valid 64-hex shape, wrong hash) for the v2 route
+( cd "$T" && shasum -a 256 "IdlefillMenubar-1.app.zip" | awk '{print $1}' | sed 's/./0/g' ) > "$T/bad.sidecar"
 
 # ---- the local releases-API stub (node http server on a scratch port) ------
 PORT=$(node -e "const n=require('net');const s=n.createServer();s.listen(0,'127.0.0.1',()=>{console.log(s.address().port);s.close()})")
 cat > "$T/stub.js" <<EOF
 const http = require('http');
 const fs = require('fs');
+// the local releases list: numbered releases (the scheme) + one legacy
+// semver tag (the pre-numbering feed) + malformed tags that must be skipped.
 const releases = [
-  { tag_name: 'v2.0.0', name: 'Idlefill 2.0.0' },
-  { tag_name: 'v1.9.9', name: 'Idlefill 1.9.9' },
-  { tag_name: 'v0.0.1', name: 'Idlefill 0.0.1' },
+  { tag_name: 'v1', name: 'Release #1' },
+  { tag_name: 'v0.0.2', name: 'Idlefill 0.0.2' },
   { tag_name: 'not-a-version', name: 'odd' },
   { tag_name: 'v1.0', name: 'two segments' }
 ];
@@ -66,22 +69,22 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify(releases));
     return;
   }
-  if (u === '/releases/download/v2.0.0/IdlefillMenubar-2.0.0.app.zip') {
+  if (u === '/releases/download/v1/IdlefillMenubar-1.app.zip') {
     res.writeHead(200, { 'Content-Type': 'application/zip' }); res.end(zip); return;
   }
-  if (u === '/releases/download/v2.0.0/IdlefillMenubar-2.0.0.app.zip.sha256') {
+  if (u === '/releases/download/v1/IdlefillMenubar-1.app.zip.sha256') {
     res.writeHead(200, { 'Content-Type': 'text/plain' }); res.end(good); return;
   }
-  if (u === '/releases/download/v3.0.0/IdlefillMenubar-3.0.0.app.zip') {
+  if (u === '/releases/download/v2/IdlefillMenubar-2.app.zip') {
     res.writeHead(200, { 'Content-Type': 'application/zip' }); res.end(zip); return; // same bytes
   }
-  if (u === '/releases/download/v3.0.0/IdlefillMenubar-3.0.0.app.zip.sha256') {
+  if (u === '/releases/download/v2/IdlefillMenubar-2.app.zip.sha256') {
     res.writeHead(200, { 'Content-Type': 'text/plain' }); res.end(bad); return;
   }
-  if (u === '/releases/download/v4.0.0/IdlefillMenubar-4.0.0.app.zip') {
+  if (u === '/releases/download/v3/IdlefillMenubar-3.app.zip') {
     res.writeHead(200, { 'Content-Type': 'application/zip' }); res.end(zip); return;
   }
-  // v4.0.0: NO sidecar route at all (missing sidecar -> refuse)
+  // v3: NO sidecar route at all (missing sidecar -> refuse)
   res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('not found');
 });
 server.listen($PORT, '127.0.0.1', () => console.log('STUB-UP ' + $PORT));
@@ -126,21 +129,39 @@ let zipPath = "__ZIP__"
 let bundleURL = URL(fileURLWithPath: bundleDest)
 
 // ---------------------------------------------------------------- (a) pure
-let canned = "[{\"tag_name\":\"v0.1.0\"},{\"tag_name\":\"v1.2.3\"},{\"tag_name\":\"v9.9.9\"},{\"tag_name\":\"weird\"},{\"tag_name\":\"v1.0\"},{\"tag_name\":\"v1.2.3-beta\"}]"
-check("a: newer -> newest valid tag (9.9.9), malformed skipped",
-      UpdateCheck.latestUpdateTag(data: j(canned), localVersion: "0.1.0") == "9.9.9")
-check("a: same -> nil",
-      UpdateCheck.latestUpdateTag(data: j(canned), localVersion: "9.9.9") == nil)
+// Numbered releases (the scheme) + a legacy semver tag + malformed tags that
+// must be skipped. v1 (the release number) is the newest and must win.
+let canned = "[{\"tag_name\":\"v0.0.1\"},{\"tag_name\":\"v0.0.2\"},{\"tag_name\":\"v1\"},{\"tag_name\":\"weird\"},{\"tag_name\":\"v1.0\"},{\"tag_name\":\"v1-beta\"}]"
+check("a: release number beats legacy semver (v1 newest), malformed skipped",
+      UpdateCheck.latestUpdateTag(data: j(canned), localVersion: "0.0.2") == "1")
+check("a: same release number -> nil",
+      UpdateCheck.latestUpdateTag(data: j(canned), localVersion: "1") == nil)
 check("a: only older tags -> nil",
-      UpdateCheck.latestUpdateTag(data: j("[{\"tag_name\":\"v0.0.9\"}]"), localVersion: "0.1.0") == nil)
-check("a: numeric compare (10.0.0 > 9.9.9)",
-      UpdateCheck.latestUpdateTag(data: j("[{\"tag_name\":\"v10.0.0\"}]"), localVersion: "9.9.9") == "10.0.0")
+      UpdateCheck.latestUpdateTag(data: j("[{\"tag_name\":\"v0.0.1\"}]"), localVersion: "0.0.2") == nil)
+check("a: higher number above lower (v2 > v1), numeric not lexicographic",
+      UpdateCheck.latestUpdateTag(data: j("[{\"tag_name\":\"v2\"}]"), localVersion: "1") == "2")
+check("a: two-digit number above one-digit (v10 > v9)",
+      UpdateCheck.latestUpdateTag(data: j("[{\"tag_name\":\"v10\"}]"), localVersion: "9") == "10")
+check("a: a semver newer than the local semver still works (v0.0.2 > v0.0.1)",
+      UpdateCheck.latestUpdateTag(data: j("[{\"tag_name\":\"v0.0.2\"}]"), localVersion: "0.0.1") == "0.0.2")
 check("a: malformed payload -> nil (fail quiet)",
-      UpdateCheck.latestUpdateTag(data: j("not json"), localVersion: "0.1.0") == nil)
+      UpdateCheck.latestUpdateTag(data: j("not json"), localVersion: "0.0.2") == nil)
 check("a: nil payload -> nil",
-      UpdateCheck.latestUpdateTag(data: nil, localVersion: "0.1.0") == nil)
+      UpdateCheck.latestUpdateTag(data: nil, localVersion: "0.0.2") == nil)
 check("a: malformed local version -> nil (fail quiet)",
-      UpdateCheck.latestUpdateTag(data: j("[{\"tag_name\":\"v9.9.9\"}]"), localVersion: "bogus") == nil)
+      UpdateCheck.latestUpdateTag(data: j("[{\"tag_name\":\"v1\"}]"), localVersion: "bogus") == nil)
+// The bare version string is what installUpdate() feeds to downloadRef —
+// the Gitea tag is the bare version with the "v" re-added, and the zip is
+// named after the bare version (never the tag).
+check("a: downloadRef (numbered) -> tag v1 / zip IdlefillMenubar-1.app.zip",
+      UpdateCheck.downloadRef(version: "1").tag == "v1"
+        && UpdateCheck.downloadRef(version: "1").zip == "IdlefillMenubar-1.app.zip")
+check("a: downloadRef (legacy semver) -> tag v0.0.2 / zip IdlefillMenubar-0.0.2.app.zip",
+      UpdateCheck.downloadRef(version: "0.0.2").tag == "v0.0.2"
+        && UpdateCheck.downloadRef(version: "0.0.2").zip == "IdlefillMenubar-0.0.2.app.zip")
+check("a: downloadRef (a v-prefixed input is normalized to bare)",
+      UpdateCheck.downloadRef(version: "v1").tag == "v1"
+        && UpdateCheck.downloadRef(version: "v1").zip == "IdlefillMenubar-1.app.zip")
 
 // --------------------------------------------------- (b) the real fetch path
 // against the LOCAL stub (the same endpoint the app hits:
@@ -149,12 +170,12 @@ let semB = DispatchSemaphore(value: 0)
 var bResult: String? = "__unset__"
 UpdateCheck.fetchReleases(base: "http://127.0.0.1:\(port)") { data in
   let m = AppModel()
-  m.applyUpdateCheck(data, localVersion: "0.1.0")
+  m.applyUpdateCheck(data, localVersion: "0.0.2")
   bResult = m.updateAvailable
   semB.signal()
 }
 if semB.wait(timeout: .now() + 20) == .success {
-  check("b: stub fetch -> update available (2.0.0)", bResult == "2.0.0")
+  check("b: stub fetch -> update available (1 — the release number wins)", bResult == "1")
 } else {
   failures += 1; print("FAIL b: stub fetch timed out")
 }
@@ -177,10 +198,12 @@ check("c: sidecar parse (non-hex) -> nil",
       UpdateCheck.parseSidecar(String(repeating: "z", count: 64)) == nil)
 
 // (c) install: CORRECT sidecar -> verifies + swaps the bundle in place.
+// tag "v1" + zip "IdlefillMenubar-1.app.zip" — exactly what downloadRef
+// yields for the bare version "1" (the value updateAvailable would hold).
 let sem1 = DispatchSemaphore(value: 0)
 var o1: UpdateCheck.Outcome = .refused("not-run")
-UpdateCheck.install(base: "http://127.0.0.1:\(port)", tag: "v2.0.0",
-                    zipName: "IdlefillMenubar-2.0.0.app.zip",
+UpdateCheck.install(base: "http://127.0.0.1:\(port)", tag: "v1",
+                    zipName: "IdlefillMenubar-1.app.zip",
                     bundleURL: bundleURL, label: "com.sam.idlefill.uc-scratch") {
   o1 = $0; sem1.signal()
 }
@@ -188,7 +211,7 @@ if sem1.wait(timeout: .now() + 40) == .success {
   let bin = bundleURL.appendingPathComponent("Contents/MacOS/IdlefillMenubar").path
   let after = (try? String(contentsOfFile: bin, encoding: .utf8)) ?? ""
   check("c: correct sidecar -> verified + swapped in place",
-        after.hasPrefix("NEW-BUNDLE-2.0.0") && !isRefused(o1))
+        after.hasPrefix("NEW-BUNDLE-1") && !isRefused(o1))
 } else {
   failures += 1; print("FAIL c: install (correct sidecar) timed out")
 }
@@ -198,8 +221,8 @@ let binPath = bundleURL.appendingPathComponent("Contents/MacOS/IdlefillMenubar")
 let currentBefore = (try? String(contentsOfFile: binPath, encoding: .utf8)) ?? ""
 let sem2 = DispatchSemaphore(value: 0)
 var o2: UpdateCheck.Outcome = .refused("not-run")
-UpdateCheck.install(base: "http://127.0.0.1:\(port)", tag: "v3.0.0",
-                    zipName: "IdlefillMenubar-3.0.0.app.zip",
+UpdateCheck.install(base: "http://127.0.0.1:\(port)", tag: "v2",
+                    zipName: "IdlefillMenubar-2.app.zip",
                     bundleURL: bundleURL, label: "com.sam.idlefill.uc-scratch") {
   o2 = $0; sem2.signal()
 }
@@ -214,8 +237,8 @@ if sem2.wait(timeout: .now() + 40) == .success {
 // (c) install: MISSING sidecar (404) -> refused.
 let sem3 = DispatchSemaphore(value: 0)
 var o3: UpdateCheck.Outcome = .refused("not-run")
-UpdateCheck.install(base: "http://127.0.0.1:\(port)", tag: "v4.0.0",
-                    zipName: "IdlefillMenubar-4.0.0.app.zip",
+UpdateCheck.install(base: "http://127.0.0.1:\(port)", tag: "v3",
+                    zipName: "IdlefillMenubar-3.app.zip",
                     bundleURL: bundleURL, label: "com.sam.idlefill.uc-scratch") {
   o3 = $0; sem3.signal()
 }

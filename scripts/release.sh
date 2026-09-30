@@ -9,12 +9,17 @@
 #   release.sh            -> reads env, publishes IDLEFILL_VERSION
 #
 # Required env:
-#   IDLEFILL_VERSION   semver-ish release version, e.g. 1.0.0
+#   IDLEFILL_VERSION   release number (integer >= 1), e.g. 1 — the tag is
+#                      v$V (v1) and the Forgejo release is named "Release #1".
+#                      (The pre-numbering semver tags, v0.0.1/v0.0.2, are
+#                      already in the signed feed; the menubar's update check
+#                      still understands them and they keep sorting below any
+#                      release number.)
 #   FORGEJO_TOKEN      a Forgejo access token with write:releases on
 #                      sam/idlefill (operator-provided; NOT read from git
 #                      config by this script).
 # Optional env:
-#   IDLEFILL_CHANGELOG  release notes text (default "Idlefill $VERSION").
+#   IDLEFILL_CHANGELOG  release notes text (default "Release #$V").
 #   IDLEFILL_FORGEJO_BASE  (default https://git.samwarth.com)
 #   IDLEFILL_REPO    repo root (default: parent of this script's dir)
 #   IDLEFILL_STAGING persistent staging dir (default ~/idlefill-release-staging)
@@ -30,7 +35,15 @@
 set -euo pipefail
 
 # ---- inputs ----------------------------------------------------------------
-V="${IDLEFILL_VERSION:?IDLEFILL_VERSION is required (e.g. 1.0.0)}"
+V="${IDLEFILL_VERSION:?IDLEFILL_VERSION is required (release number, e.g. 1)}"
+# Release numbers are plain integers >= 1 (the numbered-release scheme): the
+# tag is v$V and the Forgejo release is named "Release #$V". Anything else
+# (semver, zero, non-numeric) is refused up front — the release.yml tag guard
+# is the same check for the CI path.
+case "$V" in
+  *[!0-9]*) echo "error: IDLEFILL_VERSION must be a release number (integer >= 1), got '$V'" >&2; exit 1 ;;
+esac
+[ -n "$V" ] && [ "$V" -ge 1 ] || { echo "error: release number must be >= 1 (got '$V')" >&2; exit 1; }
 CHANGELOG="${IDLEFILL_CHANGELOG:-}"
 DRY_RUN="${DRY_RUN:-0}"
 # FORGEJO_TOKEN is only needed for a live publish; a DRY_RUN validates the
@@ -44,6 +57,17 @@ BASE="${IDLEFILL_FORGEJO_BASE:-https://git.samwarth.com}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="${IDLEFILL_REPO:-$(cd "$HERE/.." && pwd)}"
 STAGING="${IDLEFILL_STAGING:-$HOME/idlefill-release-staging}"
+# A DRY_RUN must never touch the persistent staging dir: the build writes the
+# new zip + appcast there, and a dry run's artifacts (a version that is never
+# published) would poison the NEXT real release — an appcast item whose zip
+# 404s makes the carry-forward chain refuse to publish. Isolate a dry run in
+# a temp dir unless the operator explicitly pointed IDLEFILL_STAGING at the
+# persistent one.
+if [ "$DRY_RUN" = "1" ] && [ -z "${IDLEFILL_STAGING:-}" ]; then
+  STAGING="$(mktemp -d "${TMPDIR:-/tmp}/idlefill-release-dry.XXXXXX")"
+  echo "==> DRY_RUN with an isolated staging dir: $STAGING (the persistent staging dir is left untouched)"
+  trap 'rm -rf "$STAGING"' EXIT
+fi
 
 DESKTOP="$REPO/desktop"
 VENDOR="$DESKTOP/vendor/sparkle"
@@ -60,7 +84,7 @@ PREFIX="https://git.samwarth.com/sam/idlefill/releases/download/latest/"
 FEED_URL="https://git.samwarth.com/sam/idlefill/releases/download/latest/appcast.xml"
 API="$BASE/api/v1/repos/sam/idlefill"
 ZIPNAME="Idlefill $V.zip"
-RELNAME="Idlefill $V"
+RELNAME="Release #$V"
 MENUBAR="$REPO/menubar"
 # The menubar artifact: the .app bundle zip (the .app dir at the zip root —
 # the same convention as the desktop zip, unzip lands a ready bundle) + a
@@ -266,9 +290,11 @@ if [ -n "$EXISTING_ID" ]; then
   [ "$code" = "204" ] || { echo "error: delete existing release -> HTTP $code" >&2; exit 1; }
 fi
 
-# 5b. create the release (tag v$V on main).
-BODY="${CHANGELOG:-Idlefill $V}"
-CREATE_JSON="$(python3 -c "import json,sys; print(json.dumps({'tag_name':'v'+sys.argv[1],'target_branch':'main','name':'Idlefill '+sys.argv[1],'body':sys.argv[2]}))" "$V" "$BODY")"
+# 5b. create the release (tag v$V on main). The release name is
+# "Release #$V" (the numbered scheme) — the idempotency delete above matches
+# on exactly this name, so re-runs of the same number republish in place.
+BODY="${CHANGELOG:-Release #$V}"
+CREATE_JSON="$(python3 -c "import json,sys; print(json.dumps({'tag_name':'v'+sys.argv[1],'target_branch':'main','name':'Release #'+sys.argv[1],'body':sys.argv[2]}))" "$V" "$BODY")"
 NEWID="$(curl -sS --max-time 60 -X POST -H "$AUTH" -H 'Content-Type: application/json' "$API/releases" --data "$CREATE_JSON" | python3 -c "import json,sys
 try: print(json.load(sys.stdin).get('id',''))
 except Exception: print('')")"

@@ -95,9 +95,13 @@ jobs:
         run: |
           V="${GITHUB_REF_NAME#v}"
           if [ -z "$V" ] || [ "$V" = "$GITHUB_REF_NAME" ]; then
-            echo "tag must be vX.Y.Z (got $GITHUB_REF_NAME)"; exit 1
+            echo "tag must be v<release number> (e.g. v1) (got $GITHUB_REF_NAME)"; exit 1
           fi
-          echo "==> publishing Idlefill $V (tag $GITHUB_REF_NAME)"
+          case "$V" in
+            *[!0-9]*) echo "release number must be an integer >= 1 (got $V)"; exit 1 ;;
+          esac
+          if [ "$V" -lt 1 ]; then echo "release number must be >= 1 (got $V)"; exit 1; fi
+          echo "==> publishing Release #$V (tag $GITHUB_REF_NAME)"
           IDLEFILL_VERSION="$V" \
-          IDLEFILL_CHANGELOG="Idlefill $V — cut by CI (tag $GITHUB_REF_NAME)." \
+          IDLEFILL_CHANGELOG="Release #$V — cut by CI (tag $GITHUB_REF_NAME)." \
           bash scripts/release.sh

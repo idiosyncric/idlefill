@@ -159,8 +159,9 @@ final class AppModel: ObservableObject {
   // the binary prints the release it was built from). A dev build where the
   // placeholder was never substituted reports itself as a dev build.
   let version = AppModel.bakedVersion()
-  /// Update available (newest published `vX.Y.Z` strictly greater than the
-  /// baked version) — exception-only, the panel's row renders when non-nil.
+  /// Update available (newest published release — a release number `v1` or a
+  /// legacy `v0.0.1` — strictly greater than the baked version) —
+  /// exception-only, the panel's row renders when non-nil.
   @Published var updateAvailable: String? = nil
 
   init() {
@@ -243,8 +244,16 @@ final class AppModel: ObservableObject {
    *  host. The check is anonymous (the repo is public) and never sends the
    *  arbiter token. */
   static func updateBase() -> String {
-    (ProcessInfo.processInfo.environment["IDLEFILL_UPDATE_BASE"] ?? "https://git.samwarth.com")
-      .replacingOccurrences(of: "/", with: "")
+    let raw = ProcessInfo.processInfo.environment["IDLEFILL_UPDATE_BASE"] ?? "https://git.samwarth.com"
+    // Strip trailing slash only (the paths are appended with a leading
+    // "/"). Stripping ALL slashes is fatal: it turns the default
+    // "https://git.samwarth.com" into "https:git.samwarth.com" — a URL with
+    // no host — so the check would never reach the server and the app would
+    // silently report "no update" forever (the update check is the
+    // offline-tolerant kind: it fails quiet, so this was invisible).
+    var base = raw
+    while base.hasSuffix("/") { base.removeLast() }
+    return base
   }
 
   /** The menubar bundle's install location: the bundle under the repo root
@@ -513,10 +522,10 @@ final class AppModel: ObservableObject {
 
   /** The update check: on launch and every 6h (UpdateCheck.cadenceSeconds),
    *  GET the Forgejo releases list ANONYMOUSLY (the repo is public — the
-   *  arbiter token is never sent to Forgejo), compare the newest `vX.Y.Z`
-   *  against the baked version. OFFLINE-TOLERANT: any fetch/parse failure
-   *  sets nothing and fails quiet — no dialog, no error row; the next
-   *  cadence tick retries. */
+   *  arbiter token is never sent to Forgejo), compare the newest release
+   *  number (or legacy semver tag) against the baked version.
+   *  OFFLINE-TOLERANT: any fetch/parse failure sets nothing and fails quiet
+   *  — no dialog, no error row; the next cadence tick retries. */
   func checkForUpdates() {
     let base = AppModel.updateBase()
     URLSession.shared.dataTask(with: URL(string: "\(base)/api/v1/repos/sam/idlefill/releases?limit=10")!) { [weak self] data, _, _ in
@@ -538,12 +547,18 @@ final class AppModel: ObservableObject {
    *  the current binary), then swap the bundle in place under the repo
    *  root and kickstart the LaunchAgent when it is loaded. */
   func installUpdate() {
-    guard let tag = updateAvailable else { return }
-    updateNote = "installing \(tag) …"
+    guard let version = updateAvailable else { return }
+    // `updateAvailable` is the BARE version string (what latestUpdateTag
+    // returns). The download URL needs the TAG (the version with the "v");
+    // the published zip is named after the bare version — downloadRef keeps
+    // the two straight (a bare version in the tag slot would 404: Gitea's
+    // per-tag route is keyed on the tag, not the version).
+    let ref = UpdateCheck.downloadRef(version: version)
+    updateNote = "installing \(version) …"
     UpdateCheck.install(
       base: AppModel.updateBase(),
-      tag: tag,
-      zipName: "IdlefillMenubar-\(tag).app.zip",
+      tag: ref.tag,
+      zipName: ref.zip,
       bundleURL: AppModel.menubarBundleURL(),
       label: "com.sam.idlefill.menubar"
     ) { [weak self] outcome in
@@ -551,10 +566,10 @@ final class AppModel: ObservableObject {
       DispatchQueue.main.async {
         switch outcome {
         case .installed:
-          self.updateNote = "installed \(tag) — relaunched"
+          self.updateNote = "installed \(version) — relaunched"
           self.updateAvailable = nil
         case .notLoaded:
-          self.updateNote = "installed \(tag) — agent not loaded: run menubar/install.sh"
+          self.updateNote = "installed \(version) — agent not loaded: run menubar/install.sh"
           self.updateAvailable = nil
         case .refused:
           // The current binary is untouched; the note explains the refusal.
@@ -596,60 +611,86 @@ enum UpdateCheck {
     return t.lowercased()
   }
 
-  /// Parse a release tag: `v<maj>.<min>.<patch>` (three numeric segments)
-  /// → ((maj,min,patch), version string like "1.2.4"); anything else (a
-  /// pre-release, an odd tag, a different segment count, a non-numeric
-  /// segment) → nil — such tags are SKIPPED by the check.
-  private static func parseTag(_ tag: String) -> ((Int, Int, Int), String)? {
+  /// Parse a release tag into its numeric version segments. Accepts the
+  /// release number (`v1`, `v2`, …) AND the legacy semver (`v0.0.1`,
+  /// `v1.2.3`) — 1–3 numeric segments after the leading "v". Anything else
+  /// (a pre-release, an odd tag, a non-numeric segment, 0 or >3 segments)
+  /// → nil — such tags are SKIPPED by the check. Returns the segments plus
+  /// the BARE version string (the tag without the leading "v").
+  private static func parseTag(_ tag: String) -> ([Int], String)? {
     guard tag.hasPrefix("v") else { return nil }
-    var segs: [Int?] = []
-    var strs: [String] = []
-    for seg in tag.dropFirst().split(separator: ".") {
-      guard !seg.isEmpty, seg.allSatisfy(\.isNumber), let n = Int(seg) else { return nil }
-      segs.append(n)
-      strs.append(String(seg))
+    let body = tag.dropFirst()
+    let segs = Array(body.split(separator: "."))
+    guard (1...3).contains(segs.count) else { return nil }
+    var nums: [Int] = []
+    for seg in segs {
+      guard !seg.isEmpty, seg.allSatisfy(\.isNumber),
+            let n = Int(seg), n < 100_000 else { return nil }
+      nums.append(n)
     }
-    guard segs.count == 3,
-          let a = segs[0], let b = segs[1], let c = segs[2],
-          a < 100_000, b < 100_000, c < 100_000 else { return nil }
-    return ((a, b, c), strs.joined(separator: "."))
+    return (nums, String(body))
   }
 
-  /// The newest release whose `tag_name` is `v<maj>.<min>.<patch>` (numeric
-  /// compare of the three segments; malformed tags skipped), strictly
-  /// greater than the local version → its version string (e.g. "1.2.4").
-  /// Any failure (unparseable payload, malformed version, no valid tags)
-  /// → nil: fail quiet, nothing set, next tick retries.
+  /// The newest release strictly newer than the local version, as its BARE
+  /// version string (e.g. "1" for tag v1, "0.0.2" for v0.0.2); nil when
+  /// nothing is strictly newer. Malformed tags are skipped; any failure
+  /// (unparseable payload, malformed local version, no valid tags) → nil:
+  /// fail quiet, nothing set, next tick retries.
   static func latestUpdateTag(data: Data?, localVersion: String) -> String? {
     guard let data,
           let o = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else {
       return nil
     }
-    guard let local = semver(localVersion) else { return nil }
-    var best: ((Int, Int, Int), String)?
+    guard let local = versionSegments(localVersion) else { return nil }
+    var best: ([Int], String)?
     for rel in o {
       guard let tag = rel["tag_name"] as? String,
             let parsed = parseTag(tag) else { continue }
-      if best == nil || parsed.0 > best!.0 { best = (parsed.0, parsed.1) }
+      if best == nil || versionOrder(parsed.0, best!.0) > 0 { best = (parsed.0, parsed.1) }
     }
     guard let b = best else { return nil }
-    return b.0 > local ? b.1 : nil
+    return versionOrder(b.0, local) > 0 ? b.1 : nil
   }
 
-  /// "1.2.3" → (1, 2, 3); non-numeric segments, a different segment count,
-  /// or out-of-range values → nil (a malformed local version fails quiet).
-  private static func semver(_ s: String) -> (Int, Int, Int)? {
-    var parts: [Int?] = []
-    for seg in s.split(separator: ".") {
-      if seg.isEmpty || !seg.allSatisfy(\.isNumber) { return nil }
-      parts.append(Int(seg))
+  /// Parse a BARE version string (no leading "v") into numeric segments —
+  /// the same 1–3 numeric segments a release tag carries. A malformed local
+  /// version (non-numeric segment, wrong segment count, out of range) → nil
+  /// (a malformed local version fails quiet).
+  private static func versionSegments(_ s: String) -> [Int]? {
+    let segs = Array(s.split(separator: "."))
+    guard (1...3).contains(segs.count) else { return nil }
+    var nums: [Int] = []
+    for seg in segs {
+      guard !seg.isEmpty, seg.allSatisfy(\.isNumber),
+            let n = Int(seg), n < 100_000 else { return nil }
+      nums.append(n)
     }
-    guard parts.count == 3,
-          let a = parts[0], let b = parts[1], let c = parts[2],
-          a >= 0, a < 100_000, b >= 0, b < 100_000, c >= 0, c < 100_000 else {
-      return nil
+    return nums
+  }
+
+  /// Numeric version order: compare segment-by-segment, zero-padding the
+  /// shorter, so a release number sorts ABOVE the legacy semver
+  /// (1 > 0.1.0 > 0.0.2 > 0.0.1) and a higher number above a lower one
+  /// (3 > 2 > 1). Returns negative if a < b, 0 if equal, positive if a > b.
+  private static func versionOrder(_ a: [Int], _ b: [Int]) -> Int {
+    let n = max(a.count, b.count)
+    for i in 0..<n {
+      let x = i < a.count ? a[i] : 0
+      let y = i < b.count ? b[i] : 0
+      if x != y { return x < y ? -1 : 1 }
     }
-    return (a, b, c)
+    return 0
+  }
+
+  /// The Gitea per-tag download route is keyed on the TAG (the version with
+  /// the leading "v"), but the published zip is named after the BARE version
+  /// (`IdlefillMenubar-1.app.zip`). Given the bare version string (what
+  /// `updateAvailable` holds, e.g. "1" or "0.0.2") → the (tag, zipName) the
+  /// install must fetch. The tag always re-adds the "v"; the zip name never
+  /// has one — so `updateAvailable` must feed this BARE (no "v").
+  static func downloadRef(version: String) -> (tag: String, zip: String) {
+    let bare = version.hasPrefix("v") ? String(version.dropFirst()) : version
+    return ("v" + bare, "IdlefillMenubar-\(bare).app.zip")
   }
 
   /// GET `base/api/v1/repos/sam/idlefill/releases?limit=10` (anonymous).
