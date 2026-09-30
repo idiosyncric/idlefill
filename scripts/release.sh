@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Publish an idlefill desktop release to the Forgejo repo's releases (the
-# Sparkle appcast feed). This is the LIVE publish path — it tags a commit,
-# uploads the update zip + appcast.xml as release assets, and verifies the
-# feed over the public (authed) download URL.
+# Publish an idlefill release to the Forgejo repo's releases: the desktop
+# Sparkle feed (appcast.xml + zips) AND the menubar artifacts (the .app
+# bundle zip + its sha256 sidecar — the menubar's phase-1 update story).
+# This is the LIVE publish path — it tags a commit, uploads the artifacts
+# as release assets, and verifies the feed over the public (authed)
+# download URL.
 #
 #   release.sh            -> reads env, publishes IDLEFILL_VERSION
 #
@@ -59,9 +61,22 @@ FEED_URL="https://git.samwarth.com/sam/idlefill/releases/download/latest/appcast
 API="$BASE/api/v1/repos/sam/idlefill"
 ZIPNAME="Idlefill $V.zip"
 RELNAME="Idlefill $V"
+MENUBAR="$REPO/menubar"
+# The menubar artifact: the .app bundle zip (the .app dir at the zip root —
+# the same convention as the desktop zip, unzip lands a ready bundle) + a
+# sha256 sidecar the menubar's Install action verifies BEFORE any swap.
+MZIPNAME="IdlefillMenubar-$V.app.zip"
+# The menubar artifacts live in a SEPARATE staging dir, not $ZIPDIR:
+# generate_appcast and the staging-clean guard both scan $ZIPDIR, and the
+# menubar zip is not a Sparkle artifact — it must never be picked up by the
+# feed generator or flagged as a stray archive on the NEXT release (the
+# staging dir persists between releases, so a menubar zip left in $ZIPDIR
+# would refuse the next publish).
+MZIPDIR="$STAGING/menubar-zips"
 
 [ -f "$GEN_APPCAST" ] || { echo "error: $GEN_APPCAST missing" >&2; exit 1; }
 [ -f "$DESKTOP/build.sh" ] || { echo "error: $DESKTOP/build.sh missing" >&2; exit 1; }
+[ -f "$MENUBAR/build.sh" ] || { echo "error: $MENUBAR/build.sh missing" >&2; exit 1; }
 
 # Auth header, assembled from fragments so a token-shaped literal never
 # appears in this file (the secret-redaction filter mangles "Bearer <tok>"
@@ -107,11 +122,18 @@ PY
 printf '==> derived SUPublicEDKEY: %s-char base64\n' "${#PUB}"
 
 # ---- 1. build --------------------------------------------------------------
-echo "==> [1/6] build desktop app (version $V)"
+echo "==> [1/8] build desktop app (version $V)"
 IDLEFILL_VERSION="$V" IDLEFILL_SUPUBLICEDKEY="$PUB" bash "$DESKTOP/build.sh"
 
-# ---- 2. zip (bundle at zip root) ------------------------------------------
-echo "==> [2/6] zip $ZIPNAME (bundle at root)"
+# The menubar bundle at the release version (its --version prints $V, the
+# Info.plist carries $V). Builds into $MENUBAR/IdlefillMenubar.app.
+echo "==> [2/8] build menubar bundle (version $V)"
+IDLEFILL_VERSION="$V" bash "$MENUBAR/build.sh"
+MAPP="$MENUBAR/IdlefillMenubar.app"
+[ -d "$MAPP" ] || { echo "error: menubar bundle missing: $MAPP" >&2; exit 1; }
+
+# ---- 3. zip (bundle at zip root) ------------------------------------------
+echo "==> [3/8] zip $ZIPNAME (bundle at root)"
 mkdir -p "$ZIPDIR"
 ZIPSRC="$ZIPDIR/$ZIPNAME"
 rm -f "$ZIPSRC"
@@ -120,15 +142,19 @@ rm -f "$ZIPSRC"
 ( cd "$DESKTOP" && zip -qr "$ZIPSRC" Idlefill.app )
 [ -f "$ZIPSRC" ] || { echo "error: zip failed" >&2; exit 1; }
 
-# ---- 3. generate_appcast (sign, prune, carry-forward) ---------------------
-echo "==> [3/6] generate + sign appcast"
+# ---- 4. generate_appcast (sign, prune, carry-forward) ---------------------
+echo "==> [4/8] generate + sign appcast"
 # Guard: generate_appcast adds EVERY archive in the staging dir to the feed
 # (pruning only happens for entries whose zip is missing). A stray archive
 # — a test artifact, a wrong build — would either hard-fail the release
 # (duplicate bundle version) or, worse, silently enter the live feed as a
 # bogus "update" (any app would try to "update" to it). Refuse to publish
 # unless every archive is either this release or already referenced by the
-# current appcast (the carry-forward set).
+# current appcast (the carry-forward set). NOTE: this guard scans $ZIPDIR
+# only — the desktop zips. The menubar artifacts live in $MZIPDIR (a
+# separate dir, created AFTER this scan), so they can never be picked up by
+# generate_appcast and can never trip this guard, on this run or the next
+# (the persistent staging dir is shared between releases).
 python3 - "$ZIPDIR" "$ZIPSRC" "$APPCAST" <<'PY'
 import os, sys, xml.etree.ElementTree as ET
 from urllib.parse import unquote
@@ -165,8 +191,28 @@ PY
   "$ZIPDIR"
 [ -f "$APPCAST" ] || { echo "error: appcast not produced" >&2; exit 1; }
 
-# ---- 4. resolve referenced zips (carry-forward) ---------------------------
-echo "==> [4/6] parse feed -> referenced zips"
+# ---- 5. menubar artifact: bundle zip + sha256 sidecar ---------------------
+# AFTER the appcast: generate_appcast scans the zips dir, and the menubar
+# zip is not a Sparkle artifact — it must never land in the feed. The zip's
+# root is the .app dir (the desktop zip's convention — unzip lands a ready
+# bundle); the sidecar (64 hex + newline) is what the menubar's Install
+# action verifies BEFORE any swap.
+echo "==> [5/8] zip $MZIPNAME + sha256 sidecar (in $MZIPDIR — out of the feed-scan dir)"
+mkdir -p "$MZIPDIR"
+MZIP="$MZIPDIR/$MZIPNAME"
+MSIDE="$MZIP.sha256"
+rm -f "$MZIP" "$MSIDE"
+( cd "$MENUBAR" && zip -qr "$MZIP" IdlefillMenubar.app )
+[ -f "$MZIP" ] || { echo "error: menubar zip failed" >&2; exit 1; }
+# The sidecar is the HASH ONLY + newline (64 hex) — the menubar's
+# parseSidecar rejects anything else (shasum's "<hash>  <file>" form is
+# NOT the format; awk strips the filename).
+( cd "$MZIPDIR" && shasum -a 256 "$MZIPNAME" | awk '{print $1}' > "$MZIPNAME.sha256" )
+[ -f "$MSIDE" ] || { echo "error: menubar sidecar write failed" >&2; exit 1; }
+echo "==> menubar artifacts: $MZIPNAME + $MZIPNAME.sha256"
+
+# ---- 6. resolve referenced zips (carry-forward) ---------------------------
+echo "==> [6/8] parse feed -> referenced zips"
 # Every enclosure URL's basename must exist in ZIPDIR; those are the zips we
 # attach (plus appcast.xml). Missing one = a carry-forward gap.
 # NOTE: the feed URL-encodes the space in "Idlefill 1.0.0.zip" as %20, so
@@ -191,11 +237,13 @@ done <<< "$REFFILES"
 echo "==> referenced zips:"
 while IFS= read -r fn; do [ -n "$fn" ] && printf '    %s\n' "$fn"; done <<< "$REFFILES"
 
-# ---- 5. Forgejo publish ---------------------------------------------------
-echo "==> [5/6] publish to Forgejo (release $RELNAME, tag v$V)"
+# ---- 7. Forgejo publish ---------------------------------------------------
+echo "==> [7/8] publish to Forgejo (release $RELNAME, tag v$V)"
 if [ "${DRY_RUN:-0}" = "1" ]; then
   echo "==> DRY_RUN=1 — skipping live Forgejo publish (staging feed left at $APPCAST)."
-  echo "    referenced zips to be attached: appcast.xml +:"
+  echo "    artifacts to be attached: appcast.xml + menubar zip + sidecar + referenced zips:"
+  printf '      %s\n' "$MZIPNAME"
+  printf '      %s\n' "$MZIPNAME.sha256"
   while IFS= read -r fn; do [ -n "$fn" ] && printf '      %s\n' "$fn"; done <<< "$REFFILES"
   echo "DRY-RUN-DONE (no Forgejo writes, no live verify)"
   exit 0
@@ -242,21 +290,26 @@ except Exception: print('FAIL')")"
   echo "    uploaded: $(basename "$file")"
 }
 upload "$APPCAST"
+# The menubar artifacts (zip + sha256 sidecar) — NOT referenced by the
+# appcast, so they are uploaded explicitly (the menubar's Install action
+# fetches them by tag: /releases/download/<vTag>/<fileName>).
+upload "$MZIP"
+upload "$MSIDE"
 while IFS= read -r fn; do
   [ -n "$fn" ] || continue
   upload "$ZIPDIR/$fn"
 done <<< "$REFFILES"
 
-# ---- 6. verify the LIVE feed (authed) -------------------------------------
-echo "==> [6/6] verify live feed at $FEED_URL"
+# ---- 8. verify the LIVE feed (authed) -------------------------------------
+echo "==> [8/8] verify live feed at $FEED_URL"
 TMPFEED="$(mktemp)"
 trap 'rm -f "$TMPFEED"' EXIT
 vcode="$(curl -sS --max-time 60 -H "$AUTH" -o "$TMPFEED" -w '%{http_code}' "$FEED_URL")"
 [ "$vcode" = "200" ] || { echo "error: live feed GET -> HTTP $vcode (repo may still be private)" >&2; exit 1; }
 
-python3 - "$TMPFEED" "$V" <<'PY'
+python3 - "$TMPFEED" "$V" "$MZIPNAME" "$MZIP" "$BASE/sam/idlefill/releases/download/v$V" <<'PY'
 import sys, os, subprocess, xml.etree.ElementTree as ET
-feed_path, V = sys.argv[1], sys.argv[2]
+feed_path, V, mzip_name, mzip_path, dl_base = sys.argv[1:6]
 
 raw = open(feed_path, "rb").read()
 
@@ -307,6 +360,31 @@ for s in sigs:
     assert len(raw_sig) == 64, f"edSignature not a 64-byte ed25519 sig (got {len(raw_sig)})"
 assert b"edSignature" in raw, "no edSignature material in feed"
 print(f"PASS (d) ed25519 signatures present: {len(sigs)} per-enclosure (each 64-byte ed25519)")
+
+# (e) the menubar artifacts: the bundle zip + sha256 sidecar GET 200 and the
+# sidecar's hash matches the (already verified-on-disk) staging zip — the
+# menubar's Install action depends on exactly this pair.
+import hashlib
+mzip_name, mzip_path = sys.argv[3], sys.argv[4]
+side_path = mzip_path + ".sha256"
+disk_hash = hashlib.sha256(open(mzip_path, "rb").read()).hexdigest()
+for name, url_suffix in [(mzip_name, mzip_name), (mzip_name + ".sha256", mzip_name + ".sha256")]:
+    r = subprocess.run(["curl", "-sS", "--max-time", "120",
+                        "-H", f"Authorization: *** {token}",
+                        "-o", "/dev/null", "-w", "%{http_code} %{content_type}",
+                        f"{dl_base}/{url_suffix}"],
+                       capture_output=True, text=True)
+    parts = r.stdout.split(" ", 1)
+    assert parts[0] == "200", f"menubar asset {name} -> HTTP {parts[0]}"
+    print(f"PASS (e) {name}: 200")
+live_sidecar = subprocess.run(["curl", "-sS", "--max-time", "120",
+                               "-H", f"Authorization: *** {token}",
+                               f"{dl_base}/{mzip_name}.sha256"],
+                              capture_output=True, text=True).stdout.strip()
+local_sidecar = open(side_path).read().strip()
+assert live_sidecar == local_sidecar, "live sidecar differs from staging"
+assert live_sidecar == disk_hash, "live sidecar does not match the published zip's hash"
+print("PASS (e) sha256 sidecar: live == staging == recomputed zip hash")
 
 print("VERIFICATION-OK")
 PY

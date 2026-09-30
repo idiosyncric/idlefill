@@ -179,9 +179,38 @@ Show Logs · Start/Stop · Restart · Update code · Quit.
   installed the menu bar no longer opens the arbiter web dashboard — the
   handoff goes to the desktop app.
 
-- **Build:** `menubar/build.sh` → `menubar/IdlefillMenubar`. It is **not**
-  installed as a launchd job by default; `menubar/IdlefillMenubar.plist` is
-  the opt-in LaunchAgent if you want it at login.
+- **Build:** `menubar/build.sh` → `menubar/IdlefillMenubar.app`, a real
+  bundle: `Contents/MacOS/IdlefillMenubar` + `Contents/Info.plist`
+  (bundle id `com.sam.idlefill.menubar`, `LSUIElement` — a status-bar app,
+  no dock icon). `CFBundleShortVersionString` is the root `package.json`
+  version (read with `node` at build time, overridable via
+  `IDLEFILL_VERSION`), injected into the binary through the
+  `__MENUBAR_VERSION__` placeholder — so the binary answers
+  `IdlefillMenubar --version` with the release it was built from. The
+  bundle is ad-hoc `codesign`ed as the last step (the desktop's
+  `build.sh` is the pattern). The compiled bundle is gitignored.
+- **Install:** `menubar/install.sh` scripts `launchctl bootstrap` for the
+  LaunchAgent (`com.sam.idlefill.menubar`) — idempotent: an already-loaded
+  label is a clean no-op (no re-bootstrap, no writes), `--reinstall` takes
+  the bootout+bootstrap cycle, `--uninstall` is bootout only. It renders
+  the live plist from the committed template
+  (`menubar/IdlefillMenubar.plist`) with this checkout's repo root in
+  every path and creates the log dir. The menu bar survives
+  logout/login (the agent is `RunAtLoad` + `KeepAlive`). It touches only
+  the menubar label, never the daemon's.
+- **Update check:** on launch and every 6h the app GETs the Forgejo
+  releases list **anonymously** (the repo is public — the arbiter token is
+  never sent to Forgejo), picks the newest `v<maj>.<min>.<patch>` tag, and
+  compares it against its own baked version. Strictly newer → an
+  exception-only `Install Update <version>` row appears in the panel
+  (hidden while no update is available); the install downloads the
+  `IdlefillMenubar-<v>.app.zip` release asset **and its `.sha256` sidecar**,
+  verifies the hash before touching anything (a mismatch or missing
+  sidecar refuses and keeps the current bundle), swaps
+  `menubar/IdlefillMenubar.app` in place, and `launchctl kickstart -k`s
+  the agent when it is loaded. OFFLINE-TOLERANT: with the network down
+  the check says nothing and fails quiet — no dialog, no error row; the
+  next cadence tick retries.
 - **Repo discovery:** the binary ships at `<repo>/menubar/`, so it resolves
   the repo from its own location (one level up), honoring
   `IDLEFILL_CONFIG_FILE` when set. The token is read at runtime from the
@@ -367,20 +396,40 @@ Two workflows in `.gitea/workflows/`:
 
 - **`test.yml`** — every push + PR to `main`: full suite (server + client +
   adapter tests, `tsc --noEmit` both packages, `npm run build`, `node --check`
-  on the MCP server, `swiftc -parse` on the desktop source). Tests only —
-  never publishes.
+  on the MCP server, `swiftc -parse` on the desktop and menubar sources).
+  Tests only — never publishes.
 - **`release.yml`** — on a `v*` tag on `main` (or manual re-run): the same
   full suite runs **first, as a hard gate** — any failing step stops the job
   and nothing is published. Only a fully green gate reaches the publish step:
-  `scripts/release.sh` (build → zip → sign appcast → Forgejo publish → live
-  feed verify).
+  `scripts/release.sh` (build desktop + menubar → zip + sha256 sidecar →
+  sign appcast → Forgejo publish → live feed verify).
 
-**Why tag-triggered, not merge-triggered:** a Sparkle release ships only the
-desktop `.app` (the arbiter, daemon, and MCP server run from each machine's
-local checkout — they are not distributed). Publishing on every merge would
-push a possibly-broken build to every user's machine on every push, even
-when the desktop app didn't change. Tagging `vX.Y.Z` on `main` is the
+**Why tag-triggered, not merge-triggered:** a release ships the Mac
+artifacts (the desktop `.app` Sparkle feed + the menubar `.app` zip and
+sha256 sidecar) — the arbiter, daemon, and MCP server run from each
+machine's local checkout and are not distributed. Publishing on every
+merge would push a possibly-broken build to every user's machine on every
+push, even when nothing changed. Tagging `vX.Y.Z` on `main` is the
 deliberate "this version is a release" bump.
+
+### Versions & releases
+
+The root `package.json` is the single version source: the release tag
+`v<X.Y.Z>` is cut from it, and the release artifacts are stamped with it —
+the desktop feed's `sparkle:version` and the menubar bundle's
+`CFBundleShortVersionString` + baked `--version` string (the menubar's
+`build.sh` reads the root version with `node` by default;
+`scripts/release.sh` takes `IDLEFILL_VERSION` = the tag's version). The
+daemon resolves it the same way at runtime — its registration carries
+`version` + `protocol` (the version handshake), echoed on `/api/state`
+per worker row and shown on the dashboard's per-worker row when present.
+```bash
+node client/src/index.ts --version    # the daemon prints its version (exit 0)
+menubar/IdlefillMenubar.app/Contents/MacOS/IdlefillMenubar --version
+```
+The daemon does not self-update — it reports its version and the
+operator sees which revision each worker speaks; the menu bar is the
+self-updating artifact (update check + sha256-verified install, above).
 
 ```bash
 git tag v0.0.2 main && git push origin v0.0.2   # runs release.yml; gate then publish

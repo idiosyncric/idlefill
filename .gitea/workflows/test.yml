@@ -46,3 +46,6 @@ jobs:
 
       - name: desktop source parse (swiftc)
         run: swiftc -parse desktop/IdlefillDesktop.swift
+
+      - name: menubar source parse (swiftc)
+        run: swiftc -parse menubar/IdlefillMenubar.swift
