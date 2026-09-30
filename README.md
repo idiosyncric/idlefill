@@ -201,21 +201,38 @@ Restart · Update code · Quit.
   every path and creates the log dir. The menu bar survives
   logout/login (the agent is `RunAtLoad` + `KeepAlive`). It touches only
   the menubar label, never the daemon's.
-- **Update check:** on launch and every 6h the app GETs the Forgejo
-  releases list **anonymously** (the repo is public — the arbiter token is
-  never sent to Forgejo), picks the newest release — a release number
+- **Update check:** on launch and every 6h the app checks its update
+  channel **anonymously** (the repo is public — the arbiter token is
+  never sent to Forgejo). **Releases channel (the default):** it GETs the
+  Forgejo releases list, picks the newest release — a release number
   (`v1`, `v2`, …; the pre-numbering semver tags `v0.0.1`/`v0.0.2` are still
   understood and sort below any number) — and
   compares it against its own baked version. Strictly newer → an
   exception-only `Install Update <version>` row appears in the panel
-  (hidden while no update is available); the install downloads the
-  `IdlefillMenubar-<version>.app.zip` release asset **and its `.sha256` sidecar**,
+  (hidden while no update is available). **Back-switch rule:** a build
+  whose baked version is NOT numeric (an edge marker, a dev build) can
+  never compare numerically, so the check offers the newest release
+  unconditionally — such a machine can always get back to the releases
+  channel. **Branch channel (opt-in):** set `update_channel` to a branch
+  name in `client/config.json` (absent = releases). The check then GETs
+  the branch's TIP via the git refs API (`GET
+  …/git/refs/heads/<branch>`, anonymous) and compares its edge marker
+  (`edge-<branch>-<sha7>`) against the baked marker — an update is
+  available whenever the two differ (no ordering on branch builds: a
+  newer push is a different marker, and the difference IS the update).
+  A tip for a branch that does not exist (a typo'd name) says so in the
+  note; the row then reads `Install Update edge-<branch>-<sha7>` and the
+  install downloads the marker-named `IdlefillMenubar-<marker>.app.zip`
+  release asset **and its `.sha256` sidecar**. Either way the install
   verifies the hash before touching anything (a mismatch or missing
   sidecar refuses and keeps the current bundle), swaps
   `menubar/IdlefillMenubar.app` in place, and `launchctl kickstart -k`s
   the agent when it is loaded. OFFLINE-TOLERANT: with the network down
   the check says nothing and fails quiet — no dialog, no error row; the
-  next cadence tick retries.
+  next cadence tick retries. The edge builds it can install are
+  published per push to a tracked branch by `edge.yml` (below); the pure
+  decision logic is proven headlessly by `menubar/edge-test.sh` (the same
+  harness pattern as `menubar/uc-test.sh`).
 - **Update Code:** fast-forwards this checkout to `origin/main` and
   reinstalls/rebuilds/restarts only what changed. Pre-flight gates, in
   order — a refusal at any gate writes nothing (no merge, no install, no
@@ -372,8 +389,11 @@ ground truth.
     (the token included — it is never displayed anywhere) and keeps the
     file's `0600` mode; afterwards a "daemon restart to apply" note offers a
     Restart that uses the same launchd path as Settings.
-  - **Settings** — opt-in launchd management (below) plus the repo-path
-    field.
+  - **Settings** — opt-in launchd management (below), the repo-path
+    field, and the **update channel** (below): a `releases` | `branch`
+    picker + a branch field (default `main`), persisted alongside the
+    repo path in `~/Library/Application Support/Idlefill/config.json`
+    (the same read-modify-write save that preserves every other key).
 - **launchd management model (opt-in).** Two toggles — **daemon** and
   **menu bar** — each manage a LaunchAgent in the user's `gui/<uid>` domain
   (no root, no system domain). **ON** writes the agent's plist and runs
@@ -394,14 +414,17 @@ ground truth.
   runtime from the gitignored `client/config.json` — never baked into the
   plist, the bundle, or the binary.
 
-## Updating (Sparkle, private feed)
+## Updating (two channels: releases + branch)
 
 The desktop app self-updates via [Sparkle](desktop/vendor/sparkle/SPARKLE.md)
 against a **private update feed**: the appcast and update zips live as
 **assets on a Forgejo release** (`git.samwarth.com/sam/idlefill`), not in
 the repo tree. The repo is public but **ingress is LAN-restricted**, so the
 feed is only reachable from inside the network — that is what makes it
-private in practice (Sparkle does a plain HTTPS GET, no auth).
+private in practice (Sparkle does a plain HTTPS GET, no auth). This is the
+**releases channel** — the default. The **branch channel** (below) is the
+second, opt-in channel: it tracks a git branch's latest published edge
+build instead of the numbered feed.
 
 **Feed URL** (in `Info.plist` `SUFeedURL` and the app's `kSparkleFeedURL`):
 
@@ -454,6 +477,67 @@ an updater. Status reports: checking, up-to-date, update found / downloaded
 / installed, or a fetch/parse failure (the feed is only reachable from the
 LAN, so an off-network machine reports a fetch failure, not "up to date").
 
+### The branch channel (edge builds)
+
+The second, opt-in channel (issue #26): instead of the numbered feed, the
+app tracks the TIP of a git branch and can install the edge build that was
+published for it.
+
+**Settings.** The Settings tab carries the channel option: an
+**update channel** picker (`releases` — the default, the Sparkle flow
+above — or `branch`) and, while `branch` is selected, a **branch** field
+(default `main`). Both persist in `~/Library/Application Support/Idlefill/
+config.json` alongside `repo_path`, with the exact same read-modify-write
+save (pretty JSON, every other key preserved). A channel value that is not
+one of the two known names falls back to `releases` — a hand-edited config
+never points the check at a third channel.
+
+**The check.** On `branch`, **Check for Updates…** GETs the branch's tip
+via the git refs API (`GET …/api/v1/repos/sam/idlefill/git/refs/heads/
+<branch>`, **anonymous** — the repo is public; the arbiter token is never
+sent). The tip's **edge marker** is `edge-<branch>-<sha7>` (the branch's
+name + the pushed commit's first 7 hex chars — one string, three uses: the
+edge release's tag, its name's tail, and the artifact-zip name part). An
+update is available ⇔ the baked marker differs from the tip's marker —
+no ordering on branch builds: a newer push is a different marker, and the
+difference IS the update. The status line names the tip marker; the
+Settings row then gains an **install edge build** confirm control.
+Confirmation re-fetches the tip (the check may be stale), downloads
+`Idlefill <marker>.zip` **and its `.sha256` sidecar** from the edge
+release, verifies the hash BEFORE any swap (a mismatch, missing or
+malformed sidecar refuses and keeps the current bundle, and the status
+line says so), then swaps the installed bundle with the `desktop/update.sh`
+sequence — unzip, quit the running app cleanly (SIGTERM; the quit matches
+the TARGET bundle, never a bare name match), replace, relaunch — driven
+from a detached helper so the app can replace itself. A 404 (the branch
+does not exist — a typo'd name) is distinct from the offline silence: the
+status line says `branch <name> not found`. Offline-tolerant throughout:
+a dead network or an unparseable body sets nothing new (the previous
+status is restored) and the next check retries.
+
+**Where the edge builds come from.** `edge.yml` publishes one per push to
+a tracked branch (see below): `scripts/edge-release.sh` builds BOTH
+artifacts with the marker (`IDLEFILL_VERSION=<marker>` for the menubar;
+`IDLEFILL_DESKTOP_BUILD=<marker>` for the desktop), zips them as
+`IdlefillMenubar-<marker>.app.zip` / `Idlefill <marker>.zip`, and
+publishes them on a Forgejo release tagged `<marker>` — carrying the live
+numbered feed forward (the edge release is the newest, so `latest` serves
+it; without the carry-forward the numbered appcast would 404 for every
+Sparkle machine). The edge zips never enter the appcast and edge builds
+never carry the Sparkle key — the numbered pipeline is the only signer.
+
+**Build identity.** `desktop/build.sh` bakes a build marker into the
+binary the same way `menubar/build.sh` bakes its version: `Idlefill
+--version` prints it (release builds print the numeric release number; an
+edge build prints its marker, so an installed build proves its own
+origin). An un-substituted build (an ad-hoc `swiftc` on the source)
+reports the default `1.0` — never the literal placeholder.
+`CFBundleVersion` stays the numeric release number either way: Sparkle
+compares `CFBundleVersion`, never the marker. The pure decision logic is
+proven headlessly by `desktop/edge-test.sh` (real source minus `@main` +
+a driver, `env -i`, against a local stub of the refs API + a scratch
+bundle — the same harness pattern as `menubar/edge-test.sh`).
+
 ## Releases & CI (Gitea Actions)
 
 The repo runs Forgejo Actions on a **local runner** (urza, arm64 macOS —
@@ -465,7 +549,7 @@ release requires that Mac to be on — the same constraint as the manual
 its registration secret stays on the host at
 `~/Software/ci-cd/idlefill-runner/`, never committed — this repo is public).
 
-Two workflows in `.gitea/workflows/`:
+Three workflows in `.gitea/workflows/`:
 
 - **`test.yml`** — every push + PR to `main`: full suite (server + client +
   adapter tests, `tsc --noEmit` both packages, `npm run build`, `node --check`
@@ -476,6 +560,15 @@ Two workflows in `.gitea/workflows/`:
   and nothing is published. Only a fully green gate reaches the publish step:
   `scripts/release.sh` (build desktop + menubar → zip + sha256 sidecar →
   sign appcast → Forgejo publish → live feed verify).
+- **`edge.yml`** — on a push to a tracked branch (today: `main`; the branch
+  list is a one-line variable at the top of the file): the same full suite
+  runs **first, as a hard gate** (the same step list as `release.yml` — the
+  edge builds are never signed, so there is no signing-key pre-flight). Only
+  a fully green gate reaches the publish step: `scripts/edge-release.sh`
+  (build BOTH apps with the edge marker → zip + sha256 sidecar → carry the
+  live numbered feed forward → Forgejo release on tag `edge-<branch>-<sha7>`
+  → live verify). See **The branch channel (edge builds)** above for what
+  this publishes and who consumes it.
 
 **Why tag-triggered, not merge-triggered:** a release ships the Mac
 artifacts (the desktop `.app` Sparkle feed + the menubar `.app` zip and
