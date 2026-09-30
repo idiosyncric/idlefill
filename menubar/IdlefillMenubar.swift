@@ -10,7 +10,8 @@
 //    stats    — queue depth, today finished/failed, tokens out (UTC), the
 //               running lease (job · auto-cancels-in)
 //    actions  — Open Dashboard · Show Logs · Start/Stop · Restart ·
-//               Update code (git pull + npm ci + restart) · Quit
+//               Update code (gated fast-forward + lock-delta install +
+//               menu-bar rebuild + daemon restart) · Quit
 //
 //  Click routing (decided by the pure MenuBarRouter — testable headlessly):
 //    single click  — toggle the popover (today's behavior, exactly)
@@ -150,9 +151,27 @@ final class AppModel: ObservableObject {
   @Published var tokensToday: (project: String, cap: Double?, value: Double?) = ("", nil, nil)
   @Published var lease: (job: String, expiresAt: Double) = ("", 0)
   @Published var lastSeenS: Int? = nil
+  /// The revision of THIS checkout's tree, as the operator should read it:
+  /// `git rev-parse --short HEAD`. Refreshed at launch (init) and on every
+  /// completed Update Code (where the deployed revision is exactly the
+  /// merged origin/main HEAD — no extra git call needed). Not polled on
+  /// the 10s cadence: the revision only changes when Update Code runs, so
+  /// polling would just burn a git call per tick for a value that cannot
+  /// change between updates. The panel shows it in a dedicated `revision`
+  /// row (always visible once known) — it is the standing answer to
+  /// "what is deployed?".
+  @Published var deployedRevision: String? = nil
   @Published var updateNote: String? = nil
 
-  let repoRoot: String = AppModel.findRepoRoot()
+  /** The repo the update machinery acts on. `repoRootOverride` (headless
+   *  test hook) wins when set — the harness points it at a scratch repo so
+   *  the app's OWN updateCode drives the real plan + wrappers against
+   *  scratch git state; the app leaves it nil and uses its discovered
+   *  root. (A test hook on a plain property, not the environment: the
+   *  driver mutates it per-case after process start.) */
+  var repoRoot: String { repoRootOverride ?? _repoRoot }
+  var repoRootOverride: String? = nil
+  private let _repoRoot = AppModel.findRepoRoot()
 
   // The baked version (substituted at build time by menubar/build.sh — the
   // `__MENUBAR_VERSION__` placeholder carries the release tag's version, so
@@ -170,6 +189,10 @@ final class AppModel: ObservableObject {
       self?.poll()
     }
     poll()
+    // The deployed revision (git rev-parse --short HEAD) — best-effort at
+    // launch; a failure (no git, not a repo) leaves it nil and the
+    // revision row stays hidden until a successful read.
+    if let rev = UpdateLog.currentRevision(repo: repoRoot) { deployedRevision = rev }
     // The release check (update story): once at launch, then every 6h.
     // Offline-tolerant — any failure sets nothing and fails quiet.
     checkForUpdates()
@@ -385,7 +408,7 @@ final class AppModel: ObservableObject {
    *  running a command that quotes the path — and stop() would SIGINT the
    *  wrong process.
    */
-  func daemonPIDs() -> [Int] {
+  static func daemonPIDs(repo: String) -> [Int] {
     // Write ps's output to a temp FILE, not a pipe. `ps -ax` on this box
     // emits ~190 KB — far more than the 64 KB pipe buffer — and reading the
     // pipe only AFTER waitUntilExit() deadlocks: ps blocks on a full pipe,
@@ -413,7 +436,6 @@ final class AppModel: ObservableObject {
     let data = (try? Data(contentsOf: URL(fileURLWithPath: tmp))) ?? Data()
     try? FileManager.default.removeItem(atPath: tmp)
     let text = String(data: data, encoding: .utf8) ?? ""
-    let repo = repoRoot
     var pids: [Int] = []
     for line in text.split(separator: "\n") {
       let parts = line.split(separator: " ", omittingEmptySubsequences: true)
@@ -428,7 +450,7 @@ final class AppModel: ObservableObject {
   }
 
   /** PID of the running client daemon, or nil. */
-  private func daemonPID() -> Int? { daemonPIDs().first }
+  private func daemonPID() -> Int? { AppModel.daemonPIDs(repo: repoRoot).first }
 
   func start() {
     if daemonPID() != nil {
@@ -460,7 +482,7 @@ final class AppModel: ObservableObject {
   }
 
   func stop() {
-    let pids = daemonPIDs()
+    let pids = AppModel.daemonPIDs(repo: repoRoot)
     guard !pids.isEmpty else {
       updateNote = "no daemon process found"
       return
@@ -479,16 +501,272 @@ final class AppModel: ObservableObject {
     DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.start() }
   }
 
+  // MARK: update code (issue #11)
+  //
+  // The OLD updateCode ran `git pull --ff-only` + `npm ci` against the live
+  // tree the daemon runs from: `ci` tore down the daemon's own node_modules
+  // (restoring exactly the lock file's contents — destroying any uncommitted
+  // work in the process) and nothing ever rebuilt the menu bar. The new
+  // shape (decision in the pure UpdatePlan, side effects in thin wrappers):
+  //
+  //   1. pre-flight gates, in order — a refusal stops the operation, and
+  //      NOTHING is written (no fetch result consumed, no merge, no
+  //      install, no signal to the daemon):
+  //        a. tree not clean (git status --porcelain non-empty, the call
+  //           timeout-bounded) → refuse
+  //        b. git fetch origin main fails → refuse, nothing written
+  //        c. HEAD not an ancestor of origin/main (diverged) → refuse
+  //        d. no delta (HEAD == origin/main) → no-op note, done
+  //      A `git pull` is NEVER run — the only write is `git merge
+  //      --ff-only origin/main`, after all three gates pass.
+  //   2. stop the daemon FIRST (the existing stop() path — SIGINT the
+  //      whole matching PID set): the daemon never runs against a
+  //      mid-merge tree or a torn-down node_modules.
+  //   3. the gate-verified merge (ff-only onto the fetched origin/main).
+  //   4. `npm ci` ONLY on a lock delta (git diff --quiet old..new
+  //      -- package-lock.json) — never unconditional, never while the
+  //      daemon runs.
+  //   5. start() — the same control path Restart uses — ONLY when a
+  //      daemon was running (decision 3: if the stop found no daemon
+  //      PID, the update applies, no restart is needed, and the final
+  //      note says so).
+  //   6. rebuild the menu bar bundle (menubar/build.sh — the honest
+  //      shape: the running menu bar cannot re-exec its own binary in
+  //      place). When the launchd label is loaded AND the label runs the
+  //      bundle we just rebuilt (ProgramArguments.0 == the bundle's own
+  //      executable path), `launchctl kickstart -k` relaunches the agent
+  //      on the new binary and this process exits with the note
+  //      "restarting menu bar with new code"; otherwise (dev run, or a
+  //      stale label pointing elsewhere — e.g. a bare-binary plist from
+  //      before the bundle era) the note says "menu bar rebuilt —
+  //      relaunch it to run the new code" and NO process is killed.
+  //   7. record: one line per completed update appended to
+  //      logs/idlefill-menubar.log (rotated — never deleted, never
+  //      truncated to empty), and deployedRevision = the merged HEAD.
   func updateCode() {
     let repo = repoRoot
+    updateNote = "updating: checking tree …"
     let logDir = (repo as NSString).appendingPathComponent("logs")
     try? FileManager.default.createDirectory(atPath: logDir, withIntermediateDirectories: true)
     let logFile = (logDir as NSString).appendingPathComponent("idlefill-menubar.log")
-    updateNote = "updating: git pull + npm ci …"
-    run("/usr/bin/git", ["pull", "--ff-only", "origin", "main"], cwd: repo, log: logFile)
-    run(npmPath(), ["ci", "--no-audit", "--no-fund"], cwd: repo, log: logFile)
-    updateNote = "updated — restarting daemon"
-    restart()
+    let kickLabel = "gui/\(geteuid())/\(UpdatePlan.label)"
+
+    // ---- gate (a): the tree must be clean (bounded — a wedged git must
+    // not hang the panel; a timeout is a refusal, not a pass). Tracked
+    // changes only (status --porcelain with no flags): the repo
+    // intentionally ignores untracked scratch. Refuse BEFORE any fetch or
+    // write — a dirty tree gets no fetch, no merge, no install, no signal.
+    let treeClean = UpdateFacts.gitStatusClean(repo: repo)
+    if !treeClean {
+      updateNote = UpdatePlan.note(for: .refuse(.dirty))
+      return
+    }
+
+    // ---- gate (b): fetch (a detached read of the remote — no
+    // working-tree mutation). Any failure refuses; nothing is written.
+    updateNote = "updating: fetching …"
+    let fetchOk = gatedRun(["/usr/bin/git", "fetch", "origin", "main"], cwd: repo, log: logFile).isOK
+    guard fetchOk else {
+      updateNote = "fetch failed — update aborted"
+      return
+    }
+
+    // ---- the remaining gate facts from the real wrappers — the SAME
+    //    UpdateFacts.gather the headless harness drives against a scratch
+    //    repo (isAncestor, hasDelta, lockChanged, daemonPids,
+    //    labelLoaded, thisIsLabelBinary, currentShortSha). gather
+    //    re-verifies the tree (a concurrent edit between the pre-fetch
+    //    check and now refuses at gate (a) — before any write) and reads
+    //    both revisions; it returns nil only when they cannot be read.
+    guard var input = UpdateFacts.gather(repo: repo) else {
+      updateNote = "could not read the current revision — update aborted"
+      return
+    }
+    // gather hardcodes fetchOk (it does not fetch); the caller's logged
+    // fetch above is the gate-(b) fact.
+    input.fetchOk = fetchOk
+
+    // ---- the pure decision: the gate outcome + the ordered step list +
+    // the note, all from the facts above (no side effects in UpdatePlan).
+    // The relaunch safety is inside gather: thisIsLabelBinary is true
+    // only when the label runs THIS process's own binary (exact path —
+    // a bundle run is its bundle's executable, a bare-binary run is that
+    // bare path). On any miss it is false and the rebuild becomes a note,
+    // never a kill.
+    let plan = UpdatePlan.plan(input)
+
+    // The NEW revision (origin/main, just fetched — the merge's target).
+    // Read NOW, pre-merge: deployedRevision and the log line must carry it
+    // even when the last step (a kickstart) ends this process, and a
+    // ff-only merge lands exactly here.
+    let newSha = UpdateFacts.shortSha("origin/main", cwd: repo)
+
+    // A refusal or a no-op never writes (the fetch above was read-only):
+    // the status row says which, and stop. (treeClean/fetchOk already
+    // passed, so only `.diverged` or `.noOp` reach here.)
+    if case .proceed = plan.gate {
+      // fall through to the step executor
+    } else {
+      updateNote = plan.note
+      if !plan.input.hasDelta, let s = plan.input.currentShortSha { deployedRevision = s }
+      return
+    }
+
+    // ---- execute the plan's ordered steps (the pure UpdatePlan decided
+    // the list; these wrappers only run and gate on each exit status).
+    // A failing step halts the operation — the next step (e.g. the
+    // install after a failed merge) never runs.
+    var startRan = false
+    func run(_ s: UpdatePlan.Step) -> Bool {
+      var ok = false
+      switch s {
+      case .stopDaemon:
+        // SIGINT the whole matching PID set (the existing stop() path).
+        // Fire-and-forget: give the pair a beat to exit before the tree
+        // changes under it. No PIDs → stop() notes "no daemon process
+        // found" and the update proceeds (no restart needed — the note
+        // says so at the end).
+        stop()
+        Thread.sleep(forTimeInterval: 1.5)
+        ok = true
+      case .merge:
+        updateNote = "updating: merging …"
+        ok = gatedRun(["/usr/bin/git", "merge", "--ff-only", "origin/main"], cwd: repo, log: logFile).isOK
+        if !ok { updateNote = "merge failed — see logs/idlefill-menubar.log" }
+      case .install:
+        updateNote = "updating: lock file changed — npm ci …"
+        ok = gatedRun([npmPath(), "ci", "--no-audit", "--no-fund"], cwd: repo, log: logFile).isOK
+        if !ok { updateNote = "npm ci failed — see logs/idlefill-menubar.log" }
+      case .startDaemon:
+        updateNote = "updating: starting daemon …"
+        startRan = true
+        start() // sets a refusal note when it cannot start (nil on success)
+        ok = (updateNote == nil || updateNote == "daemon already running")
+      case .buildMenubar:
+        updateNote = "updating: rebuilding menu bar …"
+        let buildSh = (repo as NSString).appendingPathComponent("menubar/build.sh")
+        ok = gatedRun(["/bin/bash", buildSh], cwd: repo, log: logFile).isOK
+        if !ok { updateNote = "menu bar build failed — see logs/idlefill-menubar.log" }
+      case .kickMenubar:
+        // Set BEFORE the kick (the issue's requirement): launchd re-runs
+        // the (rebuilt) bundle on the same path — this process exits and
+        // the new binary takes over.
+        updateNote = "restarting menu bar with new code"
+        ok = gatedRun(["/bin/launchctl", "kickstart", "-k", kickLabel], cwd: repo, log: logFile).isOK
+        if !ok { updateNote = "menu bar rebuilt — relaunch it to run the new code (kickstart failed)" }
+      }
+      return ok
+    }
+    var halted = false
+    for s in plan.steps {
+      if halted { break }
+      if !run(s) { halted = true }
+    }
+
+    // ---- record (a line per COMPLETED update — a halted update appends
+    // nothing to the revision log; the per-step output it did produce is
+    // already in the log, so the effect is auditable) + the status row's
+    // deployed revision.
+    if halted {
+      var n = updateNote ?? "update aborted"
+      if !plan.input.daemonPids.isEmpty && !startRan {
+        n += " — the daemon was stopped by this update; Start it to restore it"
+      }
+      updateNote = n
+      return
+    }
+    // The NEW revision (read pre-merge above — the ff-only merge lands
+    // exactly at origin/main, so it is the deployed revision once the
+    // steps complete).
+    guard let newShort = newSha else {
+      updateNote = "merge applied but the new revision could not be read — see logs/idlefill-menubar.log"
+      return
+    }
+    let line = UpdatePlan.logLine(oldShort: input.currentShortSha ?? "?", newShort: newShort,
+                                  daemonPid: plan.input.daemonPids.first,
+                                  lockChanged: input.lockChanged)
+    UpdateLog.append(line, at: logFile)
+    deployedRevision = newShort
+    let lastStep: UpdatePlan.Step? = plan.steps.last
+    let didKick = lastStep == .kickMenubar
+    if !didKick {
+      var finalNote = UpdatePlan.note(for: plan.gate)
+      if plan.input.daemonPids.isEmpty {
+        finalNote += " (daemon was not running — no restart)"
+      }
+      updateNote = finalNote + " — " + line
+    }
+    // didKick: the "restarting menu bar with new code" note set before the
+    // kick is the final word — the process is about to relaunch.
+  }
+
+  /** Run a command, capture whether it succeeded, and append its output to
+   *  the log. The termination status is returned so the caller gates the
+   *  next step on it (a failing fetch must not be followed by a merge; a
+   *  failing merge must not be followed by an install) — the class fix the
+   *  issue's item 4 asks for. The log is appended with O_APPEND (see
+   *  `appendLog`), never truncated. */
+  private func gatedRun(_ cmd: [String], cwd: String, log: String) -> RunResult {
+    let captured = Pipe()
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: cmd[0])
+    p.arguments = Array(cmd.dropFirst())
+    p.currentDirectoryURL = URL(fileURLWithPath: cwd)
+    // A GUI-launched app carries a minimal PATH; give the children the
+    // Homebrew prefix (npm, node, git live there on this box).
+    var env = ProcessInfo.processInfo.environment
+    env["PATH"] = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", env["PATH"] ?? ""].joined(separator: ":")
+    p.environment = env
+    p.standardOutput = captured
+    p.standardError = captured
+    do {
+      try p.run()
+    } catch {
+      return .failed(255) // spawn failed — treat as a gate failure
+    }
+    p.waitUntilExit()
+    // Drain the pipe (bounded: these are small git/launchctl outputs —
+    // the 190 KB ps case is handled by the temp-file path in daemonPIDs).
+    let data = (try? captured.fileHandleForReading.readToEnd()) ?? Data()
+    if log != "/dev/null" {
+      appendLog(cmd: cmd, data: data, exit: Int(p.terminationStatus), at: log)
+    }
+    return p.terminationStatus == 0 ? .ok : .failed(Int(p.terminationStatus))
+  }
+
+  /** Append one command's output to the update log. `FileHandle
+   *  (forWritingAtPath:)` TRUNCATES (verified in a probe: a second open
+   *  left only the newest line), so appending through it — even with
+   *  seekToEndOfFile — destroys the log on the first write. This opens
+   *  with O_APPEND instead: the kernel places every write at the true
+   *  end, the file is created when missing, and the log is never deleted
+   *  nor truncated (rotation is UpdateLog's job, and it keeps a tail). */
+  private func appendLog(cmd: [String], data: Data, exit: Int, at path: String) {
+    let fm = FileManager.default
+    let dir = (path as NSString).deletingLastPathComponent
+    try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    // The 3-ARG open with an explicit mode: a 2-arg open(O_CREAT) creates
+    // the file with mode 0000 (the implicit mode is 0), so even the owner
+    // could never read the log back (EACCES) — and the next reopen-for-
+    //write-or-read would fail too. 0o644 on create; existing files keep
+    // their mode. O_APPEND: the kernel places every write at the true end.
+    let fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+    guard fd >= 0 else { return }
+    defer { close(fd) }
+    let header = "\n$ \(cmd.joined(separator: " "))\n"
+    let footer = "\n[exit \(exit)]\n"
+    if let h = header.data(using: .utf8) { _ = h.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) } }
+    _ = data.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+    if let f = footer.data(using: .utf8) { _ = f.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) } }
+  }
+
+  private enum RunResult {
+    case ok
+    case failed(Int)
+    var isOK: Bool {
+      if case .ok = self { return true }
+      return false
+    }
   }
 
   private func npmPath() -> String {
@@ -496,26 +774,6 @@ final class AppModel: ObservableObject {
       if FileManager.default.isExecutableFile(atPath: cand) { return cand }
     }
     return "/usr/bin/env"
-  }
-
-  private func run(_ path: String, _ args: [String], cwd: String, log: String) {
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: path)
-    p.arguments = args
-    p.currentDirectoryURL = URL(fileURLWithPath: cwd)
-    if let f = FileHandle(forWritingAtPath: log) {
-      p.standardOutput = f
-      p.standardError = f
-    }
-    do {
-      try p.run()
-      p.waitUntilExit()
-      if p.terminationStatus != 0 {
-        updateNote = "\((path as NSString).lastPathComponent) exited \(p.terminationStatus) — see logs/idlefill-menubar.log"
-      }
-    } catch {
-      updateNote = "\((path as NSString).lastPathComponent) failed: \(error.localizedDescription)"
-    }
   }
 
   // MARK: release update (check + install)
@@ -804,6 +1062,415 @@ enum UpdateCheck {
   }
 }
 
+// MARK: - update code (issue #11 — the pure, testable core)
+
+/** The pure decision core of Update Code. Given the pre-flight facts (each
+ *  gathered by a thin wrapper that runs a real git/launchd/ps command and
+ *  gates on its exit status), decide:
+ *
+ *   - the gate outcome (`.refuse` with a reason, `.noOp`, or `.proceed`),
+ *   - the ordered list of SIDE-EFFECT STEPS to run when it proceeds, and
+ *   - the final status-row note.
+ *
+ *  No git, no launchctl, no Process, no file IO lives here — the headless
+ *  harness drives THIS type (plus the real git wrappers) against a scratch
+ *  repo, so what the tests prove is what ships.
+ *
+ *  Gate order (a refusal at any gate means NOTHING is written — no merge,
+ *  no install, no signal to the daemon):
+ *    a. treeClean==false            → refuse `dirty`
+ *    b. fetchOk==false              → refuse `fetch`
+ *    c. isAncestor==false           → refuse `diverged`
+ *    d. hasDelta==false             → noOp (already up to date)
+ *  A `git pull` is never run; the only write step is `.merge` (ff-only
+ *  onto the fetched origin/main), present only when every gate passed.
+ */
+enum UpdatePlan {
+  /** The pre-flight facts a plan is decided from. */
+  struct Input {
+    var treeClean: Bool
+    var fetchOk: Bool
+    var isAncestor: Bool        // HEAD is an ancestor of origin/main
+    var hasDelta: Bool          // HEAD != origin/main (after the fetch)
+    var lockChanged: Bool       // package-lock.json differs old..new
+    var daemonPids: [Int]       // the current daemon PID set (may be empty)
+    var labelLoaded: Bool       // launchctl print gui/<uid>/<label> exit 0
+    var thisIsLabelBinary: Bool // this process is the binary the label runs
+    var currentShortSha: String?
+  }
+
+  /** The gate outcome. `.refuse` and `.noOp` carry no steps; `.proceed`
+   *  means the step list is to be executed. Equatable so the harness can
+   *  assert on the outcome directly. */
+  enum Gate: Equatable {
+    case refuse(Reason)
+    case noOp
+    case proceed
+    enum Reason: Equatable {
+      case dirty        // tree not clean
+      case fetch        // git fetch origin main failed
+      case diverged     // HEAD is not an ancestor of origin/main
+    }
+  }
+
+  /** One ordered side-effect step. The executor (updateCode) maps each to
+   *  a real command/wrapper and gates the next step on the exit status. */
+  enum Step: Equatable {
+    case stopDaemon     // SIGINT the whole matching PID set (stop() path)
+    case merge          // git merge --ff-only origin/main (the only write)
+    case install        // npm ci --no-audit --no-fund (lock delta only)
+    case startDaemon    // start() — the same control path as Restart
+    case buildMenubar   // bash menubar/build.sh (rebuild the bundle)
+    case kickMenubar    // launchctl kickstart -k gui/<uid>/<label> (relaunch)
+  }
+
+  /** The plan: gate + steps + note. Built by `init(input:)`. */
+  struct Plan {
+    var input: Input
+    var gate: Gate
+    var steps: [Step]
+    var note: String
+  }
+
+  /// The menubar LaunchAgent label (the same one menubar/install.sh uses).
+  /// `IDLEFILL_MENUBAR_LABEL` override (headless test hook — the harness
+  /// points it at a scratch label); the app uses the real label.
+  static var label: String {
+    ProcessInfo.processInfo.environment["IDLEFILL_MENUBAR_LABEL"] ?? "com.sam.idlefill.menubar"
+  }
+
+  /** The pure decision. The gate is evaluated in order; a refusal or a
+   *  no-op yields an empty step list (nothing runs, nothing is written).
+   *  A proceed builds the step list:
+   *    1. stopDaemon  (always first — the daemon never runs against a
+   *       mid-merge tree or a torn-down node_modules; empty PIDs is fine,
+   *       the note says the daemon was not running)
+   *    2. merge       (the gate-verified ff-only write)
+   *    3. install     (ONLY when lockChanged — never unconditional)
+   *    4. startDaemon (ONLY when a daemon was running — decision 3: if
+   *       the stop found no PID, the update applies and no restart is
+   *       needed; the note says so. Starting a daemon that was
+   *       intentionally off would surprise the operator.)
+   *    5. buildMenubar (always — the menu bar's own code must update)
+   *    6. kickMenubar  (only when labelLoaded AND thisIsLabelBinary —
+   *       otherwise the note says "rebuild — relaunch it"; no kill of a
+   *       process that is not the label's)
+   */
+  static func plan(_ input: Input) -> Plan {
+    // (a) tree
+    if !input.treeClean {
+      return Plan(input: input, gate: .refuse(.dirty), steps: [], note: note(for: .refuse(.dirty)))
+    }
+    // (b) fetch
+    if !input.fetchOk {
+      return Plan(input: input, gate: .refuse(.fetch), steps: [], note: note(for: .refuse(.fetch)))
+    }
+    // (c) divergence
+    if !input.isAncestor {
+      return Plan(input: input, gate: .refuse(.diverged), steps: [], note: note(for: .refuse(.diverged)))
+    }
+    // (d) no delta
+    if !input.hasDelta {
+      return Plan(input: input, gate: .noOp, steps: [], note: "already up to date (\(input.currentShortSha ?? "?"))")
+    }
+    // proceed
+    var steps: [Step] = [.stopDaemon, .merge]
+    if input.lockChanged { steps.append(.install) }
+    if !input.daemonPids.isEmpty { steps.append(.startDaemon) }
+    steps.append(.buildMenubar)
+    if input.labelLoaded && input.thisIsLabelBinary { steps.append(.kickMenubar) }
+    var note = "updated"
+    if input.daemonPids.isEmpty { note += " (daemon was not running — no restart)" }
+    if !(input.labelLoaded && input.thisIsLabelBinary) {
+      note += " — menu bar rebuilt; relaunch it to run the new code"
+    }
+    return Plan(input: input, gate: .proceed, steps: steps, note: note)
+  }
+
+  /** The status-row note for a gate outcome. */
+  static func note(for gate: Gate) -> String {
+    switch gate {
+    case .refuse(.dirty):    return "tree not clean — commit or stash first, update aborted"
+    case .refuse(.fetch):    return "fetch failed — update aborted"
+    case .refuse(.diverged): return "local branch diverged from origin/main — reconcile first, update aborted"
+    case .noOp:              return "already up to date"
+    case .proceed:           return "updated"
+    }
+  }
+
+  // -- pure helpers over the gate facts (no side effects) ------------------
+
+  /** `git diff --quiet old new -- package-lock.json` exit semantics: 0 =
+   *  identical (NOT changed), non-zero = changed (or an error, which the
+   *  caller treats as "not a lock delta" — no install, fail quiet about
+   *  the install and the merge still applies). */
+  static func lockDeltaChanged(diffQuietExit: Int32) -> Bool {
+    diffQuietExit != 0
+  }
+
+  /** The one-line update record: `<old> → <new> <ISO ts> daemon-pid=<pid
+   *  or none> lock-changed=<yes|no>`. */
+  static func logLine(oldShort: String, newShort: String, daemonPid: Int?, lockChanged: Bool,
+                      timestamp: String = UpdateLog.nowISO()) -> String {
+    "\(oldShort) → \(newShort) \(timestamp) daemon-pid=\(daemonPid.map { String($0) } ?? "none") lock-changed=\(lockChanged ? "yes" : "no")"
+  }
+}
+
+/** The thin wrappers that gather the pre-flight facts from the real
+ *  system (git / launchctl / ps). Each is pure + param-driven (no hidden
+ *  state, no `repoRoot`) so the headless harness drives THESE wrappers —
+ *  the same ones the app uses — against a scratch repo. They are the
+ *  "where practical, the REAL git wrappers" of the DoD. The read-only
+ *  probes here (status / rev-parse / is-ancestor / diff --quiet / launchctl
+ *  print / ps) do NOT log; the write steps in `updateCode` (fetch / merge /
+ *  install / build / kick) go through the logged `gatedRun` instead, so the
+ *  update log records what an update did.
+ */
+enum UpdateFacts {
+  /** `git status --porcelain` is empty AND the call returned within the
+   *  timeout (a wedged git refuses the update rather than hanging the
+   *  panel — the repo can sit on a network mount where status stalls).
+   *  The timeout is enforced by the perl alarm wrapper (`git` itself has
+   *  no timeout flag). Tracked changes only: a dirty tracked file refuses;
+   *  untracked scratch is intentionally ignored. */
+  static func gitStatusClean(repo: String, timeout: UInt32 = 10) -> Bool {
+    let tmp = (NSTemporaryDirectory() as NSString)
+      .appendingPathComponent("idlefill-status-\(getpid()).txt")
+    FileManager.default.createFile(atPath: tmp, contents: nil)
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/perl")
+    // alarm N then exec: the child is replaced by git and killed by SIGALRM
+    // after N seconds. exit 0 + empty output = clean; anything else (a
+    // dirty tree, an error, or the timeout's 128+SIGALRM) = refuse.
+    p.arguments = ["-e", "my $t = shift @ARGV; alarm $t; exec @ARGV",
+                   String(timeout), "/usr/bin/git", "-C", repo, "status", "--porcelain"]
+    p.currentDirectoryURL = URL(fileURLWithPath: repo)
+    // The output FileHandle MUST stay open until AFTER waitUntilExit —
+    // closing it before run() invalidates the fd Process dups at launch
+    // (NSFileHandleOperationException). git status --porcelain output is
+    // small, so a temp file (not a 64KB pipe) is safe and the handle can
+    // be released only once git has exited.
+    let h = FileHandle(forWritingAtPath: tmp)
+    if let h { p.standardOutput = h; p.standardError = h }
+    do { try p.run() } catch { if let h { try? h.close() }; return false }
+    p.waitUntilExit()
+    if let h { try? h.close() }
+    guard p.terminationStatus == 0,
+          let data = try? Data(contentsOf: URL(fileURLWithPath: tmp)) else { return false }
+    return (String(data: data, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+  }
+
+  /** `git rev-parse --short <rev>` (thin wrapper): the short-SHA string, or
+   *  nil on any failure (bad ref, no git, not a repo). */
+  static func shortSha(_ rev: String, cwd: String) -> String? {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+    p.arguments = ["-C", cwd, "rev-parse", "--short", rev]
+    p.currentDirectoryURL = URL(fileURLWithPath: cwd)
+    let captured = Pipe()
+    p.standardOutput = captured
+    p.standardError = FileHandle.nullDevice
+    do { try p.run() } catch { return nil }
+    p.waitUntilExit()
+    guard p.terminationStatus == 0 else { return nil }
+    let data = (try? captured.fileHandleForReading.readToEnd()) ?? Data()
+    let s = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return s.isEmpty ? nil : s
+  }
+
+  /** Is `HEAD` an ancestor of `origin/main` (the divergence gate)? A
+   *  non-ancestor (diverged local branch) or an error (no origin/main)
+   *  → false, which refuses the update. */
+  static func isAncestorOfOriginMain(repo: String) -> Bool {
+    probeExit(["/usr/bin/git", "merge-base", "--is-ancestor", "HEAD", "origin/main"], cwd: repo) == 0
+  }
+
+  /** Does `package-lock.json` differ between the two revisions (the
+   *  install trigger)? `git diff --quiet old new -- package-lock.json`:
+   *  exit 0 = identical (no install), non-zero = changed (install). */
+  static func lockDelta(old: String, new: String, cwd: String) -> Bool {
+    UpdatePlan.lockDeltaChanged(diffQuietExit:
+      probeExit(["/usr/bin/git", "diff", "--quiet", old, new, "--", "package-lock.json"], cwd: cwd))
+  }
+
+  /** Is the launchd label loaded (`launchctl print gui/<uid>/<label>`
+   *  exit 0)? */
+  static func labelLoaded(uid: UInt32, label: String) -> Bool {
+    probeExit(["/bin/launchctl", "print", "gui/\(uid)/\(label)"], cwd: "/") == 0
+  }
+
+  /** The path the launchd label currently runs (ProgramArguments.0 of the
+   *  live `launchctl print gui/<uid>/<label>` output), or nil. The relaunch
+   *  safety check is an EXACT compare against this process's own binary —
+   *  the label must run what this checkout is, not merely "a menubar". */
+  static func labelRuns(uid: UInt32, label: String) -> String? {
+    // `launchctl print <target>` renders the job's ProgramArguments as a
+    // block of indented lines after `arguments = {`; take the first.
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+    p.arguments = ["print", "gui/\(uid)/\(label)"]
+    let captured = Pipe()
+    p.standardOutput = captured
+    p.standardError = FileHandle.nullDevice
+    do { try p.run(); p.waitUntilExit() } catch { return nil }
+    let data = (try? captured.fileHandleForReading.readToEnd()) ?? Data()
+    let text = String(data: data, encoding: .utf8) ?? ""
+    guard let start = text.range(of: "arguments = {") else { return nil }
+    let rest = text[start.upperBound...]
+    for line in rest.split(separator: "\n") {
+      let t = line.trimmingCharacters(in: .whitespaces)
+      if t == "}" { return nil }
+      if !t.isEmpty { return t }
+    }
+    return nil
+  }
+
+  /** This process's own executable path (a bundle run is its bundle's
+   *  executable; a bare-binary run is that bare path). */
+  static func thisBinary() -> String {
+    Bundle.main.bundleURL.path.hasSuffix(".app")
+      ? Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/IdlefillMenubar").path
+      : (Bundle.main.executablePath ?? "/")
+  }
+
+  /** Run a command and return ONLY its termination status (no log, no
+   *  capture) — the "probe" primitive for the read-only gate facts. A
+   *  failed spawn returns non-zero, so `== 0` reads as "the probe held".
+   *  A GUI-launched app carries a minimal PATH; the children get the
+   *  Homebrew prefix (git, node live there on this box). */
+  static func probeExit(_ cmd: [String], cwd: String) -> Int32 {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: cmd[0])
+    p.arguments = Array(cmd.dropFirst())
+    p.currentDirectoryURL = URL(fileURLWithPath: cwd)
+    var env = ProcessInfo.processInfo.environment
+    env["PATH"] = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", env["PATH"] ?? ""].joined(separator: ":")
+    p.environment = env
+    p.standardOutput = FileHandle.nullDevice
+    p.standardError = FileHandle.nullDevice
+    do {
+      try p.run()
+      p.waitUntilExit()
+      return p.terminationStatus
+    } catch {
+      return 255
+    }
+  }
+
+  /** Assemble the full `UpdatePlan.Input` from the live system. Returns
+   *  nil only when the CURRENT revision cannot be read (no git / not a
+   *  repo / no HEAD) — the caller then aborts with a note. `origin/main`
+   *  absent (a fresh clone that never fetched) reads as
+   *  isAncestor=false + hasDelta=false — the plan refuses (diverged) and
+   *  NOTHING is written, which is the safe default; in both the app and
+   *  the harness gather runs only AFTER a successful fetch, so that
+   *  branch is defensive. The gate ORDER is the caller's responsibility
+   *  (it checks treeClean, then runs the fetch, then consumes these) so a
+   *  dirty tree never triggers a fetch or any write; this helper is the
+   *  fact bundle for the pure decision once the gates have been checked
+   *  in order. */
+  static func gather(repo: String, uid: UInt32 = geteuid(),
+                     label: String = UpdatePlan.label,
+                     thisBin: String? = thisBinary()) -> UpdatePlan.Input? {
+    guard let old = shortSha("HEAD", cwd: repo) else { return nil }
+    let loaded = labelLoaded(uid: uid, label: label)
+    let thisIsLabelBinary = loaded && (labelRuns(uid: uid, label: label) == thisBin)
+    let pids = AppModel.daemonPIDs(repo: repo)
+    let clean = gitStatusClean(repo: repo)
+    // origin/main present (fetched): the real delta facts. Absent (a fresh
+    // clone that never fetched): read as "no delta" (the no-op note is the
+    // correct answer, and the caller's fetch gate runs before this anyway).
+    if let new = shortSha("origin/main", cwd: repo) {
+      return UpdatePlan.Input(
+        treeClean: clean, fetchOk: true,
+        isAncestor: isAncestorOfOriginMain(repo: repo),
+        hasDelta: old != new,
+        lockChanged: lockDelta(old: old, new: new, cwd: repo),
+        daemonPids: pids, labelLoaded: loaded,
+        thisIsLabelBinary: thisIsLabelBinary, currentShortSha: old)
+    }
+    return UpdatePlan.Input(
+      treeClean: clean, fetchOk: true, isAncestor: false, hasDelta: false,
+      lockChanged: false, daemonPids: pids, labelLoaded: loaded,
+      thisIsLabelBinary: thisIsLabelBinary, currentShortSha: old)
+  }
+}
+
+/** The update log at `<repo>/logs/idlefill-menubar.log` — the app's own
+ *  log (the launchd plist's StandardOut/Err live elsewhere). One line per
+ *  completed update, appended with O_APPEND (never deleted, never
+ *  truncated to empty). Rotation: before an append, if the file exceeds
+ *  the cap, keep only the last 512 KiB (truncate the head) — the file is
+ *  always left non-empty. */
+enum UpdateLog {
+  static let capBytes: UInt64 = 1_048_576      // 1 MiB
+  static let keepBytes: UInt64 = 524_288       // 512 KiB tail
+  static let fileName = "idlefill-menubar.log"
+
+  /** Append one line (rotating first when over the cap). */
+  static func append(_ line: String, at path: String) {
+    rotateIfNeeded(path: path)
+    let dir = (path as NSString).deletingLastPathComponent
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    let fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+    guard fd >= 0 else { return }
+    defer { close(fd) }
+    var bytes = Data(line.utf8)
+    bytes.append(0x0a) // \n
+    _ = bytes.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+  }
+
+  /** If the file is over the cap, keep only its last `keepBytes` — but
+   *  never below the start of the final line (a rotation must not cut a
+   *  line in half, and must never empty the file). */
+  static func rotateIfNeeded(path: String) {
+    guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+          let size = attrs[.size] as? UInt64, size > capBytes else { return }
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return }
+    var keep = Array(data.suffix(Int(keepBytes)))
+    // Never cut the final line: if the kept tail does not end with a
+    // newline boundary that aligns to a whole line, back up to the last
+    // newline so the tail is whole lines only. (If that would empty it,
+    // keep the entire tail.)
+    if let nl = keep.lastIndex(where: { $0 == 0x0a }), nl != keep.count - 1 {
+      keep = Array(keep.suffix(from: nl + 1))
+    }
+    if keep.isEmpty { keep = Array(data.suffix(Int(keepBytes))) }
+    let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+    guard fd >= 0 else { return }
+    defer { close(fd) }
+    _ = keep.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+  }
+
+  /** ISO-8601 UTC timestamp, e.g. `2026-09-30T12:34:56Z`. */
+  static func nowISO() -> String {
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.timeZone = TimeZone(identifier: "UTC")
+    f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss'Z'"
+    return f.string(from: Date())
+  }
+
+  /** `git rev-parse --short HEAD` in `cwd` (thin wrapper — the value the
+   *  deployed-revision row shows). nil on any failure. */
+  static func currentRevision(repo: String) -> String? {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+    p.arguments = ["-C", repo, "rev-parse", "--short", "HEAD"]
+    p.currentDirectoryURL = URL(fileURLWithPath: repo)
+    let captured = Pipe()
+    p.standardOutput = captured
+    p.standardError = FileHandle.nullDevice
+    do { try p.run() } catch { return nil }
+    p.waitUntilExit()
+    guard p.terminationStatus == 0 else { return nil }
+    let data = (try? captured.fileHandleForReading.readToEnd()) ?? Data()
+    let s = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return s.isEmpty ? nil : s
+  }
+}
+
 // MARK: - views
 
 struct KVRow: View {
@@ -871,6 +1538,13 @@ struct ContentView: View {
 
       VStack(spacing: 4) {
         KVRow(k: "this machine", v: statusRow)
+        // The deployed revision (git rev-parse --short HEAD) — the standing
+        // answer to "what is deployed?". Always shown once known (set at
+        // launch and on every completed Update Code); hidden only before
+        // the first successful read.
+        if let rev = m.deployedRevision {
+          KVRow(k: "revision", v: rev)
+        }
         KVRow(k: "queue", v: "\(m.queueDepth)")
         KVRow(k: "today", v: "\(m.today.finished) ok · \(m.today.failed) failed")
         if m.tokensToday.value != nil {
