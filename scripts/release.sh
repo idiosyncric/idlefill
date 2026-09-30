@@ -122,6 +122,39 @@ rm -f "$ZIPSRC"
 
 # ---- 3. generate_appcast (sign, prune, carry-forward) ---------------------
 echo "==> [3/6] generate + sign appcast"
+# Guard: generate_appcast adds EVERY archive in the staging dir to the feed
+# (pruning only happens for entries whose zip is missing). A stray archive
+# — a test artifact, a wrong build — would either hard-fail the release
+# (duplicate bundle version) or, worse, silently enter the live feed as a
+# bogus "update" (any app would try to "update" to it). Refuse to publish
+# unless every archive is either this release or already referenced by the
+# current appcast (the carry-forward set).
+python3 - "$ZIPDIR" "$ZIPSRC" "$APPCAST" <<'PY'
+import os, sys, xml.etree.ElementTree as ET
+from urllib.parse import unquote
+zdir, new_zip, appcast = sys.argv[1], sys.argv[2], sys.argv[3]
+on_disk = {f for f in os.listdir(zdir) if f.endswith(".zip")}
+ref = set()
+if os.path.exists(appcast):
+    try:
+        t = ET.parse(appcast)
+        ref = {unquote(e.get("url").rsplit("/", 1)[-1])
+               for e in t.getroot().iter("enclosure") if e.get("url")}
+    except ET.ParseError:
+        ref = set()
+allowed = ref | {os.path.basename(new_zip)}
+junk = sorted(on_disk - allowed)
+if junk:
+    print(f"error: staging dir {zdir} contains archives that are neither this "
+          f"release ({os.path.basename(new_zip)}) nor referenced by the current "
+          f"appcast (carry-forward set): {junk}", file=sys.stderr)
+    print("       remove them — they would enter the live feed as bogus "
+          "updates — and retry:", file=sys.stderr)
+    for f in junk:
+        print(f"         rm {os.path.join(zdir, f)!r}", file=sys.stderr)
+    sys.exit(1)
+print(f"    staging clean: {sorted(on_disk)}")
+PY
 # --maximum-deltas 0: no .delta side-files, so the feed carries only zips
 # (keeps carry-forward to a simple "attach the referenced zips").
 "$GEN_APPCAST" \
