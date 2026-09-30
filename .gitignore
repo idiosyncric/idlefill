@@ -11,3 +11,4 @@ menubar/IdlefillMenubar
 menubar/IdlefillMenubar.app
 menubar/.IdlefillMenubar.versioned.swift
 desktop/Idlefill.app
+desktop/.IdlefillDesktop.versioned.swift
