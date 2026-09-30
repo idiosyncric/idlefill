@@ -6,9 +6,28 @@
 //  routing below needs) showing the arbiter state at a glance and
 //  controlling the local client daemon:
 //
-//    status   — color-coded state word + this machine's live status row
-//    stats    — queue depth, today finished/failed, tokens out (UTC), the
-//               running lease (job · auto-cancels-in)
+//    status   — color-coded state word (the arbiter's global verdict for
+//               the box) + the picked scope's live status row
+//    scope    — a machine picker over clients[] (online dot, last_seen;
+//               the default "this machine" = the client row whose name
+//               matches this checkout's config client_name, whatever the
+//               payload order; the labelled "all machines" aggregate is
+//               the explicitly-chosen fallback) and, inside it, a project
+//               picker over the picked client's reported projects (the
+//               default "all projects" is today's aggregate)
+//    stats    — per picked scope: queue depth, today finished/failed,
+//               tokens out (UTC) with the project's OWN cap, the running
+//               lease(s) (every active lease of this client — max
+//               concurrent > 1 lists them all), the published queue peek
+//               (queue_preview; a worker publishing no preview degrades
+//               to the depth number)
+//    controls — the published per-scope detail drives exception-only
+//               controls on existing routes (no new endpoints): the
+//               project pause gate (POST /api/projects/:name), the grant
+//               knobs (POST /api/projects/:name/settings), the worker
+//               pause/force override (POST /api/clients/:ref/override).
+//               Same token gate as the dashboard: no token → no POST and
+//               the status row names the missing token.
 //    actions  — Open Dashboard · Show Logs · Start/Stop · Restart ·
 //               Update code (gated fast-forward + lock-delta install +
 //               menu-bar rebuild + daemon restart) · Quit
@@ -86,7 +105,7 @@ enum Pal {
 // MARK: - state
 
 enum Conn: String {
-  case off, busy, working, idle, degraded, unreachable
+  case off, busy, working, idle, degraded, unreachable, noToken, unauthorized
 
   var color: Color {
     switch self {
@@ -96,6 +115,14 @@ enum Conn: String {
     case .idle: return Pal.ok
     case .degraded: return Pal.err
     case .unreachable: return Pal.err
+    // Distinct from .unreachable (the arbiter's red is "the server is down"):
+    // a missing token is a local misconfiguration — the operator cannot fix
+    // it by restarting anything, so the signal word AND colour must let the
+    // two fail on screen (DESIGN.md: red = failure, amber = blocked/at risk).
+    case .noToken: return Pal.warn
+    // The token is present but the arbiter rejects it (401) — a third,
+    // equally operator-actionable state; it must not read as a dead server.
+    case .unauthorized: return Pal.warn
     }
   }
   var word: String {
@@ -106,6 +133,8 @@ enum Conn: String {
     case .idle: return "idle"
     case .degraded: return "degraded"
     case .unreachable: return "unreachable"
+    case .noToken: return "no token"
+    case .unauthorized: return "bad token"
     }
   }
 }
@@ -143,14 +172,397 @@ enum MenuBarRouter {
   }
 }
 
+// MARK: - client config (parsed once)
+
+/** The gitignored client config, parsed ONCE at launch into a value.
+ *  Today's shape re-read + re-parsed the file on every call (token() and
+ *  serverURL() each parsed the whole file per poll, per control POST). The
+ *  parse also takes `client_name` — the key that survives daemon restarts
+ *  (registration is idempotent by name), so the menu bar can select THIS
+ *  machine's row from the state payload by name instead of by whatever
+ *  happens to come first.
+ *
+ *  Never printed, never logged; the token rides from here into the
+ *  Authorization header only. */
+struct ClientConfig: Equatable {
+  let token: String?
+  let serverURL: String
+  let clientName: String?
+
+  static let serverURLDefault = "http://100.105.225.1:8787"
+
+  static func load(path: String) -> ClientConfig {
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+          let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+      return ClientConfig(token: nil, serverURL: serverURLDefault, clientName: nil)
+    }
+    let token = (o["token"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+    let url = (o["server_url"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? serverURLDefault
+    let name = (o["client_name"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+    return ClientConfig(token: token, serverURL: url, clientName: name)
+  }
+}
+
+// MARK: - scope view (pure — testable headlessly)
+
+/** One machine row in the state payload's clients[]. */
+struct ScopeClient {
+  let id: String
+  let name: String
+  let lastSeen: Double     // epoch-ms (0 = unknown)
+  let projectNames: [String]
+  let overrideLabel: String?   // active operator override (exception-only)
+  let queueTotal: Int          // sum over the client's project rows
+}
+
+/** One running lease row for the scope. */
+struct ScopeLease {
+  let jobId: String
+  let project: String
+  let expiresAt: Double        // epoch-ms
+}
+
+/** A queue peek row from the published queue_preview (a worker that
+ *  publishes no preview degrades to the depth number alone). */
+struct ScopeQueueRow {
+  let title: String
+  let company: String
+}
+
+/** One project row under the picked machine, as the arbiter publishes it:
+ *  the client-reported values + the arbiter's per-project view (workers[],
+ *  scheduling, today, budget_today). `me` marks the picked client's own
+ *  worker row inside this project — the row the per-worker override acts
+ *  on. */
+struct ScopeProject {
+  let name: String
+  let depth: Int
+  let finished: Int
+  let failed: Int
+  let tokensOut: Double
+  let cap: Double
+  let paused: Bool
+  let budgetFull: Bool
+  let idleSeconds: Double
+  let maxLeases: Double
+  let ttlSeconds: Double
+  /** The GLOBAL grant knobs (scheduling.global) — the value an override
+   *  falls back to. The panel's knob cycle cycles from THESE (a cycle
+   *  that read the effective value would chase its own override). */
+  let globalIdleSeconds: Double
+  let globalMaxLeases: Double
+  let globalTtlSeconds: Double
+  let workersOnline: Int
+  let workersTotal: Int
+  let meOnline: Bool?
+  let mePaused: Bool?
+  let meQueuePreview: [ScopeQueueRow]
+  let idleOverride: Double?
+  let maxOverride: Double?
+  let ttlOverride: Double?
+}
+
+/** The panel's data, projected PURELY from one state payload — the
+ *  dashboard's standing convention (data comes straight from the payload;
+ *  the menu bar recomputes nothing). Driven headlessly by the harness
+ *  (menubar/scope-test.sh) with canned payloads, so what the tests prove
+ *  is what ships.
+ *
+ *  The two levels of scope (machine × project) are decided here, not in
+ *  the view:
+ *    - the machine picker lists every clients[] row (online dot +
+ *      last_seen);
+ *    - "this machine" (the DEFAULT, and today's behaviour) is the row
+ *      whose name equals the config's client_name — whatever the order in
+ *      the payload. If the payload carries no row of that name (config
+ *      without client_name, or this machine never registered), the
+ *      picker defaults to the explicitly labelled "all machines"
+ *      aggregate — the old first-online heuristic survives ONLY as that
+ *      labelled fallback, never as the default;
+ *    - the project picker lists the picked client's reported project
+ *      names; the default "all projects" aggregates them (today's
+ *      behaviour). The per-project rows always render, so a second
+ *      project's depth/budget/results are never invisible. */
+enum ScopeView {
+  static let allMachinesKey = "__all_machines__"
+  static let allProjectsKey = "__all_projects__"
+  /** "Unset" machine selection (the model's placeholder before the first
+   *  projection): project() resolves it to the DEFAULT (the name-matched
+   *  row, else the labelled "all machines" fallback). The old first-
+   *  online heuristic survives ONLY as that fallback's label, never as
+   *  the default. */
+  static let unsetMachineKey = "__unset__"
+
+  /** One machine-picker option: a clients[] row, or the "all machines"
+   *  fallback (the old heuristic, explicitly labelled — chosen by the
+   *  operator, never the default). */
+  struct MachineOption {
+    var key: String
+    var label: String
+    var online: Bool
+    var lastSeen: Double
+  }
+
+  struct Result {
+    let machines: [MachineOption]
+    /** The picked machine's key (a client_id or allMachinesKey). */
+    var selectedMachine: String
+    let machineLabel: String
+    /** The picked client's reported project names (the project picker).
+     *  Empty for the "all machines" aggregate (it projects the
+     *  per-project view across every machine — no client-specific rows). */
+    let projectNames: [String]
+    var selectedProject: String
+    let projects: [ScopeProject]
+    let queueTotal: Int
+    let finished: Int
+    let failed: Int
+    /** This client's running leases (ALL of them — max_concurrent_leases
+     *  > 1 lists every concurrent lease). Empty for "all machines". */
+    let leases: [ScopeLease]
+    /** The picked project's published queue peek (empty when the worker
+     *  publishes no preview — the panel degrades to the depth number). */
+    let queuePreview: [ScopeQueueRow]
+  }
+
+  static func machineLabel(clientId: String?, name: String?) -> String {
+    // id == name when the arbiter's name is a bare word (e.g. "mac-sam");
+    // never show the id twice.
+    if let id = clientId, let n = name, !n.isEmpty, id != n { return "\(n) (\(id))" }
+    if let n = name, !n.isEmpty { return n }
+    return clientId ?? "unknown"
+  }
+
+  static func machineLabel(clientId: String?, name: String?, allMachines: Bool) -> String {
+    allMachines ? "all machines" : machineLabel(clientId: clientId, name: name)
+  }
+
+  /** Project one state payload (JSON dictionary) into the panel view for
+   *  the operator's current picker selection.
+   *  - configName: the config's client_name — the key that selects this
+   *    machine's row whatever the payload order; nil → the "all machines"
+   *    fallback is the default;
+   *  - selectedMachine: a client_id / allMachinesKey; a
+   *    key the payload no longer carries (a renamed/removed client)
+   *    re-resolves to the default;
+   *  - selectedProject: a project name / allProjectsKey; a name the
+   *    picked client no longer reports falls back to allProjectsKey. */
+  static func project(payload: [String: Any],
+                      configName: String?,
+                      selectedMachine: String,
+                      selectedProject: String,
+                      nowMs: Double) -> Result {
+    let clients = (payload["clients"] as? [[String: Any]]) ?? []
+    let clientRows: [ScopeClient] = clients.map { c in
+      let projs = (c["projects"] as? [[String: Any]]) ?? []
+      return ScopeClient(
+        id: (c["client_id"] as? String) ?? "",
+        name: (c["name"] as? String) ?? "",
+        lastSeen: (c["last_seen"] as? Double) ?? 0,
+        projectNames: projs.compactMap { $0["name"] as? String },
+        overrideLabel: ((c["override"] as? [String: Any])?["override"] as? String) ?? nil,
+        queueTotal: projs.compactMap { $0["queue_depth"] as? Int }.reduce(0, +)
+      )
+    }
+    let projectRows = (payload["projects"] as? [[String: Any]]) ?? []
+
+    // ---- machine picker options (every row; online = last_seen < 90s —
+    // the same window the arbiter uses for workers; the row's own
+    // last_seen is the client row's liveness — it carries no `online`
+    // flag).
+    let machines: [MachineOption] = clientRows.map { c in
+      MachineOption(key: c.id,
+                    label: machineLabel(clientId: c.id, name: c.name),
+                    online: c.lastSeen > 0 && nowMs - c.lastSeen < 90_000,
+                    lastSeen: c.lastSeen)
+    }
+
+    // ---- the picked machine. The DEFAULT is the name-matched row (the
+    // config's client_name — registration is idempotent by name, so the
+    // name survives daemon restarts). A requested key that no longer
+    // exists re-resolves to the default; an absent configName (or no
+    // matching row) lands on the explicitly labelled "all machines"
+    // fallback — the old first-online heuristic is that fallback's
+    // selection, never the default.
+    let defaultKey: String
+    if let cn = configName {
+      defaultKey = clientRows.first(where: { $0.name == cn })?.id ?? allMachinesKey
+    } else {
+      defaultKey = allMachinesKey
+    }
+    let pickedKey: String
+    if selectedMachine == allMachinesKey {
+      pickedKey = allMachinesKey
+    } else if clientRows.contains(where: { $0.id == selectedMachine }) {
+      pickedKey = selectedMachine
+    } else {
+      pickedKey = defaultKey
+    }
+    let picked = clientRows.first(where: { $0.id == pickedKey })
+
+    // ---- the scope's client rows: the picked machine, or EVERY machine
+    // for the labelled aggregate (today's rows, minus the identity guess
+    // — the default "all projects" sums over all of them exactly as
+    // before).
+    let scopeClients: [ScopeClient] =
+      pickedKey == allMachinesKey ? clientRows : (picked.map { [$0] } ?? [])
+
+    // ---- the picked client's project names (the project picker) —
+    // the client's OWN reported rows, in payload order. The "all machines"
+    // aggregate has no client-specific project rows: its projects come
+    // from the arbiter's per-project view (the union every machine
+    // reports), so the picker lists those.
+    let projectNames: [String]
+    if let p = picked {
+      projectNames = p.projectNames
+    } else {
+      projectNames = projectRows.compactMap { $0["name"] as? String }
+    }
+
+    // ---- the picked project. A name the picked client no longer reports
+    // (a project dropped from its config since the last tick) falls back
+    // to allProjectsKey.
+    let projKey: String = projectNames.contains(selectedProject)
+      ? selectedProject : allProjectsKey
+
+    // ---- project rows for the scope: the arbiter's per-project view
+    // (workers[], scheduling, today, budget_today) narrowed to the scope's
+    // client rows (a project with NO worker in the scope is not listed —
+    // the same way today's aggregate only saw the picked client's
+    // projects).
+    var projects: [ScopeProject] = []
+    for pr in projectRows {
+      let pName = (pr["name"] as? String) ?? ""
+      guard !pName.isEmpty else { continue }
+      let workers = (pr["workers"] as? [[String: Any]]) ?? []
+      guard workers.contains(where: { w in
+        scopeClients.contains(where: { $0.name == ((w["client"] as? String) ?? "") })
+      }) else { continue }
+      let sched = (pr["scheduling"] as? [String: Any]) ?? [:]
+      let today = (pr["today"] as? [String: Any]) ?? [:]
+      let budget = (pr["budget_today"] as? [String: Any]) ?? [:]
+      // The me-row: the picked client's own worker row inside this project
+      // (the per-worker override acts on it). nil for "all machines" (there
+      // is no single me) — the panel then shows no worker-gate control.
+      let meRow = (pickedKey == allMachinesKey ? nil : workers.first { w in
+        (w["client"] as? String) == picked?.name
+      })
+      let overrides = (sched["overrides"] as? [String: Any]) ?? [:]
+      let globals = (sched["global"] as? [String: Any]) ?? [:]
+      let dNum: (Any?) -> Double? = { (v: Any?) in (v as? NSNumber)?.doubleValue }
+      let tokensOut = dNum(budget["tokens_out"]) ?? 0
+      let cap = dNum(sched["daily_token_cap"]) ?? 0
+      // Budget full = the dashboard's own rule (index.html): a FINITE cap
+      // (MAX_SAFE_INTEGER = ∞) that the day's tokens_out has reached.
+      let finiteCap = cap > 0 && cap < 9_007_199_254_740_992
+      let idle = (sched["idle_seconds"] as? NSNumber)?.doubleValue ?? 0
+      let maxl = (sched["max_concurrent_leases"] as? NSNumber)?.doubleValue ?? 0
+      let ttl = (sched["lease_ttl_seconds"] as? NSNumber)?.doubleValue ?? 0
+      // The SCOPE's share of the project: the picked machine's own worker
+      // rows (for "all machines": every row — the aggregate is the sum of
+      // its parts, the dashboard's own rule). `workers` itself is the
+      // project's GLOBAL roster (every machine reporting it).
+      let scopeWorkers = workers.filter { w in
+        scopeClients.contains { sc in (w["client"] as? String) == sc.name }
+      }
+      projects.append(ScopeProject(
+        name: pName,
+        depth: scopeWorkers.compactMap { $0["queue_depth"] as? Int }.reduce(0, +),
+        finished: (today["finished"] as? NSNumber)?.intValue ?? 0,
+        failed: (today["failed"] as? NSNumber)?.intValue ?? 0,
+        tokensOut: tokensOut,
+        cap: cap,
+        paused: (sched["paused"] as? Bool) == true,
+        budgetFull: finiteCap && tokensOut >= cap,
+        idleSeconds: idle,
+        maxLeases: maxl,
+        ttlSeconds: ttl,
+        globalIdleSeconds: dNum(globals["idle_seconds"]) ?? idle,
+        globalMaxLeases: dNum(globals["max_concurrent_leases"]) ?? maxl,
+        globalTtlSeconds: dNum(globals["lease_ttl_seconds"]) ?? ttl,
+        workersOnline: scopeWorkers.filter { ($0["online"] as? Bool) == true }.count,
+        workersTotal: scopeWorkers.count,
+        meOnline: meRow.flatMap { $0["online"] as? Bool },
+        mePaused: meRow.flatMap { (($0["stats"] as? [String: Any])?["paused"] as? Bool) },
+        meQueuePreview: (meRow?["queue_preview"] as? [[String: Any]])?.compactMap { r in
+          let title = (r["title"] as? String) ?? (r["job_id"] as? String) ?? ""
+          let company = (r["company"] as? String) ?? ""
+          return ScopeQueueRow(title: title, company: company)
+        } ?? [],
+        idleOverride: dNum(overrides["idle_seconds"]),
+        maxOverride: dNum(overrides["max_concurrent_leases"]),
+        ttlOverride: dNum(overrides["lease_ttl_seconds"])
+      ))
+    }
+
+    // ---- the picked project's values. "all projects" = the sum of its
+    // parts (today's aggregate, built from the published per-project
+    // rows — never recomputed from raw client data). A specific project =
+    // that row's own published values.
+    let pickedProj = (projKey == allProjectsKey ? nil : projects.first { $0.name == projKey })
+    let queueTotal = pickedProj.map { $0.depth } ?? projects.map { $0.depth }.reduce(0, +)
+    let finished = pickedProj.map { $0.finished } ?? projects.map { $0.finished }.reduce(0, +)
+    let failed = pickedProj.map { $0.failed } ?? projects.map { $0.failed }.reduce(0, +)
+    let queuePreview = pickedProj?.meQueuePreview ?? []
+
+    // ---- the running leases. For a picked client: EVERY active lease of
+    // that client (max_concurrent_leases > 1 → all of them). For "all
+    // machines": none — the aggregate has no single lease owner to show
+    // (the icon's spin stays tied to this client's leases, which for the
+    // default scope is the name-matched row).
+    let activeLeases = (payload["active_leases"] as? [[String: Any]]) ?? []
+    let leases: [ScopeLease] = (pickedKey == allMachinesKey ? [] : activeLeases.filter {
+      ($0["client_id"] as? String) == picked?.id
+    }).map { l in
+      ScopeLease(jobId: (l["job_id"] as? String) ?? "?",
+                 project: (l["project"] as? String) ?? "",
+                 expiresAt: (l["expires_at"] as? Double) ?? 0)
+    }
+
+    let machineLabel: String = {
+      if pickedKey == allMachinesKey { return "all machines" }
+      return machineLabel(clientId: picked?.id, name: picked?.name)
+    }()
+
+    return Result(machines: machines,
+                  selectedMachine: pickedKey,
+                  machineLabel: machineLabel,
+                  projectNames: projectNames,
+                  selectedProject: projKey,
+                  projects: projects,
+                  queueTotal: queueTotal,
+                  finished: finished,
+                  failed: failed,
+                  leases: leases,
+                  queuePreview: queuePreview)
+  }
+}
+
 final class AppModel: ObservableObject {
   @Published var conn: Conn = .off
   @Published var daemonRunning = false
+  // The scope (issue #12): the machine × project pickers drive which rows
+  // the panel shows. The DEFAULT is "this machine · all projects" — the
+  // name-matched client row (the config's client_name) and its aggregate —
+  // exactly today's behaviour; the pickers let the operator widen it.
+  @Published var machine: ScopeView.MachineOption
+    = ScopeView.MachineOption(key: ScopeView.unsetMachineKey, label: "…",
+                              online: false, lastSeen: 0)
+  @Published var projectKey: String = ScopeView.allProjectsKey
+  @Published var scopeProjects: [ScopeProject] = []
   @Published var queueDepth = 0
   @Published var today: (finished: Int, failed: Int) = (0, 0)
-  @Published var tokensToday: (project: String, cap: Double?, value: Double?) = ("", nil, nil)
-  @Published var lease: (job: String, expiresAt: Double) = ("", 0)
+  @Published var leases: [ScopeLease] = []
+  @Published var queuePreview: [ScopeQueueRow] = []
   @Published var lastSeenS: Int? = nil
+  /// Every clients[] row from the last payload (the machine picker's
+  /// options; the "all machines" aggregate row is added by viewMachines).
+  @Published var machines: [ScopeView.MachineOption] = []
+  /// The published per-project token budget for the picked project
+  /// ("all projects" sums the parts; a hidden row = the scope has no
+  /// budget data yet).
+  @Published var tokensToday: (label: String, cap: Double, value: Double) = ("", 0, 0)
+  @Published var tokenRowVisible = false
   /// The revision of THIS checkout's tree, as the operator should read it:
   /// `git rev-parse --short HEAD`. Refreshed at launch (init) and on every
   /// completed Update Code (where the deployed revision is exactly the
@@ -172,6 +584,16 @@ final class AppModel: ObservableObject {
   var repoRoot: String { repoRootOverride ?? _repoRoot }
   var repoRootOverride: String? = nil
   private let _repoRoot = AppModel.findRepoRoot()
+  /// The gitignored client config, parsed ONCE at launch (token + server
+  /// URL + client_name). Replaces the old token()/serverURL() pair, each of
+  /// which re-read + re-parsed the same file per call.
+  let config: ClientConfig = ClientConfig.load(
+    path: (AppModel.findRepoRoot() as NSString).appendingPathComponent("client/config.json"))
+  /** The config path the app's own repo discovery resolved to (the
+   *  operator-visible "the token lives in <path>" fact). */
+  var configPath: String {
+    (repoRoot as NSString).appendingPathComponent("client/config.json")
+  }
 
   // The baked version (substituted at build time by menubar/build.sh — the
   // `__MENUBAR_VERSION__` placeholder carries the release tag's version, so
@@ -193,6 +615,12 @@ final class AppModel: ObservableObject {
     // launch; a failure (no git, not a repo) leaves it nil and the
     // revision row stays hidden until a successful read.
     if let rev = UpdateLog.currentRevision(repo: repoRoot) { deployedRevision = rev }
+    // A missing token is a DISTINCT state from an unreachable arbiter
+    // (criterion 5): "no token" (amber) vs "unreachable" (red) — the
+    // operator cannot tell an unconfigured client from a dead server any
+    // other way. The 10s poll retries and the word switches on its own
+    // once a token appears in the config.
+    if config.token == nil { conn = .noToken }
     // The release check (update story): once at launch, then every 6h.
     // Offline-tolerant — any failure sets nothing and fails quiet.
     checkForUpdates()
@@ -205,8 +633,14 @@ final class AppModel: ObservableObject {
     // Returns the REPO ROOT — the dir that CONTAINS `client/` (every caller
     // does repoRoot + "client/…"). IDLEFILL_CONFIG_FILE is a path to
     // client/config.json, so strip two components to get the repo.
+    // GUARD: an env value without at least two path components (a bare
+    // filename) would collapse to the filesystem ROOT — the one-level-deeper
+    // bug class this file has hit before — so treat it as unset and fall
+    // through to the binary-location discovery.
     if let p = ProcessInfo.processInfo.environment["IDLEFILL_CONFIG_FILE"] {
-      return (((p as NSString).deletingLastPathComponent as NSString).deletingLastPathComponent)
+      let parent = (p as NSString).deletingLastPathComponent
+      let root = (parent as NSString).deletingLastPathComponent
+      if !(parent.isEmpty || root.isEmpty) { return root }
     }
     // The binary ships at <repo>/menubar/IdlefillMenubar. bundleURL points at
     // the executable's own directory (…/menubar), so the repo root is one
@@ -286,36 +720,51 @@ final class AppModel: ObservableObject {
     URL(fileURLWithPath: (findRepoRoot() as NSString).appendingPathComponent("menubar/IdlefillMenubar.app"))
   }
 
-  func token() -> String? {
-    let path = (repoRoot as NSString).appendingPathComponent("client/config.json")
-    guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-          let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-          let t = o["token"] as? String, !t.isEmpty else { return nil }
-    return t
-  }
+  /** The client config's arbiter token (parsed once at launch — see
+   *  `config`). The Authorization header is the ONLY place it rides; it is
+   *  never printed, logged, or baked into the bundle. */
+  var arbiterToken: String? { config.token }
 
-  func serverURL() -> String {
-    let path = (repoRoot as NSString).appendingPathComponent("client/config.json")
-    if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-       let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-       let u = o["server_url"] as? String, !u.isEmpty { return u }
-    return "http://100.105.225.1:8787"
-  }
+  /** The arbiter URL (config's server_url, parsed once at launch). */
+  func serverURL() -> String { config.serverURL }
 
   // MARK: poll
 
   func poll() {
-    guard let tok = token() else {
-      conn = .unreachable
+    guard let tok = arbiterToken else {
+      // DISTINCT on screen from a dead arbiter (criterion 5): the word is
+      // "no token" (amber — a local misconfiguration), not "unreachable"
+      // (red — the server is down). No request is issued; the 10s retry
+      // switches the word on its own once a token appears in the config.
+      conn = .noToken
       return
     }
     var req = URLRequest(url: URL(string: serverURL() + "/api/state")!)
     req.timeoutInterval = 5
     req.setValue("Bearer \(tok)", forHTTPHeaderField: "Authorization")
-    URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+    URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
       guard let self else { return }
-      DispatchQueue.main.async { self.apply(data) }
+      DispatchQueue.main.async {
+        if let e = resp as? HTTPURLResponse, e.statusCode == 401 {
+          // A WRONG token (the config's token is no longer valid) is
+          // operator-actionable and must not read as a dead server.
+          self.conn = .unauthorized
+          return
+        }
+        self.apply(data)
+      }
     }.resume()
+  }
+
+  /** Test hook (the scope harness): inject a state payload as if the
+   *  poll had just received it — the SAME path the poll drives (apply).
+   *  INERT in the production app: nothing but the harness calls it, and
+   *  it performs no network of its own (the harness needs the model's
+   *  picker state without the no-token model ever polling — a stray
+   *  request would itself be the failure being tested). */
+  func injectStatePayload(_ o: [String: Any]) {
+    guard let data = try? JSONSerialization.data(withJSONObject: o) else { return }
+    apply(data)
   }
 
   private func apply(_ data: Data?) {
@@ -323,63 +772,150 @@ final class AppModel: ObservableObject {
       conn = .unreachable
       return
     }
+    // The pure scope projection (ScopeView — the harness's target): the
+    // machine × project pickers' state + every value the panel shows, all
+    // straight from the payload. A token that just appeared clears the
+    // "no token" state.
+    conn = .off
+    lastPayload = o
+    let nowMs = Date().timeIntervalSince1970 * 1000
+    let view = ScopeView.project(payload: o,
+                                 configName: config.clientName,
+                                 selectedMachine: machine.key,
+                                 selectedProject: projectKey,
+                                 nowMs: nowMs)
+    applyProjection(view, nowMs: nowMs, o: o)
+  }
 
-    // me — this machine's client row (prefer the online one; fall back to
-    // the first row).
-    let clients = (o["clients"] as? [[String: Any]]) ?? []
-    let me = clients.first(where: { ($0["online"] as? Bool) == true }) ?? clients.first
-    guard let c = me else {
-      conn = .unreachable
-      return
-    }
-    // Client rows carry NO `online` flag (that lives on the arbiter's
-    // projects[].workers rows) — liveness = last_seen within 90s, the same
-    // window the arbiter uses for workers.
-    let lastSeen = (c["last_seen"] as? Double) ?? 0
-    if lastSeen > 0 {
-      lastSeenS = Int(Date().timeIntervalSince1970 * 1000 - lastSeen) / 1000
-    }
-    daemonRunning = lastSeen > 0 && (Date().timeIntervalSince1970 * 1000 - lastSeen) < 90_000
-
-    // my project rows
-    let projs = (c["projects"] as? [[String: Any]]) ?? []
-    queueDepth = projs.compactMap { $0["queue_depth"] as? Int }.reduce(0, +)
-    let finished = projs.compactMap { (($0["stats"] as? [String: Any])?["finished"] as? NSNumber)?.intValue }.reduce(0, +)
-    let failed = projs.compactMap { (($0["stats"] as? [String: Any])?["failed"] as? NSNumber)?.intValue }.reduce(0, +)
-    today = (finished, failed)
-
-    // running lease held by me
-    let leases = (o["active_leases"] as? [[String: Any]]) ?? []
-    let myLease = leases.first(where: { ($0["client_id"] as? String) == (c["client_id"] as? String) })
-    if let l = myLease {
-      lease = ((l["job_id"] as? String) ?? "?", (l["expires_at"] as? Double) ?? 0)
+  /** Applies the pure projection to the model's state. Shared by apply()
+   *  (the 10s poll) and reproject() (a picker selection — no network; the
+   *  data stays the last payload's). */
+  private func applyProjection(_ view: ScopeView.Result, nowMs: Double, o: [String: Any]) {
+    // A picker key the payload no longer carries (a renamed/removed
+    // client, a dropped project) re-resolves to the default — the model
+    // tracks the RESOLVED selection so the next tick stays put.
+    machine = ScopeView.MachineOption(key: view.selectedMachine,
+                                      label: view.machineLabel,
+                                      online: view.machines.first(where: { $0.key == view.selectedMachine })?.online ?? false,
+                                      lastSeen: view.machines.first(where: { $0.key == view.selectedMachine })?.lastSeen ?? 0)
+    machines = view.machines
+    projectKey = view.selectedProject
+    scopeProjects = view.projects
+    queueDepth = view.queueTotal
+    today = (view.finished, view.failed)
+    leases = view.leases
+    queuePreview = view.queuePreview
+    // The picked project's published token budget ("all projects" sums the
+    // parts — the aggregate equals the sum of its parts). Hidden while the
+    // scope has no budget rows at all (a fresh arbiter state).
+    if view.projects.isEmpty {
+      tokensToday = ("", 0, 0)
+      tokenRowVisible = false
     } else {
-      lease = ("", 0)
+      let isAll = projectKey == ScopeView.allProjectsKey
+      let value = view.projects.map { $0.tokensOut }.reduce(0, +)
+      let finite = view.projects.map { $0.cap > 0 && $0.cap < 9_007_199_254_740_992 ? $0.cap : 0 }.reduce(0, +)
+      tokensToday = (isAll ? "all projects" : projectKey, finite, value)
+      tokenRowVisible = true
     }
-
-    // tokens today for my project (best-effort: the arbiter surfaces the cap
-    // on the project row; the row is hidden until a running value is found).
-    if let p0 = projs.first {
-      let name = (p0["name"] as? String) ?? ""
-      var cap: Double? = nil
-      var val: Double? = nil
-      if let projects = o["projects"] as? [[String: Any]] {
-        if let mine = projects.first(where: { ($0["name"] as? String) == name }) {
-          cap = ((mine["scheduling"] as? [String: Any])?["daily_token_cap"] as? NSNumber)?.doubleValue
-          val = (mine["tokens_today"] as? NSNumber)?.doubleValue
-        }
+    // Liveness. TWO distinct facts, kept distinct (the row displayed and
+    // the process controlled can belong to different machines — nothing
+    // on screen may blur that):
+    //   - `daemonRunning` (drives the Start/Stop row) is the LOCAL
+    //     daemon's liveness — the name-matched row ("this machine") —
+    //     because those controls act on the local process table
+    //     (daemonPID()), whatever the picker shows. No name match (a
+    //     fresh config / unregistered machine) falls back to the
+    //     freshest row — the old heuristic, now only ever a fallback.
+    //   - the status row's STALENESS is the SCOPE machine's last_seen
+    //     (the operator is looking at that machine's row; "all machines"
+    //     = the freshest row).
+    let clients = (o["clients"] as? [[String: Any]]) ?? []
+    let meLastSeen: Double
+    if let cn = config.clientName,
+       let c = clients.first(where: { ($0["name"] as? String) == cn }) {
+      meLastSeen = (c["last_seen"] as? Double) ?? 0
+    } else {
+      meLastSeen = clients.compactMap { $0["last_seen"] as? Double }.max() ?? 0
+    }
+    daemonRunning = meLastSeen > 0 && nowMs - meLastSeen < 90_000
+    let scopeRows: [Double]
+    if machine.key == ScopeView.allMachinesKey {
+      scopeRows = clients.compactMap { $0["last_seen"] as? Double }
+    } else {
+      scopeRows = clients.compactMap { row in
+        ((row["client_id"] as? String) == machine.key) ? (row["last_seen"] as? Double) : nil
       }
-      tokensToday = (name, cap, val)
+    }
+    let scopeLastSeen = scopeRows.max() ?? 0
+    if scopeLastSeen > 0 {
+      lastSeenS = Int(nowMs - scopeLastSeen) / 1000
     }
 
-    // the state word
-    guard daemonRunning else { conn = .off; return }
+    // the state word — the arbiter's GLOBAL verdict for the box (a scope
+    // the operator picked never rewords the header): degraded is a
+    // box-wide condition, idle is the arbiter's own signal, and "working"
+    // = ANY active lease (the box is running an idle task right now). A
+    // payload with NO client rows at all is still .unreachable — the
+    // arbiter answering without any registered client is indistinguishable
+    // from a dead one (today's semantics).
+    guard !clients.isEmpty else { conn = .unreachable; return }
     let idle = (o["idle"] as? [String: Any]) ?? [:]
-    switch ((idle["degraded"] as? Bool) == true, myLease != nil, (idle["idle"] as? Bool) == true) {
+    switch ((idle["degraded"] as? Bool) == true, activeLeasesGlobal(o).isEmpty, (idle["idle"] as? Bool) == true) {
     case (true, _, _): conn = .degraded
-    case (false, true, _): conn = .working
-    case (false, false, true): conn = .idle
+    case (false, false, _): conn = .working
+    case (false, true, true): conn = .idle
     default: conn = .busy
+    }
+  }
+
+  /** Every ACTIVE lease in the payload (scope-independent — the header
+   *  word is the arbiter's verdict for the box, not for a picked machine). */
+  private func activeLeasesGlobal(_ o: [String: Any]) -> [[String: Any]] {
+    ((o["active_leases"] as? [[String: Any]]) ?? []).filter {
+      ($0["status"] as? String ?? "active") == "active"
+    }
+  }
+
+  // MARK: view-facing scope facts (pure reads of the model state)
+
+  /** The machine picker's rows: the explicitly labelled "all machines"
+   *  aggregate FIRST, then every clients[] row (the dot = online). The
+   *  default selection ("this machine" — the name-matched row) sits
+   *  among its siblings; nothing about the picker's layout changes when
+   *  the operator widens the scope. */
+  var viewMachines: [ScopeView.MachineOption] {
+    let all = ScopeView.MachineOption(key: ScopeView.allMachinesKey,
+                                      label: "all machines", online: false, lastSeen: 0)
+    return [all] + machines
+  }
+
+  /** The machine row's active override (exception-only tag; nil = none). */
+  func viewMachineOverride(_ key: String) -> String? {
+    guard key != ScopeView.allMachinesKey, let o = lastPayload else { return nil }
+    return ((o["clients"] as? [[String: Any]])?.first(where: { ($0["client_id"] as? String) == key })?["override"] as? [String: Any])?["override"] as? String
+  }
+
+  /** The project-gate control row exists only for a picked (non-aggregate)
+   *  project — exception-only, the dashboard's same rule. */
+  var pickedProjectVisible: Bool { pickedProject != nil }
+
+  /** The project gate's LIVE label ("pause project X" / "resume project
+   *  X" — the state is in the label, not in a separate badge). */
+  var pickedProjectLabel: String {
+    guard let p = pickedProject else { return "" }
+    return (p.paused ? "resume project " : "pause project ") + p.name
+  }
+
+  /** The worker-override control row's LIVE label (a specific machine
+   *  only — "all machines" has no single worker to act on; nil hides it).
+   *  none → pause; pause → resume (clear); force → clear force. */
+  var scopeWorkerControlLabel: String? {
+    guard machine.key != ScopeView.allMachinesKey, lastPayload != nil else { return nil }
+    switch scopeMachineOverride ?? "none" {
+    case "pause": return "resume this worker"
+    case "force": return "clear force (this worker)"
+    default: return "pause this worker"
     }
   }
 
@@ -499,6 +1035,192 @@ final class AppModel: ObservableObject {
   func restart() {
     stop()
     DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.start() }
+  }
+
+  // MARK: scope pickers (issue #12)
+  //
+  // The machine × project pickers are model state: a selection re-runs the
+  // pure ScopeView projection against the LAST state payload (no network —
+  // the next 10s tick refreshes the data under the new selection). A key
+  // the last payload does not carry is rejected (the picker rows only ever
+  // come from the last payload).
+
+  /** The last raw state payload (the picker re-projection's input; nil
+   *  until the first successful poll). */
+  private var lastPayload: [String: Any]?
+
+  func selectMachine(_ key: String) {
+    guard lastPayload != nil,
+          key == ScopeView.allMachinesKey ||
+          (lastPayload?["clients"] as? [[String: Any]])?.contains(where: { ($0["client_id"] as? String) == key }) == true
+    else { return }
+    machine.key = key
+    machine.online = false
+    machine.lastSeen = 0
+    reproject()
+  }
+
+  func selectProject(_ key: String) {
+    guard lastPayload != nil,
+          key == ScopeView.allProjectsKey ||
+          scopeProjects.contains(where: { $0.name == key })
+    else { return }
+    projectKey = key
+    reproject()
+  }
+
+  private func reproject() {
+    guard let o = lastPayload else { return }
+    let nowMs = Date().timeIntervalSince1970 * 1000
+    let view = ScopeView.project(payload: o,
+                                 configName: config.clientName,
+                                 selectedMachine: machine.key,
+                                 selectedProject: projectKey,
+                                 nowMs: nowMs)
+    applyProjection(view, nowMs: nowMs, o: o)
+  }
+
+  // MARK: scope controls (issue #12)
+  //
+  // The published per-scope detail drives the panel's exception-only
+  // controls on the routes that ALREADY exist (no new endpoints — the
+  // dashboard's token gate is the reference, scripts/idlefill-control.mjs):
+  //   project pause gate     POST /api/projects/:name            {paused}
+  //   grant knobs            POST /api/projects/:name/settings   {knobs}
+  //   worker override        POST /api/clients/:ref/override     {override, until}
+  // SAME token gate as the dashboard: no token → NO request is issued and
+  // the status row names the missing token.
+
+  /** The picked project row (nil for the "all projects" aggregate). */
+  private var pickedProject: ScopeProject? {
+    projectKey == ScopeView.allProjectsKey ? nil : scopeProjects.first { $0.name == projectKey }
+  }
+
+  /** The picked client's row in the last payload (the worker override's
+   *  `:ref` — the client NAME, the key that survives daemon restarts). */
+  private var pickedClientRef: String? {
+    guard let o = lastPayload else { return nil }
+    if machine.key == ScopeView.allMachinesKey { return nil }
+    return (o["clients"] as? [[String: Any]])?.first(where: { ($0["client_id"] as? String) == machine.key })?["name"] as? String
+  }
+
+  /** Toggle the picked project's pause gate (POST /api/projects/:name).
+   *  Token-gated: no token → no request, and the status row names the
+   *  missing token (criterion 4). */
+  func toggleProjectPaused() {
+    guard let p = pickedProject else { return }
+    guard arbiterToken != nil else {
+      updateNote = "no token configured — project gate needs the arbiter token (\(configPath)) — no request sent"
+      return
+    }
+    postJSON(path: "/api/projects/\(Self.urlEncode(p.name))",
+             body: ["paused": !p.paused],
+             ok: "project \(p.paused ? "resumed" : "paused")",
+             detail: p.name)
+  }
+
+  /** Cycle the picked project's grant knobs through
+   *  global → 2 × global → 3 × global → global (POST
+   *  /api/projects/:name/settings — the body carries only the touched
+   *  knob; JSON null clears the override back to the global). The cycle
+   *  reads the GLOBAL knob (scheduling.global), never the effective one —
+   *  a cycle that read the effective value would chase its own override.
+   *  Token-gated like the gate. */
+  func cycleProjectKnob(_ knob: String) {
+    guard let p = pickedProject else { return }
+    guard arbiterToken != nil else {
+      updateNote = "no token configured — grant knobs need the arbiter token (\(configPath)) — no request sent"
+      return
+    }
+    let global: Double
+    let current: Double?
+    switch knob {
+    case "idle": global = p.globalIdleSeconds; current = p.idleOverride
+    case "max": global = p.globalMaxLeases; current = p.maxOverride
+    default: global = p.globalTtlSeconds; current = p.ttlOverride
+    }
+    let next: Double? = current == nil ? global * 2 : (current == global * 2 ? global * 3 : nil)
+    let key = knob == "idle" ? "idle_seconds" : (knob == "max" ? "max_concurrent_leases" : "lease_ttl_seconds")
+    // null (JSON) clears the knob back to the global — the dashboard's
+    // same shape (NSNull: a nil Optional would not serialize at all).
+    let value: Any = next.map { $0 as Any } ?? NSNull()
+    let body: [String: Any] = [key: value]
+    postJSON(path: "/api/projects/\(Self.urlEncode(p.name))/settings",
+             body: body,
+             ok: "project \(p.name) \(knob) → \(next.map { String(Int($0)) } ?? "global")",
+             detail: p.name)
+  }
+
+  /** Cycle the picked client's worker override: none → pause → force →
+   *  none (POST /api/clients/:ref/override — the body is exactly
+   *  {override, until}). Token-gated like the gate. */
+  func cycleWorkerOverride() {
+    guard let ref = pickedClientRef else { return }
+    guard arbiterToken != nil else {
+      updateNote = "no token configured — worker override needs the arbiter token (\(configPath)) — no request sent"
+      return
+    }
+    let cur = scopeMachineOverride ?? "none"
+    let next: String
+    switch cur {
+    case "pause": next = "force"
+    case "force": next = "none"
+    default: next = "pause"
+    }
+    postJSON(path: "/api/clients/\(Self.urlEncode(ref))/override",
+             body: ["override": next == "none" ? NSNull() : next, "until": NSNull()],
+             ok: "worker \(ref) → \(next)",
+             detail: ref)
+  }
+
+  /** The picked machine's active override (from the last payload; nil =
+   *  none) — drives the worker control row's label. */
+  private var scopeMachineOverride: String? {
+    guard let o = lastPayload, machine.key != ScopeView.allMachinesKey else { return nil }
+    return ((o["clients"] as? [[String: Any]])?.first(where: { ($0["client_id"] as? String) == machine.key })?["override"] as? [String: Any])?["override"] as? String
+  }
+
+  /** Token-gated POST to an existing route. No token → the caller has
+   *  already refused (the status row names the missing token) — this
+   *  method issues NO request without one. On 2xx the note confirms; on
+   *  anything else the note carries the HTTP status (the operator can
+   *  then look at the arbiter). The body is exactly what the route
+   *  documents — NSNull() serializes as JSON null (the clear-value shape). */
+  private func postJSON(path: String, body: [String: Any], ok: String, detail: String) {
+    guard let tok = arbiterToken,
+          let url = URL(string: serverURL() + path) else {
+      // Belt-and-braces: the public entry points (toggleProjectPaused &
+      // co.) already gate on the token and name it in the status row.
+      updateNote = "no token configured — no request sent (\(detail))"
+      return
+    }
+    var req = URLRequest(url: url)
+    req.httpMethod = "POST"
+    req.timeoutInterval = 5
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.setValue("Bearer \(tok)", forHTTPHeaderField: "Authorization")
+    do { req.httpBody = try JSONSerialization.data(withJSONObject: body) }
+    catch { updateNote = "could not encode the \(detail) request — no request sent"; return }
+    updateNote = "sending \(detail) …"
+    URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
+      guard let self else { return }
+      DispatchQueue.main.async {
+        if let e = err {
+          self.updateNote = "\(detail) failed: \(e.localizedDescription)"
+        } else if let r = resp as? HTTPURLResponse, (200..<300).contains(r.statusCode) {
+          self.updateNote = ok
+        } else {
+          self.updateNote = "\(detail) → HTTP \((resp as? HTTPURLResponse)?.statusCode ?? -1) — see the arbiter"
+        }
+        // Refresh the published view (the gate's state rides back on the
+        // next poll; fetch it now so the panel reflects the write).
+        self.poll()
+      }
+    }.resume()
+  }
+
+  static func urlEncode(_ s: String) -> String {
+    s.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? s
   }
 
   // MARK: update code (issue #11)
@@ -1486,6 +2208,33 @@ struct KVRow: View {
   }
 }
 
+/** A picker row (machine / project): a dot + label + an optional
+ *  exception tag (paused/budget-full/paused-worker — DESIGN.md: tags for
+ *  exceptions only) + a checkmark on the selected row. */
+struct PickRow: View {
+  let label: String
+  let selected: Bool
+  var dot: Color = Pal.dim            // online dot (green) or off (dim)
+  var showDot: Bool = true
+  var tag: (text: String, color: Color)? = nil
+  var body: some View {
+    HStack(spacing: 6) {
+      if showDot {
+        Circle().fill(dot).frame(width: 7, height: 7)
+      }
+      Text(label).font(.system(.body, design: .monospaced))
+        .foregroundStyle(selected ? Pal.text : Pal.dim)
+      if let t = tag {
+        Text(t.text).font(.system(.caption, design: .monospaced)).foregroundStyle(t.color)
+      }
+      Spacer()
+      if selected {
+        Text("•").font(.system(.body, design: .monospaced)).foregroundStyle(Pal.accent)
+      }
+    }
+  }
+}
+
 struct DividerLine: View {
   var body: some View {
     Rectangle().fill(Pal.hairline).frame(height: 1)
@@ -1522,7 +2271,9 @@ struct ContentView: View {
   var body: some View {
     VStack(spacing: 0) {
       HStack(spacing: 8) {
-        LogoView(spinning: m.lease.1 > 0)
+        // The arc's spin stays tied to THIS client's leases (the scope
+        // machine's — every active lease, not just the first).
+        LogoView(spinning: !m.leases.isEmpty)
           .frame(width: 14, height: 14)
         Text("idlefill")
           .font(.system(.headline, design: .monospaced).weight(.semibold))
@@ -1536,25 +2287,83 @@ struct ContentView: View {
 
       DividerLine()
 
+      // ---- the scope (machine × project). The default is "this machine ·
+      // all projects" (the config's client_name row — today's behaviour);
+      // the pickers widen it. The machine picker lists the explicitly
+      // labelled "all machines" aggregate FIRST, then every clients[] row
+      // (online dot + the exception-only override tag); the aggregate's
+      // dot stays dim (it is a view, not a machine). The project picker
+      // lists the scope's projects; "all projects" is the aggregate.
+      VStack(spacing: 3) {
+        Text("machine").font(.system(.caption, design: .monospaced))
+          .foregroundStyle(Pal.dim).textCase(.uppercase).kerning(0.5)
+        ForEach(Array(m.viewMachines.enumerated()), id: \.element.key) { _, opt in
+          let isAll = opt.key == ScopeView.allMachinesKey
+          let ov = m.viewMachineOverride(opt.key)
+          let ovTag: (text: String, color: Color)? = ov.map { t in
+            (text: (t == "pause" ? "paused" : t), color: (t == "pause" ? Pal.err : Pal.warn))
+          }
+          pickRow(label: isAll ? "all machines" : opt.label,
+                  selected: opt.key == m.machine.key,
+                  dot: opt.online ? Pal.ok : Pal.dim,
+                  showDot: !isAll,
+                  tag: ovTag) {
+            m.selectMachine(opt.key)
+          }
+        }
+        Text("project").font(.system(.caption, design: .monospaced))
+          .foregroundStyle(Pal.dim).textCase(.uppercase).kerning(0.5)
+        pickRow(label: "all projects",
+                selected: m.projectKey == ScopeView.allProjectsKey, showDot: false) {
+          m.selectProject(ScopeView.allProjectsKey)
+        }
+        ForEach(m.scopeProjects, id: \.name) { p in
+          pickRow(label: p.name, selected: p.name == m.projectKey, showDot: false,
+                  tag: p.paused ? ("paused", Pal.warn) : (p.budgetFull ? ("budget full", Pal.warn) : (p.mePaused == true ? ("worker paused", Pal.err) : nil))) {
+            m.selectProject(p.name)
+          }
+        }
+      }
+      .padding(14).padding(.vertical, 8)
+
+      DividerLine()
+
       VStack(spacing: 4) {
-        KVRow(k: "this machine", v: statusRow)
-        // The deployed revision (git rev-parse --short HEAD) — the standing
-        // answer to "what is deployed?". Always shown once known (set at
-        // launch and on every completed Update Code); hidden only before
-        // the first successful read.
+        KVRow(k: machineLabelKey, v: statusRow)
         if let rev = m.deployedRevision {
           KVRow(k: "revision", v: rev)
         }
         KVRow(k: "queue", v: "\(m.queueDepth)")
         KVRow(k: "today", v: "\(m.today.finished) ok · \(m.today.failed) failed")
-        if m.tokensToday.value != nil {
+        if m.tokenRowVisible {
           KVRow(k: "tokens out", v: tokenRow)
         }
-        if m.lease.1 > 0 {
-          KVRow(k: "running", v: leaseRow, vcolor: Pal.accent)
+        // Every running lease of the scope machine (max concurrent > 1
+        // lists them all — today showed only the first).
+        ForEach(Array(m.leases.enumerated()), id: \.offset) { _, l in
+          KVRow(k: "running", v: leaseRow(l), vcolor: Pal.accent)
+        }
+        // The picked project's published queue peek (a worker publishing
+        // no preview degrades to the depth number above).
+        ForEach(Array(m.queuePreview.prefix(4).enumerated()), id: \.offset) { i, r in
+          KVRow(k: "queue \(i + 1)", v: queuePeekRow(r))
+        }
+        if !m.queuePreview.isEmpty {
+          KVRow(k: "", v: "\(m.queuePreview.count) shown of \(m.queueDepth) waiting")
         }
       }
       .padding(14).padding(.vertical, 8)
+
+      DividerLine()
+
+      // ---- the scope controls (exception-only; existing routes, the
+      // dashboard's token gate).
+      if m.pickedProjectVisible {
+        controlRow(m.pickedProjectLabel) { m.toggleProjectPaused() }
+      }
+      if m.scopeWorkerControlLabel != nil {
+        controlRow(m.scopeWorkerControlLabel!) { m.cycleWorkerOverride() }
+      }
 
       DividerLine()
 
@@ -1585,23 +2394,74 @@ struct ContentView: View {
     .frame(width: 300)
   }
 
+  // The picker rows (tappable PickRows) — the same row style as the
+  // action rows (hover-free; the whole row is the tap target).
+  private func pickRow(label: String, selected: Bool,
+                       dot: Color = Pal.dim, showDot: Bool = true,
+                       tag: (text: String, color: Color)? = nil,
+                       action: @escaping () -> Void) -> some View {
+    Button(action: action) {
+      PickRow(label: label, selected: selected, dot: dot, showDot: showDot, tag: tag)
+        .padding(.horizontal, 14).padding(.vertical, 4)
+        .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+  }
+
+  /** A scope-control row (the project gate / worker override): the same
+   *  row style as the pickers; the label carries the LIVE state ("pause
+   *  project" / "resume project", "pause this worker" / "unpause …"). */
+  private func controlRow(_ label: String, action: @escaping () -> Void) -> some View {
+    Button(action: action) {
+      HStack {
+        Text(label).font(.system(.body, design: .monospaced))
+          .foregroundStyle(m.conn == .noToken || m.conn == .unauthorized ? Pal.warn : Pal.accent)
+        Spacer()
+      }
+      .padding(.horizontal, 14).padding(.vertical, 4)
+      .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+  }
+
   private var statusRow: String {
+    if m.conn == .noToken {
+      // Criterion 4/5: the status row NAMES the missing token (and no
+      // request was ever sent).
+      return "no token — set the arbiter token in \(m.configPath)"
+    }
+    if m.conn == .unauthorized {
+      return "bad token — the arbiter rejected it (\(m.configPath))"
+    }
     if !m.daemonRunning { return "stopped" }
     if let s = m.lastSeenS, s >= 120 { return "stale (\(s / 60) min)" }
     return m.conn.word
   }
 
-  private var tokenRow: String {
-    let v = m.tokensToday.value ?? 0
-    if let cap = m.tokensToday.cap, cap > 0 {
-      return String(format: "%.0f / %.0f (%.0f%%)", v, cap, v / cap * 100)
-    }
-    return String(format: "%.0f", v)
+  /** The machine row's key: "this machine" for the name-matched default,
+   *  "machine" when the operator widened to the aggregate. */
+  private var machineLabelKey: String {
+    m.machine.key == ScopeView.allMachinesKey ? "machines" : "machine"
   }
 
-  private var leaseRow: String {
-    let left = Int(max(0, m.lease.1 / 1000 - Date().timeIntervalSince1970))
-    return "\(m.lease.0) · auto-cancels \(left / 60)m \(left % 60)s"
+  private var tokenRow: String {
+    let (label, cap, v) = m.tokensToday
+    let head = label == "all projects" ? "" : "\(label) · "
+    if cap > 0 {
+      return head + String(format: "%.0f / %.0f (%.0f%%)", v, cap, v / cap * 100)
+    }
+    return head + String(format: "%.0f (cap ∞)", v)
+  }
+
+  private func leaseRow(_ l: ScopeLease) -> String {
+    let left = Int(max(0, l.expiresAt / 1000 - Date().timeIntervalSince1970))
+    let job = l.project.isEmpty ? l.jobId : "\(l.jobId) · \(l.project)"
+    return "\(job) · auto-cancels \(left / 60)m \(left % 60)s"
+  }
+
+  private func queuePeekRow(_ r: ScopeQueueRow) -> String {
+    let t = r.company.isEmpty ? r.title : "\(r.title) · \(r.company)"
+    return t.count > 34 ? String(t.prefix(34)) + "…" : t
   }
 
   @ViewBuilder
@@ -1736,7 +2596,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // for free; re-render on a slow timer instead.
     Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
       guard let self, let button = self.statusItem?.button else { return }
-      button.image = MenuIcon.image(spinning: (self.model?.lease.1 ?? 0) > 0)
+      button.image = MenuIcon.image(spinning: !(self.model?.leases ?? []).isEmpty)
     }
   }
 
