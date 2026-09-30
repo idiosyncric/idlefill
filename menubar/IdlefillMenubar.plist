@@ -6,7 +6,7 @@
 	<string>com.sam.idlefill.menubar</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/Users/sam/Software/idlefill/menubar/IdlefillMenubar</string>
+		<string>/Users/sam/Software/idlefill/menubar/IdlefillMenubar.app/Contents/MacOS/IdlefillMenubar</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>

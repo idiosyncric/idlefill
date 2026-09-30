@@ -52,6 +52,22 @@
 
 import AppKit
 import SwiftUI
+import CryptoKit
+
+// The version baked into the binary at build time. menubar/build.sh
+// substitutes the QUOTED placeholder literal (the declaration below — the
+// only QUOTED occurrence of the placeholder in the file; the sentinel is
+// fragmented so the build's sed can never touch it) with the release
+// version (IDLEFILL_VERSION — default: the root package.json version, the
+// single version source) BEFORE compiling, so a release binary prints the
+// release it was built from — even on a checkout whose package.json has
+// since moved on. DO NOT RENAME OR DELETE: build.sh byte-verifies this
+// exact declaration (a silent miss would bake the placeholder string into
+// the binary).
+let __MENUBAR_VERSION__ = "__MENUBAR_VERSION__"
+/// The UNSUBSTITUTED marker (fragmented — the build's sed only touches the
+/// quoted placeholder literal, so this comparison survives the injection).
+let __MENUBAR_VERSION_UNSUBSTITUTED__ = "__MENUBAR_" + "VERSION__"
 
 // MARK: - palette (DESIGN.md tokens)
 
@@ -138,12 +154,27 @@ final class AppModel: ObservableObject {
 
   let repoRoot: String = AppModel.findRepoRoot()
 
+  // The baked version (substituted at build time by menubar/build.sh — the
+  // `__MENUBAR_VERSION__` placeholder carries the release tag's version, so
+  // the binary prints the release it was built from). A dev build where the
+  // placeholder was never substituted reports itself as a dev build.
+  let version = AppModel.bakedVersion()
+  /// Update available (newest published `vX.Y.Z` strictly greater than the
+  /// baked version) — exception-only, the panel's row renders when non-nil.
+  @Published var updateAvailable: String? = nil
+
   init() {
     // Self-driving 10s poll (main runloop — App init runs on the main thread).
     Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
       self?.poll()
     }
     poll()
+    // The release check (update story): once at launch, then every 6h.
+    // Offline-tolerant — any failure sets nothing and fails quiet.
+    checkForUpdates()
+    Timer.scheduledTimer(withTimeInterval: UpdateCheck.cadenceSeconds, repeats: true) { [weak self] _ in
+      self?.checkForUpdates()
+    }
   }
 
   static func findRepoRoot() -> String {
@@ -177,6 +208,50 @@ final class AppModel: ObservableObject {
       dir = parent
     }
     return NSHomeDirectory()
+  }
+
+  /** The version baked into the binary at build time. `build.sh` substitutes
+   *  the `__MENUBAR_VERSION__` placeholder with the version passed in as
+   *  `IDLEFILL_VERSION` (default: the root package.json version), so a
+   *  release binary prints the release it was built from; a build that never
+   *  went through the substitution (e.g. an ad-hoc `swiftc` on the source)
+   *  still resolves to the root package.json version, and a truly broken
+   *  read falls back to `0.0.0-dev` — never crashes. */
+  static func bakedVersion() -> String {
+    if __MENUBAR_VERSION__ != __MENUBAR_VERSION_UNSUBSTITUTED__
+      && !__MENUBAR_VERSION__.trimmingCharacters(in: .whitespaces).isEmpty {
+      return __MENUBAR_VERSION__
+    }
+    if let p = ProcessInfo.processInfo.environment["IDLEFILL_CONFIG_FILE"] {
+      let repo = (((p as NSString).deletingLastPathComponent as NSString).deletingLastPathComponent)
+      if let v = readRootVersion(repo: repo) { return v }
+    }
+    if let v = readRootVersion(repo: findRepoRoot()) { return v }
+    return "0.0.0-dev"
+  }
+
+  /** Read `version` from `<repo>/package.json`. */
+  private static func readRootVersion(repo: String) -> String? {
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: (repo as NSString).appendingPathComponent("package.json"))),
+          let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let v = o["version"] as? String, !v.isEmpty else { return nil }
+    return v
+  }
+
+  /** The update-check base URL: `IDLEFILL_UPDATE_BASE` (test hook — the
+   *  headless tests point it at a local stub), defaulting to the Forgejo
+   *  host. The check is anonymous (the repo is public) and never sends the
+   *  arbiter token. */
+  static func updateBase() -> String {
+    (ProcessInfo.processInfo.environment["IDLEFILL_UPDATE_BASE"] ?? "https://git.samwarth.com")
+      .replacingOccurrences(of: "/", with: "")
+  }
+
+  /** The menubar bundle's install location: the bundle under the repo root
+   *  (the LaunchAgent plist points there — the install action swaps it in
+   *  place). */
+  static func menubarBundleURL() -> URL {
+    URL(fileURLWithPath: (findRepoRoot() as NSString).appendingPathComponent("menubar/IdlefillMenubar.app"))
   }
 
   func token() -> String? {
@@ -433,6 +508,259 @@ final class AppModel: ObservableObject {
       updateNote = "\((path as NSString).lastPathComponent) failed: \(error.localizedDescription)"
     }
   }
+
+  // MARK: release update (check + install)
+
+  /** The update check: on launch and every 6h (UpdateCheck.cadenceSeconds),
+   *  GET the Forgejo releases list ANONYMOUSLY (the repo is public — the
+   *  arbiter token is never sent to Forgejo), compare the newest `vX.Y.Z`
+   *  against the baked version. OFFLINE-TOLERANT: any fetch/parse failure
+   *  sets nothing and fails quiet — no dialog, no error row; the next
+   *  cadence tick retries. */
+  func checkForUpdates() {
+    let base = AppModel.updateBase()
+    URLSession.shared.dataTask(with: URL(string: "\(base)/api/v1/repos/sam/idlefill/releases?limit=10")!) { [weak self] data, _, _ in
+      guard let self else { return }
+      DispatchQueue.main.async { self.applyUpdateCheck(data, localVersion: self.version) }
+    }.resume()
+  }
+
+  /** Pure: given the releases-list payload + the baked local version, set
+   *  the exception-only `updateAvailable` (the tag's version) or clear it.
+   *  Split out so the headless test can drive it with canned payloads. */
+  func applyUpdateCheck(_ data: Data?, localVersion: String) {
+    updateAvailable = UpdateCheck.latestUpdateTag(data: data, localVersion: localVersion)
+  }
+
+  /** Install action (phase 1 — sha256, not Developer ID): download the
+   *  menubar zip + its sha256 sidecar for the available release, verify the
+   *  hash BEFORE any swap (a mismatch or missing sidecar refuses and keeps
+   *  the current binary), then swap the bundle in place under the repo
+   *  root and kickstart the LaunchAgent when it is loaded. */
+  func installUpdate() {
+    guard let tag = updateAvailable else { return }
+    updateNote = "installing \(tag) …"
+    UpdateCheck.install(
+      base: AppModel.updateBase(),
+      tag: tag,
+      zipName: "IdlefillMenubar-\(tag).app.zip",
+      bundleURL: AppModel.menubarBundleURL(),
+      label: "com.sam.idlefill.menubar"
+    ) { [weak self] outcome in
+      guard let self else { return }
+      DispatchQueue.main.async {
+        switch outcome {
+        case .installed:
+          self.updateNote = "installed \(tag) — relaunched"
+          self.updateAvailable = nil
+        case .notLoaded:
+          self.updateNote = "installed \(tag) — agent not loaded: run menubar/install.sh"
+          self.updateAvailable = nil
+        case .refused:
+          // The current binary is untouched; the note explains the refusal.
+          break
+        }
+      }
+    }
+  }
+}
+
+// MARK: - release update check (pure + async — testable headlessly)
+
+/** The update check over the network (issue #10): on launch + every 6h the
+ *  menu bar GETs the Forgejo releases list ANONYMOUSLY (the repo is public;
+ *  the arbiter token is never sent to Forgejo) and compares the newest
+ *  `v<major>.<minor>.<patch>` tag against the baked version.
+ *
+ *  OFFLINE-TOLERANT: any fetch/parse failure sets nothing — no dialog, no
+ *  error row; the next cadence tick retries.
+ *
+ *  Phase 1 verification is a published sha256 sidecar (Developer ID signing
+ *  + notarization is tracked separately): the install downloads the zip AND
+ *  the `.sha256` sidecar, verifies the hash BEFORE any swap, and a mismatch
+ *  or missing sidecar refuses (the current binary is kept). */
+enum UpdateCheck {
+  /// The check cadence: launch, then every 6 hours.
+  static let cadenceSeconds: TimeInterval = 6 * 60 * 60
+
+  /// sha256 in lowercase hex. (Phase 1 — the published sidecar format.)
+  static func sha256Hex(_ data: Data) -> String {
+    SHA256.hash(data: data).compactMap { String(format: "%02x", $0) }.joined()
+  }
+
+  /// Parse `<64 hex>\n` from a sidecar; nil when malformed (the wrong
+  /// length or non-hex chars mean the sidecar is not a sha256 — refuse).
+  static func parseSidecar(_ text: String) -> String? {
+    let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard t.count == 64, t.allSatisfy(\.isHexDigit) else { return nil }
+    return t.lowercased()
+  }
+
+  /// Parse a release tag: `v<maj>.<min>.<patch>` (three numeric segments)
+  /// → ((maj,min,patch), version string like "1.2.4"); anything else (a
+  /// pre-release, an odd tag, a different segment count, a non-numeric
+  /// segment) → nil — such tags are SKIPPED by the check.
+  private static func parseTag(_ tag: String) -> ((Int, Int, Int), String)? {
+    guard tag.hasPrefix("v") else { return nil }
+    var segs: [Int?] = []
+    var strs: [String] = []
+    for seg in tag.dropFirst().split(separator: ".") {
+      guard !seg.isEmpty, seg.allSatisfy(\.isNumber), let n = Int(seg) else { return nil }
+      segs.append(n)
+      strs.append(String(seg))
+    }
+    guard segs.count == 3,
+          let a = segs[0], let b = segs[1], let c = segs[2],
+          a < 100_000, b < 100_000, c < 100_000 else { return nil }
+    return ((a, b, c), strs.joined(separator: "."))
+  }
+
+  /// The newest release whose `tag_name` is `v<maj>.<min>.<patch>` (numeric
+  /// compare of the three segments; malformed tags skipped), strictly
+  /// greater than the local version → its version string (e.g. "1.2.4").
+  /// Any failure (unparseable payload, malformed version, no valid tags)
+  /// → nil: fail quiet, nothing set, next tick retries.
+  static func latestUpdateTag(data: Data?, localVersion: String) -> String? {
+    guard let data,
+          let o = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else {
+      return nil
+    }
+    guard let local = semver(localVersion) else { return nil }
+    var best: ((Int, Int, Int), String)?
+    for rel in o {
+      guard let tag = rel["tag_name"] as? String,
+            let parsed = parseTag(tag) else { continue }
+      if best == nil || parsed.0 > best!.0 { best = (parsed.0, parsed.1) }
+    }
+    guard let b = best else { return nil }
+    return b.0 > local ? b.1 : nil
+  }
+
+  /// "1.2.3" → (1, 2, 3); non-numeric segments, a different segment count,
+  /// or out-of-range values → nil (a malformed local version fails quiet).
+  private static func semver(_ s: String) -> (Int, Int, Int)? {
+    var parts: [Int?] = []
+    for seg in s.split(separator: ".") {
+      if seg.isEmpty || !seg.allSatisfy(\.isNumber) { return nil }
+      parts.append(Int(seg))
+    }
+    guard parts.count == 3,
+          let a = parts[0], let b = parts[1], let c = parts[2],
+          a >= 0, a < 100_000, b >= 0, b < 100_000, c >= 0, c < 100_000 else {
+      return nil
+    }
+    return (a, b, c)
+  }
+
+  /// GET `base/api/v1/repos/sam/idlefill/releases?limit=10` (anonymous).
+  /// The completion ALWAYS runs, on any thread — including failure (that is
+  /// the offline-tolerant contract: the caller must set nothing).
+  static func fetchReleases(base: String, completion: @escaping (Data?) -> Void) {
+    let url = URL(string: "\(base)/api/v1/repos/sam/idlefill/releases?limit=10")
+    guard let u = url else { completion(nil); return }
+    var req = URLRequest(url: u)
+    req.timeoutInterval = 10
+    URLSession.shared.dataTask(with: req) { data, _, _ in
+      completion(data)
+    }.resume()
+  }
+
+  // -- install (phase 1: sha256-verified swap) -----------------------------
+
+  enum Outcome { case installed, notLoaded, refused(String) }
+
+  /** Download `<base>/releases/download/<tag>/<zipName>` + the sidecar
+   *  (`<zipName>.sha256`) to a temp dir, verify the hash, then swap the
+   *  bundle in place (a temp dir next to the target, then a rename — no
+   *  partial-bundle window) and `launchctl kickstart -k gui/<uid>/<label>`
+   *  when the agent is loaded. A hash mismatch, a missing/malformed
+   *  sidecar, or a failed swap REFUSES: the current bundle is untouched
+   *  and the refusal reason is returned. */
+  static func install(base: String, tag: String, zipName: String,
+                      bundleURL: URL, label: String,
+                      completion: @escaping (Outcome) -> Void) {
+    let tagEnc = tag.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? tag
+    let tmpDir = FileManager.default.temporaryDirectory
+      .appendingPathComponent("idlefill-menubar-install-\(getpid())").path
+    let fm = FileManager.default
+    try? fm.createDirectory(atPath: tmpDir, withIntermediateDirectories: true)
+    let zipDest = tmpDir + "/" + zipName
+    let sidecarDest = zipDest + ".sha256"
+    let dl = { (name: String, dest: String, done: @escaping (Bool, String?) -> Void) in
+      let encodedName = name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? name
+      guard let url = URL(string: "\(base)/releases/download/\(tagEnc)/\(encodedName)") else {
+        done(false, "bad url for \(name)")
+        return
+      }
+      URLSession.shared.downloadTask(with: url) { tmp, _, e in
+        guard let tmp = tmp else { done(false, e?.localizedDescription ?? "no data"); return }
+        do {
+          if fm.fileExists(atPath: dest) { try fm.removeItem(atPath: dest) }
+          try fm.moveItem(at: tmp, to: URL(fileURLWithPath: dest))
+          done(true, nil)
+        } catch { done(false, error.localizedDescription) }
+      }.resume()
+    }
+    dl(zipName, zipDest) { ok, err in
+      guard ok else { completion(.refused("download failed: \(err ?? "?")")); return }
+      dl(zipName + ".sha256", sidecarDest) { ok, err in
+        guard ok else { completion(.refused("sidecar download failed: \(err ?? "?") — the update was NOT installed")); return }
+        guard let zipData = try? Data(contentsOf: URL(fileURLWithPath: zipDest)),
+              let sideData = try? Data(contentsOf: URL(fileURLWithPath: sidecarDest)),
+              let expected = parseSidecar(String(data: sideData, encoding: .utf8) ?? "") else {
+          completion(.refused("sha256 sidecar missing or malformed — the update was NOT installed"))
+          return
+        }
+        if sha256Hex(zipData) != expected {
+          completion(.refused("sha256 mismatch — the downloaded artifact does not match the published hash; the current build was kept"))
+          return
+        }
+        // Hash verified — the swap is safe.
+        do {
+          let destDir = bundleURL.deletingLastPathComponent()
+          let newURL = destDir.appendingPathComponent("IdlefillMenubar.app.new")
+          if fm.fileExists(atPath: newURL.path) { try fm.removeItem(atPath: newURL.path) }
+          try fm.createDirectory(atPath: destDir.path, withIntermediateDirectories: true)
+          let unz = Process()
+          unz.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+          unz.arguments = ["-q", "-d", newURL.path, zipName]
+          unz.currentDirectoryURL = URL(fileURLWithPath: tmpDir)
+          unz.standardError = FileHandle.nullDevice
+          try unz.run()
+          unz.waitUntilExit()
+          guard unz.terminationStatus == 0 else {
+            throw NSError(domain: "idlefill-menubar", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "unzip exited \(unz.terminationStatus)"])
+          }
+          // The zip's root is the .app dir (the release convention) —
+          // unwrap it so <bundle> is ready to rename.
+          let inner = newURL.appendingPathComponent(bundleURL.lastPathComponent)
+          let final = inner
+          if fm.fileExists(atPath: bundleURL.path) { try fm.removeItem(atPath: bundleURL.path) }
+          try fm.moveItem(at: final, to: bundleURL)
+          try? fm.removeItem(atPath: newURL.path)
+          try? fm.removeItem(atPath: zipDest)
+        } catch {
+          completion(.refused("swap failed: \(error.localizedDescription) — the current build was kept"))
+          return
+        }
+        // Relaunch the agent when it is loaded; otherwise note it.
+        let uid = geteuid()
+        let kick = Process()
+        kick.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        kick.arguments = ["kickstart", "-k", "gui/\(uid)/\(label)"]
+        kick.standardOutput = FileHandle.nullDevice
+        kick.standardError = FileHandle.nullDevice
+        do {
+          try kick.run()
+          kick.waitUntilExit()
+          completion(kick.terminationStatus == 0 ? .installed : .notLoaded)
+        } catch {
+          completion(.notLoaded)
+        }
+      }
+    }
+  }
 }
 
 // MARK: - views
@@ -523,6 +851,12 @@ struct ContentView: View {
       DividerLine()
       actionRow("Update Code")
 
+      // Exception-only (the same pattern as the updateNote below): the row
+      // exists only while an update is available — hidden otherwise.
+      if let v = m.updateAvailable {
+        actionRow("Install Update \(v)")
+      }
+
       if let note = m.updateNote {
         DividerLine()
         Text(note).font(.system(.caption, design: .monospaced)).foregroundStyle(Pal.dim)
@@ -586,7 +920,11 @@ struct ContentView: View {
       case "Restart": m.restart()
       case "Update Code": m.updateCode()
       case "Quit": NSApplication.shared.terminate(nil)
-      default: break
+      // The Install Update row carries the version in its label (the
+      // exception-only row — it only exists while one is available).
+      default:
+        if label.hasPrefix("Install Update") { m.installUpdate() }
+        else { break }
       }
     }) {
       HStack {
@@ -627,7 +965,22 @@ enum MenuBarAppState {
   }
 }
 
+/** `--version` / `-v` (first arg) prints `idlefill-menubar <version>` and
+ *  exits 0 BEFORE any AppKit setup (the App's init /
+ *  applicationDidFinishLaunching never run on this path — the decision is
+ *  made in main() before the App type is ever touched). */
 @main
+enum IdlefillMain {
+  static func main() {
+    let args = CommandLine.arguments
+    if args.count > 1, args[1] == "--version" || args[1] == "-v" {
+      print("idlefill-menubar \(AppModel.bakedVersion())")
+      exit(0)
+    }
+    IdlefillApp.main()
+  }
+}
+
 struct IdlefillApp: App {
   @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
 
