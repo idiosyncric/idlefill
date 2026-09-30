@@ -165,7 +165,8 @@ a scope (machine × project pickers — see the **Scope** bullet), the
 picked scope's queue depth, today's finished/failed, tokens out with the
 project's own cap, every running lease of the picked machine, the
 published queue peek, plus Open Dashboard · Show Logs · Start/Stop ·
-Restart · Update code · Quit.
+Restart · Open Desktop (right half carries the exception-only update
+indicator) · Install Update <v> (exception-only).
 
 - **Click routing:** a *single click* toggles the popover (the panel —
   today's behavior, exactly). A *double click* opens the **desktop app**
@@ -181,6 +182,26 @@ Restart · Update code · Quit.
   opens the log dir in Finder (today's behavior). With the desktop app
   installed the menu bar no longer opens the arbiter web dashboard — the
   handoff goes to the desktop app.
+- **Open Desktop row:** an always-on row that performs the *double-click
+  action* — `idlefill://open` (the desktop app's **State** view), falling
+  back to `open /Applications/Idlefill.app` when the URL-scheme open is
+  not handled. The row and the double-click routing call the SAME shared
+  helper (`MenuBarAppState.openDesktopApp`), so they cannot drift. Its
+  right half carries the exception-only update indicator: when an update
+  is available the tag shows the `updateAvailable` value **verbatim** (a
+  release number `1`, a legacy `0.0.2`, an edge marker
+  `edge-main-a9787a7`) in the panel's tag color; when none is available
+  the row is label-only — no tag, no "current" mark (the Exception-Only
+  rule). The `Update Code` and `Quit` rows are gone (issue #27): the
+  Update Code *machinery* (`UpdatePlan`, `updateCode()`, the revision
+  log, `uc-update-test.sh`) stays fully intact and tested — only the
+  panel door was removed. The app's exit path is the CLI
+  (`node scripts/idlefill-menubar.mjs app stop`) or launchd
+  (`launchctl bootout gui/$(id -u)/com.sam.idlefill.menubar`). The row
+  set and the exception-only tag are pure (`AppModel.panelActionRows` /
+  `desktopRowTag` — the view renders that spec) and are proven headlessly
+  by `menubar/panel-test.sh` (the same harness pattern as
+  `menubar/uc-test.sh`).
 
 - **Build:** `menubar/build.sh` → `menubar/IdlefillMenubar.app`, a real
   bundle: `Contents/MacOS/IdlefillMenubar` + `Contents/Info.plist`
@@ -201,7 +222,8 @@ Restart · Update code · Quit.
   every path and creates the log dir. The menu bar survives
   logout/login (the agent is `RunAtLoad` + `KeepAlive`). It touches only
   the menubar label, never the daemon's.
-- **Update check:** on launch and every 6h the app checks its update
+- **Update check:** on launch and every `update_check_minutes` (see the
+  config note below; default 360 = 6h) the app checks its update
   channel **anonymously** (the repo is public — the arbiter token is
   never sent to Forgejo). **Releases channel (the default):** it GETs the
   Forgejo releases list, picks the newest release — a release number
@@ -247,7 +269,17 @@ Restart · Update code · Quit.
   published per push to a tracked branch by `edge.yml` (below); the pure
   decision logic is proven headlessly by `menubar/edge-test.sh` (the same
   harness pattern as `menubar/uc-test.sh`).
-- **Update Code:** fast-forwards this checkout to `origin/main` and
+  **Cadence (configurable):** `update_check_minutes` in
+  `client/config.json` sets the interval in minutes (default **360** =
+  6h; clamped to a minimum of **5** — a lower value is clamped up and
+  the clamp is logged once at launch to `logs/idlefill-menubar.log`,
+  never shown in the panel). Absent/empty/invalid = the default. Parsed
+  once at launch like every other config key — a relaunch picks up a
+  new value.
+- **Update Code:** *(no panel row since issue #27 — the row was removed;
+  the machinery below stays fully intact and is still proven headlessly
+  by `menubar/uc-update-test.sh`.)* Fast-forwards this checkout to
+  `origin/main` and
   reinstalls/rebuilds/restarts only what changed. Pre-flight gates, in
   order — a refusal at any gate writes nothing (no merge, no install, no
   signal to the daemon): (a) the tree must be clean
@@ -277,7 +309,8 @@ Restart · Update code · Quit.
   `menubar/uc-update-test.sh` against scratch repos (the same harness
   pattern as `menubar/uc-test.sh`).
 - **Scope (machine × project):** the client config is parsed **once** at
-  launch (`ClientConfig`: `token` + `server_url` + `client_name`) and the
+  launch (`ClientConfig`: `token` + `server_url` + `client_name` +
+  `update_channel` + `update_pin` + `update_check_minutes`) and the
   panel's default scope is **"this machine · all projects"** — the client
   row whose `name` equals the config's `client_name`, whatever the order
   in the payload (registration is idempotent by name, so the name — not
@@ -546,8 +579,9 @@ is operator-actionable — `pin <marker> not published — publish it:
 scripts/edge-release.sh <marker> <sha>` — and any other outcome (the
 network is down) restores the previous status. A pin equal to this
 build's own marker reports `up to date (<marker>)`. The menubar's
-equivalent is `update_pin` in `client/config.json` (the 6-hour
-automatic check takes the pin path and fails quiet on a missing/unpublished
+equivalent is `update_pin` in `client/config.json` (the automatic check —
+every `update_check_minutes`, default 6h — takes the pin path and fails
+quiet on a missing/unpublished
 pin — no status line there to carry the publish hint; the desktop's
 Settings shows it).
 

@@ -5,9 +5,15 @@
   "ip": "100.94.165.102",
   "proxy_port": 11435,
   "llm_target": "http://100.105.225.1:11434",
+  "update_channel": "",
+  "update_pin": "",
+  "update_check_minutes": 360,
   "_docs": {
     "config": "Copy this file to client/config.json (untracked/local). Relative paths (queue_file, results_file) resolve against the client/ package dir — e.g. '../data/queue.jsonl' → <repo>/data/queue.jsonl.",
-    "executor": "Command template run via bash -c. Placeholders: {payload_file}, {result_file}, and {repo} — expanded to the TRUE idlefill repo root in both layouts (dev: tsx client/src/index.ts; packaged: client/dist), so 'node {repo}/adapters/career-ops/eval.mjs …' finds the adapter at <repo>/adapters/career-ops/eval.mjs. At startup the client checks the expanded script path exists and refuses to request leases (staying registered/online-but-inactive, FATAL in the log) if it is missing — a broken executor template must not burn job attempts."
+    "executor": "Command template run via bash -c. Placeholders: {payload_file}, {result_file}, and {repo} — expanded to the TRUE idlefill repo root in both layouts (dev: tsx client/src/index.ts; packaged: client/dist), so 'node {repo}/adapters/career-ops/eval.mjs …' finds the adapter at <repo>/adapters/career-ops/eval.mjs. At startup the client checks the expanded script path exists and refuses to request leases (staying registered/online-but-inactive, FATAL in the log) if it is missing — a broken executor template must not burn job attempts.",
+    "update_channel": "Menu bar app only. Absent/empty = the releases channel (the default — the newest published release). A branch name = the branch channel: the check tracks that branch's tip edge build (edge-<branch>-<sha7>). Read once at launch; a relaunch picks up a change.",
+    "update_pin": "Menu bar app only, opt-in within the branch channel. A commit SHA (7–40 hex): the check targets the PINNED commit's edge build instead of the branch's tip. Malformed/empty = absent (tip-following). Ignored on the releases channel.",
+    "update_check_minutes": "Menu bar app only. The automatic update-check cadence in minutes (default 360 = 6h; clamped to a minimum of 5 — a lower value is clamped up and the clamp is logged once at launch to logs/idlefill-menubar.log). Absent/empty/invalid = the default. Read once at launch; a relaunch picks up a new value."
   },
   "projects": [
     {
