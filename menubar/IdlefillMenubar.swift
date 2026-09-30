@@ -188,18 +188,24 @@ struct ClientConfig: Equatable {
   let token: String?
   let serverURL: String
   let clientName: String?
+  /** The update channel (issue #26), from `update_channel`: nil/absent =
+   *  the releases channel (today's behavior); a branch name = the branch
+   *  channel (the branch's tip is the "latest build"). Same parse
+   *  discipline as the other keys (empty string = absent). */
+  let updateChannel: String?
 
   static let serverURLDefault = "http://100.105.225.1:8787"
 
   static func load(path: String) -> ClientConfig {
     guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
           let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
-      return ClientConfig(token: nil, serverURL: serverURLDefault, clientName: nil)
+      return ClientConfig(token: nil, serverURL: serverURLDefault, clientName: nil, updateChannel: nil)
     }
     let token = (o["token"] as? String).flatMap { $0.isEmpty ? nil : $0 }
     let url = (o["server_url"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? serverURLDefault
     let name = (o["client_name"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-    return ClientConfig(token: token, serverURL: url, clientName: name)
+    let channel = (o["update_channel"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+    return ClientConfig(token: token, serverURL: url, clientName: name, updateChannel: channel)
   }
 }
 
@@ -600,10 +606,18 @@ final class AppModel: ObservableObject {
   // the binary prints the release it was built from). A dev build where the
   // placeholder was never substituted reports itself as a dev build.
   let version = AppModel.bakedVersion()
-  /// Update available (newest published release — a release number `v1` or a
-  /// legacy `v0.0.1` — strictly greater than the baked version) —
-  /// exception-only, the panel's row renders when non-nil.
+  /// Update available — exception-only, the panel's row renders when
+  /// non-nil. A RELEASES-channel value is the release's BARE version
+  /// (a release number `1` or a legacy `0.0.2`); a BRANCH-channel value
+  /// is the tip's EDGE MARKER (`edge-<branch>-<sha7>` — a non-numeric
+  /// marker is a first-class value, not a malformed version).
   @Published var updateAvailable: String? = nil
+  /// The channel an available update comes from (issue #26) — "releases"
+  /// or the tracked branch name; nil until the first check resolves one.
+  /// The install path routes on it: a release value resolves to
+  /// `v<bare>` + the numbered zip name; an edge value is its OWN tag
+  /// (the marker) with the marker-named menubar zip.
+  @Published var updateChannel: String? = nil
 
   init() {
     // Self-driving 10s poll (main runloop — App init runs on the main thread).
@@ -1501,17 +1515,35 @@ final class AppModel: ObservableObject {
   // MARK: release update (check + install)
 
   /** The update check: on launch and every 6h (UpdateCheck.cadenceSeconds),
-   *  GET the Forgejo releases list ANONYMOUSLY (the repo is public — the
-   *  arbiter token is never sent to Forgejo), compare the newest release
-   *  number (or legacy semver tag) against the baked version.
-   *  OFFLINE-TOLERANT: any fetch/parse failure sets nothing and fails quiet
-   *  — no dialog, no error row; the next cadence tick retries. */
+   *  routed on the CONFIG'S CHANNEL (issue #26; `client/config.json`'s
+   *  `update_channel` — absent = releases, today's behavior):
+   *
+   *  - releases (the default): GET the Forgejo releases list ANONYMOUSLY
+   *    (the repo is public — the arbiter token is never sent to Forgejo),
+   *    compare the newest release number (or legacy semver tag) against
+   *    the baked version (a NON-NUMERIC baked version — an edge marker or
+   *    a dev build — offers the newest release unconditionally: the
+   *    back-switch rule, without which such a machine could never come
+   *    back to this channel).
+   *  - branch: GET the tracked branch's tip via the refs API, offer the
+   *    tip's edge marker whenever it differs from the baked marker.
+   *
+   *  OFFLINE-TOLERANT: any fetch/parse failure sets nothing and fails
+   *  quiet — no dialog, no error row; the next cadence tick retries. */
   func checkForUpdates() {
     let base = AppModel.updateBase()
-    URLSession.shared.dataTask(with: URL(string: "\(base)/api/v1/repos/sam/idlefill/releases?limit=10")!) { [weak self] data, _, _ in
-      guard let self else { return }
-      DispatchQueue.main.async { self.applyUpdateCheck(data, localVersion: self.version) }
-    }.resume()
+    let channel = config.updateChannel
+    if let channel {
+      UpdateCheck.fetchBranchTip(base: base, branch: channel) { [weak self] data in
+        guard let self else { return }
+        DispatchQueue.main.async { self.applyBranchCheck(data, branch: channel) }
+      }
+    } else {
+      URLSession.shared.dataTask(with: URL(string: "\(base)/api/v1/repos/sam/idlefill/releases?limit=10")!) { [weak self] data, _, _ in
+        guard let self else { return }
+        DispatchQueue.main.async { self.applyUpdateCheck(data, localVersion: self.version) }
+      }.resume()
+    }
   }
 
   /** Pure: given the releases-list payload + the baked local version, set
@@ -1519,21 +1551,40 @@ final class AppModel: ObservableObject {
    *  Split out so the headless test can drive it with canned payloads. */
   func applyUpdateCheck(_ data: Data?, localVersion: String) {
     updateAvailable = UpdateCheck.latestUpdateTag(data: data, localVersion: localVersion)
+    // The channel fact rides with the marker (the install routes on it):
+    // a value set here came from the releases channel — "releases".
+    updateChannel = updateAvailable == nil ? nil : "releases"
+  }
+
+  /** Pure (the branch channel): given the refs-API payload + the baked
+   *  marker, set `updateAvailable` to the tip's marker (or clear it) when
+   *  the tip differs. The refs payload is the source of truth for the
+   *  branch name, so a config switched to a different branch simply sees
+   *  the new branch's tip on the next tick. (The static `branchCheck`
+   *  carries the same facts for a chosen local marker — the headless
+   *  test drives THAT; the model drives it with its own baked version.) */
+  func applyBranchCheck(_ data: Data?, branch: String) {
+    let r = UpdateCheck.branchCheck(data: data, localMarker: version)
+    updateAvailable = r?.marker
+    updateChannel = r?.channel
   }
 
   /** Install action (phase 1 — sha256, not Developer ID): download the
-   *  menubar zip + its sha256 sidecar for the available release, verify the
-   *  hash BEFORE any swap (a mismatch or missing sidecar refuses and keeps
-   *  the current binary), then swap the bundle in place under the repo
-   *  root and kickstart the LaunchAgent when it is loaded. */
+   *  menubar zip + its sha256 sidecar for the available build — a release
+   *  (the release's numbered zip) or an EDGE build (the branch channel's
+   *  marker-named zip, same verification) — verify the hash BEFORE any
+   *  swap (a mismatch or missing sidecar refuses and keeps the current
+   *  binary), then swap the bundle in place under the repo root and
+   *  kickstart the LaunchAgent when it is loaded. */
   func installUpdate() {
     guard let version = updateAvailable else { return }
-    // `updateAvailable` is the BARE version string (what latestUpdateTag
-    // returns). The download URL needs the TAG (the version with the "v");
-    // the published zip is named after the bare version — downloadRef keeps
-    // the two straight (a bare version in the tag slot would 404: Gitea's
-    // per-tag route is keyed on the tag, not the version).
-    let ref = UpdateCheck.downloadRef(version: version)
+    // `updateAvailable` is a release's BARE version (the releases channel)
+    // or a branch's EDGE MARKER (the branch channel). downloadRef keeps the
+    // two straight: releases re-add the "v" tag + numbered zip name (the
+    // per-tag route is keyed on the tag — a bare version there would 404);
+    // an edge marker IS its own tag and its zip's name.
+    let isEdge = updateChannel != "releases"
+    let ref = UpdateCheck.downloadRef(version: version, isEdge: isEdge)
     updateNote = "installing \(version) …"
     UpdateCheck.install(
       base: AppModel.updateBase(),
@@ -1548,9 +1599,11 @@ final class AppModel: ObservableObject {
         case .installed:
           self.updateNote = "installed \(version) — relaunched"
           self.updateAvailable = nil
+          self.updateChannel = nil
         case .notLoaded:
           self.updateNote = "installed \(version) — agent not loaded: run menubar/install.sh"
           self.updateAvailable = nil
+          self.updateChannel = nil
         case .refused:
           // The current binary is untouched; the note explains the refusal.
           break
@@ -1562,10 +1615,24 @@ final class AppModel: ObservableObject {
 
 // MARK: - release update check (pure + async — testable headlessly)
 
-/** The update check over the network (issue #10): on launch + every 6h the
- *  menu bar GETs the Forgejo releases list ANONYMOUSLY (the repo is public;
- *  the arbiter token is never sent to Forgejo) and compares the newest
- *  `v<major>.<minor>.<patch>` tag against the baked version.
+/** The update check over the network (issue #10) + the EDGE CHANNEL
+ *  (issue #26): on launch + every 6h the menu bar checks the update
+ *  channel ANONYMOUSLY (the repo is public; the arbiter token is never
+ *  sent to Forgejo) and, when a newer build is published, sets
+ *  `updateAvailable`:
+ *
+ *  - releases channel (the default): the newest release number (or
+ *    legacy semver tag) strictly above the baked version. Plus the
+ *    BACK-SWITCH rule (issue #26): a machine whose baked version is a
+ *    NON-NUMERIC marker (an edge marker, a dev build) can never compare
+ *    numerically — today that made `versionSegments` return nil and the
+ *    check fail quiet FOREVER (the machine could not come back to the
+ *    releases channel at all). Now a non-numeric local version offers
+ *    the newest release unconditionally.
+ *  - branch channel: the tracked branch's TIP (via the git refs API)
+ *    vs the baked marker — an update is available whenever the baked
+ *    marker differs from the tip marker (no ordering on branch builds:
+ *    a newer push is a different marker, and that is the signal).
  *
  *  OFFLINE-TOLERANT: any fetch/parse failure sets nothing — no dialog, no
  *  error row; the next cadence tick retries.
@@ -1613,15 +1680,22 @@ enum UpdateCheck {
 
   /// The newest release strictly newer than the local version, as its BARE
   /// version string (e.g. "1" for tag v1, "0.0.2" for v0.0.2); nil when
-  /// nothing is strictly newer. Malformed tags are skipped; any failure
-  /// (unparseable payload, malformed local version, no valid tags) → nil:
-  /// fail quiet, nothing set, next tick retries.
+  /// nothing is strictly newer. Malformed tags are skipped; a fetch/parse
+  /// failure (unparseable payload, no valid tags) → nil: fail quiet,
+  /// nothing set, next tick retries.
+  ///
+  /// BACK-SWITCH rule (issue #26): a NON-NUMERIC local version (an edge
+  /// marker, a dev build) cannot compare numerically — the pre-#26 code
+  /// returned nil here and failed quiet FOREVER, so a machine baked with
+  /// a non-numeric version could never come back to the releases channel.
+  /// It now offers the newest release unconditionally: any release is a
+  /// known-good signed build, and a non-numeric local build is never
+  /// "newer" than it. Numeric local versions keep the old rule exactly.
   static func latestUpdateTag(data: Data?, localVersion: String) -> String? {
     guard let data,
           let o = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else {
       return nil
     }
-    guard let local = versionSegments(localVersion) else { return nil }
     var best: ([Int], String)?
     for rel in o {
       guard let tag = rel["tag_name"] as? String,
@@ -1629,7 +1703,96 @@ enum UpdateCheck {
       if best == nil || versionOrder(parsed.0, best!.0) > 0 { best = (parsed.0, parsed.1) }
     }
     guard let b = best else { return nil }
+    guard let local = versionSegments(localVersion) else { return b.1 }
     return versionOrder(b.0, local) > 0 ? b.1 : nil
+  }
+
+  // -- branch (edge) channel (issue #26) -----------------------------------
+
+  /** The edge-channel marker: `edge-<branch>-<sha7>`. ONE string, three
+   *  uses — the Forgejo release TAG, the Forgejo release name's tail
+   *  ("Edge <branch> <sha7>"), and the artifact-zip name part
+   *  (`IdlefillMenubar-<marker>.app.zip` / `Idlefill <marker>.zip`). The
+   *  branch must be URL-safe (the edge publish derives it from the pushed
+   *  branch name); sha7 is the pushed commit's first 7 hex chars. */
+  static func edgeMarker(branch: String, sha7: String) -> String {
+    "edge-\(branch)-\(sha7)"
+  }
+
+  /** Pure (the branch channel): the channel facts an available update
+   *  carries, given the refs-API payload + the local's BAKED marker.
+   *  Split out so the headless test can drive it with a CHOSEN local
+   *  marker (the app's own baked version can't be injected). The
+   *  CHANNEL fact is the branch the tip belongs to (the payload's own
+   *  ref — the source of truth), never re-derived from the marker
+   *  string. `nil` = nothing to set (equal markers, or any
+   *  fetch/parse failure). */
+  static func branchCheck(data: Data?, localMarker: String) -> (marker: String, channel: String)? {
+    guard let data,
+          let o = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]],
+          let first = o.first,
+          let ref = first["ref"] as? String,
+          ref.hasPrefix("refs/heads/"),
+          let obj = first["object"] as? [String: Any],
+          (obj["type"] as? String) == "commit",
+          let sha = obj["sha"] as? String,
+          sha.count == 40, sha.allSatisfy(\.isHexDigit) else {
+      return nil
+    }
+    let branch = String(ref.dropFirst("refs/heads/".count))
+    guard !branch.isEmpty else { return nil }
+    let marker = edgeMarker(branch: branch, sha7: String(sha.prefix(7)))
+    guard marker != localMarker else { return nil }
+    return (marker, branch)
+  }
+
+  /** Pure: the BRANCH-channel update verdict. Given the refs-API payload
+   *  (verified live: `GET …/git/refs/heads/<b>` → 200
+   *  `[{ref, url, object:{type:"commit", sha}}]`; unknown branch → 404
+   *  JSON) + the baked marker, an update is available ⇔ the baked marker
+   *  DIFFERS from the tip's marker — no ordering on branch builds: a
+   *  newer push is a different marker, and the difference IS the update
+   *  (equal markers → up to date → nil). The branch name is read from
+   *  the payload's own `ref` (the source of truth — a config that was
+   *  switched to a different branch must see the new branch's tip). Any
+   *  failure (nil payload, malformed, 404 JSON, malformed sha) → nil:
+   *  fail quiet, nothing set, next tick retries. */
+  static func branchUpdateMarker(data: Data?, localMarker: String) -> String? {
+    guard let data,
+          let o = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]],
+          let first = o.first,
+          let ref = first["ref"] as? String,
+          ref.hasPrefix("refs/heads/"),
+          let obj = first["object"] as? [String: Any],
+          (obj["type"] as? String) == "commit",
+          let sha = obj["sha"] as? String,
+          sha.count == 40, sha.allSatisfy(\.isHexDigit) else {
+      return nil
+    }
+    // The branch name is the ref's own tail (the source of truth — the
+    // prefix was just verified).
+    let branch = String(ref.dropFirst("refs/heads/".count))
+    guard !branch.isEmpty else { return nil }
+    let tip = edgeMarker(branch: branch, sha7: String(sha.prefix(7)))
+    return tip == localMarker ? nil : tip
+  }
+
+  /** GET `<base>/api/v1/repos/sam/idlefill/git/refs/heads/<branch>`
+   *  (anonymous — the same posture as `fetchReleases`; the
+   *  `IDLEFILL_UPDATE_BASE` test hook applies). The completion ALWAYS
+   *  runs, on any thread — including failure (that is the
+   *  offline-tolerant contract: the caller must set nothing). */
+  static func fetchBranchTip(base: String, branch: String,
+                             completion: @escaping (Data?) -> Void) {
+    let branchEnc = branch.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? branch
+    guard let url = URL(string: "\(base)/api/v1/repos/sam/idlefill/git/refs/heads/\(branchEnc)") else {
+      completion(nil); return
+    }
+    var req = URLRequest(url: url)
+    req.timeoutInterval = 10
+    URLSession.shared.dataTask(with: req) { data, _, _ in
+      completion(data)
+    }.resume()
   }
 
   /// Parse a BARE version string (no leading "v") into numeric segments —
@@ -1668,7 +1831,22 @@ enum UpdateCheck {
   /// `updateAvailable` holds, e.g. "1" or "0.0.2") → the (tag, zipName) the
   /// install must fetch. The tag always re-adds the "v"; the zip name never
   /// has one — so `updateAvailable` must feed this BARE (no "v").
+  /// RELEASES-channel form — untouched by issue #26 (the edge path calls
+  /// the overload below with `isEdge: true`).
   static func downloadRef(version: String) -> (tag: String, zip: String) {
+    downloadRef(version: version, isEdge: false)
+  }
+
+  /** The CHANNEL-AWARE ref resolution (issue #26). Releases channel
+   *  (`isEdge: false`): the release rule above, byte-identical. Edge
+   *  channel (`isEdge: true`): `updateAvailable` holds the marker
+   *  (`edge-<branch>-<sha7>`) — the marker IS the tag (no "v" to add),
+   *  and the edge publish names the zip after the marker
+   *  (`IdlefillMenubar-<marker>.app.zip`). */
+  static func downloadRef(version: String, isEdge: Bool) -> (tag: String, zip: String) {
+    if isEdge {
+      return (version, "IdlefillMenubar-\(version).app.zip")
+    }
     let bare = version.hasPrefix("v") ? String(version.dropFirst()) : version
     return ("v" + bare, "IdlefillMenubar-\(bare).app.zip")
   }

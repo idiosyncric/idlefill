@@ -148,8 +148,8 @@ check("a: malformed payload -> nil (fail quiet)",
       UpdateCheck.latestUpdateTag(data: j("not json"), localVersion: "0.0.2") == nil)
 check("a: nil payload -> nil",
       UpdateCheck.latestUpdateTag(data: nil, localVersion: "0.0.2") == nil)
-check("a: malformed local version -> nil (fail quiet)",
-      UpdateCheck.latestUpdateTag(data: j("[{\"tag_name\":\"v1\"}]"), localVersion: "bogus") == nil)
+check("a: malformed local version -> the BACK-SWITCH rule (issue #26) offers the newest release unconditionally — a non-numeric local version can never compare numerically, and must not strand the machine on the releases channel (the pre-#26 expectation was nil/fail-quiet-forever — the exact bug #26 fixes)",
+      UpdateCheck.latestUpdateTag(data: j("[{\"tag_name\":\"v1\"}]"), localVersion: "bogus") == "1")
 // The bare version string is what installUpdate() feeds to downloadRef —
 // the Gitea tag is the bare version with the "v" re-added, and the zip is
 // named after the bare version (never the tag).
