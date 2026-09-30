@@ -352,6 +352,42 @@ an updater. Status reports: checking, up-to-date, update found / downloaded
 / installed, or a fetch/parse failure (the feed is only reachable from the
 LAN, so an off-network machine reports a fetch failure, not "up to date").
 
+## Releases & CI (Gitea Actions)
+
+The repo runs Forgejo Actions on a **local runner** (urza, arm64 macOS —
+`com.sam.idlefill.actrunner` via launchd, like the daemon and menubar). It
+has the Xcode CLT, node, and python3 the pipeline needs. Tradeoff: cutting a
+release requires that Mac to be on — the same constraint as the manual
+`scripts/release.sh` path.
+
+Two workflows in `.gitea/workflows/`:
+
+- **`test.yml`** — every push + PR to `main`: full suite (server + client +
+  adapter tests, `tsc --noEmit` both packages, `npm run build`, `node --check`
+  on the MCP server, `swiftc -parse` on the desktop source). Tests only —
+  never publishes.
+- **`release.yml`** — on a `v*` tag on `main` (or manual re-run): the same
+  full suite runs **first, as a hard gate** — any failing step stops the job
+  and nothing is published. Only a fully green gate reaches the publish step:
+  `scripts/release.sh` (build → zip → sign appcast → Forgejo publish → live
+  feed verify).
+
+**Why tag-triggered, not merge-triggered:** a Sparkle release ships only the
+desktop `.app` (the arbiter, daemon, and MCP server run from each machine's
+local checkout — they are not distributed). Publishing on every merge would
+push a possibly-broken build to every user's machine on every push, even
+when the desktop app didn't change. Tagging `vX.Y.Z` on `main` is the
+deliberate "this version is a release" bump.
+
+```bash
+git tag v0.0.2 main && git push origin v0.0.2   # runs release.yml; gate then publish
+```
+
+The runner injects `FORGEJO_TOKEN` (write:releases on this repo) into the
+publish step; the ed25519 signing key stays at
+`~/.config/idlefill/sparkle-ed-key.b64` on the runner host (never in the
+repo, never a CI secret).
+
 ## Auth model
 
 - Every API call and the WS connection must present a token from the server's

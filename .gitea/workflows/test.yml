@@ -1,0 +1,42 @@
+# Full test suite — the gate. Runs on every push + PR to main.
+# Runner: idlefill-urza (arm64 macOS, Xcode CLT + node + python3).
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: "full suite (server + client + adapter + types + desktop)"
+    runs-on: urza
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: install
+        run: npm ci --no-audit --no-fund
+
+      - name: "tests (all workspaces: server + client + adapter)"
+        run: npm test
+
+      - name: typecheck (server + client)
+        run: |
+          npx tsc --noEmit -p server/tsconfig.json
+          npx tsc --noEmit -p client/tsconfig.json
+
+      - name: build (all workspaces)
+        run: npm run build
+
+      - name: mcp server syntax
+        run: node --check adapters/career-ops/idlefill-mcp.mjs
+
+      - name: desktop source parse (swiftc)
+        run: swiftc -parse desktop/IdlefillDesktop.swift

@@ -1,0 +1,75 @@
+# Tag-triggered Sparkle release.
+#
+#   A `vX.Y.Z` tag on main is the deliberate "this is a release" bump.
+#   The FULL test suite runs FIRST in this job (the gate): if any test /
+#   typecheck / parse step fails, the job stops and NOTHING is published.
+#   Only a fully green gate reaches the publish step (scripts/release.sh).
+#
+#   Pushes and PRs to main do NOT publish — test.yml handles those.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch: # manual retry of a failed release (same tag/version)
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: gate (full suite) then build + publish signed release
+    runs-on: urza
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: install
+        run: npm ci --no-audit --no-fund
+
+      # ---- GATE (the release only proceeds if every one of these passes) ----
+
+      - name: "gate: tests (all workspaces: server + client + adapter)"
+        run: npm test
+
+      - name: "gate: typecheck (server + client)"
+        run: |
+          npx tsc --noEmit -p server/tsconfig.json
+          npx tsc --noEmit -p client/tsconfig.json
+
+      - name: "gate: build (all workspaces)"
+        run: npm run build
+
+      - name: "gate: mcp server syntax"
+        run: node --check adapters/career-ops/idlefill-mcp.mjs
+
+      - name: "gate: desktop source parse (swiftc)"
+        run: swiftc -parse desktop/IdlefillDesktop.swift
+
+      # ---- PUBLISH (only reached if the whole gate above was green) ----
+
+      - name: "publish: drop any auto-created empty tag release"
+        env:
+          FORGEJO_TOKEN: "${{ env.FORGEJO_TOKEN || env.GITEA_TOKEN }}"
+          TAG: "${{ github.ref_name }}"
+        run: bash scripts/drop-auto-release.sh
+
+      - name: "publish: build, zip, sign appcast, Forgejo publish, live verify"
+        env:
+          FORGEJO_TOKEN: "${{ env.FORGEJO_TOKEN || env.GITEA_TOKEN }}"
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          if [ -z "$V" ] || [ "$V" = "$GITHUB_REF_NAME" ]; then
+            echo "tag must be vX.Y.Z (got $GITHUB_REF_NAME)"; exit 1
+          fi
+          echo "==> publishing Idlefill $V (tag $GITHUB_REF_NAME)"
+          IDLEFILL_VERSION="$V" \
+          IDLEFILL_CHANGELOG="Idlefill $V — cut by CI (tag $GITHUB_REF_NAME)." \
+          bash scripts/release.sh
