@@ -29,8 +29,14 @@
 //               Same token gate as the dashboard: no token → no POST and
 //               the status row names the missing token.
 //    actions  — Open Dashboard · Show Logs · Start/Stop · Restart ·
-//               Update code (gated fast-forward + lock-delta install +
-//               menu-bar rebuild + daemon restart) · Quit
+//               Open Desktop (the double-click action as a row; its right
+//               half carries the exception-only update tag — the
+//               updateAvailable value verbatim, no tag when up to date) ·
+//               Install Update <v> (exception-only). The Update Code and
+//               Quit rows are GONE (issue #27 — the panel door only; the
+//               UpdatePlan/updateCode() machinery stays intact and
+//               tested); the app's exit path is the CLI
+//               (`node scripts/idlefill-menubar.mjs app stop`) or launchd.
 //
 //  Click routing (decided by the pure MenuBarRouter — testable headlessly):
 //    single click  — toggle the popover (today's behavior, exactly)
@@ -39,7 +45,10 @@
 //                    `open /Applications/Idlefill.app` when the URL-scheme
 //                    open is not handled (the desktop app not registered
 //                    yet). A double click ALWAYS attempts the desktop app —
-//                    only the two panel rows below fall back.
+//                    only the two panel rows below fall back. The
+//                    `Open Desktop` panel row performs the SAME action
+//                    through the SAME shared helper (MenuBarAppState
+//                    .openDesktopApp) so row and router cannot drift.
 //
 //  Re-routed panel rows (same button-row style; the desktop app is
 //  "installed" when /Applications/Idlefill.app exists — the standard
@@ -204,6 +213,17 @@ struct ClientConfig: Equatable {
    *  Malformed (not 7–40 hex) or empty = ABSENT — today's tip-following
    *  behavior is the fallback. On the releases channel it is ignored. */
   let updatePin: String?
+  /** The automatic update-check cadence in MINUTES (issue #27), from
+   *  `update_check_minutes`: absent/empty/non-numeric = the default 360
+   *  (today's hardcoded 6h). Clamped to a minimum of 5 — a value below
+   *  the floor is clamped AND the clamp is logged once at launch to the
+   *  menubar log (see `UpdateCheck.resolveCadence`). Read once at launch
+   *  like every other key; a relaunch picks up a new value. */
+  let updateCheckMinutes: Int
+  /// Set when the configured value was BELOW the floor and got clamped:
+  /// the raw value, so AppModel can log the clamp once at launch (the
+  /// panel never shows it — the note belongs in the menubar log).
+  let updateCheckClampedFrom: Int?
 
   static let serverURLDefault = "http://100.105.225.1:8787"
 
@@ -211,7 +231,9 @@ struct ClientConfig: Equatable {
     guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
           let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
       return ClientConfig(token: nil, serverURL: serverURLDefault, clientName: nil,
-                          updateChannel: nil, updatePin: nil)
+                          updateChannel: nil, updatePin: nil,
+                          updateCheckMinutes: UpdateCheck.cadenceMinutesDefault,
+                          updateCheckClampedFrom: nil)
     }
     let token = (o["token"] as? String).flatMap { $0.isEmpty ? nil : $0 }
     let url = (o["server_url"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? serverURLDefault
@@ -219,8 +241,14 @@ struct ClientConfig: Equatable {
     let channel = (o["update_channel"] as? String).flatMap { $0.isEmpty ? nil : $0 }
     let pin = (o["update_pin"] as? String).flatMap { $0.isEmpty ? nil : $0 }
       .flatMap { UpdateCheck.isPinSha($0) ? $0 : nil }
+    // Same parse discipline as the other keys: absent / empty / invalid
+    // (non-numeric, non-integer JSON) = the default. The clamp + its
+    // once-at-launch log note live in UpdateCheck.resolveCadence.
+    let cadence = UpdateCheck.resolveCadence(o["update_check_minutes"])
     return ClientConfig(token: token, serverURL: url, clientName: name,
-                        updateChannel: channel, updatePin: pin)
+                        updateChannel: channel, updatePin: pin,
+                        updateCheckMinutes: cadence.value,
+                        updateCheckClampedFrom: cadence.clampedFrom)
   }
 }
 
@@ -634,6 +662,50 @@ final class AppModel: ObservableObject {
   /// (the marker) with the marker-named menubar zip.
   @Published var updateChannel: String? = nil
 
+  // MARK: panel action block (pure — the harness asserts what renders)
+
+  /** One row of the panel's action block: label + the render options.
+   *  `dividerBefore` places the hairline above the row (the block's
+   *  visual groups). */
+  struct PanelActionRow {
+    let label: String
+    var arrow: Bool = false
+    var dividerBefore: Bool = false
+    var tag: (text: String, color: Color)? = nil
+  }
+
+  /** The exception-only update indicator on the `Open Desktop` row: the
+   *  `updateAvailable` value VERBATIM (a release number `1`, a legacy
+   *  `0.0.2`, an edge marker `edge-main-a9787a7`) in the panel's tag
+   *  color (amber — the exception color the paused/budget tags use);
+   *  nil (no update) -> NO tag: label-only row, no empty tag box, no dim
+   *  "current" mark (DESIGN.md Exception-Only rule). Pure so the headless
+   *  harness proves exactly what renders. */
+  static func desktopRowTag(updateAvailable: String?) -> (text: String, color: Color)? {
+    guard let v = updateAvailable else { return nil }
+    return (v, Pal.warn)
+  }
+
+  /** The action block's row SET (issue #27): Open Dashboard · Show Logs ·
+   *  Start/Stop · Restart · Open Desktop (always-on; right half carries
+   *  `desktopRowTag`) · Install Update <v> (exception-only). NO Update
+   *  Code, NO Quit — the panel door is gone, the machinery stays. The
+   *  view renders THIS list, so the harness asserts the shipped panel. */
+  static func panelActionRows(updateAvailable: String?, daemonRunning: Bool) -> [PanelActionRow] {
+    var rows: [PanelActionRow] = [
+      PanelActionRow(label: "Open Dashboard", arrow: true),
+      PanelActionRow(label: "Show Logs"),
+      PanelActionRow(label: daemonRunning ? "Stop" : "Start", dividerBefore: true),
+      PanelActionRow(label: "Restart"),
+      PanelActionRow(label: "Open Desktop", dividerBefore: true,
+                     tag: desktopRowTag(updateAvailable: updateAvailable)),
+    ]
+    if let v = updateAvailable {
+      rows.append(PanelActionRow(label: "Install Update \(v)"))
+    }
+    return rows
+  }
+
   init() {
     // Self-driving 10s poll (main runloop — App init runs on the main thread).
     Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
@@ -650,10 +722,23 @@ final class AppModel: ObservableObject {
     // other way. The 10s poll retries and the word switches on its own
     // once a token appears in the config.
     if config.token == nil { conn = .noToken }
-    // The release check (update story): once at launch, then every 6h.
+    // The cadence clamp (issue #27): a configured value below the floor
+    // is clamped — the clamp is logged ONCE at launch to the menubar log
+    // (never the panel; the panel stays exception-free for a local config
+    // quirk that is already resolved).
+    if let raw = config.updateCheckClampedFrom {
+      let logDir = (repoRoot as NSString).appendingPathComponent("logs")
+      try? FileManager.default.createDirectory(atPath: logDir, withIntermediateDirectories: true)
+      UpdateLog.append("update_check_minutes \(raw) below floor \(UpdateCheck.cadenceMinutesMin) — clamped to \(config.updateCheckMinutes) (\(UpdateLog.nowISO()))",
+                       at: (logDir as NSString).appendingPathComponent(UpdateLog.fileName))
+    }
+    // The release check (update story): once at launch, then every
+    // `update_check_minutes` (config; default 360 = 6h — issue #27 made
+    // the cadence explicit; the value is read ONCE at launch like every
+    // other config key — a relaunch picks up a new one).
     // Offline-tolerant — any failure sets nothing and fails quiet.
     checkForUpdates()
-    Timer.scheduledTimer(withTimeInterval: UpdateCheck.cadenceSeconds, repeats: true) { [weak self] _ in
+    Timer.scheduledTimer(withTimeInterval: TimeInterval(config.updateCheckMinutes * 60), repeats: true) { [weak self] _ in
       self?.checkForUpdates()
     }
   }
@@ -1529,7 +1614,8 @@ final class AppModel: ObservableObject {
 
   // MARK: release update (check + install)
 
-  /** The update check: on launch and every 6h (UpdateCheck.cadenceSeconds),
+  /** The update check: on launch and every `update_check_minutes`
+   *  (config; default 360 = 6h),
    *  routed on the CONFIG'S CHANNEL (issue #26; `client/config.json`'s
    *  `update_channel` — absent = releases, today's behavior):
    *
@@ -1663,7 +1749,8 @@ final class AppModel: ObservableObject {
 // MARK: - release update check (pure + async — testable headlessly)
 
 /** The update check over the network (issue #10) + the EDGE CHANNEL
- *  (issue #26): on launch + every 6h the menu bar checks the update
+ *  (issue #26): on launch + every `update_check_minutes` (config; default
+ *  360 = 6h) the menu bar checks the update
  *  channel ANONYMOUSLY (the repo is public; the arbiter token is never
  *  sent to Forgejo) and, when a newer build is published, sets
  *  `updateAvailable`:
@@ -1689,8 +1776,29 @@ final class AppModel: ObservableObject {
  *  the `.sha256` sidecar, verifies the hash BEFORE any swap, and a mismatch
  *  or missing sidecar refuses (the current binary is kept). */
 enum UpdateCheck {
-  /// The check cadence: launch, then every 6 hours.
-  static let cadenceSeconds: TimeInterval = 6 * 60 * 60
+  /// The DEFAULT check cadence in MINUTES (issue #27 made it configurable
+  /// via `update_check_minutes`): launch, then every 6 hours.
+  static let cadenceMinutesDefault = 6 * 60
+  /// The floor for a configured cadence — below it the value is clamped
+  /// up AND the clamp is logged once at launch (never silently).
+  static let cadenceMinutesMin = 5
+
+  /** Pure: resolve the raw `update_check_minutes` JSON value into the
+   *  cadence actually used. Absent / empty / non-numeric / non-integer /
+   *  boolean -> the default (360), no clamp note. A numeric value below
+   *  the floor -> the floor, with `clampedFrom` carrying the raw value so
+   *  the caller can log the clamp once at launch. (JSON booleans box as
+   *  NSNumber too — they are not a cadence.) */
+  static func resolveCadence(_ raw: Any?) -> (value: Int, clampedFrom: Int?) {
+    var parsed: Int? = nil
+    if let n = raw as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() {
+      let d = n.doubleValue
+      if d == d.rounded(), d >= -2_147_483_647, d <= 2_147_483_647 { parsed = n.intValue }
+    }
+    guard let p = parsed else { return (cadenceMinutesDefault, nil) }
+    if p < cadenceMinutesMin { return (cadenceMinutesMin, p) }
+    return (p, nil)
+  }
 
   /// sha256 in lowercase hex. (Phase 1 — the published sidecar format.)
   static func sha256Hex(_ data: Data) -> String {
@@ -2648,18 +2756,18 @@ struct ContentView: View {
 
       DividerLine()
 
-      actionRow("Open Dashboard", arrow: true)
-      actionRow("Show Logs")
-      DividerLine()
-      actionRow(m.daemonRunning ? "Stop" : "Start")
-      actionRow("Restart")
-      DividerLine()
-      actionRow("Update Code")
-
-      // Exception-only (the same pattern as the updateNote below): the row
-      // exists only while an update is available — hidden otherwise.
-      if let v = m.updateAvailable {
-        actionRow("Install Update \(v)")
+      // The action block renders the PURE spec (AppModel.panelActionRows)
+      // — the headless harness asserts that same spec, so what the tests
+      // prove IS what ships (issue #27). Open Desktop carries the
+      // exception-only update tag (the updateAvailable value VERBATIM;
+      // no update = label-only row, no tag — DESIGN.md Exception-Only
+      // rule); Install Update <v> is exception-only. NO Update Code,
+      // NO Quit rows (the exit path is the CLI / launchd).
+      ForEach(Array(AppModel.panelActionRows(updateAvailable: m.updateAvailable,
+                                             daemonRunning: m.daemonRunning).enumerated()),
+              id: \.offset) { _, r in
+        if r.dividerBefore { DividerLine() }
+        actionRow(r.label, arrow: r.arrow, tag: r.tag)
       }
 
       if let note = m.updateNote {
@@ -2667,9 +2775,6 @@ struct ContentView: View {
         Text(note).font(.system(.caption, design: .monospaced)).foregroundStyle(Pal.dim)
           .padding(10).frame(maxWidth: .infinity, alignment: .leading)
       }
-
-      DividerLine()
-      actionRow("Quit")
     }
     .background(Pal.canvas)
     .frame(width: 300)
@@ -2746,7 +2851,8 @@ struct ContentView: View {
   }
 
   @ViewBuilder
-  func actionRow(_ label: String, arrow: Bool = false) -> some View {
+  func actionRow(_ label: String, arrow: Bool = false,
+                 tag: (text: String, color: Color)? = nil) -> some View {
     Button(action: {
       switch label {
       case "Open Dashboard":
@@ -2774,8 +2880,12 @@ struct ContentView: View {
       case "Start": m.start()
       case "Stop": m.stop()
       case "Restart": m.restart()
-      case "Update Code": m.updateCode()
-      case "Quit": NSApplication.shared.terminate(nil)
+      // The Open Desktop row = the double-click action, executed through
+      // the SAME shared helper the router calls (issue #27 — one call
+      // path, no drift). The Update Code and Quit rows are gone: the
+      // UpdatePlan/updateCode() machinery stays (CLI/launchd drive the
+      // exit path; uc-update-test.sh still proves the core).
+      case "Open Desktop": MenuBarAppState.openDesktopApp()
       // The Install Update row carries the version in its label (the
       // exception-only row — it only exists while one is available).
       default:
@@ -2786,6 +2896,11 @@ struct ContentView: View {
       HStack {
         Text(label).font(.system(.body, design: .monospaced)).foregroundStyle(Pal.text)
         Spacer()
+        // The exception-only right-half tag (the PickRow pattern —
+        // DESIGN.md: no tag is the healthy state). nil renders nothing.
+        if let t = tag {
+          Text(t.text).font(.system(.caption, design: .monospaced)).foregroundStyle(t.color)
+        }
         if arrow {
           Image(systemName: "arrow.up.forward").font(.system(size: 10)).foregroundStyle(Pal.dim)
         }
@@ -2818,6 +2933,14 @@ enum MenuBarAppState {
     if !opened {
       NSWorkspace.shared.open(URL(fileURLWithPath: DesktopApp.appPath))
     }
+  }
+
+  /** THE desktop-app-open action (issue #27): `idlefill://open` — the
+   *  State view — with the app-path fallback. The ONE call path for both
+   *  the double-click routing (AppDelegate) and the panel's `Open Desktop`
+   *  row (ContentView), so the two can never drift. */
+  static func openDesktopApp() {
+    openDesktopURL("\(DesktopApp.scheme)://open")
   }
 }
 
@@ -2894,8 +3017,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       togglePopover(sender)
     case .openDesktopApp:
       // A double click ALWAYS attempts the desktop app (the fallback to
-      // `open` of the app path is inside openDesktopURL).
-      MenuBarAppState.openDesktopURL("\(DesktopApp.scheme)://open")
+      // `open` of the app path is inside openDesktopApp). The panel's
+      // `Open Desktop` row calls the SAME helper (issue #27).
+      MenuBarAppState.openDesktopApp()
     }
   }
 
