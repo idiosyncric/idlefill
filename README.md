@@ -231,8 +231,12 @@ ground truth.
   It assembles the bundle (`Contents/MacOS/Idlefill` + `Info.plist`,
   `LSUIElement false` — it has a window), registers the `idlefill://` URL
   scheme (`CFBundleURLTypes`), draws the dock icon at runtime (the
-  open-ring logo, no `.icns`), and `codesign --force -s -` signs it so
-  Gatekeeper-on-local is happy. Run it with `open desktop/Idlefill.app`.
+  open-ring logo, no `.icns`), links the vendored **Sparkle** framework into
+  `Contents/Frameworks`, writes the Sparkle keys into `Info.plist`
+  (`SUFeedURL`, `SUPublicEDKey`, `SUEnableInstallerLauncherService`), and
+  `codesign --force -s -` signs it so Gatekeeper-on-local is happy. The
+  version is `IDLEFILL_VERSION` (default `0.0.1`). Run it with
+  `open desktop/Idlefill.app`.
   Install to Applications with `cp -R desktop/Idlefill.app /Applications/`,
   or just run **`desktop/update.sh`** — one command to update an installed
   copy: rebuilds, quits the running app (clean SIGTERM — the app holds no
@@ -287,6 +291,66 @@ ground truth.
   the log path, and the token source derive from it. The token is read at
   runtime from the gitignored `client/config.json` — never baked into the
   plist, the bundle, or the binary.
+
+## Updating (Sparkle, private feed)
+
+The desktop app self-updates via [Sparkle](desktop/vendor/sparkle/SPARKLE.md)
+against a **private update feed**: the appcast and update zips live as
+**assets on a Forgejo release** (`git.samwarth.com/sam/idlefill`), not in
+the repo tree. The repo is public but **ingress is LAN-restricted**, so the
+feed is only reachable from inside the network — that is what makes it
+private in practice (Sparkle does a plain HTTPS GET, no auth).
+
+**Feed URL** (in `Info.plist` `SUFeedURL` and the app's `kSparkleFeedURL`):
+
+```
+https://git.samwarth.com/sam/idlefill/releases/download/latest/appcast.xml
+```
+
+Gitea's release-download route is `/releases/download/{vTag}/{fileName}` —
+there is **no** `/releases/latest/download/` route (that GitHub form 404s on
+Gitea even once the repo is public), so the feed uses the `latest`
+pseudo-tag in the `{vTag}` slot. `latest` resolves to the newest release,
+which carries the **whole current feed**: `appcast.xml` + every zip it
+references. The enclosures in the appcast point at the same
+`/releases/download/latest/` prefix.
+
+**Signing.** Each update is signed with **ed25519 (EdDSA)**: the enclosure
+carries a `sparkle:edSignature` (a 64-byte ed25519 signature over the zip),
+and the bundle's `Info.plist` carries the matching **`SUPublicEDKey`**
+(base64 of the 32-byte public key) that Sparkle verifies against. The
+private seed lives at `~/.config/idlefill/sparkle-ed-key.b64` (mode `0600`,
+base64 of 32 bytes). `scripts/release.sh` derives the public key from it;
+if the file is missing it generates one and prints the public key to bake
+into the build.
+
+**Releasing** — `scripts/release.sh` runs the whole pipeline:
+
+1. build the app (`IDLEFILL_VERSION=x.y.z`, with the `SUPublicEDKey`);
+2. zip the bundle (`Idlefill x.y.z.zip`);
+3. `generate_appcast` with `--maximum-deltas 0` (zips only, no `.delta`)
+   against a **persistent staging dir** (`~/idlefill-release-staging`) so
+   the feed carries the full history — old zips are carried forward;
+4. parse the feed and collect every referenced enclosure;
+5. **publish** to Forgejo: delete any existing release named
+   `Idlefill x.y.z`, create release `Idlefill x.y.z` tagged `vX.Y.Z`, and
+   attach `appcast.xml` + every referenced zip (idempotent re-runs);
+6. **verify the live feed** (authed GET): it parses as XML, the newest
+   `sparkle:version` is `x.y.z`, every zip enclosure GETs `200` with a
+   zip-ish `Content-Type`, and the ed25519 signature is present.
+
+```bash
+IDLEFILL_VERSION=1.0.0 FORGEJO_TOKEN=<forgejo token> scripts/release.sh
+# FORGEJO_TOKEN is read at runtime from the gitignored credential — it is
+# never written into the feed or the repo.
+```
+
+**In-app.** The Settings tab has a **Check for Updates…** button and a
+status line. The `SPUStandardUpdaterController` is created **lazily — on
+the first tap**, never at launch — so headless builds and tests never start
+an updater. Status reports: checking, up-to-date, update found / downloaded
+/ installed, or a fetch/parse failure (the feed is only reachable from the
+LAN, so an off-network machine reports a fetch failure, not "up to date").
 
 ## Auth model
 

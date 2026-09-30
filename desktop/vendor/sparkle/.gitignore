@@ -1,0 +1,4 @@
+# This file is deliberate: the vendored framework + release tooling ARE
+# tracked. A future broad ignore (e.g. *.framework or dist patterns at the
+# repo root) must not silently exclude this directory — the appcast feed
+# tooling and the framework binary are both needed to build the desktop app.
