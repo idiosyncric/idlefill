@@ -213,6 +213,35 @@ Show Logs · Start/Stop · Restart · Update code · Quit.
   the agent when it is loaded. OFFLINE-TOLERANT: with the network down
   the check says nothing and fails quiet — no dialog, no error row; the
   next cadence tick retries.
+- **Update Code:** fast-forwards this checkout to `origin/main` and
+  reinstalls/rebuilds/restarts only what changed. Pre-flight gates, in
+  order — a refusal at any gate writes nothing (no merge, no install, no
+  signal to the daemon): (a) the tree must be clean
+  (`git status --porcelain`, timeout-bounded) — a dirty tree refuses with
+  `commit or stash first`; (b) `git fetch origin main` must succeed — a
+  failed fetch refuses; (c) `HEAD` must be an ancestor of `origin/main`
+  (`git merge-base --is-ancestor`) — a diverged local branch refuses.
+  `git pull` is never run: the only write is `git merge --ff-only
+  origin/main`, after all three gates. If `HEAD == origin/main` the
+  update is a no-op (`already up to date`), no install/rebuild/restart.
+  The daemon is stopped **first** (the same `SIGINT`-the-whole-pair path
+  as Stop), so it never runs against a mid-merge tree or a torn-down
+  `node_modules`; `npm ci` runs **only** when `package-lock.json` differs
+  between the two revisions (`git diff --quiet old new --
+  package-lock.json`), never while the daemon runs. Then the menu bar
+  bundle is rebuilt (`menubar/build.sh`), and if the launchd label is
+  loaded **and** runs this process's own binary (exact path compare — a
+  stale label pointing elsewhere is a note, never a kill),
+  `launchctl kickstart -k` relaunches the agent on the new code and the
+  note before the kick says `restarting menu bar with new code`. Each
+  completed update appends one line to `logs/idlefill-menubar.log`
+  (`<oldsha> → <newsha> <ISO ts> daemon-pid=<pid|none>
+  lock-changed=<yes|no>`, rotated at 1 MiB keeping the last 512 KiB —
+  never deleted, never truncated to empty) and the panel's `revision`
+  row shows the deployed `git rev-parse --short HEAD`. The decision core
+  (`UpdatePlan`) is pure and is proven headlessly by
+  `menubar/uc-update-test.sh` against scratch repos (the same harness
+  pattern as `menubar/uc-test.sh`).
 - **Repo discovery:** the binary ships at `<repo>/menubar/`, so it resolves
   the repo from its own location (one level up), honoring
   `IDLEFILL_CONFIG_FILE` when set. The token is read at runtime from the
