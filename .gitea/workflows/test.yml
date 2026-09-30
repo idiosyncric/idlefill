@@ -2,6 +2,12 @@
 # Runner: idlefill-urza (arm64 macOS, Xcode CLT + node + python3).
 name: test
 
+# Pin the env so the pipeline is hermetic regardless of the host daemon's
+# environment: npm ci must install devDependencies (tsx is the test runner
+# for the server + client suites), so NODE_ENV must not be "production".
+env:
+  NODE_ENV: test
+
 on:
   push:
     branches: [main]

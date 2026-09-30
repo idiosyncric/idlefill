@@ -358,7 +358,10 @@ The repo runs Forgejo Actions on a **local runner** (urza, arm64 macOS —
 `com.sam.idlefill.actrunner` via launchd, like the daemon and menubar). It
 has the Xcode CLT, node, and python3 the pipeline needs. Tradeoff: cutting a
 release requires that Mac to be on — the same constraint as the manual
-`scripts/release.sh` path.
+`scripts/release.sh` path. Setup + day-2 ops for the runner live in
+[`runner/`](runner/README.md) (token-free templates; the live config with
+its registration secret stays on the host at
+`~/Software/ci-cd/idlefill-runner/`, never committed — this repo is public).
 
 Two workflows in `.gitea/workflows/`:
 

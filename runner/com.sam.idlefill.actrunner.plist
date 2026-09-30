@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.sam.idlefill.actrunner</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/homebrew/bin/forgejo-runner</string>
+		<string>daemon</string>
+		<string>--config</string>
+		<string>/Users/sam/Software/ci-cd/idlefill-runner/config.yaml</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>WorkingDirectory</key>
+	<string>/Users/sam/Software/ci-cd/idlefill-runner</string>
+	<key>StandardOutPath</key>
+	<string>/Users/sam/Software/ci-cd/idlefill-runner/runner.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/sam/Software/ci-cd/idlefill-runner/runner.log</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<!-- Sane PATH, and deliberately NO NODE_ENV: the workflows pin
+			NODE_ENV: test themselves, so the daemon's env can't leak
+			production into npm ci (which would skip devDependencies). -->
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+</dict>
+</plist>

@@ -8,6 +8,12 @@
 #   Pushes and PRs to main do NOT publish — test.yml handles those.
 name: release
 
+# Pin the env so the pipeline is hermetic regardless of the host daemon's
+# environment: npm ci must install devDependencies (tsx is the test runner
+# for the server + client suites), so NODE_ENV must not be "production".
+env:
+  NODE_ENV: test
+
 on:
   push:
     tags:

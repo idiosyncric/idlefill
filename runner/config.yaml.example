@@ -1,0 +1,53 @@
+# idlefill Forgejo Actions runner — urza (arm64, macOS)
+#
+# TEMPLATE. Copy to the runner home and paste the uuid + token from the
+# Forgejo UI into the two placeholder lines:
+#   cp config.yaml.example config.yaml && chmod 600 config.yaml
+#   https://git.samwarth.com/sam/idlefill/settings/actions/runners
+#   -> "Create new runner" (repo-scoped: runs only sam/idlefill workflows)
+#
+# The live config holds a registration secret — it stays on the host,
+# 0600, and is NEVER committed. This template has no secret in it.
+#
+# The registration lives in this file (forgejo-runner v13+ "connections"
+# model — the `forgejo-runner register` subcommand is deprecated and can't
+# consume the new-style UI credentials).
+
+log:
+  level: info
+  job_level: info
+
+runner:
+  # Adjust to wherever the runner home lives on the host.
+  file: /Users/sam/Software/ci-cd/idlefill-runner/runner
+  capacity: 1
+  timeout: 2h
+  shutdown_timeout: 5m
+  env_file: ""
+  # ":host" backend — jobs run as plain processes on the Mac, no container.
+  # (A Docker-less host: the `:host` suffix is what keeps forgejo-runner
+  # from pinging the Docker daemon and hard-exiting on startup.)
+  labels:
+    - urza:host
+
+actions:
+  # no restrictions
+  whitelist: []
+  blacklist: []
+
+cache:
+  enabled: false
+
+server:
+  connections:
+    forgejo:
+      url: https://git.samwarth.com/
+      uuid: PASTE-UUID-FROM-THE-UI
+      token: PASTE-TOKEN-FROM-THE-UI
+      labels:
+        - urza:host
+
+container:
+  # Jobs run as plain processes on this Mac (no Docker) — they need
+  # swiftc + node + npm + python3, all present in sam's PATH.
+  options: ""
