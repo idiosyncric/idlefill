@@ -5,9 +5,13 @@
  * Lets an agent (e.g. a Hermes profile) schedule idle work without touching
  * the arbiter API or the queue files directly:
  *
- *   idlefill_add_jobs     add job(s) to a project queue (deduped by job_id)
- *   idlefill_queue_status queue depth + what is running now (arbiter /api/state)
- *   idlefill_results      recent results lines from a project's results file
+ *   idlefill_add_jobs      add job(s) to a project queue (deduped by job_id)
+ *   idlefill_queue_status  queue depth + what is running now (arbiter /api/state)
+ *   idlefill_results       recent results lines from a project's results file
+ *   idlefill_remove_jobs   drop job(s) by exact job_id (unknown ids reported)
+ *   idlefill_clear_queue   empty a project queue
+ *   idlefill_job_lookup    exact job_id lookup: queue position, results
+ *                          history, done/quarantined facts, running/throttled
  *
  * Transport: MCP over stdio — newline-delimited JSON per the MCP stdio spec
  * (JSON-RPC 2.0). No dependencies — Node builtins only; runs under plain
@@ -353,6 +357,8 @@ function results(args) {
         ok: r.ok === true,
         score: r.score ?? null,
         error: r.error || null,
+        company: typeof r.company === 'string' && r.company !== '' ? r.company : null,
+        title: typeof r.title === 'string' && r.title !== '' ? r.title : null,
         tokens_out: r.tokens_out ?? null,
         ts: r.ts || null,
         report_path: r.report_path || null,
@@ -362,6 +368,238 @@ function results(args) {
     }
   }
   return { ok: true, project, count: out.length, results: out };
+}
+
+// ---------------------------------------------------------------------------
+// Queue mutation — remove / clear (write + verify + one retry, the same
+// discipline as add_jobs: the daemon rewrites queue.jsonl as jobs end)
+// ---------------------------------------------------------------------------
+
+/**
+ * The queue's write+verify+one-retry pattern, generalized for the mutation
+ * tools. plan(existing) → the jobs the queue SHOULD hold after this call;
+ * verify() → true when the on-disk file now carries the intended change.
+ * On a lost write (a same-moment daemon rewrite clobbered ours) the state is
+ * RE-READ and planned again — never blind-applied, so a job that finished
+ * in the gap is not resurrected.
+ */
+function writeQueueVerified(file, plan, verify, logLabel) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const merged = plan(readQueue(file));
+    writeQueue(file, merged);
+    if (verify()) {
+      log(`${logLabel} queue=${readQueue(file).length}${attempt > 1 ? ` (retry ${attempt})` : ''}`);
+      return { ok: true };
+    }
+    // A concurrent daemon rewrite dropped our write — re-read + re-plan once.
+  }
+  return { ok: false, error: 'queue write lost to a concurrent daemon rewrite twice; try again' };
+}
+
+function resolveProject(cfg, projectArg) {
+  const project = String(projectArg || 'career-ops');
+  const paths = projectPaths(cfg).get(project);
+  if (!paths) return { error: `unknown project "${project}" — client config knows: ${[...projectPaths(cfg).keys()].join(', ')}` };
+  return { project, paths };
+}
+
+function removeJobs(args) {
+  const cfg = loadClientConfig();
+  if (cfg.__error) return { ok: false, error: cfg.__error };
+  const res = resolveProject(cfg, args.project);
+  if (res.error) return { ok: false, error: res.error };
+  const { project, paths } = res;
+
+  const input = Array.isArray(args.job_ids) ? args.job_ids : [args.job_ids];
+  if (!input.length) return { ok: false, error: 'job_ids (or job_ids[0]) is required' };
+  const bad = input.findIndex((id) => typeof id !== 'string' || !id);
+  if (bad !== -1) return { ok: false, error: `job_ids[${bad}] must be a non-empty string` };
+
+  const dryRun = args.dry_run === true;
+  // De-dupe while preserving first-seen order (one id = one removal).
+  const wanted = [...new Set(input)];
+
+  // Classify against the LIVE queue (the same fresh-read rule as add_jobs):
+  // present ids are the removal candidates, the rest are reported not_found.
+  // The removal itself is idempotent, so the classification stays honest even
+  // if the queue moves between this read and the write.
+  const have = new Set(readQueue(paths.queue_file).map((j) => j.job_id));
+  const notFound = wanted.filter((id) => !have.has(id));
+  const toRemove = wanted.filter((id) => have.has(id));
+
+  if (dryRun) {
+    log(`remove_jobs project=${project} dry_run would_remove=${toRemove.length} not_found=${notFound.length} queue=${readQueue(paths.queue_file).length}`);
+    return {
+      ok: true,
+      project,
+      dry_run: true,
+      removed: toRemove,
+      not_found: notFound,
+      queue_length: readQueue(paths.queue_file).length - toRemove.length,
+      note: 'dry_run: queue file NOT modified; this is what would have been removed',
+    };
+  }
+
+  // Verify re-reads the file: every toRemove id must be gone. A retry re-reads
+  // and re-plans from the moved file (writeQueueVerified), so a job that
+  // finished in the gap is not resurrected.
+  const out = writeQueueVerified(
+    paths.queue_file,
+    (existing) => existing.filter((j) => !wanted.includes(j.job_id)),
+    () => !readQueue(paths.queue_file).some((j) => wanted.includes(j.job_id)),
+    `remove_jobs project=${project}`,
+  );
+  if (!out.ok) return out;
+  const after = new Set(readQueue(paths.queue_file).map((j) => j.job_id));
+  return {
+    ok: true,
+    project,
+    removed: toRemove.filter((id) => !after.has(id)),
+    not_found: notFound,
+    queue_length: readQueue(paths.queue_file).length,
+    note: 'the queue file is the only thing touched — an in-flight lease for a removed job settles on its own and is simply not re-queued',
+  };
+}
+
+function clearQueue(args) {
+  const cfg = loadClientConfig();
+  if (cfg.__error) return { ok: false, error: cfg.__error };
+  const res = resolveProject(cfg, args.project);
+  if (res.error) return { ok: false, error: res.error };
+  const { project, paths } = res;
+
+  const dryRun = args.dry_run === true;
+  const depth = readQueue(paths.queue_file).length;
+
+  if (dryRun) {
+    log(`clear_queue project=${project} dry_run would_clear=${depth}`);
+    return {
+      ok: true,
+      project,
+      dry_run: true,
+      cleared: depth,
+      note: 'dry_run: queue file NOT modified; this is what would have been cleared',
+    };
+  }
+
+  const out = writeQueueVerified(
+    paths.queue_file,
+    () => [],
+    () => readQueue(paths.queue_file).length === 0,
+    `clear_queue project=${project}`,
+  );
+  if (!out.ok) return out;
+  return {
+    ok: true,
+    project,
+    cleared: depth,
+    queue_length: 0,
+    note: 'the queue file is the only thing touched — in-flight leases settle on their own (their job is already out of the queue)',
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Job lookup — exact job_id (no fuzzy search: identity is the slug+hash,
+// fuzzy would mislead). File facts are read LIVE per call.
+// ---------------------------------------------------------------------------
+
+function jobLookup(args) {
+  const cfg = loadClientConfig();
+  if (cfg.__error) return { ok: false, error: cfg.__error };
+  const res = resolveProject(cfg, args.project);
+  if (res.error) return { ok: false, error: res.error };
+  const { project, paths } = res;
+  const jobId = String(args.job_id ?? '');
+  if (!jobId) return { ok: false, error: 'job_id is required' };
+
+  const limit = Math.max(1, Math.min(100, Number(args.limit) || 20));
+
+  const out = { ok: true, project, job_id: jobId, found: false, in_queue: false, position: null, payload: null };
+
+  // Queue membership + 1-based position + payload (live read).
+  const queue = readQueue(paths.queue_file);
+  const idx = queue.findIndex((j) => j.job_id === jobId);
+  if (idx !== -1) {
+    const j = queue[idx];
+    out.found = true;
+    out.in_queue = true;
+    out.position = idx + 1;
+    out.queue_length = queue.length;
+    out.payload = {
+      url: j.payload?.url ?? null,
+      company: j.payload?.company ?? null,
+      title: j.payload?.title ?? null,
+      score: j.payload?.score ?? null,
+      attempts: typeof j.attempts === 'number' ? j.attempts : 0,
+    };
+  }
+
+  // Results history: last N lines for THIS job, newest first (the file is
+  // append-ordered; the daemon appends one line per finished attempt).
+  if (existsSync(paths.results_file)) {
+    const lines = readFileSync(paths.results_file, 'utf-8').split('\n').filter((l) => l.trim());
+    const mine = [];
+    for (let i = lines.length - 1; i >= 0 && mine.length < limit; i--) {
+      try {
+        const r = JSON.parse(lines[i]);
+        if (r && r.job_id === jobId) {
+          mine.push({
+            ok: r.ok === true,
+            score: r.score ?? null,
+            error: r.error || null,
+            company: typeof r.company === 'string' && r.company !== '' ? r.company : null,
+            title: typeof r.title === 'string' && r.title !== '' ? r.title : null,
+            tokens_out: r.tokens_out ?? null,
+            ts: r.ts || null,
+            report_path: r.report_path || null,
+          });
+        }
+      } catch {
+        /* skip corrupt line */
+      }
+    }
+    if (mine.length) {
+      out.found = true;
+      out.results = mine;
+    }
+  }
+
+  // Ground-truth facts (same rule as queue.mjs / add_jobs): done = last
+  // results line ok:true; quarantined = in quarantine.jsonl.
+  const { done, quarantined } = exclusionFacts(paths);
+  out.done = done.has(jobId);
+  out.quarantined = quarantined.has(jobId);
+
+  if (out.done) {
+    out.found = true;
+    out.hint = 'done: its last results line is ok:true — it will not be re-queued (use --force in queue.mjs or re-add to run it again)';
+  } else if (out.quarantined) {
+    out.found = true;
+    out.hint = 'quarantined: it burned all retry attempts — it never runs again until the operator edits the files by hand';
+  } else if (!out.found) {
+    out.hint = 'not in the queue, no results line, not quarantined — this arbiter has never seen this job_id (check the company/url that would hash to it)';
+  }
+
+  // Best-effort live arbiter: running (lease) or throttled for this job.
+  const st = arbiterState(cfg).catch((e) => ({ error: `arbiter unreachable: ${e.message}` }));
+  st.then((state) => {
+    if (state && state.error) {
+      out.arbiter = { error: state.error };
+      return;
+    }
+    if (!state) return;
+    out.arbiter = {
+      running: (state.active_leases || []).filter((l) => l.job_id === jobId).map((l) => ({
+        lease_id: l.lease_id,
+        worker: l.client,
+        granted_at: l.granted_at ?? null,
+        expires_at: l.expires_at ?? null,
+      })),
+      throttled: (state.throttled_jobs || []).filter((t) => t.project === project && t.job_id === jobId),
+    };
+  });
+  out.__arbiterPromise = st;
+  return out;
 }
 
 const TOOLS = [
@@ -412,13 +650,67 @@ const TOOLS = [
   {
     name: 'idlefill_results',
     description:
-      'Show recent evaluation results from a project (newest first): job_id, ok, score, error, tokens_out, timestamp, report path.',
+      'Show recent evaluation results from a project (newest first): job_id, ok, score, error, company, title, tokens_out, timestamp, report path. ' +
+      'company/title are present on rows written by the career-ops executor; rows from other executors may lack them (null).',
     inputSchema: {
       type: 'object',
       properties: {
         project: { type: 'string', description: 'default career-ops' },
         limit: { type: 'number', description: 'how many lines, 1-200 (default 20)' },
       },
+    },
+  },
+  {
+    name: 'idlefill_remove_jobs',
+    description:
+      'Drop one or more jobs from an idlefill project queue by EXACT job_id (no fuzzy match). ' +
+      'Unknown job ids are reported (not_found), not an error. dry_run=true previews without writing. ' +
+      'Only the queue file is touched: removing a job that is CURRENTLY RUNNING does not cancel its lease — ' +
+      'the lease settles on its own and the job is simply no longer re-queued. ' +
+      'Use idlefill_queue_status or idlefill_job_lookup to list job_ids first.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: { type: 'string', description: 'idlefill project name (default career-ops)' },
+        job_ids: {
+          type: 'array',
+          description: 'exact job_ids to drop from the queue',
+          items: { type: 'string' },
+        },
+        dry_run: { type: 'boolean', description: 'preview only, do not write the queue file' },
+      },
+      required: ['job_ids'],
+    },
+  },
+  {
+    name: 'idlefill_clear_queue',
+    description:
+      'Empty an idlefill project queue (remove every queued job). dry_run=true previews the count without writing. ' +
+      'Only the queue file is touched: in-flight leases settle on their own. Results/quarantine files are never modified.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: { type: 'string', description: 'idlefill project name (default career-ops)' },
+        dry_run: { type: 'boolean', description: 'preview only, do not write the queue file' },
+      },
+    },
+  },
+  {
+    name: 'idlefill_job_lookup',
+    description:
+      'Find a job by EXACT job_id (identity is <company-slug>-<sha256(url)[0:8]> — no fuzzy search, it would mislead). ' +
+      'Returns in_queue + 1-based queue position + the job payload (url/company/title/score/attempts), ' +
+      'its results history (last N lines: ok/score/error/ts/report_path), and the done/quarantined ground-truth facts. ' +
+      'When the arbiter is reachable it also reports whether the job is running (lease) or throttled. ' +
+      'A job this arbiter never saw returns {ok:true, found:false} with a hint (it may be done or quarantined — those facts are returned either way).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: { type: 'string', description: 'idlefill project name (default career-ops)' },
+        job_id: { type: 'string', description: 'the exact job_id to look up' },
+        limit: { type: 'number', description: 'how many results lines to include, 1-100 (default 20)' },
+      },
+      required: ['job_id'],
     },
   },
 ];
@@ -438,6 +730,16 @@ const TOOL_IMPL = {
     return out;
   },
   idlefill_results: async (a) => results(a),
+  idlefill_remove_jobs: async (a) => removeJobs(a),
+  idlefill_clear_queue: async (a) => clearQueue(a),
+  idlefill_job_lookup: async (a) => {
+    const out = jobLookup(a);
+    // Same pattern as queue_status: await the arbiter read so the response is
+    // complete — jobLookup's .then() already shaped out.arbiter.
+    if (out.__arbiterPromise) await out.__arbiterPromise;
+    delete out.__arbiterPromise;
+    return out;
+  },
 };
 
 // ---------------------------------------------------------------------------
