@@ -42,6 +42,67 @@
 
 import AppKit
 import SwiftUI
+import Sparkle
+
+// MARK: - auto-update (Sparkle)
+
+/** The appcast feed: a release ASSET on the Forgejo repo (public repo,
+ *  ingress LAN-restricted — see README "Updating"). Gitea's release-download
+ *  route is `/releases/download/{vTag}/{fileName}` (web.go — there is NO
+ *  `/releases/latest/download/` route, that GitHub form 404s on Gitea), so
+ *  the feed uses the `latest` pseudo-tag in the {vTag} slot. `latest`
+ *  resolves against the LATEST release, which carries the whole current
+ *  feed (appcast.xml + every zip it references). No auth — Sparkle does a
+ *  plain HTTPS GET. */
+let kSparkleFeedURL = "https://git.samwarth.com/sam/idlefill/releases/download/latest/appcast.xml"
+
+/** Sparkle updater delegate: pins the feed URL at runtime (belt-and-
+ *  suspenders with SUFeedURL in Info.plist) and surfaces errors in the
+ *  Settings status line. Every method is @optional in the protocol; we
+ *  implement only what the app needs. */
+final class UpdaterDelegate: NSObject, SPUUpdaterDelegate {
+  var onStatus: (String) -> Void = { _ in }
+
+  // The appcast feed URL (belt-and-suspenders with SUFeedURL in Info.plist).
+  // NOTE: the ObjC `feedURLStringForUpdater:` requirement is imported into
+  // Swift as `feedURLString(for:)`.
+  func feedURLString(for updater: SPUUpdater) -> String? {
+    return kSparkleFeedURL
+  }
+
+  // "No update" has TWO overloads in the protocol. The no-error one fires on
+  // a genuine up-to-date; the error-carrying one fires when the fetch/parse
+  // failed (feed 404s while the repo is still private, malformed appcast, …).
+  // Implementing both keeps the status line honest instead of collapsing
+  // "up to date" and "couldn't reach the feed" into one string.
+  func updaterDidNotFindUpdate(_ updater: SPUUpdater) {
+    onStatus("up to date")
+  }
+
+  func updaterDidNotFindUpdate(_ updater: SPUUpdater, error: Error) {
+    onStatus("no update found — " + error.localizedDescription)
+  }
+
+  func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
+    onStatus("update available: v" + item.displayVersionString)
+  }
+
+  func updater(_ updater: SPUUpdater, didDownloadUpdate item: SUAppcastItem) {
+    onStatus("update v\(item.displayVersionString) downloaded — Sparkle will install on relaunch")
+  }
+
+  func updater(_ updater: SPUUpdater, failedToDownloadUpdate item: SUAppcastItem, error: Error) {
+    onStatus("download failed — " + error.localizedDescription)
+  }
+
+  func userDidCancelDownload(_ updater: SPUUpdater) {
+    onStatus("download cancelled")
+  }
+
+  func updater(_ updater: SPUUpdater, didAbortWithError error: Error) {
+    onStatus("update aborted — " + error.localizedDescription)
+  }
+}
 
 // MARK: - palette (DESIGN.md tokens)
 
@@ -129,6 +190,12 @@ final class AppModel: ObservableObject {
   @Published var daemonNote: String? = nil
   @Published var menubarNote: String? = nil
 
+  // auto-update (Sparkle)
+  @Published var updateStatus: String? = nil
+  @Published var updateChecking = false
+  private var updaterController: SPUStandardUpdaterController?
+  private let updaterDelegate = UpdaterDelegate()
+
   private(set) var repoRoot: String = AppModel.findRepoRoot()
 
   private var logOffset: UInt64 = 0
@@ -150,6 +217,38 @@ final class AppModel: ObservableObject {
       self?.pollLogs()
     }
     poll()
+  }
+
+  // MARK: auto-update (Sparkle)
+
+  /** Lazily build the Sparkle controller on the FIRST "Check for Updates…"
+   *  tap (never at launch — the Settings panel must work before any update
+   *  plumbing exists, and a headless build/test must not start an updater).
+   *  The controller's `updaterDelegate` is weak, so we hold it. The updater
+   *  targets the app's own main bundle (the running bundle). */
+  private func ensureUpdaterController() {
+    guard updaterController == nil else { return }
+    updaterDelegate.onStatus = { [weak self] msg in
+      DispatchQueue.main.async {
+        self?.updateStatus = msg
+        self?.updateChecking = false
+      }
+    }
+    updaterController = SPUStandardUpdaterController(
+      updaterDelegate: updaterDelegate,
+      userDriverDelegate: nil
+    )
+  }
+
+  /** Kick off a manual update check. Sparkle's standard UI shows the
+   *  progress dialog; the status line here mirrors the delegate callbacks
+   *  (checking → up-to-date / update available / download + install). */
+  func checkForUpdates() {
+    ensureUpdaterController()
+    guard let c = updaterController else { return }
+    updateStatus = "checking for updates…"
+    updateChecking = true
+    c.checkForUpdates(nil)
   }
 
   // MARK: repo path resolution
@@ -1192,6 +1291,27 @@ struct SettingsPanel: View {
             .buttonStyle(.plain)
             .foregroundStyle(Pal.accent)
         }
+
+        DividerLine()
+
+        HStack(spacing: 8) {
+          Button(m.updateChecking ? "checking…" : "check for updates…") { m.checkForUpdates() }
+            .font(.system(.body, design: .monospaced))
+            .buttonStyle(.plain)
+            .foregroundStyle(m.updateChecking ? Pal.dim : Pal.accent)
+            .disabled(m.updateChecking)
+          if let status = m.updateStatus {
+            Text(status)
+              .font(.system(.caption, design: .monospaced))
+              .foregroundStyle(status.hasPrefix("no update") && status.contains("—") ? Pal.err : Pal.dim)
+              .frame(maxWidth: .infinity, alignment: .leading)
+          }
+        }
+
+        Text("updates come from the Forgejo repo's releases (appcast.xml) — see the README \"Updating\" section.")
+          .font(.system(size: 11, design: .monospaced))
+          .foregroundStyle(Pal.dim)
+          .frame(maxWidth: .infinity, alignment: .leading)
 
         Text("launchd agents in gui/\(String(getuid())) — the toggles reflect real launchctl state, re-checked every 5s.")
           .font(.system(size: 11, design: .monospaced))
