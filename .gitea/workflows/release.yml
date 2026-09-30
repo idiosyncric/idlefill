@@ -40,6 +40,19 @@ jobs:
       - name: install
         run: npm ci --no-audit --no-fund
 
+      # ---- PRE-FLIGHT (host prerequisites the publish depends on) ----
+
+      - name: "pre-flight: Ed25519 signing key present (never auto-create in CI)"
+        run: |
+          KEY=/Users/sam/.config/idlefill/sparkle-ed-key.b64
+          if [ ! -s "$KEY" ]; then
+            echo "error: $KEY is missing or empty — the Sparkle signing key is"
+            echo "       host-local and is NOT a CI secret. Restore it on this"
+            echo "       runner (or set IDLEFILL_ED_KEY) before cutting releases."
+            exit 1
+          fi
+          echo "Ed25519 signing key present ($(wc -c <"$KEY" | tr -d ' ') bytes)"
+
       # ---- GATE (the release only proceeds if every one of these passes) ----
 
       - name: "gate: tests (all workspaces: server + client + adapter)"
@@ -63,13 +76,22 @@ jobs:
 
       - name: "publish: drop any auto-created empty tag release"
         env:
-          FORGEJO_TOKEN: "${{ env.FORGEJO_TOKEN || env.GITEA_TOKEN }}"
+          # Injected per-run job token (write:releases on this repo —
+          # verified live). A dedicated repo secret FORGEJO_TOKEN, if set,
+          # takes precedence.
+          FORGEJO_TOKEN: "${{ secrets.FORGEJO_TOKEN || secrets.GITHUB_TOKEN }}"
           TAG: "${{ github.ref_name }}"
         run: bash scripts/drop-auto-release.sh
 
       - name: "publish: build, zip, sign appcast, Forgejo publish, live verify"
         env:
-          FORGEJO_TOKEN: "${{ env.FORGEJO_TOKEN || env.GITEA_TOKEN }}"
+          FORGEJO_TOKEN: "${{ secrets.FORGEJO_TOKEN || secrets.GITHUB_TOKEN }}"
+          # Absolute paths, deliberately not $HOME-relative: the job's HOME
+          # may not be /Users/sam, and a "missing" key must never silently
+          # regenerate a new signing key (that would break every installed
+          # app's trust in the feed's signatures).
+          IDLEFILL_ED_KEY: /Users/sam/.config/idlefill/sparkle-ed-key.b64
+          IDLEFILL_STAGING: /Users/sam/idlefill-release-staging
         run: |
           V="${GITHUB_REF_NAME#v}"
           if [ -z "$V" ] || [ "$V" = "$GITHUB_REF_NAME" ]; then
