@@ -69,8 +69,22 @@ import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import { loadClientConfig, type ClientConfig, type ClientProjectConfig } from './config.js';
 import { startLlmProxy, waitProxyReady, type LlmProxy } from './proxy.js';
+import { resolveVersion } from './version.js';
 
 const clientDir = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * Wire-protocol revision this client speaks (the version handshake). 1 =
+ * the first versioned registration (name + ip + projects + version +
+ * protocol). Named constant — there is no protocol history yet, and the
+ * arbiter stores whatever revision the client reports (an operator can
+ * refuse grants to a worker predating a required capability later; the
+ * enforcement rule itself is out of scope).
+ */
+export const WIRE_PROTOCOL = 1;
+
+/** This checkout's version (root package.json) — `--version` + handshake. */
+const clientVersion = resolveVersion(clientDir);
 
 // ---------------------------------------------------------------------------
 // Logging (rotate at 10 MB, keep 1)
@@ -561,6 +575,12 @@ export class ClientDaemon {
     const { status, body } = await api<{ client_id: string; created?: boolean }>(this.cfg, 'POST', '/api/clients/register', {
       name: this.cfg.client_name,
       ip: this.cfg.ip || undefined,
+      // Version handshake: this checkout's version + the wire-protocol
+      // revision. The arbiter stores it on the client row and echoes it on
+      // /api/state, so the operator can see which worker revision is
+      // connected (pre-version clients send neither and keep working).
+      version: clientVersion,
+      protocol: WIRE_PROTOCOL,
       // The arbiter stores this per-project view for the dashboard
       // (Projects → workers allocated). Re-registration is a heartbeat:
       // last_seen refreshes and queue depths update on every tick. `stats`
@@ -1021,6 +1041,14 @@ async function main(): Promise<void> {
 // Only run when invoked directly (tests import the classes).
 const isMain = process.argv[1] && (process.argv[1] === fileURLToPath(import.meta.url) || process.argv[1].endsWith('/index.ts'));
 if (isMain) {
+  // --version / -v: print the release this checkout was built from (root
+  // package.json) and exit BEFORE any daemon work — no config read, no
+  // register, no sockets. Same on the dev path (tsx src/index.ts) and the
+  // built path (node dist/index.js).
+  if (process.argv.includes('--version') || process.argv.includes('-v')) {
+    console.log(clientVersion);
+    process.exit(0);
+  }
   main().catch((err) => {
     console.error(`[idlefill-client] fatal: ${err instanceof Error ? err.stack ?? err.message : err}`);
     process.exit(1);
