@@ -1,0 +1,91 @@
+# Edge publish (issue #26) — the second, opt-in update channel.
+#
+#   A push to a TRACKED BRANCH publishes the branch's edge artifacts
+#   (desktop + menubar zips built with the marker edge-<branch>-<sha7>)
+#   as a Forgejo release, carrying the live numbered feed forward (the
+#   edge release is the newest, so 'latest' serves it — without the
+#   carry-forward the numbered appcast would 404 for every Sparkle
+#   machine). The FULL test suite runs FIRST as a hard gate (the same
+#   steps as release.yml): if any step fails, the job stops and NOTHING
+#   is published.
+#
+#   The numbered release pipeline (release.yml, tag-triggered) is the
+#   only signer; edge builds never carry the Sparkle key and never touch
+#   the appcast (no generate_appcast on this path — the carry-forward is
+#   a fetch, not a regeneration).
+name: edge
+
+# Pin the env so the pipeline is hermetic regardless of the host daemon's
+# environment: npm ci must install devDependencies (tsx is the test
+# runner for the server + client suites), so NODE_ENV must not be
+# "production".
+env:
+  NODE_ENV: test
+
+on:
+  push:
+    # The tracked branches, one line each. Extending the edge channel to
+    # another branch is a one-line change here.
+    branches:
+      - main
+
+concurrency:
+  group: edge
+  cancel-in-progress: false
+
+jobs:
+  edge:
+    name: gate (full suite) then build + publish edge artifacts
+    runs-on: urza
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: install
+        run: npm ci --no-audit --no-fund
+
+      # ---- GATE (the publish only proceeds if every one of these
+      # passes — the same step list as release.yml, copied verbatim) ----
+
+      - name: "gate: tests (all workspaces: server + client + adapter)"
+        run: npm test
+
+      - name: "gate: typecheck (server + client)"
+        run: |
+          npx tsc --noEmit -p server/tsconfig.json
+          npx tsc --noEmit -p client/tsconfig.json
+
+      - name: "gate: build (all workspaces)"
+        run: npm run build
+
+      - name: "gate: mcp server syntax"
+        run: node --check adapters/career-ops/idlefill-mcp.mjs
+
+      - name: "gate: desktop source parse (swiftc)"
+        run: swiftc -parse desktop/IdlefillDesktop.swift
+
+      # ---- PUBLISH (only reached if the whole gate above was green) ----
+
+      - name: "publish: edge artifacts (tag, zips, carry-forward, verify)"
+        env:
+          # Injected per-run job token (write:releases on this repo —
+          # verified live). A dedicated repo secret FORGEJO_TOKEN, if set,
+          # takes precedence (same pattern as release.yml).
+          FORGEJO_TOKEN: "${{ secrets.FORGEJO_TOKEN || secrets.GITHUB_TOKEN }}"
+        run: |
+          # The marker = edge-<branch>-<sha7> (the pushed commit; the
+          # checkout IS the push, so HEAD == the pushed sha). One string,
+          # three uses: the release tag, the release name's tail, and the
+          # artifact-zip name part. The script anchors the tag's sha7 tail
+          # to the sha itself — a mismatch is refused before anything is
+          # built or pushed.
+          BRANCH="${GITHUB_REF_NAME}"
+          SHA="${GITHUB_SHA}"
+          TAG="edge-${BRANCH}-${SHA:0:7}"
+          echo "==> publishing edge build $TAG (branch $BRANCH @ ${SHA:0:7})"
+          bash scripts/edge-release.sh "$TAG" "$SHA"
