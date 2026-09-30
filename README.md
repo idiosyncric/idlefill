@@ -160,9 +160,12 @@ It is a second *view* of the same daemon, not a different daemon: liveness
 is read from the arbiter (the client row's `last_seen`, within the
 arbiter's 90s window), so the daemon can be started from anywhere — the
 menu bar, an Orca tab, launchd — and the arbiter stays the ground truth.
-The panel shows the state word, this machine's status, queue depth,
-today's finished/failed, and the running lease, plus Open Dashboard ·
-Show Logs · Start/Stop · Restart · Update code · Quit.
+The panel shows the state word (the arbiter's global verdict for the box),
+a scope (machine × project pickers — see the **Scope** bullet), the
+picked scope's queue depth, today's finished/failed, tokens out with the
+project's own cap, every running lease of the picked machine, the
+published queue peek, plus Open Dashboard · Show Logs · Start/Stop ·
+Restart · Update code · Quit.
 
 - **Click routing:** a *single click* toggles the popover (the panel —
   today's behavior, exactly). A *double click* opens the **desktop app**
@@ -242,6 +245,45 @@ Show Logs · Start/Stop · Restart · Update code · Quit.
   (`UpdatePlan`) is pure and is proven headlessly by
   `menubar/uc-update-test.sh` against scratch repos (the same harness
   pattern as `menubar/uc-test.sh`).
+- **Scope (machine × project):** the client config is parsed **once** at
+  launch (`ClientConfig`: `token` + `server_url` + `client_name`) and the
+  panel's default scope is **"this machine · all projects"** — the client
+  row whose `name` equals the config's `client_name`, whatever the order
+  in the payload (registration is idempotent by name, so the name — not
+  the `client_id` — survives daemon restarts). If the payload carries no
+  row of that name the picker defaults to the explicitly labelled
+  **"all machines"** aggregate — the old first-online heuristic is that
+  labelled fallback only, never a silent default. The machine picker
+  (online dot + `last_seen` + the exception-only override tag) widens to
+  any machine; the project picker (the scope's published projects, with
+  `paused` / `budget full` / `worker paused` exception tags) narrows to
+  one project. The selection is MODEL STATE: picking re-projects the LAST
+  payload through the pure `ScopeView` — no network on selection, and a
+  key the next payload no longer carries re-resolves to the default.
+  Values come from the published per-project view, never recomputed: the
+  scope's queue depth is the scope machine's own worker rows (the
+  aggregate is the sum of its parts), `tokens out` sums the parts with
+  each project's own cap, and the header state word stays the arbiter's
+  GLOBAL verdict (a scope never rewords the header). Liveness keeps two
+  facts apart: the status row's staleness is the SCOPE machine's
+  `last_seen`, while Start/Stop still act on the LOCAL process table
+  (the row displayed and the process controlled can differ — the panel
+  says which). The published per-scope detail drives exception-only
+  controls on the EXISTING routes (no new endpoints): the project gate
+  (`POST /api/projects/:name` `{paused}`), the grant knobs
+  (`POST /api/projects/:name/settings` — the body carries only the
+  touched knob; JSON `null` clears it back to the global; the cycle
+  reads the GLOBAL knob, never the effective one, or it would chase its
+  own override), and the worker override
+  (`POST /api/clients/:ref/override`). Same token gate as the dashboard:
+  no token → NO request is issued and the status row names the missing
+  token — "no token" (amber, a local misconfiguration) is distinct on
+  screen from "unreachable" (red, the server is down), and a 401 reads
+  as "bad token" (amber). The decision core (`ScopeView`) is pure and is
+  proven headlessly by `menubar/scope-test.sh` — the same harness
+  pattern as `menubar/uc-test.sh`, against canned payloads AND a
+  throwaway arbiter instance with two fake clients and two active
+  leases.
 - **Repo discovery:** the binary ships at `<repo>/menubar/`, so it resolves
   the repo from its own location (one level up), honoring
   `IDLEFILL_CONFIG_FILE` when set. The token is read at runtime from the
