@@ -43,6 +43,24 @@
 import AppKit
 import SwiftUI
 import Sparkle
+import CryptoKit
+
+// MARK: - build marker (issue #26)
+
+// The marker baked into the binary at build time. desktop/build.sh
+// substitutes the QUOTED placeholder literal (the declaration below — the
+// only QUOTED occurrence of the placeholder in the file; the sentinel is
+// fragmented so the build's sed can never touch it) with the build marker
+// (IDLEFILL_DESKTOP_BUILD — default: the numeric IDLEFILL_VERSION, the
+// CFBundleVersion) BEFORE compiling, so `Idlefill --version` prints the
+// build it was baked with — an installed edge build proves its own origin
+// (`edge-main-a9787a7`) instead of posing as a release. DO NOT RENAME OR
+// DELETE: build.sh byte-verifies this exact declaration (a silent miss
+// would bake the placeholder string into the binary).
+let __DESKTOP_BUILD__ = "__DESKTOP_BUILD__"
+/// The UNSUBSTITUTED marker (fragmented — the build's sed only touches the
+/// quoted placeholder literal, so this comparison survives the injection).
+let __DESKTOP_BUILD_UNSUBSTITUTED__ = "__DESKTOP_" + "BUILD__"
 
 // MARK: - auto-update (Sparkle)
 
@@ -190,11 +208,21 @@ final class AppModel: ObservableObject {
   @Published var daemonNote: String? = nil
   @Published var menubarNote: String? = nil
 
-  // auto-update (Sparkle)
+  // auto-update (Sparkle + the edge channel)
   @Published var updateStatus: String? = nil
   @Published var updateChecking = false
   private var updaterController: SPUStandardUpdaterController?
   private let updaterDelegate = UpdaterDelegate()
+  /** The update channel (issue #26): "releases" (the default — today's
+   *  Sparkle flow, byte-identical) or "branch" (the branch channel: the
+   *  tracked branch's latest published build). Persisted in the app
+   *  config alongside `repo_path`. */
+  @Published var updateChannel: String = "releases"
+  /** The branch the BRANCH channel tracks (default "main"). */
+  @Published var updateBranch: String = "main"
+  /** An edge build is awaiting the operator's confirm (set by the branch
+   *  check; cleared on confirm / channel change / re-check). */
+  @Published var edgePending: Bool = false
 
   private(set) var repoRoot: String = AppModel.findRepoRoot()
 
@@ -240,15 +268,374 @@ final class AppModel: ObservableObject {
     )
   }
 
-  /** Kick off a manual update check. Sparkle's standard UI shows the
-   *  progress dialog; the status line here mirrors the delegate callbacks
-   *  (checking → up-to-date / update available / download + install). */
+  /** Kick off a manual update check, routed on the channel (issue #26):
+   *  `releases` → the existing Sparkle flow, byte-identical (Sparkle's
+   *  standard UI shows the progress dialog; the status line here mirrors
+   *  the delegate callbacks — checking → up-to-date / update available /
+   *  download + install). `branch` → the branch check below. */
   func checkForUpdates() {
+    if updateChannel == "branch" {
+      checkBranchUpdates()
+      return
+    }
     ensureUpdaterController()
     guard let c = updaterController else { return }
     updateStatus = "checking for updates…"
     updateChecking = true
     c.checkForUpdates(nil)
+  }
+
+  // MARK: update channel — branch (edge) channel (issue #26)
+
+  /** The update-check base for the branch channel: `IDLEFILL_UPDATE_BASE`
+   *  (the same test hook the menubar's check uses — the headless harness
+   *  points it at a local stub of the refs API), defaulting to the host
+   *  that `kSparkleFeedURL` derives from (parse the feed URL's HOST —
+   *  the feed URL is `<host>/sam/idlefill/releases/download/…`, so the
+   *  check base is `<scheme>://<host>`, the same host the feed lives on).
+   *  The check is ANONYMOUS (the repo is public) and never sends the
+   *  arbiter token. */
+  static func updateBase() -> String {
+    if let raw = ProcessInfo.processInfo.environment["IDLEFILL_UPDATE_BASE"] {
+      var base = raw
+      while base.hasSuffix("/") { base.removeLast() }
+      return base
+    }
+    if let u = URL(string: kSparkleFeedURL), let host = u.host {
+      return "https://" + host
+    }
+    return "https://git.samwarth.com"
+  }
+
+  /** Pure: the BRANCH-channel update verdict (the desktop's copy of the
+   *  menubar's `UpdateCheck.branchUpdateMarker` — the logic is tiny and
+   *  both apps are bare-swiftc single files, so each carries its own; a
+   *  shared file would need a shared build step neither has).
+   *
+   *  Given the refs-API payload (verified live: `GET …/git/refs/heads/<b>`
+   *  → 200 `[{ref, url, object:{type:"commit", sha}}]`; unknown branch →
+   *  404 JSON) + the baked marker, an update is available ⇔ the baked
+   *  marker DIFFERS from the tip's marker — no ordering on branch builds:
+   *  a newer push is a different marker, and the difference IS the
+   *  update (equal markers → up to date → nil). The branch name is read
+   *  from the payload's own `ref` (the source of truth — a config
+   *  switched to a different branch sees the new branch's tip on the
+   *  next check). Any failure (nil payload, malformed, 404 JSON,
+   *  malformed sha) → nil: fail quiet, nothing set, next check retries. */
+  static func branchUpdateMarker(data: Data?, localMarker: String) -> String? {
+    guard let data,
+          let o = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]],
+          let first = o.first,
+          let ref = first["ref"] as? String,
+          ref.hasPrefix("refs/heads/"),
+          let obj = first["object"] as? [String: Any],
+          (obj["type"] as? String) == "commit",
+          let sha = obj["sha"] as? String,
+          sha.count == 40, sha.allSatisfy(\.isHexDigit) else {
+      return nil
+    }
+    // The branch name is the ref's own tail (the source of truth — the
+    // prefix was just verified).
+    let branch = String(ref.dropFirst("refs/heads/".count))
+    guard !branch.isEmpty else { return nil }
+    let tip = "edge-\(branch)-\(String(sha.prefix(7)))"
+    return tip == localMarker ? nil : tip
+  }
+
+  /** The baked build marker (the build identity — `--version` prints it).
+   *  Release builds carry the numeric version (the CFBundleVersion); edge
+   *  builds carry the edge marker. An un-substituted build reports the
+   *  default `1.0` (the build.sh default), never the literal placeholder. */
+  var bakedMarker: String {
+    if __DESKTOP_BUILD__ != __DESKTOP_BUILD_UNSUBSTITUTED__,
+       !__DESKTOP_BUILD__.trimmingCharacters(in: .whitespaces).isEmpty {
+      return __DESKTOP_BUILD__
+    }
+    return "1.0"
+  }
+
+  /** The BRANCH-channel check: GET the tracked branch's tip via the refs
+   *  API (anonymous, `IDLEFILL_UPDATE_BASE`-overridable), compare the
+   *  tip's marker against this build's marker. An available update sets
+   *  `edgePending` (the Settings row turns into the confirm control);
+   *  the status line names the tip marker. A 404 (the branch does not
+   *  exist — a typo'd branch name) says so in the status line (operator-
+   *  actionable, distinct from the offline-tolerant silence of a fetch
+   *  failure). OFFLINE-TOLERANT (the automatic check's contract): a DEAD
+   *  network (no response) or an unparseable body (a 5xx, a non-refs
+   *  payload) sets nothing new — the previous status is RESTORED (the
+   *  "checking …" narration was set at the start of this check and must
+   *  not outlive it as a permanent row) and the next check retries.
+   *  "up to date" is reserved for a genuine refs response whose tip
+   *  equals this build's marker. A REFUSED install keeps the current
+   *  bundle and says so in the status line (the same contract as the
+   *  menubar's sha256 gate). */
+  func checkBranchUpdates() {
+    let branch = updateBranch.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !branch.isEmpty else {
+      updateStatus = "set a branch name for the branch channel"
+      return
+    }
+    // The status to RESTORE when a check that already started fails
+    // offline — the "checking …" narration set below must not outlive a
+    // dead fetch as a permanent row, and a failed fetch must not be
+    // mistaken for "up to date".
+    let prevStatus = updateStatus
+    updateStatus = "checking \(branch) for a new build…"
+    updateChecking = true
+    let base = AppModel.updateBase()
+    let branchEnc = branch.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? branch
+    guard let url = URL(string: "\(base)/api/v1/repos/sam/idlefill/git/refs/heads/\(branchEnc)") else {
+      updateChecking = false
+      updateStatus = prevStatus
+      return
+    }
+    var req = URLRequest(url: url)
+    req.timeoutInterval = 10
+    URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
+      guard let self else { return }
+      DispatchQueue.main.async {
+        self.updateChecking = false
+        // OFFLINE-TOLERANT: only a GENUINE refs response (2xx) or a
+        // genuine 404 (the branch does not exist) changes the status line.
+        // Any other outcome — no HTTP response at all (the network is
+        // down), a 5xx, a non-refs payload — sets nothing new: the
+        // previous status is restored, no error row, the next check
+        // retries.
+        guard let e = resp as? HTTPURLResponse else {
+          self.edgePending = false
+          self.updateStatus = prevStatus
+          return
+        }
+        if e.statusCode == 404 {
+          // The branch does not exist (a typo'd branch name) — the refs
+          // API answers 404. A distinct, operator-actionable note (NOT
+          // the offline-tolerant silence: the fetch succeeded).
+          self.edgePending = false
+          self.updateStatus = "branch \(branch) not found — check the name"
+          return
+        }
+        guard (200..<300).contains(e.statusCode), let data else {
+          self.edgePending = false
+          self.updateStatus = prevStatus
+          return
+        }
+        // A genuine 2xx payload: is it a WELL-FORMED refs response?
+        // `branchUpdateMarker` returns nil for BOTH "the tip equals this
+        // build's marker" (up to date) AND "the payload is not a refs
+        // payload" (a fetch that answered but did not answer) — the shape
+        // check separates the "up to date" verdict from a failure.
+        guard let o = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]],
+              let first = o.first,
+              let ref = first["ref"] as? String, ref.hasPrefix("refs/heads/"),
+              let obj = first["object"] as? [String: Any],
+              (obj["type"] as? String) == "commit",
+              let sha = obj["sha"] as? String,
+              sha.count == 40, sha.allSatisfy(\.isHexDigit) else {
+          self.edgePending = false
+          self.updateStatus = prevStatus
+          return
+        }
+        let tip = AppModel.branchUpdateMarker(data: data, localMarker: self.bakedMarker)
+        if let tip {
+          self.edgePending = true
+          self.updateStatus = "new build \(tip) on \(branch) — confirm to install"
+        } else {
+          // The tip equals this build's marker (up to date) — the marker
+          // is named so the operator sees WHICH build this is.
+          self.edgePending = false
+          self.updateStatus = "up to date (\(self.bakedMarker))"
+        }
+      }
+    }.resume()
+  }
+
+  /** Confirm control (branch channel): re-fetch the tip at confirm time
+   *  (the check may be stale — a newer push since the check would have a
+   *  different marker), download the DESKTOP zip + sidecar for it, verify
+   *  sha256 BEFORE any swap (a mismatch or missing sidecar refuses — the
+   *  current bundle is kept and the status line says so), then swap the
+   *  installed bundle in the `desktop/update.sh` sequence (unzip → quit
+   *  the running app cleanly → replace → relaunch), driven from a
+   *  DETACHED helper: the app is the GUI and must not kill its own
+   *  process tree from inside itself. The status line narrates each
+   *  phase the way `updateStatus` does today. */
+  func confirmEdgeInstall() {
+    let branch = updateBranch.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !branch.isEmpty else { return }
+    updateStatus = "downloading the new build…"
+    updateChecking = true
+    let base = AppModel.updateBase()
+    let branchEnc = branch.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? branch
+    guard let url = URL(string: "\(base)/api/v1/repos/sam/idlefill/git/refs/heads/\(branchEnc)") else {
+      updateChecking = false
+      return
+    }
+    var req = URLRequest(url: url)
+    req.timeoutInterval = 10
+    URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+      guard let self else { return }
+      DispatchQueue.main.async {
+        guard let tip = AppModel.branchUpdateMarker(data: data, localMarker: self.bakedMarker) else {
+          self.updateChecking = false
+          self.edgePending = false
+          self.updateStatus = "up to date (\(self.bakedMarker))"
+          return
+        }
+        self.installEdge(marker: tip)
+      }
+    }.resume()
+  }
+
+  /** The download + verify (branch channel; main thread, status-line
+   *  narration): the zip + sidecar for the tip's marker, sha256 verified
+   *  BEFORE any swap (the menubar's Phase-1 contract, CryptoKit — a
+   *  mismatch / missing / malformed sidecar refuses and keeps the current
+   *  bundle). Then the swap in a detached helper (below). */
+  private func installEdge(marker: String) {
+    let zipName = "Idlefill \(marker).zip"
+    let tagEnc = marker.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? marker
+    let dlBase = AppModel.updateBase() + "/sam/idlefill/releases/download/\(tagEnc)"
+    let tmpDir = FileManager.default.temporaryDirectory
+      .appendingPathComponent("idlefill-desktop-edge-\(getpid())").path
+    let fm = FileManager.default
+    try? fm.createDirectory(atPath: tmpDir, withIntermediateDirectories: true)
+    let zipDest = tmpDir + "/" + zipName
+    let sidecarDest = zipDest + ".sha256"
+    let dl = { (suffix: String, dest: String, done: @escaping (Bool) -> Void) in
+      let enc = suffix.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? suffix
+      guard let url = URL(string: "\(dlBase)/\(enc)") else { done(false); return }
+      URLSession.shared.downloadTask(with: url) { tmp, _, _ in
+        guard let tmp = tmp else { done(false); return }
+        do {
+          if fm.fileExists(atPath: dest) { try fm.removeItem(atPath: dest) }
+          try fm.moveItem(at: tmp, to: URL(fileURLWithPath: dest))
+          done(true)
+        } catch { done(false) }
+      }.resume()
+    }
+    dl(zipName, zipDest) { [weak self] ok in
+      guard let self else { return }
+      DispatchQueue.main.async {
+        guard ok else {
+          self.updateChecking = false
+          self.edgePending = false
+          self.updateStatus = "download failed — \(marker) was NOT installed"
+          return
+        }
+        self.updateStatus = "downloading the hash…"
+        dl(zipName + ".sha256", sidecarDest) { [weak self] ok in
+          guard let self else { return }
+          DispatchQueue.main.async {
+            guard ok,
+                  let zipData = try? Data(contentsOf: URL(fileURLWithPath: zipDest)),
+                  let sideData = try? Data(contentsOf: URL(fileURLWithPath: sidecarDest)) else {
+              self.updateChecking = false
+              self.updateStatus = "sha256 sidecar missing — \(marker) was NOT installed (the current build was kept)"
+              self.edgePending = false
+              return
+            }
+            let text = (String(data: sideData, encoding: .utf8) ?? "")
+              .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard text.count == 64, text.allSatisfy(\.isHexDigit) else {
+              self.updateChecking = false
+              self.updateStatus = "sha256 sidecar malformed — \(marker) was NOT installed (the current build was kept)"
+              self.edgePending = false
+              return
+            }
+            let hash = SHA256.hash(data: zipData).compactMap { String(format: "%02x", $0) }.joined()
+            guard hash == text.lowercased() else {
+              self.updateChecking = false
+              self.updateStatus = "sha256 mismatch — the downloaded artifact does not match the published hash; the current build was kept"
+              self.edgePending = false
+              return
+            }
+            self.runEdgeSwap(zip: zipDest, marker: marker)
+          }
+        }
+      }
+    }
+  }
+
+  /** The swap, in a DETACHED helper — the `desktop/update.sh` sequence
+   *  with the build step replaced by the downloaded zip: unzip → quit the
+   *  running app (clean SIGTERM; the app holds no leases) → replace the
+   *  installed bundle → relaunch. The helper is a plain `bash` process
+   *  whose stdio points at null (NOT a Pipe — a Process with a Pipe
+   *  deadlocks past the 64 KB buffer) and is NOT waited on: the helper
+   *  reparents to launchd when this app exits (it may kill THIS app as
+   *  part of the swap — it must outlive it).
+   *
+   *  The quit step matches the TARGET bundle, not just the process name
+   *  (a bare `pkill -x Idlefill` would also kill an Idlefill running
+   *  from a different checkout — the repo's daemon-identity rule: never
+   *  match on a name that other processes share; a `ps` parse over the
+   *  name-matched PIDs, keeping only the one whose executable lives in
+   *  the target bundle). Test hooks (the IDLEFILL_DESKTOP_TEST
+   *  pattern): `IDLEFILL_DESKTOP_EDGE_TARGET` re-points the target (the
+   *  harness swaps a scratch bundle — never /Applications), and
+   *  `IDLEFILL_DESKTOP_EDGE_NO_OPEN` skips the relaunch (a headless run
+   *  must not spawn a GUI app). Both inert in production (unset). */
+  private func runEdgeSwap(zip: String, marker: String) {
+    let target = ProcessInfo.processInfo.environment["IDLEFILL_DESKTOP_EDGE_TARGET"]
+      ?? "/Applications/Idlefill.app"
+    let noOpen = ProcessInfo.processInfo.environment["IDLEFILL_DESKTOP_EDGE_NO_OPEN"] != nil
+    // The relaunch line (the LAST line of the script): the real `open` in
+    // production, a no-op for a headless test run (the env hook — the
+    // script shape stays identical either way, so the swap logic is the
+    // one thing that gets verified).
+    let openLine = noOpen ? ": # headless run — no relaunch" : "open \"$TARGET\""
+    let script = """
+      set -euo pipefail
+      T=$(mktemp -d)
+      unzip -q -d "$T" "\(zip)"
+      [ -d "$T/Idlefill.app" ] || { echo "zip root is not the Idlefill.app bundle"; exit 1; }
+      # Quit the running app ONLY when it is the one that lives in the
+      # target bundle (a name match alone would kill an Idlefill from a
+      # different checkout — the daemon-identity rule, applied to the app).
+      for pid in $(pgrep -x Idlefill 2>/dev/null || true); do
+        exe=$(ps -p "$pid" -o comm= 2>/dev/null || true)
+        case "$exe" in
+          "$TARGET"/*) kill -TERM "$pid" 2>/dev/null || true ;;
+        esac
+      done
+      for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -x Idlefill >/dev/null 2>&1 || break; sleep 0.5; done
+      mkdir -p "$(dirname "$TARGET")"
+      rm -rf "$TARGET.new"
+      mv "$T/Idlefill.app" "$TARGET.new"
+      rm -rf "$TARGET"
+      mv "$TARGET.new" "$TARGET"
+      rm -rf "$T"
+      \(openLine)
+      """
+    let scriptPath = FileManager.default.temporaryDirectory
+      .appendingPathComponent("idlefill-edge-swap-\(getpid()).sh").path
+    guard (try? script.write(toFile: scriptPath, atomically: true, encoding: .utf8)) != nil else {
+      updateStatus = "could not write the install script — \(marker) was NOT installed (the current build was kept)"
+      return
+    }
+    try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: scriptPath)
+    updateStatus = "installing \(marker) — the app will quit and relaunch"
+    updateChecking = false
+    edgePending = false
+    let helper = Process()
+    helper.executableURL = URL(fileURLWithPath: "/bin/bash")
+    // The helper's env carries the TARGET (the script's $TARGET) — the
+    // test hooks are read by the APP (above), not the script, so only
+    // the target crosses. sleep 0.5: let this process's main thread
+    // reach run() before the script's quit step lands; stdio to null (a
+    // Pipe would deadlock the helper if it ever wrote past the 64 KB
+    // buffer).
+    helper.arguments = ["-c", "sleep 0.5; TARGET='\(target)' bash '\(scriptPath)' >/dev/null 2>&1; rm -f '\(scriptPath)'"]
+    helper.standardOutput = FileHandle.nullDevice
+    helper.standardError = FileHandle.nullDevice
+    do {
+      try helper.run()
+      // Deliberately NOT waited on — the helper is the one that quits
+      // this app (the quit step in the swap script).
+    } catch {
+      updateStatus = "could not start the install helper — \(marker) was NOT installed (the current build was kept)"
+    }
   }
 
   // MARK: repo path resolution
@@ -289,6 +676,16 @@ final class AppModel: ObservableObject {
   }
 
   static func appConfigPath() -> String {
+    // Test hook (the IDLEFILL_DESKTOP_TEST pattern — the menubar's
+    // IDLEFILL_CONFIG_FILE equivalent): a headless harness re-points the
+    // config file. This is NOT optional comfort — a GUI app (AppKit)
+    // IGNORES the HOME environment: NSHomeDirectory() resolves to the
+    // user's real home even under `env -i HOME=<scratch>` (AppKit resets
+    // it from the account DB), so without this hook a harness "scratch
+    // config" would silently READ AND WRITE the user's real config file.
+    if let raw = ProcessInfo.processInfo.environment["IDLEFILL_DESKTOP_CONFIG"], !raw.isEmpty {
+      return raw
+    }
     let base = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Application Support/Idlefill")
     try? FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
     return (base as NSString).appendingPathComponent("config.json")
@@ -301,6 +698,33 @@ final class AppModel: ObservableObject {
     } else {
       repoPath = repoRoot
     }
+    // The update channel + branch (issue #26) — same read discipline as
+    // repo_path (empty/absent = the default). A malformed channel value
+    // (anything but the two known names) falls back to "releases": a
+    // hand-edited config must never point the check at a third channel.
+    if let o = AppModel.readAppConfig(), let c = o["update_channel"] as? String, !c.isEmpty {
+      updateChannel = (c == "branch") ? "branch" : "releases"
+    }
+    if let o = AppModel.readAppConfig(), let b = o["update_branch"] as? String, !b.isEmpty {
+      updateBranch = b
+    }
+  }
+
+  /** Persist the update channel + branch (issue #26). The EXACT
+   *  save/preserve pattern of saveRepoPath: read-modify-write, pretty
+   *  JSON, every other key (repo_path included) preserved. Switching away
+   *  from the branch channel clears any pending edge offer — a stale
+   *  "update available" for a channel the operator just left would
+   *  install from the wrong place. */
+  func saveUpdateChannel() {
+    let branch = updateBranch.trimmingCharacters(in: .whitespacesAndNewlines)
+    var o = AppModel.readAppConfig() ?? [:]
+    o["update_channel"] = updateChannel
+    o["update_branch"] = branch
+    let data = (try? JSONSerialization.data(withJSONObject: o, options: [.prettyPrinted, .sortedKeys])) ?? Data()
+    try? data.write(to: URL(fileURLWithPath: AppModel.appConfigPath()))
+    updateBranch = branch.isEmpty ? "main" : branch
+    edgePending = false
   }
 
   /** Persist the Settings repo-path field. An empty field clears the override
@@ -1294,21 +1718,66 @@ struct SettingsPanel: View {
 
         DividerLine()
 
+        // The update channel (issue #26): `releases` (the default —
+        // today's Sparkle flow) | `branch` (the branch channel — the
+        // tracked branch's latest published build, an edge marker).
+        // Persisted alongside the repo path (saveUpdateChannel).
+        HStack(spacing: 8) {
+          Text("update channel").font(.system(.body, design: .monospaced)).foregroundStyle(Pal.dim)
+          Picker("", selection: $m.updateChannel) {
+            Text("releases").tag("releases")
+            Text("branch").tag("branch")
+          }
+          .labelsHidden()
+          .frame(width: 110)
+          if m.updateChannel == "branch" {
+            // The branch the channel tracks (default main) — exception-
+            // only, rendered only while the branch channel is selected.
+            Text("branch").font(.system(.body, design: .monospaced)).foregroundStyle(Pal.dim)
+            TextField("", text: $m.updateBranch)
+              .font(.system(.body, design: .monospaced))
+              .textFieldStyle(.plain)
+              .foregroundStyle(Pal.text)
+              .background(Pal.canvas)
+              .clipShape(RoundedRectangle(cornerRadius: 4))
+              .padding(4)
+              .frame(maxWidth: 200)
+          }
+          Button("save") { m.saveUpdateChannel() }
+            .font(.system(.body, design: .monospaced))
+            .buttonStyle(.plain)
+            .foregroundStyle(Pal.accent)
+        }
+
+        DividerLine()
+
         HStack(spacing: 8) {
           Button(m.updateChecking ? "checking…" : "check for updates…") { m.checkForUpdates() }
             .font(.system(.body, design: .monospaced))
             .buttonStyle(.plain)
             .foregroundStyle(m.updateChecking ? Pal.dim : Pal.accent)
             .disabled(m.updateChecking)
+          // The branch-channel confirm control — exception-only (the
+          // menubar's Install Update row pattern): it exists only while
+          // an edge build is pending (the check found a tip marker
+          // newer than this build). Releases channel: never shown (the
+          // Sparkle dialog drives its own install).
+          if m.edgePending {
+            Button("install edge build") { m.confirmEdgeInstall() }
+              .font(.system(.body, design: .monospaced))
+              .buttonStyle(.plain)
+              .foregroundStyle(m.updateChecking ? Pal.dim : Pal.ok)
+              .disabled(m.updateChecking)
+          }
           if let status = m.updateStatus {
             Text(status)
               .font(.system(.caption, design: .monospaced))
-              .foregroundStyle(status.hasPrefix("no update") && status.contains("—") ? Pal.err : Pal.dim)
+              .foregroundStyle(statusColor(status))
               .frame(maxWidth: .infinity, alignment: .leading)
           }
         }
 
-        Text("updates come from the Forgejo repo's releases (appcast.xml) — see the README \"Updating\" section.")
+        Text("updates come from the Forgejo repo — the releases channel (appcast.xml, Sparkle) or the branch channel (a build per push to the picked branch) — see the README \"Updating\" section.")
           .font(.system(size: 11, design: .monospaced))
           .foregroundStyle(Pal.dim)
           .frame(maxWidth: .infinity, alignment: .leading)
@@ -1320,6 +1789,16 @@ struct SettingsPanel: View {
       }
       .padding(14).padding(.vertical, 8)
     }
+  }
+
+  /** The status line's color: a refusal / bad-branch-name / failed
+   *  status is operator-actionable (red); the narration is dim. (The
+   *  pre-#26 rule kept — a Sparkle fetch failure reads "no update …".) */
+  private func statusColor(_ s: String) -> Color {
+    if s.hasPrefix("no update") && s.contains("—") { return Pal.err }
+    if s.contains("NOT installed") || s.contains("not found")
+      || s.contains("mismatch") || s.contains("failed") { return Pal.err }
+    return Pal.dim
   }
 }
 
@@ -1391,6 +1870,32 @@ struct ContentView: View {
 // MARK: - app
 
 @main
+enum IdlefillMain {
+  static func main() {
+    // `--version` / `-v` (first arg) prints the baked build marker and
+    // exits 0 BEFORE any AppKit setup (the App's init /
+    // applicationDidFinishLaunching never run on this path — the decision
+    // is made in main() before the App type is ever touched). The marker
+    // is the build's identity (issue #26): the numeric release version for
+    // release builds, the edge marker (`edge-<branch>-<sha7>`) for branch
+    // channel builds — an installed build proves its own origin. A build
+    // that never went through the substitution (an ad-hoc `swiftc` on the
+    // source) reports the default `1.0` — NOT the literal placeholder
+    // (the same fail-mode as the menubar's `0.0.0-dev`).
+    let args = CommandLine.arguments
+    if args.count > 1, args[1] == "--version" || args[1] == "-v" {
+      if __DESKTOP_BUILD__ != __DESKTOP_BUILD_UNSUBSTITUTED__,
+         !__DESKTOP_BUILD__.trimmingCharacters(in: .whitespaces).isEmpty {
+        print("idlefill \(__DESKTOP_BUILD__)")
+      } else {
+        print("idlefill 1.0")
+      }
+      exit(0)
+    }
+    IdlefillApp.main()
+  }
+}
+
 struct IdlefillApp: App {
   @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
   @StateObject private var model = AppModel()
