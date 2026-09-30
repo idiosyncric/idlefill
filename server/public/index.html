@@ -224,10 +224,24 @@
   table.q td.qpos { color: var(--dim); width: 30px; }
   table.q td.qjob { overflow-wrap: anywhere; }
   table.q td.qscore, table.q td.qatt { white-space: nowrap; width: 60px; }
-  /* View switch: the queue detail route shows ONLY the queue section. */
+  /* Queue search — the input is static DOM (survives the 5s pane rebuilds);
+     only #queue-search-results is re-rendered per tick. Visible on BOTH
+     routes (the queuepage rule whitelists it — the search is the overview's
+     job filter). */
+  #queue-search {
+    margin-left: 10px; vertical-align: 2px;
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 4px; font: inherit; font-size: 12px; padding: 3px 8px; width: 320px;
+  }
+  #queue-search:focus { outline: 1px solid var(--accent); }
+  #queue-search-results .qsr-head { margin: 4px 0; }
+  #queue-search-results table { margin-top: 4px; }
+  /* View switch: the queue detail route shows ONLY the queue section — the
+     search section excepted (it filters the overview's worker previews and
+     is useful from the queue page too). */
   #queue-section { display: none; }
   body.queuepage #queue-section { display: block; }
-  body.queuepage > main > section:not(#queue-section) { display: none; }
+  body.queuepage > main > section:not(#queue-section):not(#queue-search-section) { display: none; }
   footer { padding: 10px 20px; color: var(--dim); font-size: 11px; border-top: 1px solid var(--border); margin-top: 10px; }
   a { color: var(--accent); text-decoration: none; }
   code { background: rgba(110,118,129,0.2); padding: 0 4px; border-radius: 3px; font-size: 12px; }
@@ -270,6 +284,20 @@
   <section id="throttled-section" style="display:none">
     <h2>Throttled jobs</h2>
     <div id="throttled"></div>
+  </section>
+
+  <!-- Queue search — client-side filter of the per-worker PUBLISHED
+       queue_preview rows (the /api/state payload already carries them; no
+       new API, read-only, token-gating untouched). The input is STATIC DOM
+       in its own section: the 5s re-render rebuilds the panes above but
+       never this one, so a mid-type query survives a tick — only the
+       results block is rebuilt. Exception-only, like the throttled
+       section: hidden while the query is empty. -->
+  <section id="queue-search-section" style="display:none">
+    <h2>Queue search
+      <input id="queue-search" type="text" placeholder="filter queued jobs — job_id / company / title" spellcheck="false" autocomplete="off" title="substring match across every worker's published queue preview (first 100 queued per worker) — read-only, no API call">
+    </h2>
+    <div id="queue-search-results"></div>
   </section>
 
   <!-- Queue detail — /[project]/[worker]/queue (the SAME single-file
@@ -628,6 +656,13 @@ async function refresh() {
   const live = liveStatus(st);
   setStatus(live.cls, live.label, live.note);
 
+  // Queue search runs on BOTH routes: feed the filter the published worker
+  // previews now (the queuepage branch below returns before the overview's
+  // own projectsCache assignment). The input is static DOM, so only the
+  // results block is re-rendered per tick.
+  projectsCache = st.projects || [];
+  renderQueueSearch();
+
   // Queue detail page — its overview panes are hidden by CSS (body.queuepage);
   // render only the queue block (the logs tray keeps working either way).
   if (QUEUE_PAGE) {
@@ -821,6 +856,66 @@ function renderQueuePage(st) {
     body +
     "</tbody></table>";
 }
+
+// ---------------------------------------------------------------------------
+// Queue search — client-side filter over the per-worker PUBLISHED previews
+// (w.queue_preview rows; the arbiter never reads queue files, so the search
+// is only as deep as the preview: the first 100 queued per worker). The
+// input is static DOM (its own section, never rebuilt by refresh), so the
+// query survives the 5s ticks; renderQueueSearch re-reads projectsCache and
+// re-renders ONLY the results block. Read-only: no API call, no writes.
+// ---------------------------------------------------------------------------
+function renderQueueSearch() {
+  const inp = $("queue-search");
+  const box = $("queue-search-results");
+  const section = $("queue-search-section");
+  if (!inp || !box || !section) return;
+  const q = inp.value.trim().toLowerCase();
+  if (!q) {
+    section.style.display = "none";
+    box.innerHTML = "";
+    return;
+  }
+  // Exception-only, like the throttled section: the box appears only when
+  // there is a query.
+  section.style.display = "";
+  const matches = [];
+  for (const p of projectsCache || []) {
+    for (const w of p.workers || []) {
+      for (const r of w.queue_preview || []) {
+        const hay = [r.job_id, r.company, r.title].map((x) => String(x ?? "").toLowerCase());
+        if (hay.some((h) => h.includes(q))) matches.push({ p: p.name, w: w.client, r });
+      }
+    }
+  }
+  if (matches.length === 0) {
+    box.innerHTML = '<div class="empty">no queued job matches “' + esc(inp.value.trim()) + '” in the published previews (first 100 queued per worker)</div>';
+    return;
+  }
+  const rows = matches.map((m) =>
+    "<tr>" +
+    '<td class="qjob" title="' + esc(m.r.job_id) + '"><b>' + esc(m.r.title) + "</b><span class='dim'> " + esc(m.r.job_id) + "</span></td>" +
+    "<td>" + esc(m.r.company) + "</td>" +
+    '<td><a class="qlink" href="/' + esc(m.p) + "/" + esc(m.w) + '/queue">' + esc(m.p) + " › " + esc(m.w) + "</a></td>" +
+    '<td class="qscore">' + (m.r.score === null || m.r.score === undefined ? "—" : m.r.score) + "</td>" +
+    "<td>" + (m.r.attempts > 0 ? '<span class="warn">' + m.r.attempts + "</span>" : "0") + "</td>" +
+    "</tr>"
+  ).join("");
+  box.innerHTML =
+    '<div class="note qsr-head">' + matches.length + " match" + (matches.length === 1 ? "" : "es") +
+    " across the published previews (job_id / company / title, substring)</div>" +
+    '<table class="q"><thead><tr><th>job</th><th>company</th><th>project › worker</th><th>score</th><th>retries</th></tr></thead><tbody>' +
+    rows +
+    "</tbody></table>";
+}
+(function wireQueueSearch() {
+  const inp = $("queue-search");
+  if (!inp) return;
+  // input (per keystroke) covers typing and paste; change covers clear-by-
+  // select-all. Both are cheap: the filter is a scan of published rows.
+  inp.addEventListener("input", renderQueueSearch);
+  inp.addEventListener("change", renderQueueSearch);
+})();
 
 // (refresh is invoked at the END of the script, after all render + gate
 // helpers are defined — see the bottom.)
