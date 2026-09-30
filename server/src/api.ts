@@ -62,7 +62,7 @@ function bearer(req: { headers: Record<string, unknown>; query: unknown }): stri
 function projectView(
   arbiter: Arbiter,
   cfg: ServerConfig,
-  clients: { name: string; last_seen: number; projects: { name: string; model: string; estimated_seconds: number; queue_depth: number; queue_preview?: QueuePreviewRow[]; stats?: Record<string, number | string> }[] }[],
+  clients: { name: string; last_seen: number; projects: { name: string; model: string; estimated_seconds: number; queue_depth: number; queue_preview?: QueuePreviewRow[]; stats?: Record<string, number | string> }[]; version?: string; protocol?: number }[],
   day: string,
   now: number,
   today: Record<string, { finished: number; failed: number }>,
@@ -83,6 +83,11 @@ function projectView(
           queue_preview: alloc?.queue_preview ?? [],
           online: now - c.last_seen < 90_000,
           stats: alloc?.stats ?? {},
+          // Version handshake (exception-only: absent on pre-version
+          // clients, so the row carries the keys only when the client
+          // reported them — the dashboard renders them exception-only too).
+          ...(c.version ? { version: c.version } : {}),
+          ...(c.protocol !== undefined ? { protocol: c.protocol } : {}),
         };
       })
       .sort((a, b) => Number(b.online) - Number(a.online) || a.client.localeCompare(b.client));
@@ -208,7 +213,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   // ------------------------------------------------------------------
 
   app.post('/api/clients/register', async (req, reply) => {
-    const body = (req.body ?? {}) as { name?: string; ip?: string; projects?: ProjectAllocation[] };
+    const body = (req.body ?? {}) as { name?: string; ip?: string; projects?: ProjectAllocation[]; version?: unknown; protocol?: unknown };
     const name = typeof body.name === 'string' ? body.name.trim() : '';
     if (!name) return reply.code(400).send({ error: 'name required' });
     const remote = (req.ip ?? '').split(':').pop() ?? 'unknown';
@@ -257,7 +262,20 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
             stats: cleanStats((p as { stats?: unknown }).stats),
           }))
       : undefined;
-    const res = arbiter.registerClient(name, typeof body.ip === 'string' && body.ip.trim() ? body.ip.trim() : undefined, remote, projects);
+    // Version handshake (optional — pre-version clients omit both and keep
+    // registering fine): the client's own version string + the wire-protocol
+    // revision it speaks. Sanitized in registerClient (version: string
+    // ≤64 chars; protocol: integer 0..1000; malformed → dropped).
+    const version = typeof body.version === 'string' ? body.version : undefined;
+    const protocol = typeof body.protocol === 'number' ? body.protocol : undefined;
+    const res = arbiter.registerClient(
+      name,
+      typeof body.ip === 'string' && body.ip.trim() ? body.ip.trim() : undefined,
+      remote,
+      projects,
+      undefined,
+      version !== undefined || protocol !== undefined ? { version, protocol } : undefined,
+    );
     return reply.code(200).send({ client_id: res.client_id, created: res.created });
   });
 

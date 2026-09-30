@@ -554,7 +554,9 @@ function workBlock(p, st) {
       : "";
     return '<div class="worker" title="reported by ' + esc(w.client) + ': model used · estimated time per job · jobs waiting in this worker\'s queue">' +
       '<span class="dot ' + (w.online ? "on" : "off") + '" title="' + (w.online ? "online (saw a heartbeat within 90s)" : "offline (no recent heartbeat)") + '"></span>' +
-      '<span class="wname">' + esc(w.client) + (w.online ? "" : ' <span class="wmeta">(offline)</span>') + pausedBadge + "</span>" +
+      // The worker's own version (the version handshake — exception-only:
+      // absent on pre-version workers, rendered dimmed after the name).
+      '<span class="wname">' + esc(w.client) + (w.version ? ' <span class="wmeta" title="version reported by this worker at registration">' + esc(w.version) + '</span>' : "") + (w.online ? "" : ' <span class="wmeta">(offline)</span>') + pausedBadge + "</span>" +
       '<span class="wmeta">' + esc(w.model || "—") + (w.estimated_seconds ? " · " + durFmt(w.estimated_seconds) + "/job" : "") + "</span>" +
       '<span class="wqueue">' + (w.queue_depth || 0).toLocaleString() + " queued" +
       (w.queue_depth > 0

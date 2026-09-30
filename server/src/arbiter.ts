@@ -99,6 +99,10 @@ export class Arbiter {
    * the reported project allocations (the client re-sends its queue depths
    * every poll tick, so the dashboard's per-project worker view stays fresh).
    *
+   * `info` (optional) carries the client's own version string + wire-protocol
+   * revision (the version handshake — a pre-version client sends neither and
+   * keeps working; the fields stay absent on the row, never a rejection).
+   *
    * IP rule (self-traffic exemption): the OBSERVED connection IP wins over
    * the client-reported one. The client's config carries a static tailnet
    * IP that goes stale when Tailscale reassigns addresses — a stale
@@ -111,9 +115,21 @@ export class Arbiter {
     observedIp: string,
     projects?: ProjectAllocation[],
     now?: number,
+    info?: { version?: string; protocol?: number },
   ): { client_id: string; created: boolean } {
     const s = this.store.state;
     const seen = now ?? Date.now();
+    // Version handshake facts, sanitized at the edge (display-only; never a
+    // gate). Malformed values are dropped, like any other bad report field
+    // (same rule as stats: version is a string ≤64 chars, else absent).
+    const version =
+      typeof info?.version === 'string' && info.version.trim() !== '' && info.version.trim().length <= 64
+        ? info.version.trim()
+        : undefined;
+    const protocol =
+      typeof info?.protocol === 'number' && Number.isInteger(info.protocol) && info.protocol >= 0 && info.protocol <= 1000
+        ? info.protocol
+        : undefined;
     const existing = s.clients.find((c) => c.name === name);
     if (existing) {
       if (validIp(observedIp)) existing.ip = observedIp; // observed wins
@@ -121,6 +137,11 @@ export class Arbiter {
       if (observedIp) existing.observed_ip = observedIp;
       existing.last_seen = seen;
       if (projects) existing.projects = projects;
+      // Re-registration is a heartbeat: the version handshake facts track
+      // the latest report (a restart from an older/newer checkout updates
+      // the row; an older client that never sends them leaves the row as-is).
+      if (version) existing.version = version;
+      if (protocol !== undefined) existing.protocol = protocol;
       this.store.save();
       return { client_id: existing.client_id, created: false };
     }
@@ -136,6 +157,8 @@ export class Arbiter {
       registered_at: new Date(seen).toISOString(),
       last_seen: seen,
       projects: projects ?? [],
+      ...(version ? { version } : {}),
+      ...(protocol !== undefined ? { protocol } : {}),
     });
     this.store.appendEvent({ kind: 'client_registered', detail: `${name} (${client_id})` });
     this.store.trim();

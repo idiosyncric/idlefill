@@ -858,3 +858,80 @@ test('unthrottle API: clears the throttle (was_throttled), is idempotent, 404s o
   const bad = await fetch(`${base}/api/projects/nope/jobs/job-x/unthrottle`, { method: 'POST', headers: auth, body: '{}' });
   assert.equal(bad.status, 404);
 });
+
+// ---------------------------------------------------------------------------
+// Version handshake: registration carries the client's version + wire-
+// protocol revision; the arbiter sanitizes (version: string ≤64, protocol:
+// integer 0..1000), stores, and echoes both per client row. Missing fields
+// are fine — pre-version clients keep working, their rows carry no keys.
+// (Placed LAST: the handshake-v1 client reports career-ops and would be
+// counted by the earlier per-project worker-count assertion.)
+
+test('version handshake: a register WITH version + protocol echoes both on /api/state', async () => {
+  const reg = await fetch(`${base}/api/clients/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({
+      name: 'handshake-v1',
+      version: '1.2.3',
+      protocol: 1,
+      projects: [{ name: 'career-ops', model: 'Qwen3.8-27B', estimated_seconds: 900, queue_depth: 0 }],
+    }),
+  });
+  assert.equal(reg.status, 200);
+  const st = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: { name: string; version?: string; protocol?: number }[];
+    projects: { name: string; workers: { client: string; version?: string; protocol?: number }[] }[];
+  };
+  const row = st.clients.find((c) => c.name === 'handshake-v1')!;
+  assert.equal(row.version, '1.2.3', 'the client row carries version');
+  assert.equal(row.protocol, 1, 'the client row carries protocol');
+  const w = st.projects.find((p) => p.name === 'career-ops')!.workers.find((x) => x.client === 'handshake-v1')!;
+  assert.equal(w.version, '1.2.3', 'the per-project worker row carries version (the dashboard renders it)');
+  assert.equal(w.protocol, 1, 'the per-project worker row carries protocol');
+});
+
+test('version handshake: a register WITHOUT them still 200s with no version/protocol keys (old clients)', async () => {
+  const reg = await fetch(`${base}/api/clients/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ name: 'handshake-legacy' }),
+  });
+  assert.equal(reg.status, 200, 'pre-version clients keep registering');
+  const st = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: { name: string; version?: string; protocol?: number }[];
+  };
+  const row = st.clients.find((c) => c.name === 'handshake-legacy')!;
+  assert.ok(!('version' in row), 'no version key on a pre-version client row');
+  assert.ok(!('protocol' in row), 'no protocol key on a pre-version client row');
+});
+
+test('version handshake: malformed version/protocol values are dropped, never rejected', async () => {
+  const reg = await fetch(`${base}/api/clients/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ name: 'handshake-bad', version: 'x'.repeat(65), protocol: 99999 }),
+  });
+  assert.equal(reg.status, 200, 'malformed handshake facts never reject a registration');
+  const st = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: { name: string; version?: string; protocol?: number }[];
+  };
+  const row = st.clients.find((c) => c.name === 'handshake-bad')!;
+  assert.ok(!('version' in row), 'a >64-char version is dropped');
+  assert.ok(!('protocol' in row), 'an out-of-range protocol is dropped');
+
+  // A later re-registration with valid values updates the row (protocol 0
+  // is in range and must be kept — not treated as "absent").
+  const reg2 = await fetch(`${base}/api/clients/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ name: 'handshake-bad', version: '9.9.9', protocol: 0 }),
+  });
+  assert.equal(reg2.status, 200);
+  const st2 = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: { name: string; version?: string; protocol?: number }[];
+  };
+  const row2 = st2.clients.find((c) => c.name === 'handshake-bad')!;
+  assert.equal(row2.version, '9.9.9', 'a later valid report updates the row');
+  assert.equal(row2.protocol, 0, 'protocol 0 is in range and kept');
+});

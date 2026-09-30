@@ -152,6 +152,18 @@ export interface ClientRecord {
   last_seen: number;
   /** Projects this client reports it is allocated to (from its own config). */
   projects: ProjectAllocation[];
+  /**
+   * The client's own version string (root package.json version, sent at
+   * registration). Absent on pre-version clients — the dashboard renders
+   * it exception-only, and the operator can see which worker revision is
+   * connected. Display/audit only; never a gate (yet).
+   */
+  version?: string;
+  /**
+   * The wire-protocol revision the client speaks (integer; 1 = the first
+   * versioned handshake). Absent on pre-version clients.
+   */
+  protocol?: number;
 }
 
 /**
