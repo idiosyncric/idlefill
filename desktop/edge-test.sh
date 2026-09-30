@@ -57,6 +57,9 @@ printf '<?xml version="1.0"?><plist version="1.0"><dict></dict></plist>' > "$T/s
 # API carries the FULL 40-hex sha (the marker is its first 7 chars).
 SHA_NEW="a9787a7"
 SHA_BAD="4444444"
+# The UNPUBLISHED pin's sha7 (the 404 case: a valid pin whose edge
+# release was never published).
+SHA_PINMISS="5555555"
 SHA40_NEW="$SHA_NEW$(printf 'a%.0s' {1..33})"
 SHA40_BAD="$SHA_BAD$(printf 'b%.0s' {1..33})"
 [ "${#SHA40_NEW}" -eq 40 ] && [ "${#SHA40_BAD}" -eq 40 ] || { echo "error: sha fixture length" >&2; exit 1; }
@@ -88,8 +91,24 @@ const refOf = (b, sha) => [
 const dlMarker = '$EDGE_MARKER';
 const dlBad = '$BAD_MARKER';
 const dzip = 'Idlefill ' + dlMarker + '.zip';
+// The PIN's availability probe (releases/tags/<tag>): the marker's tag
+// answers 200 (published), every other tag the live API's exact 404.
+// Checked BEFORE the download routes (no prefix collision, but the
+// tags route is its own exact shape).
+const tagPublished = '$EDGE_MARKER';
 const server = http.createServer((req, res) => {
   const u = req.url || '';
+  const t = u.match(/^\\/api\\/v1\\/repos\\/sam\\/idlefill\\/releases\\/tags\\/([^/]+)$/);
+  if (t) {
+    if (t[1] === tagPublished) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ tag_name: t[1], name: 'Edge main ' + t[1].slice(-7) }));
+      return;
+    }
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ message: "The target couldn't be found." }));
+    return;
+  }
   const m = u.match(/^\\/api\\/v1\\/repos\\/sam\\/idlefill\\/git\\/refs\\/heads\\/([^/]+)$/);
   if (m) {
     if (m[1] === 'main') { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(refOf('main', '$SHA40_NEW'))); return; }
@@ -134,6 +153,10 @@ sed '/^@main$/,/^}$/d' "$SRC" > "$T/desktop-under-test.swift"
 if grep -q '@main' "$T/desktop-under-test.swift"; then echo "error: @main survived the strip"; exit 1; fi
 grep -q 'struct IdlefillApp: App' "$T/desktop-under-test.swift" || { echo "error: IdlefillApp lost in the strip"; exit 1; }
 grep -q 'static func branchUpdateMarker' "$T/desktop-under-test.swift" || { echo "error: branchUpdateMarker lost in the strip"; exit 1; }
+grep -q 'static func isPinSha' "$T/desktop-under-test.swift" || { echo "error: isPinSha lost in the strip"; exit 1; }
+grep -q 'static func pinUpdateMarker' "$T/desktop-under-test.swift" || { echo "error: pinUpdateMarker lost in the strip"; exit 1; }
+grep -q 'static func pinnedMarker' "$T/desktop-under-test.swift" || { echo "error: pinnedMarker lost in the strip"; exit 1; }
+grep -q 'func checkPinnedBuild' "$T/desktop-under-test.swift" || { echo "error: checkPinnedBuild lost in the strip"; exit 1; }
 grep -q 'func checkBranchUpdates' "$T/desktop-under-test.swift" || { echo "error: checkBranchUpdates lost in the strip"; exit 1; }
 grep -q 'func confirmEdgeInstall' "$T/desktop-under-test.swift" || { echo "error: confirmEdgeInstall lost in the strip"; exit 1; }
 grep -q 'func saveUpdateChannel' "$T/desktop-under-test.swift" || { echo "error: saveUpdateChannel lost in the strip"; exit 1; }
@@ -141,6 +164,7 @@ grep -q 'func saveUpdateChannel' "$T/desktop-under-test.swift" || { echo "error:
 # pass — the report's eyeball checklist).
 grep -q 'Picker("", selection: $m.updateChannel)' "$T/desktop-under-test.swift" || { echo "error: the channel picker control is missing"; exit 1; }
 grep -q 'text: $m.updateBranch' "$T/desktop-under-test.swift" || { echo "error: the branch field control is missing"; exit 1; }
+grep -q 'text: $m.updatePin' "$T/desktop-under-test.swift" || { echo "error: the pin field control is missing"; exit 1; }
 grep -q 'install edge build' "$T/desktop-under-test.swift" || { echo "error: the confirm control is missing"; exit 1; }
 
 cat > "$T/main.swift" <<'EOF'
@@ -182,6 +206,20 @@ if CommandLine.arguments.contains("--deadport") {
   check("deadport: a dead fetch restores the previous status (fail quiet)",
         restored && dm.edgePending == false
           && (dm.updateStatus ?? "").contains("up to date") == false)
+  // The PIN path's offline-tolerant contract (the same shape on the
+  // releases/tags probe): a valid pin at a DEAD base must restore the
+  // previous status — neither "up to date" NOR "not published" (a dead
+  // fetch answered nothing; the 404 note is reserved for a genuine 404).
+  dm.updatePin = "a9787a7"
+  dm.updateStatus = "seeded2"
+  dm.checkBranchUpdates()
+  let restoredPin = waitUntil(timeout: 30) {
+    !dm.updateChecking && dm.updateStatus == "seeded2"
+  }
+  check("deadport: a dead PIN probe restores the previous status (no 'up to date', no 'not published')",
+        restoredPin && dm.edgePending == false
+          && (dm.updateStatus ?? "").contains("up to date") == false
+          && (dm.updateStatus ?? "").contains("not published") == false)
   if failures > 0 { print("EDGE-DT-FAILURES \(failures)"); exit(1) }
   print("EDGE-DT-DEADPORT-PASS")
   exit(0)
@@ -219,6 +257,28 @@ check("b: it is NOT the literal placeholder (the fail-mode contract)",
       !m0.bakedMarker.contains("__DESKTOP"))
 check("b: the default channel is releases (no config)",
       m0.updateChannel == "releases" && m0.updateBranch == "main")
+check("b: the default pin is absent (no config -> tip-following)",
+      m0.updatePin == "")
+
+// ------------------------------------------- (b2) the pure pin logic
+// (the desktop's copy of the menubar's isPinSha/pinUpdateMarker/pinnedMarker).
+check("b2: isPinSha — a 7-hex sha is a pin", AppModel.isPinSha("a9787a7") == true)
+check("b2: isPinSha — a full 40-hex sha is a pin", AppModel.isPinSha("__SHANEW__") == true)
+check("b2: isPinSha — 6 chars is NOT a pin (too short)", AppModel.isPinSha("a9787a") == false)
+check("b2: isPinSha — a non-hex 7-char string is NOT a pin", AppModel.isPinSha("notsha1") == false)
+check("b2: isPinSha — empty is NOT a pin", AppModel.isPinSha("") == false)
+check("b2: pure — pin == local marker -> up to date (nil), even when published",
+      AppModel.pinUpdateMarker(pinMarker: marker, localMarker: marker, exists: true) == nil)
+check("b2: pure — a different published pin -> the offer",
+      AppModel.pinUpdateMarker(pinMarker: "edge-main-__SHA7BAD__", localMarker: marker, exists: true) == "edge-main-__SHA7BAD__")
+check("b2: pure — a different UNPUBLISHED pin -> nothing (the install would 404)",
+      AppModel.pinUpdateMarker(pinMarker: marker, localMarker: "1.0", exists: false) == nil)
+check("b2: pinnedMarker — the sha7 of the pin (a full sha pins its own prefix)",
+      AppModel.pinnedMarker(branch: "main", pin: "__SHANEW__") == marker)
+check("b2: pinnedMarker — a short pin's 7 chars",
+      AppModel.pinnedMarker(branch: "main", pin: "a9787a7") == marker)
+check("b2: pinnedMarker — the branch rides the marker",
+      AppModel.pinnedMarker(branch: "bad", pin: "__SHABAD__") == badMarker)
 
 // --------------------------------------------- (c) the app config round
 // trip through the REAL loadConfig / saveUpdateChannel. (The app config
@@ -249,6 +309,41 @@ writeJSON(["update_channel": "bogus-channel"])
 let m2 = AppModel()
 check("c: a malformed channel value falls back to releases (never a third channel)",
       m2.updateChannel == "releases")
+// The PIN round trip through the REAL loadConfig / saveUpdateChannel.
+writeJSON(["update_channel": "branch", "update_branch": "main", "update_pin": "a9787a7", "other_key": "keep-pin"])
+let m3 = AppModel()
+check("c: loadConfig — a valid pin loads from the file",
+      m3.updatePin == "a9787a7" && m3.updateChannel == "branch")
+// A malformed pin value is DROPPED at load (the check falls back to
+// tip-following — a hand-typed garbage pin must never become a marker).
+writeJSON(["update_channel": "branch", "update_branch": "main", "update_pin": "zzz-not-hex", "other_key": "keep-pin"])
+let m4 = AppModel()
+check("c: a malformed pin is dropped at load (tip-following resumes)",
+      m4.updatePin == "")
+// A 40-hex sha pin is valid and persists trimmed.
+m4.updatePin = "  __SHANEW__  "
+m4.saveUpdateChannel()
+var savedPin: [String: Any] = [:]
+if let d = try? Data(contentsOf: URL(fileURLWithPath: cfgPath)) {
+  savedPin = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] ?? [:]
+}
+check("c: saveUpdateChannel — a 40-hex pin persists TRIMMED",
+      savedPin["update_pin"] as? String == "__SHANEW__")
+check("c: saveUpdateChannel — the pin save keeps channel/branch + other keys",
+      savedPin["update_channel"] as? String == "branch" && savedPin["update_branch"] as? String == "main"
+        && savedPin["other_key"] as? String == "keep-pin")
+// An EMPTY pin field CLEARS the stored pin (tip-following resumes).
+m4.updatePin = "   "
+m4.saveUpdateChannel()
+var savedCleared: [String: Any] = [:]
+if let d = try? Data(contentsOf: URL(fileURLWithPath: cfgPath)) {
+  savedCleared = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] ?? [:]
+}
+check("c: saveUpdateChannel — an empty pin CLEARS the stored pin",
+      (savedCleared["update_pin"] == nil) || (savedCleared["update_pin"] as? NSNull) != nil)
+let m5 = AppModel()
+check("c: after the clear, loadConfig reads no pin (tip-following)",
+      m5.updatePin == "")
 
 // ------------------------- (d) the REAL checkBranchUpdates() (the fetch)
 // The model's own launch-time env carried IDLEFILL_UPDATE_BASE -> the
@@ -303,6 +398,45 @@ if semD.wait(timeout: .now() + 20) == .success {
   failures += 1; print("FAIL d: equal-markers fetch timed out")
 }
 
+// ------------------- (d2) the REAL pinned-build check (the pin path)
+// A valid pin retargets checkBranchUpdates() from the refs API to the
+// releases/tags probe: PUBLISHED pin -> the offer (edgePending + the
+// status names the marker); UNPUBLISHED pin (the stub's 404) -> the
+// operator-actionable "not published" note with the exact publish
+// command; a malformed pin -> the TIP path unchanged (the offer is
+// still the TIP's marker).
+md.updateBranch = "main" // (d)'s unknown-branch case left it on 'no-such-branch'
+md.updatePin = "a9787a7" // == SHA_NEW's sha7 -> the stub's PUBLISHED tag
+md.checkBranchUpdates()
+let gotPinOffer = waitUntil(timeout: 30) {
+  !md.updateChecking && md.updateStatus?.contains("pinned build \(marker)") == true
+}
+check("d2: published pin (the real probe) -> the offer",
+      gotPinOffer && md.edgePending == true)
+check("d2: the status line names the pinned marker (operator-facing)",
+      md.updateStatus?.contains(marker) == true)
+// UNPUBLISHED pin: a valid sha whose tag the stub 404s (SHA_PINMISS).
+md.updatePin = "__SHA7PINMISS__"
+md.edgePending = true // a stale pending offer must be cleared by the 404
+md.checkBranchUpdates()
+let gotPin404 = waitUntil(timeout: 30) {
+  !md.updateChecking && md.updateStatus?.contains("not published") == true
+}
+check("d2: unpublished pin (the stub's 404) -> the 'not published' note",
+      gotPin404 && md.edgePending == false)
+check("d2: the note names the exact publish command (marker + the pin's sha)",
+      md.updateStatus?.contains("scripts/edge-release.sh edge-main-__SHA7PINMISS__ __SHA7PINMISS__") == true)
+// A MALFORMED pin -> the check stays on the TIP path (today's behavior):
+// the offer is the TIP's marker (this build is 1.0, the tip is the
+// marker), never a pin-shaped marker.
+md.updatePin = "zzz-not-hex"
+md.checkBranchUpdates()
+let gotTipAfterBadPin = waitUntil(timeout: 30) {
+  !md.updateChecking && md.updateStatus?.contains("new build \(marker) on main") == true
+}
+check("d2: a malformed pin -> the tip path unchanged (the tip's offer)",
+      gotTipAfterBadPin && md.edgePending == true)
+
 // --------------------------------- (e) the REAL confirmEdgeInstall()
 // (e) CORRECT sidecar: download + sha256 verified BEFORE the swap, then
 // the swap in the detached helper — the SCRATCH bundle is replaced
@@ -340,6 +474,31 @@ let after = (try? String(contentsOfFile: scratchBundle, encoding: .utf8)) ?? ""
 check("e: tampered sidecar -> the current bundle is untouched",
       after == before && after.hasPrefix("NEW-EDGE-BUNDLE"))
 
+// ------------------- (e2) PIN-MODE confirm (no re-fetch)
+// With a valid pin, confirmEdgeInstall() installs the PINNED marker
+// directly (a pin cannot move — no refs re-fetch; the download +
+// sha256 gate + the detached swap are the same path). DISCRIMINATING
+// SETUP: the scratch bundle is reset to the CURRENT build first (it
+// holds NEW-EDGE-BUNDLE from (e)) — the pin-mode install must be what
+// puts it back: a pin path that silently no-ops leaves CURRENT-BUNDLE
+// and the check fails.
+try! ("CURRENT-BUNDLE".data(using: .utf8))!.write(to: URL(fileURLWithPath: scratchBundle))
+md.updateBranch = "main" // (e)'s tampered case left it on 'bad' — the pin's marker rides the branch
+md.updatePin = "a9787a7" // the marker's sha7 -> the stub's PUBLISHED tag
+md.edgePending = true
+md.confirmEdgeInstall()
+let pinSwapped = waitUntil(timeout: 60) {
+  ((try? String(contentsOfFile: scratchBundle, encoding: .utf8)) ?? "").hasPrefix("NEW-EDGE-BUNDLE")
+}
+check("e2: pin-mode confirm (no re-fetch) -> verified + the swap landed (the CURRENT bundle was replaced)",
+      pinSwapped)
+check("e2: the status line narrated the install (the pin path reached runEdgeSwap)",
+      (md.updateStatus ?? "").contains("installing") == true)
+// Clear the pin: an empty field -> tip-following (the d2 flow resumes).
+md.updatePin = ""
+check("e2: a cleared pin (empty) -> tip-following is the path again",
+      AppModel.isPinSha(md.updatePin.trimmingCharacters(in: .whitespacesAndNewlines)) == false)
+
 if failures > 0 {
   print("EDGE-DT-FAILURES \(failures)")
   exit(1)
@@ -353,6 +512,7 @@ EOF
 sed -e "s|__PORT__|$PORT|g" \
     -e "s|__SHA7NEW__|$SHA_NEW|g" \
     -e "s|__SHA7BAD__|$SHA_BAD|g" \
+    -e "s|__SHA7PINMISS__|$SHA_PINMISS|g" \
     -e "s|__SHANEW__|$SHA40_NEW|g" \
     -e "s|__SHABAD__|$SHA40_BAD|g" \
     -e "s|__SCRATCH__|$T/scratch|g" \

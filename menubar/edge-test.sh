@@ -37,8 +37,11 @@ cat > "$T/repo/package.json" <<'EOF'
 EOF
 # update_channel = "main" -> the launch check takes the BRANCH path
 # (criterion: the 6h check + the launch check follow the channel).
+# update_pin = "1111111" (SHA_OLDER's sha7 — the PUBLISHED pinned marker
+# on the stub) -> the launch check takes the PIN path (the
+# releases/tags probe instead of the refs fetch).
 cat > "$T/repo/client/config.json" <<'EOF'
-{ "server_url": "http://127.0.0.1:1", "token": "scratch-not-a-real-token", "client_name": "edge-mb-test", "update_channel": "main" }
+{ "server_url": "http://127.0.0.1:1", "token": "scratch-not-a-real-token", "client_name": "edge-mb-test", "update_channel": "main", "update_pin": "1111111" }
 EOF
 # the "current installed" bundle that a refused install must leave untouched
 mkdir -p "$T/repo/menubar/IdlefillMenubar.app/Contents/MacOS"
@@ -101,6 +104,21 @@ const refOf = (b, sha) => [
 ];
 const server = http.createServer((req, res) => {
   const u = req.url || '';
+  // The PIN's availability probe (releases/tags/<tag>) — must be checked
+  // BEFORE the releases-list prefix match (a /releases/tags/ URL starts
+  // with /releases): the PUBLISHED pinned marker answers 200, every
+  // other tag the live API's exact 404 body.
+  const t = u.match(/^\\/api\\/v1\\/repos\\/sam\\/idlefill\\/releases\\/tags\\/([A-Za-z0-9._-]+)$/);
+  if (t) {
+    if (t[1] === 'edge-main-' + shaOlder.slice(0, 7)) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ tag_name: t[1], name: 'Edge main ' + t[1].slice(-7) }));
+      return;
+    }
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ message: "The target couldn't be found." }));
+    return;
+  }
   if (u.startsWith('/api/v1/repos/sam/idlefill/releases')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(releases));
@@ -158,6 +176,9 @@ grep -q 'struct IdlefillApp: App' "$T/menubar-under-test.swift" || { echo "error
 grep -q 'enum UpdateCheck' "$T/menubar-under-test.swift" || { echo "error: UpdateCheck lost in the strip"; exit 1; }
 grep -q 'static func branchUpdateMarker' "$T/menubar-under-test.swift" || { echo "error: branchUpdateMarker lost in the strip"; exit 1; }
 grep -q 'updateChannel' "$T/menubar-under-test.swift" || { echo "error: ClientConfig.updateChannel lost in the strip"; exit 1; }
+grep -q 'updatePin' "$T/menubar-under-test.swift" || { echo "error: ClientConfig.updatePin lost in the strip"; exit 1; }
+grep -q 'static func pinUpdateMarker' "$T/menubar-under-test.swift" || { echo "error: pinUpdateMarker lost in the strip"; exit 1; }
+grep -q 'static func fetchReleaseExists' "$T/menubar-under-test.swift" || { echo "error: fetchReleaseExists lost in the strip"; exit 1; }
 
 cat > "$T/main.swift" <<'EOF'
 import Foundation
@@ -178,6 +199,22 @@ let refMain = "[{\"ref\":\"refs/heads/main\",\"object\":{\"type\":\"commit\",\"s
 let refOlder = "[{\"ref\":\"refs/heads/dev\",\"object\":{\"type\":\"commit\",\"sha\":\"__SHAOLDER__\"}}]"
 let ref404 = "{\"message\":\"The target couldn't be found.\"}"
 let releasesCanned = "[{\"tag_name\":\"v3\"},{\"tag_name\":\"v2\"},{\"tag_name\":\"v1\"},{\"tag_name\":\"v0.0.2\"},{\"tag_name\":\"weird\"}]"
+
+// The DEAD-network run (a second driver invocation, --deadport, with
+// IDLEFILL_UPDATE_BASE -> a dead port): the scratch config's pin routes
+// the launch check to the PIN path; a dead base -> the probe's failure
+// must set NOTHING (the offline-tolerant contract — the pre-pin shape,
+// preserved on the pin path). The env is a launch-time snapshot, so
+// this case needs its own process.
+if CommandLine.arguments.contains("--deadport") {
+  let dm = AppModel()
+  RunLoop.main.run(until: Date().addingTimeInterval(3.0))
+  check("deadport: offline pin-path launch check -> silent, no crash, nothing set",
+        dm.updateAvailable == nil && dm.updateChannel == nil && dm.updateNote == nil)
+  if failures > 0 { print("EDGE-MB-FAILURES \(failures)"); exit(1) }
+  print("EDGE-MB-DEADPORT-PASS")
+  exit(0)
+}
 
 // ------------------------------------------------------- (a) pure branch
 check("a: marker mismatch -> offer the tip marker",
@@ -256,13 +293,19 @@ if semB3.wait(timeout: .now() + 20) == .success {
   failures += 1; print("FAIL b: unknown-branch fetch timed out")
 }
 
-// (b) the AppModel init's OWN launch check fires at the DEAD base under
-// env -i (the config's update_channel = main routes it to the refs API):
-// silent, no crash, nothing set — the offline-tolerant contract.
+// (b) the AppModel init's OWN launch check: the model's env points at
+// the stub, and the scratch config carries update_channel=main +
+// update_pin=1111111 -> it takes the PIN path (the releases/tags
+// probe at the stub, NOT the refs fetch): the pinned marker (a pinned
+// build different from this dev build's) is PUBLISHED on the stub ->
+// the launch check offers it, the channel fact = the tracked branch.
+// The DEAD-base run (a fresh process, its own env — a launch-time
+// snapshot; the harness re-runs the driver with --deadport below)
+// proves the pin path's offline-tolerant silence separately.
 let m2 = AppModel()
 RunLoop.main.run(until: Date().addingTimeInterval(3.0))
-check("b: offline (dead port) launch check -> silent, no crash, nothing set",
-      m2.updateAvailable == nil && m2.updateChannel == nil && m2.updateNote == nil)
+check("b: launch check with a published pin -> offers the pinned marker (pin path, not refs)",
+      m2.updateAvailable == "edge-main-__SHA7OLDER__" && m2.updateChannel == "main" && m2.updateNote == nil)
 
 // ------------------------------------------- (c) releases channel (the
 // back-switch rule + the unchanged numeric cases). Newest in the canned
@@ -349,6 +392,66 @@ if sem2.wait(timeout: .now() + 40) == .success {
   failures += 1; print("FAIL e: edge install (tampered sidecar) timed out")
 }
 
+// -------------------------------------------------- (f) the development
+// pin (the branch channel's pinning extension): isPinSha validation,
+// the pure pin verdict, the apply path, the real probe fetch (the
+// releases/tags route on the stub), and a full-sha pin resolving to
+// the same marker as its own prefix.
+check("f: isPinSha — a 7-hex sha is a pin",
+      UpdateCheck.isPinSha("a9787a7") == true)
+check("f: isPinSha — a full 40-hex sha is a pin",
+      UpdateCheck.isPinSha("__SHANEW__") == true)
+check("f: isPinSha — 6 chars is NOT a pin (too short)",
+      UpdateCheck.isPinSha("a9787a") == false)
+check("f: isPinSha — a non-hex 7-char string is NOT a pin",
+      UpdateCheck.isPinSha("notsha1") == false)
+check("f: isPinSha — empty is NOT a pin",
+      UpdateCheck.isPinSha("") == false)
+check("f: pure — pin == local marker -> up to date (nil), even when published",
+      UpdateCheck.pinUpdateMarker(pinMarker: "edge-main-__SHA7OLDER__", localMarker: "edge-main-__SHA7OLDER__", exists: true) == nil)
+check("f: pure — a different pinned marker that EXISTS -> the offer",
+      UpdateCheck.pinUpdateMarker(pinMarker: "edge-main-__SHA7OLDER__", localMarker: "edge-main-__SHA7NEW__", exists: true) == "edge-main-__SHA7OLDER__")
+check("f: pure — a different pinned marker that does NOT exist -> nothing (the install would 404; publish it, the next tick offers)",
+      UpdateCheck.pinUpdateMarker(pinMarker: "edge-main-__SHA7NEW__", localMarker: "edge-main-__SHA7OLDER__", exists: false) == nil)
+// The apply path (the model's own set of updateAvailable/updateChannel):
+// an offer rides the tracked BRANCH (the install routes on it — an edge
+// value is its own tag, the marker-named zip).
+let mF = AppModel()
+mF.applyPinCheck(exists: true, pinMarker: "edge-main-__SHA7OLDER__")
+check("f: applyPinCheck — offer rides channel 'main' (the tracked branch)",
+      mF.updateAvailable == "edge-main-__SHA7OLDER__" && mF.updateChannel == "main")
+let mF2 = AppModel()
+mF2.applyPinCheck(exists: false, pinMarker: "edge-main-__SHA7NEW__")
+check("f: applyPinCheck — a missing pin offers nothing + clears both facts",
+      mF2.updateAvailable == nil && mF2.updateChannel == nil)
+// A full 40-hex sha pin resolves to the SAME marker as its own 7-char
+// prefix (the marker uses the sha7).
+check("f: a full-sha pin's marker == its sha7 prefix's marker",
+      UpdateCheck.edgeMarker(branch: "main", sha7: String("__SHANEW__".prefix(7))) == "edge-main-__SHA7NEW__")
+// The REAL probe fetch (the releases/tags route on the stub): the
+// PUBLISHED pinned marker -> 2xx -> the completion carries data; an
+// UNPUBLISHED marker -> the stub's 404 -> the completion carries nil
+// (a failed probe must not read "the build exists").
+let semF = DispatchSemaphore(value: 0)
+var fPub: Bool = false
+var fPriv: Bool = true // start "wrong" so a no-op completion can't fake a pass
+UpdateCheck.fetchReleaseExists(base: "http://127.0.0.1:\(port)", tag: "edge-main-__SHA7OLDER__") { data in
+  fPub = (data != nil)
+  semF.signal()
+}
+UpdateCheck.fetchReleaseExists(base: "http://127.0.0.1:\(port)", tag: "edge-main-__SHA7NEW__") { data in
+  fPriv = (data != nil)
+}
+if semF.wait(timeout: .now() + 20) == .success {
+  check("f: the real probe — a PUBLISHED pinned marker -> 2xx (data carried)", fPub == true)
+  // give the second (unpublished) probe a beat to resolve to nil
+  var waited = 0
+  while fPriv && waited < 50 { RunLoop.main.run(until: Date().addingTimeInterval(0.1)); waited += 1 }
+  check("f: the real probe — an UNPUBLISHED pinned marker (404) -> nil (fail quiet, not an offer)", fPriv == false)
+} else {
+  failures += 1; print("FAIL f: published-pin probe timed out")
+}
+
 if failures > 0 {
   print("EDGE-MB-FAILURES \(failures)")
   exit(1)
@@ -379,11 +482,25 @@ swiftc -O \
   -framework AppKit -framework SwiftUI 2>&1 | grep -E "error:" || true
 [ -x "$T/edge-mb-test" ] || { echo "error: driver did not build"; exit 1; }
 
-echo "==> run (env -i, the GUI environment; IDLEFILL_UPDATE_BASE -> dead port)"
+echo "==> run (env -i, the GUI environment; IDLEFILL_UPDATE_BASE -> the stub: the model's OWN launch check (the scratch config's pin) takes the pin path and probes the stub's releases/tags route)"
 RC=0
 env -i PATH=/usr/bin:/bin \
   IDLEFILL_CONFIG_FILE="$T/repo/client/config.json" \
-  IDLEFILL_UPDATE_BASE="http://127.0.0.1:1" \
+  IDLEFILL_UPDATE_BASE="http://127.0.0.1:$PORT" \
   "$T/edge-mb-test" || RC=$?
 echo "EDGE-MB-EXIT=$RC"
-exit $RC
+
+# The DEAD-network case (a fresh process whose check base is a DEAD port
+# — the env is a launch-time snapshot, so it needs its own run): the
+# config's pin routes the launch check to the PIN path; a dead base ->
+# the probe's failure must set nothing (the offline-tolerant contract,
+# the pre-pin shape preserved on the pin path).
+echo "==> run (dead port — the pin path's offline-tolerant contract)"
+RC2=0
+env -i PATH=/usr/bin:/bin \
+  IDLEFILL_CONFIG_FILE="$T/repo/client/config.json" \
+  IDLEFILL_UPDATE_BASE="http://127.0.0.1:1" \
+  "$T/edge-mb-test" --deadport || RC2=$?
+echo "EDGE-MB-DEADPORT-EXIT=$RC2"
+
+exit $(( RC + RC2 ))

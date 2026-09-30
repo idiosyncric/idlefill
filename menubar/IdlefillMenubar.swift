@@ -193,19 +193,34 @@ struct ClientConfig: Equatable {
    *  channel (the branch's tip is the "latest build"). Same parse
    *  discipline as the other keys (empty string = absent). */
   let updateChannel: String?
+  /** The DEVELOPMENT PIN (the pinning extension of the branch channel),
+   *  from `update_pin`: a commit SHA (7–40 hex). Set while the branch
+   *  channel is active, the check targets `edge-<channel>-<sha7(pin)>`
+   *  (the pinned commit's edge build) instead of the branch's TIP:
+   *  pinned marker == the baked marker -> up to date (nothing); a
+   *  different pinned marker is offered IFF its edge release exists
+   *  (`GET …/releases/tags/<marker>` — a per-commit tag a push to the
+   *  branch publishes, or `scripts/edge-release.sh` on demand).
+   *  Malformed (not 7–40 hex) or empty = ABSENT — today's tip-following
+   *  behavior is the fallback. On the releases channel it is ignored. */
+  let updatePin: String?
 
   static let serverURLDefault = "http://100.105.225.1:8787"
 
   static func load(path: String) -> ClientConfig {
     guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
           let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
-      return ClientConfig(token: nil, serverURL: serverURLDefault, clientName: nil, updateChannel: nil)
+      return ClientConfig(token: nil, serverURL: serverURLDefault, clientName: nil,
+                          updateChannel: nil, updatePin: nil)
     }
     let token = (o["token"] as? String).flatMap { $0.isEmpty ? nil : $0 }
     let url = (o["server_url"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? serverURLDefault
     let name = (o["client_name"] as? String).flatMap { $0.isEmpty ? nil : $0 }
     let channel = (o["update_channel"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-    return ClientConfig(token: token, serverURL: url, clientName: name, updateChannel: channel)
+    let pin = (o["update_pin"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+      .flatMap { UpdateCheck.isPinSha($0) ? $0 : nil }
+    return ClientConfig(token: token, serverURL: url, clientName: name,
+                        updateChannel: channel, updatePin: pin)
   }
 }
 
@@ -1533,6 +1548,23 @@ final class AppModel: ObservableObject {
   func checkForUpdates() {
     let base = AppModel.updateBase()
     let channel = config.updateChannel
+    if let channel, let pin = config.updatePin {
+      // The DEVELOPMENT PIN (the branch channel's pinning extension):
+      // the check targets the PINNED commit's edge marker instead of
+      // the branch's TIP — no refs fetch (a pin cannot move; the marker
+      // IS the sha). The one network fact is the pinned edge release's
+      // EXISTENCE (its per-commit tag, published by edge.yml on push or
+      // `scripts/edge-release.sh` on demand): a different marker that
+      // exists is offered; a missing tag offers nothing (the operator
+      // publishes the build, the next tick retries) — offline-tolerant
+      // like the rest of the check.
+      let marker = UpdateCheck.edgeMarker(branch: channel, sha7: String(pin.prefix(7)))
+      UpdateCheck.fetchReleaseExists(base: base, tag: marker) { [weak self] data in
+        guard let self else { return }
+        DispatchQueue.main.async { self.applyPinCheck(exists: data != nil, pinMarker: marker) }
+      }
+      return
+    }
     if let channel {
       UpdateCheck.fetchBranchTip(base: base, branch: channel) { [weak self] data in
         guard let self else { return }
@@ -1567,6 +1599,21 @@ final class AppModel: ObservableObject {
     let r = UpdateCheck.branchCheck(data: data, localMarker: version)
     updateAvailable = r?.marker
     updateChannel = r?.channel
+  }
+
+  /** Pure (the pinning check): given the pin's availability verdict +
+   *  the pinned marker, set `updateAvailable` to the PINNED marker (or
+   *  clear it) — the offer exists iff the pinned marker DIFFERS from
+   *  the baked one AND its edge release exists (a different marker
+   *  whose tag is missing offers nothing — the install would 404; the
+   *  operator publishes the build via `scripts/edge-release.sh` and the
+   *  next tick offers). The channel fact is the TRACKED BRANCH (the
+   *  pin rides on the branch channel — the install routes on it: an
+   *  edge value is its OWN tag, the marker-named zip). */
+  func applyPinCheck(exists: Bool, pinMarker: String) {
+    let offer = UpdateCheck.pinUpdateMarker(pinMarker: pinMarker, localMarker: version, exists: exists)
+    updateAvailable = offer
+    updateChannel = offer == nil ? nil : (config.updateChannel ?? "releases")
   }
 
   /** Install action (phase 1 — sha256, not Developer ID): download the
@@ -1719,6 +1766,32 @@ enum UpdateCheck {
     "edge-\(branch)-\(sha7)"
   }
 
+  /** The DEVELOPMENT PIN (the branch channel's pinning extension): a pin
+   *  value is a commit SHA — its first 7–40 hex chars (the marker uses
+   *  the sha7; a full 40-hex sha pins the same marker as its own prefix).
+   *  Anything else = malformed = ABSENT (the caller falls back to
+   *  tip-following; a hand-typed garbage pin must never become a marker
+   *  tail that 404s forever). */
+  static func isPinSha(_ s: String) -> Bool {
+    (7...40).contains(s.count) && s.allSatisfy(\.isHexDigit)
+  }
+
+  /** Pure (the pinning check, given a pinned marker + the availability
+   *  probe's verdict): the pin's OFFER. `pinMarker == localMarker` ->
+   *  nil (up to date — the machine already runs the pinned build). A
+   *  DIFFERENT pinned marker is offered only when `exists` (the pinned
+   *  edge release's tag answers 200 — its per-commit tag, published by
+   *  edge.yml on push or `scripts/edge-release.sh` on demand); a
+   *  non-existent pin (a commit that was never pushed/published, or the
+   *  release was cleaned) -> nil (NOT an offer: the install would 404 —
+   *  the check says nothing and the operator publishes the build, e.g.
+   *  `scripts/edge-release.sh edge-<branch>-<sha7> <sha>`; the next
+   *  cadence tick retries and then offers). */
+  static func pinUpdateMarker(pinMarker: String, localMarker: String, exists: Bool) -> String? {
+    guard pinMarker != localMarker else { return nil }
+    return exists ? pinMarker : nil
+  }
+
   /** Pure (the branch channel): the channel facts an available update
    *  carries, given the refs-API payload + the local's BAKED marker.
    *  Split out so the headless test can drive it with a CHOSEN local
@@ -1792,6 +1865,36 @@ enum UpdateCheck {
     req.timeoutInterval = 10
     URLSession.shared.dataTask(with: req) { data, _, _ in
       completion(data)
+    }.resume()
+  }
+
+  /** GET `<base>/api/v1/repos/sam/idlefill/releases/tags/<tag>` — the
+   *  PIN's availability probe (the pinning check's one network fact):
+   *  the pinned marker IS an edge release's TAG (the per-commit tag
+   *  edge.yml pushes / `scripts/edge-release.sh` publishes), so its
+   *  EXISTENCE is the whole verdict. The completion runs with the
+   *  payload on a genuine 2xx and with `nil` on everything else — 404
+   *  (the tag was never published / was cleaned), a non-2xx, or no
+   *  response at all (the network is down): a failed probe must not be
+   *  mistaken for an existing release (the offline-tolerant contract —
+   *  the pin offers nothing and the next cadence tick retries).
+   *  ANONYMOUS, like the rest of the check (the repo is public; the
+   *  arbiter token is never sent to Forgejo). The `IDLEFILL_UPDATE_BASE`
+   *  test hook applies (the caller builds the base). */
+  static func fetchReleaseExists(base: String, tag: String,
+                                 completion: @escaping (Data?) -> Void) {
+    let tagEnc = tag.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? tag
+    guard let url = URL(string: "\(base)/api/v1/repos/sam/idlefill/releases/tags/\(tagEnc)") else {
+      completion(nil); return
+    }
+    var req = URLRequest(url: url)
+    req.timeoutInterval = 10
+    URLSession.shared.dataTask(with: req) { data, resp, _ in
+      if let e = resp as? HTTPURLResponse, (200..<300).contains(e.statusCode) {
+        completion(data)
+      } else {
+        completion(nil)
+      }
     }.resume()
   }
 

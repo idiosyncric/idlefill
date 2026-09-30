@@ -220,6 +220,17 @@ final class AppModel: ObservableObject {
   @Published var updateChannel: String = "releases"
   /** The branch the BRANCH channel tracks (default "main"). */
   @Published var updateBranch: String = "main"
+  /** The DEVELOPMENT PIN (the branch channel's pinning extension): a
+   *  commit SHA (7–40 hex). Set while the branch channel is selected, the
+   *  check targets `edge-<branch>-<sha7(pin)>` (the pinned commit's edge
+   *  build) instead of the branch's TIP: pinned marker == this build's
+   *  marker -> up to date; a different pinned marker is offered IFF its
+   *  edge release exists (`GET …/releases/tags/<marker>` — the per-commit
+   *  tag edge.yml publishes on push, or `scripts/edge-release.sh` on
+   *  demand); a missing pin offers nothing (publish the build, re-check).
+   *  Malformed/empty = absent -> today's tip-following behavior.
+   *  Persisted in the app config alongside `update_channel`. */
+  @Published var updatePin: String = ""
   /** An edge build is awaiting the operator's confirm (set by the branch
    *  check; cleared on confirm / channel change / re-check). */
   @Published var edgePending: Bool = false
@@ -342,6 +353,36 @@ final class AppModel: ObservableObject {
     return tip == localMarker ? nil : tip
   }
 
+  /** The DEVELOPMENT PIN (the branch channel's pinning extension): a pin
+   *  value is a commit SHA — its first 7–40 hex chars (the marker uses
+   *  the sha7; a full 40-hex sha pins the same marker as its own
+   *  prefix). Anything else = malformed = ABSENT (the check falls back
+   *  to tip-following). (The desktop's copy of the menubar's
+   *  `UpdateCheck.isPinSha` — same logic, the single-file convention.) */
+  static func isPinSha(_ s: String) -> Bool {
+    (7...40).contains(s.count) && s.allSatisfy(\.isHexDigit)
+  }
+
+  /** Pure (the pinning check, given a pinned marker + the availability
+   *  probe's verdict): the pin's OFFER — the pinned marker iff it
+   *  DIFFERS from this build's marker AND its edge release exists;
+   *  otherwise nil (up to date, or the pin was never published — the
+   *  operator publishes the build via `scripts/edge-release.sh` and
+   *  re-checks). (The desktop's copy of the menubar's
+   *  `UpdateCheck.pinUpdateMarker`.) */
+  static func pinUpdateMarker(pinMarker: String, localMarker: String, exists: Bool) -> String? {
+    guard pinMarker != localMarker else { return nil }
+    return exists ? pinMarker : nil
+  }
+
+  /** The PIN's edge marker, from the tracked branch + the pin's sha:
+   *  `edge-<branch>-<sha7>` — the first 7 chars of the pin (a full 40-hex
+   *  sha pins the same marker as its own prefix; the marker IS the
+   *  per-commit edge release's TAG the probe checks + the zip's name). */
+  static func pinnedMarker(branch: String, pin: String) -> String {
+    "edge-\(branch)-\(String(pin.prefix(7)))"
+  }
+
   /** The baked build marker (the build identity — `--version` prints it).
    *  Release builds carry the numeric version (the CFBundleVersion); edge
    *  builds carry the edge marker. An un-substituted build reports the
@@ -374,6 +415,21 @@ final class AppModel: ObservableObject {
     let branch = updateBranch.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !branch.isEmpty else {
       updateStatus = "set a branch name for the branch channel"
+      return
+    }
+    // The DEVELOPMENT PIN (the branch channel's pinning extension): a
+    // valid `updatePin` retargets the check from the branch's TIP to the
+    // PINNED commit's edge marker — no refs fetch (a pin cannot move; the
+    // marker IS the sha). The one network fact is the pinned edge
+    // release's EXISTENCE (`GET …/releases/tags/<marker>` — the per-commit
+    // tag edge.yml publishes on push, or `scripts/edge-release.sh` on
+    // demand), probed with the RAW status codes (unlike the refs fetch
+    // above, a genuine 404 here is OPERATOR-ACTIONABLE: "pin not
+    // published — publish it", distinct from the offline-tolerant
+    // silence of a dead fetch).
+    let pin = updatePin.trimmingCharacters(in: .whitespacesAndNewlines)
+    if AppModel.isPinSha(pin) {
+      checkPinnedBuild(branch: branch, pin: pin)
       return
     }
     // The status to RESTORE when a check that already started fails
@@ -450,13 +506,87 @@ final class AppModel: ObservableObject {
     }.resume()
   }
 
-  /** Confirm control (branch channel): re-fetch the tip at confirm time
-   *  (the check may be stale — a newer push since the check would have a
-   *  different marker), download the DESKTOP zip + sidecar for it, verify
-   *  sha256 BEFORE any swap (a mismatch or missing sidecar refuses — the
-   *  current bundle is kept and the status line says so), then swap the
-   *  installed bundle in the `desktop/update.sh` sequence (unzip → quit
-   *  the running app cleanly → replace → relaunch), driven from a
+  /** The PINNED-build check (the branch channel's pinning extension, the
+   *  real fetch path): probe `GET …/releases/tags/<pinned marker>` with
+   *  the RAW status codes — a genuine 2xx = the pinned build is
+   *  published (offer it, except when this build already IS it: up to
+   *  date, the marker named so the operator sees WHICH build this is);
+   *  a genuine 404 = the tag was never published (or cleaned) — an
+   *  operator-actionable note that names the exact publish command
+   *  (`scripts/edge-release.sh` with the marker + the pin's sha); any
+   *  other outcome (no HTTP response — the network is down — a 5xx) =
+   *  offline-tolerant: the previous status is RESTORED, nothing
+   *  pending, the next check retries. A REFUSED install (the sha256
+   *  gate) keeps the current bundle and says so — the same contract as
+   *  the tip check. */
+  func checkPinnedBuild(branch: String, pin: String) {
+    let marker = AppModel.pinnedMarker(branch: branch, pin: pin)
+    let prevStatus = updateStatus
+    updateStatus = "checking the pinned build \(marker)…"
+    updateChecking = true
+    let base = AppModel.updateBase()
+    let tagEnc = marker.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? marker
+    guard let url = URL(string: "\(base)/api/v1/repos/sam/idlefill/releases/tags/\(tagEnc)") else {
+      updateChecking = false
+      updateStatus = prevStatus
+      return
+    }
+    var req = URLRequest(url: url)
+    req.timeoutInterval = 10
+    URLSession.shared.dataTask(with: req) { [weak self] _, resp, _ in
+      guard let self else { return }
+      DispatchQueue.main.async {
+        self.updateChecking = false
+        guard let e = resp as? HTTPURLResponse else {
+          // No HTTP response at all — the network is down. The previous
+          // status is restored (fail quiet; a dead fetch must not read
+          // "up to date" and must not read "not published").
+          self.edgePending = false
+          self.updateStatus = prevStatus
+          return
+        }
+        if e.statusCode == 404 {
+          // The tag was never published (or was cleaned) — a DISTINCT,
+          // operator-actionable note (the fetch succeeded): name the
+          // exact publish command (the marker + the pin's sha — the
+          // script validates that the tag ends in the sha's sha7).
+          self.edgePending = false
+          self.updateStatus = "pin \(marker) not published — publish it: scripts/edge-release.sh \(marker) \(pin)"
+          return
+        }
+        guard (200..<300).contains(e.statusCode) else {
+          // A non-2xx/404 (a 5xx, a rate limit) — the probe failed: the
+          // previous status is restored, the next check retries.
+          self.edgePending = false
+          self.updateStatus = prevStatus
+          return
+        }
+        let offer = AppModel.pinUpdateMarker(pinMarker: marker, localMarker: self.bakedMarker, exists: true)
+        if let offer {
+          self.edgePending = true
+          self.updateStatus = "pinned build \(offer) — confirm to install"
+        } else {
+          // The pinned marker equals this build's marker — up to date;
+          // the marker is named so the operator sees WHICH build this is.
+          self.edgePending = false
+          self.updateStatus = "up to date (\(self.bakedMarker))"
+        }
+      }
+    }.resume()
+  }
+
+  /** Confirm control (branch channel): install the build the check
+   *  offered. TIP mode (no pin): re-fetch the tip at confirm time
+   *  (the check may be stale — a newer push since the check would have
+   *  a different marker). PIN mode: the pinned marker is FINAL (a pin
+   *  cannot move) — the offered marker is re-derived and installed
+   *  directly, no re-fetch (re-probing could only return the same
+   *  verdict; the install's own download 404s fail closed). Then,
+   *  either mode: download the DESKTOP zip + sidecar for it, verify
+   *  sha256 BEFORE any swap (a mismatch or missing sidecar refuses —
+   *  the current bundle is kept and the status line says so), then swap
+   *  the installed bundle in the `desktop/update.sh` sequence (unzip →
+   *  quit the running app cleanly → replace → relaunch), driven from a
    *  DETACHED helper: the app is the GUI and must not kill its own
    *  process tree from inside itself. The status line narrates each
    *  phase the way `updateStatus` does today. */
@@ -466,6 +596,14 @@ final class AppModel: ObservableObject {
     updateStatus = "downloading the new build…"
     updateChecking = true
     let base = AppModel.updateBase()
+    // PIN mode: the pinned marker is final (no re-fetch — a pin cannot
+    // move; the check's verdict stands). TIP mode: re-fetch the tip
+    // (it may have moved since the check).
+    let pin = updatePin.trimmingCharacters(in: .whitespacesAndNewlines)
+    if AppModel.isPinSha(pin) {
+      installEdge(marker: AppModel.pinnedMarker(branch: branch, pin: pin))
+      return
+    }
     let branchEnc = branch.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? branch
     guard let url = URL(string: "\(base)/api/v1/repos/sam/idlefill/git/refs/heads/\(branchEnc)") else {
       updateChecking = false
@@ -708,22 +846,41 @@ final class AppModel: ObservableObject {
     if let o = AppModel.readAppConfig(), let b = o["update_branch"] as? String, !b.isEmpty {
       updateBranch = b
     }
+    // The DEVELOPMENT PIN (the branch channel's pinning extension) — same
+    // read discipline as the branch: empty/absent = absent, a malformed
+    // value (not 7–40 hex) is dropped: a hand-typed garbage pin must
+    // never become a marker tail that 404s forever (the check falls back
+    // to tip-following).
+    if let o = AppModel.readAppConfig(), let p = o["update_pin"] as? String, !p.isEmpty {
+      if AppModel.isPinSha(p.trimmingCharacters(in: .whitespacesAndNewlines)) {
+        updatePin = p.trimmingCharacters(in: .whitespacesAndNewlines)
+      }
+    }
   }
 
-  /** Persist the update channel + branch (issue #26). The EXACT
-   *  save/preserve pattern of saveRepoPath: read-modify-write, pretty
-   *  JSON, every other key (repo_path included) preserved. Switching away
-   *  from the branch channel clears any pending edge offer — a stale
-   *  "update available" for a channel the operator just left would
-   *  install from the wrong place. */
+  /** Persist the update channel + branch + pin (the branch channel's
+   *  pinning extension). The EXACT save/preserve pattern of
+   *  saveRepoPath: read-modify-write, pretty JSON, every other key
+   *  (repo_path included) preserved. An empty/malformed pin field
+   *  CLEARS the pin (the branch channel's tip-following behavior
+   *  resumes); switching away from the branch channel clears any
+   *  pending edge offer — a stale "update available" for a channel the
+   *  operator just left would install from the wrong place. */
   func saveUpdateChannel() {
     let branch = updateBranch.trimmingCharacters(in: .whitespacesAndNewlines)
+    let pin = updatePin.trimmingCharacters(in: .whitespacesAndNewlines)
     var o = AppModel.readAppConfig() ?? [:]
     o["update_channel"] = updateChannel
     o["update_branch"] = branch
+    if AppModel.isPinSha(pin) {
+      o["update_pin"] = pin
+    } else {
+      o["update_pin"] = NSNull()
+    }
     let data = (try? JSONSerialization.data(withJSONObject: o, options: [.prettyPrinted, .sortedKeys])) ?? Data()
     try? data.write(to: URL(fileURLWithPath: AppModel.appConfigPath()))
     updateBranch = branch.isEmpty ? "main" : branch
+    updatePin = AppModel.isPinSha(pin) ? pin : ""
     edgePending = false
   }
 
@@ -1742,6 +1899,20 @@ struct SettingsPanel: View {
               .clipShape(RoundedRectangle(cornerRadius: 4))
               .padding(4)
               .frame(maxWidth: 200)
+            // The DEVELOPMENT PIN (the branch channel's pinning extension)
+            // — exception-only, beside the branch field: a commit SHA
+            // (7–40 hex) pins the check to that commit's edge build
+            // instead of the branch's tip. Empty = follow the tip;
+            // malformed = cleared on save (tip-following resumes).
+            Text("pin").font(.system(.body, design: .monospaced)).foregroundStyle(Pal.dim)
+            TextField("", text: $m.updatePin, prompt: Text("commit sha").foregroundStyle(Pal.dim))
+              .font(.system(.body, design: .monospaced))
+              .textFieldStyle(.plain)
+              .foregroundStyle(Pal.text)
+              .background(Pal.canvas)
+              .clipShape(RoundedRectangle(cornerRadius: 4))
+              .padding(4)
+              .frame(maxWidth: 200)
           }
           Button("save") { m.saveUpdateChannel() }
             .font(.system(.body, design: .monospaced))
@@ -1797,7 +1968,8 @@ struct SettingsPanel: View {
   private func statusColor(_ s: String) -> Color {
     if s.hasPrefix("no update") && s.contains("—") { return Pal.err }
     if s.contains("NOT installed") || s.contains("not found")
-      || s.contains("mismatch") || s.contains("failed") { return Pal.err }
+      || s.contains("not published") || s.contains("mismatch")
+      || s.contains("failed") { return Pal.err }
     return Pal.dim
   }
 }

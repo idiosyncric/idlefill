@@ -220,6 +220,20 @@ Restart · Update code · Quit.
   (`edge-<branch>-<sha7>`) against the baked marker — an update is
   available whenever the two differ (no ordering on branch builds: a
   newer push is a different marker, and the difference IS the update).
+  **Development pin (opt-in within the branch channel):** set `update_pin`
+  to a commit SHA (7–40 hex chars — a full 40-hex sha pins the same build
+  as its own prefix) in `client/config.json`: the check then targets
+  `edge-<branch>-<sha7(pin)>` — the PINNED commit's edge build — instead
+  of the branch's tip. Its availability is the pinned edge release's
+  EXISTENCE (`GET …/api/v1/repos/sam/idlefill/releases/tags/<marker>`,
+  anonymous — the per-commit tag `edge.yml` pushes on every branch push,
+  or `scripts/edge-release.sh <marker> <sha>` on demand for an
+  unpublished commit): pinned marker == the baked marker → up to date;
+  a different pinned marker that exists → the `Install Update
+  <marker>` row (the same sha256-verified install as the tip's offer);
+  a pinned marker with no published release → the check says nothing
+  (fail quiet — publish the build, the next tick offers). Malformed or
+  empty `update_pin` = absent: tip-following resumes.
   A tip for a branch that does not exist (a typo'd name) says so in the
   note; the row then reads `Install Update edge-<branch>-<sha7>` and the
   install downloads the marker-named `IdlefillMenubar-<marker>.app.zip`
@@ -514,6 +528,28 @@ does not exist — a typo'd name) is distinct from the offline silence: the
 status line says `branch <name> not found`. Offline-tolerant throughout:
 a dead network or an unparseable body sets nothing new (the previous
 status is restored) and the next check retries.
+
+**The development pin (pin the branch channel to a commit).** While
+`branch` is selected, the Settings row also carries a **pin** field: a
+commit SHA (7–40 hex chars; a full 40-hex sha pins the same build as its
+own 7-char prefix), persisted alongside the branch in the app config
+(empty/malformed = absent, cleared on save — the read drops a malformed
+value rather than trusting it). With a valid pin, **Check for
+Updates…** skips the refs fetch entirely — a pin cannot move, the marker
+`edge-<branch>-<sha7(pin)>` IS the identity — and probes the pinned edge
+release's existence instead (`GET …/api/v1/repos/sam/idlefill/
+releases/tags/<marker>`, anonymous): a genuine 2xx offers the pinned
+build (the status line says `pinned build <marker> — confirm to
+install`; the **install edge build** control installs it — no re-fetch at
+confirm time, the same sha256-verified download + swap), a genuine 404
+is operator-actionable — `pin <marker> not published — publish it:
+scripts/edge-release.sh <marker> <sha>` — and any other outcome (the
+network is down) restores the previous status. A pin equal to this
+build's own marker reports `up to date (<marker>)`. The menubar's
+equivalent is `update_pin` in `client/config.json` (the 6-hour
+automatic check takes the pin path and fails quiet on a missing/unpublished
+pin — no status line there to carry the publish hint; the desktop's
+Settings shows it).
 
 **Where the edge builds come from.** `edge.yml` publishes one per push to
 a tracked branch (see below): `scripts/edge-release.sh` builds BOTH
