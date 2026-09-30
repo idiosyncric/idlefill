@@ -4,13 +4,22 @@
  * The server speaks MCP JSON-RPC over stdio with no dependencies, so the
  * hermetic test drives the REAL process: spawn it with a scratch client dir
  * (IDLEFILL_CLIENT_DIR) holding real ground-truth files (queue.jsonl,
- * results.jsonl, a dead arbiter url) and a real client config, then walk a
- * full JSON-RPC session over its stdin/stdout. No network, no real arbiter.
+ * results.jsonl, quarantine.jsonl, a dead arbiter url) and a real client
+ * config, then walk a full JSON-RPC session over its stdin/stdout. No
+ * network, no real arbiter. Two sessions against the SAME ground truth:
+ * session 1 exercises add/status/results/lookup-in-queue (and ends with the
+ * queue still holding what the add wrote, so the FILE state is assertable);
+ * session 2 exercises the mutations (remove/clear) + the lookup facts and
+ * ends with the queue emptied.
  *
  * Covers: initialize, tools/list, add_jobs (dry_run preview + real write,
  * dedupe by job_id, skip done/quarantined/in-queue, in-batch dup, bad url,
  * unknown project), queue_status (file view + best-effort arbiter error),
- * results (newest first), unknown tool → JSON-RPC error.
+ * results (newest first; company/title echo — rows WITH and WITHOUT the
+ * keys), remove_jobs (present + absent job ids, dry_run no-write, missing
+ * job_ids error), clear_queue (dry_run + real), job_lookup (in-queue with
+ * position + payload, done, quarantined, never-seen; best-effort arbiter
+ * error), unknown tool → JSON-RPC error.
  */
 
 import { test } from 'node:test';
@@ -86,7 +95,16 @@ async function driveServer(clientDir, requests) {
   return { byId, call, stderr: stderrBuf.join('') };
 }
 
-test('idlefill-mcp: full stdio session — handshake, add_jobs (dry + real), status, results', async () => {
+/** The queue file's live lines (empty when missing or empty). */
+function queueLines(dataDir) {
+  try {
+    return readFileSync(join(dataDir, 'queue.jsonl'), 'utf-8').split('\n').filter((l) => l.trim());
+  } catch {
+    return [];
+  }
+}
+
+test('idlefill-mcp: stdio sessions — add/status/results(echo)/lookup + remove/clear/lookup facts', async () => {
   const scratch = mkdtempSync(join(tmpdir(), 'idlefill-mcp-test-'));
   const clientDir = join(scratch, 'client');
   const dataDir = join(scratch, 'data');
@@ -96,17 +114,41 @@ test('idlefill-mcp: full stdio session — handshake, add_jobs (dry + real), sta
   const EXISTING = { url: 'https://example.com/opening-1', company: 'Acme', title: 'Existing', score: 5 };
   const FRESH = { url: 'https://example.com/opening-2', company: 'Acme', title: 'New job', score: 9 };
   const ALREADY_DONE = { url: 'https://done.example/1', company: 'DoneX', title: 'Already evaluated' };
+  const OTHER = { url: 'https://other.example/1', company: 'OtherX', title: 'Legacy row' };
+  const RETRIED = { url: 'https://retry.example/1', company: 'RetryCo', title: 'Retried until ok' };
+  const QUARANTINED = { url: 'https://dead.example/1', company: 'DeadCo', title: 'Burned all attempts' };
+  const GHOST = 'ghost-12345678'; // never in queue/results/quarantine
 
-  // Ground truth: EXISTING sits in the queue; ALREADY_DONE has an ok:true
-  // results line (the queue builder's "never rebuild" rule the MCP honors).
+  // Ground truth:
+  //  - EXISTING sits in the queue (position 1)
+  //  - results.jsonl: ALREADY_DONE ok:true (the career-ops executor shape —
+  //    company/title present), OTHER without company/title (another
+  //    executor), RETRIED a failure then an ok:true (retry history),
+  //    QUARANTINED a stale failure
+  //  - quarantine.jsonl: QUARANTINED (burned all 3 attempts)
   writeFileSync(
     join(dataDir, 'queue.jsonl'),
     JSON.stringify({ job_id: jobId(EXISTING.company, EXISTING.url), payload: { ...EXISTING, source: 'builder' } }) + '\n',
     'utf-8',
   );
+  const resultsLines = [
+    // the real executor result shape (eval.mjs writeResult) as the client
+    // appends it: {...result, job_id, ts}
+    { job_id: jobId(ALREADY_DONE.company, ALREADY_DONE.url), ok: true, tokens_out: 1200, tokens_in: 300, score: 4.2, report_path: '/reports/done-1.md', url: ALREADY_DONE.url, company: 'DoneX', title: 'Already evaluated', ts: '2026-09-28T10:00:00.000Z' },
+    // another executor: no company/title at all
+    { job_id: jobId(OTHER.company, OTHER.url), ok: false, error: 'extract_failed', tokens_out: 200, ts: '2026-09-28T11:00:00.000Z' },
+    { job_id: jobId(RETRIED.company, RETRIED.url), ok: false, error: 'extract_failed', company: 'RetryCo', title: 'Retried until ok', tokens_out: 150, ts: '2026-09-28T12:00:00.000Z' },
+    { job_id: jobId(RETRIED.company, RETRIED.url), ok: true, tokens_out: 900, tokens_in: 250, score: 3.8, report_path: '/reports/retry.md', url: RETRIED.url, company: 'RetryCo', title: 'Retried until ok', ts: '2026-09-28T13:00:00.000Z' },
+    { job_id: jobId(QUARANTINED.company, QUARANTINED.url), ok: false, error: 'executor_exit_1', company: 'DeadCo', title: 'Burned all attempts', ts: '2026-09-27T09:00:00.000Z' },
+  ];
   writeFileSync(
     join(dataDir, 'results.jsonl'),
-    JSON.stringify({ job_id: jobId(ALREADY_DONE.company, ALREADY_DONE.url), ok: true, ts: new Date().toISOString() }) + '\n',
+    resultsLines.map((l) => JSON.stringify(l)).join('\n') + '\n',
+    'utf-8',
+  );
+  writeFileSync(
+    join(dataDir, 'quarantine.jsonl'),
+    JSON.stringify({ job_id: jobId(QUARANTINED.company, QUARANTINED.url), attempts: 3, error: 'executor_exit_1', ts: '2026-09-27T10:00:00.000Z' }) + '\n',
     'utf-8',
   );
   writeFileSync(
@@ -126,8 +168,14 @@ test('idlefill-mcp: full stdio session — handshake, add_jobs (dry + real), sta
     'utf-8',
   );
 
+  const id = (j) => jobId(j.company, j.url);
+
   try {
-    const { byId, call, stderr } = await driveServer(clientDir, [
+    // ---------------------------------------------------------------------
+    // Session 1: the read/add surface. Ends with the queue holding
+    // [EXISTING, FRESH] — the file state is readable afterwards.
+    // ---------------------------------------------------------------------
+    const s1 = await driveServer(clientDir, [
       { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '0' } } },
       { jsonrpc: '2.0', id: 2, method: 'tools/list' },
       // dry run: EXISTING (already queued), FRESH (would add), ALREADY_DONE
@@ -139,64 +187,204 @@ test('idlefill-mcp: full stdio session — handshake, add_jobs (dry + real), sta
       { jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'idlefill_add_jobs', arguments: { project: 'p1', jobs: [FRESH] } } },
       { jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'idlefill_queue_status', arguments: { project: 'p1', limit: 5 } } },
       { jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'idlefill_results', arguments: { project: 'p1', limit: 5 } } },
-      { jsonrpc: '2.0', id: 8, method: 'tools/call', params: { name: 'idlefill_add_jobs', arguments: { jobs: [{ company: 'Bad', url: 'not-a-url' }] } } },
-      { jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'idlefill_add_jobs', arguments: { project: 'nope', jobs: [FRESH] } } },
-      { jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'unknown-tool', arguments: {} } },
+      // job_lookup BEFORE the queue mutation (in-queue positions)
+      { jsonrpc: '2.0', id: 8, method: 'tools/call', params: { name: 'idlefill_job_lookup', arguments: { project: 'p1', job_id: id(FRESH) } } },
+      { jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'idlefill_job_lookup', arguments: { project: 'p1', job_id: id(EXISTING) } } },
     ]);
+    const { byId } = s1;
+    const call = s1.call;
 
     assert.equal(byId[1]?.result?.serverInfo?.name, 'idlefill', 'initialize → serverInfo');
     const tools = byId[2]?.result?.tools?.map((x) => x.name) || [];
-    assert.deepEqual(tools, ['idlefill_add_jobs', 'idlefill_queue_status', 'idlefill_results'], 'tools/list');
+    assert.deepEqual(
+      tools,
+      ['idlefill_add_jobs', 'idlefill_queue_status', 'idlefill_results', 'idlefill_remove_jobs', 'idlefill_clear_queue', 'idlefill_job_lookup'],
+      'tools/list: all six tools',
+    );
 
+    // --- add_jobs ---
     const dry = call(3);
     assert.equal(dry.p?.ok, true, 'dry_run ok');
-    assert.deepEqual(dry.p?.added, [jobId(FRESH.company, FRESH.url)], 'dry_run: only FRESH would be added');
+    assert.deepEqual(dry.p?.added, [id(FRESH)], 'dry_run: only FRESH would be added');
     assert.equal(dry.p?.skipped_duplicate, 1, 'dry_run: the in-batch dup is the only duplicate');
-    assert.deepEqual(dry.p?.skipped_in_queue, [jobId(EXISTING.company, EXISTING.url)], 'dry_run: the already-queued job is named');
-    assert.deepEqual(dry.p?.skipped_done, [jobId(ALREADY_DONE.company, ALREADY_DONE.url)], 'dry_run: done job skipped');
+    assert.deepEqual(dry.p?.skipped_in_queue, [id(EXISTING)], 'dry_run: the already-queued job is named');
+    assert.deepEqual(dry.p?.skipped_done, [id(ALREADY_DONE)], 'dry_run: done job skipped');
     assert.equal(dry.p?.queue_length, 2, 'dry_run: queue_length preview = existing + fresh');
     assert.equal(dry.p?.dry_run, true, 'dry_run flagged');
     // "dry_run did not write" is proven by the REAL call below: if the dry
     // run had touched the file, FRESH would already be in the queue and the
     // real add would report added=[] (it is checked below to report FRESH).
-    // The file state is only read after the whole session, never mid-flight.
 
     const real = call(4);
     assert.equal(real.p?.ok, true, 'add ok');
-    assert.deepEqual(real.p?.added, [jobId(FRESH.company, FRESH.url)], 'add: exactly FRESH landed');
-    const qAfter = readFileSync(join(dataDir, 'queue.jsonl'), 'utf-8').trim().split('\n').map((l) => JSON.parse(l));
-    assert.equal(qAfter.length, 2, 'queue file now holds both jobs');
-    assert.equal(qAfter[1]?.payload?.source, 'mcp', 'the new line carries source: mcp');
-    assert.equal(qAfter[0]?.job_id, jobId(EXISTING.company, EXISTING.url), 'existing line untouched, order preserved');
+    assert.deepEqual(real.p?.added, [id(FRESH)], 'add: exactly FRESH landed');
+    assert.equal(real.p?.queue_length, 2, 'add: queue depth reported');
 
     const readd = call(5);
     assert.equal(readd.p?.ok, true, 're-add ok');
     assert.deepEqual(readd.p?.added, [], 're-add: nothing new');
-    assert.deepEqual(readd.p?.skipped_in_queue, [jobId(FRESH.company, FRESH.url)], 're-add: the job is now "already in queue"');
+    assert.deepEqual(readd.p?.skipped_in_queue, [id(FRESH)], 're-add: the job is now "already in queue"');
     assert.equal(readd.p?.skipped_duplicate, 0, 're-add: no in-batch dups');
-    assert.equal(readFileSync(join(dataDir, 'queue.jsonl'), 'utf-8').trim().split('\n').length, 2, 'queue still 2 lines');
 
+    // The FILE state after the add (session 1 ended before any mutation):
+    // exactly two lines, the pre-existing line untouched and in order, the
+    // new line carrying source: mcp.
+    const qAfter = queueLines(dataDir).map((l) => JSON.parse(l));
+    assert.equal(qAfter.length, 2, 'queue file now holds both jobs');
+    assert.equal(qAfter[0]?.job_id, id(EXISTING), 'existing line untouched, order preserved');
+    assert.equal(qAfter[1]?.job_id, id(FRESH), 'the added line is second (appended)');
+    assert.equal(qAfter[1]?.payload?.source, 'mcp', 'the new line carries source: mcp');
+
+    // --- queue_status (file view + best-effort arbiter error) ---
     const st = call(6);
     assert.equal(st.p?.ok, true, 'queue_status ok');
     assert.equal(st.p?.projects?.p1?.queue_length, 2, 'queue_status: file depth');
     assert.equal(st.p?.projects?.p1?.jobs?.length, 2, 'queue_status: both jobs shown');
+    assert.equal(st.p?.projects?.p1?.jobs?.[0]?.job_id, id(EXISTING), 'queue_status: file order (preview = priority order)');
+    assert.equal(st.p?.projects?.p1?.jobs?.[1]?.job_id, id(FRESH), 'queue_status: appended job is second');
     assert.equal(typeof st.p?.arbiter?.error, 'string', 'queue_status: arbiter read is a best-effort error (dead url)');
 
+    // --- results: newest first + company/title echo (present + absent) ---
     const res = call(7);
     assert.equal(res.p?.ok, true, 'results ok');
-    assert.equal(res.p?.count, 1, 'results: one line');
-    assert.equal(res.p?.results?.[0]?.ok, true, 'results: ok flag carried');
-    assert.equal(res.p?.results?.[0]?.job_id, jobId(ALREADY_DONE.company, ALREADY_DONE.url), 'results: identity');
+    assert.equal(res.p?.count, 5, 'results: five lines, all shown');
+    assert.equal(res.p?.results?.[0]?.job_id, id(QUARANTINED), 'results: newest first');
+    const doneRow = res.p?.results?.find((r) => r.job_id === id(ALREADY_DONE));
+    assert.equal(doneRow?.ok, true, 'results: ok flag carried');
+    assert.equal(doneRow?.company, 'DoneX', 'results: company echoed (executor row)');
+    assert.equal(doneRow?.title, 'Already evaluated', 'results: title echoed (executor row)');
+    assert.equal(doneRow?.score, 4.2, 'results: score carried');
+    assert.equal(doneRow?.report_path, '/reports/done-1.md', 'results: report_path carried');
+    const otherRow = res.p?.results?.find((r) => r.job_id === id(OTHER));
+    assert.equal(otherRow?.company, null, 'results: company null when the row lacks it');
+    assert.equal(otherRow?.title, null, 'results: title null when the row lacks it');
+    assert.equal(otherRow?.error, 'extract_failed', 'results: error carried on the failure row');
 
-    const badUrl = call(8);
+    // --- job_lookup: in-queue (positions) ---
+    const lkFresh = call(8);
+    assert.equal(lkFresh.p?.ok, true, 'lookup ok');
+    assert.equal(lkFresh.p?.found, true, 'lookup: FRESH found');
+    assert.equal(lkFresh.p?.in_queue, true, 'lookup: FRESH in queue');
+    assert.equal(lkFresh.p?.position, 2, 'lookup: 1-based position (after EXISTING)');
+    assert.equal(lkFresh.p?.queue_length, 2, 'lookup: queue length at call time');
+    assert.equal(lkFresh.p?.payload?.url, FRESH.url, 'lookup: payload url');
+    assert.equal(lkFresh.p?.payload?.company, 'Acme', 'lookup: payload company');
+    assert.equal(lkFresh.p?.payload?.title, 'New job', 'lookup: payload title');
+    assert.equal(lkFresh.p?.payload?.score, 9, 'lookup: payload score');
+    assert.equal(lkFresh.p?.payload?.attempts, 0, 'lookup: attempts defaults to 0');
+    assert.equal(lkFresh.p?.done, false, 'lookup: not done');
+    assert.equal(lkFresh.p?.quarantined, false, 'lookup: not quarantined');
+    assert.equal(typeof lkFresh.p?.arbiter?.error, 'string', 'lookup: arbiter best-effort error (dead url)');
+    const lkExisting = call(9);
+    assert.equal(lkExisting.p?.in_queue, true, 'lookup: EXISTING in queue');
+    assert.equal(lkExisting.p?.position, 1, 'lookup: EXISTING is first');
+    if (s1.stderr.trim()) console.log(`session 1 stderr:\n${s1.stderr.trim()}`);
+
+    // ---------------------------------------------------------------------
+    // Session 2: the mutations + the lookup facts. Ends with the queue
+    // empty (clear_queue), so the post-session file read asserts emptiness.
+    // The post-remove file state (1 line, EXISTING) is asserted via the
+    // server's OWN live queue_status read (id 15) — no test-side mid-flight
+    // file reads.
+    // ---------------------------------------------------------------------
+    const s2 = await driveServer(clientDir, [
+      { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '0' } } },
+      // --- remove_jobs ---
+      { jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'idlefill_remove_jobs', arguments: { project: 'p1', dry_run: true, job_ids: [id(FRESH), GHOST] } } },
+      { jsonrpc: '2.0', id: 11, method: 'tools/call', params: { name: 'idlefill_remove_jobs', arguments: { project: 'p1', job_ids: [id(FRESH), GHOST] } } },
+      { jsonrpc: '2.0', id: 12, method: 'tools/call', params: { name: 'idlefill_remove_jobs', arguments: { project: 'p1' } } },
+      // the server's live read of the post-remove file state
+      { jsonrpc: '2.0', id: 15, method: 'tools/call', params: { name: 'idlefill_queue_status', arguments: { project: 'p1', limit: 5 } } },
+      // --- clear_queue ---
+      { jsonrpc: '2.0', id: 13, method: 'tools/call', params: { name: 'idlefill_clear_queue', arguments: { project: 'p1', dry_run: true } } },
+      { jsonrpc: '2.0', id: 14, method: 'tools/call', params: { name: 'idlefill_clear_queue', arguments: { project: 'p1' } } },
+      // --- job_lookup against the ground-truth files (queue now empty) ---
+      { jsonrpc: '2.0', id: 16, method: 'tools/call', params: { name: 'idlefill_job_lookup', arguments: { project: 'p1', job_id: id(ALREADY_DONE) } } },
+      { jsonrpc: '2.0', id: 17, method: 'tools/call', params: { name: 'idlefill_job_lookup', arguments: { project: 'p1', job_id: id(QUARANTINED) } } },
+      { jsonrpc: '2.0', id: 18, method: 'tools/call', params: { name: 'idlefill_job_lookup', arguments: { project: 'p1', job_id: GHOST } } },
+      // --- pre-existing error surfaces ---
+      { jsonrpc: '2.0', id: 19, method: 'tools/call', params: { name: 'idlefill_add_jobs', arguments: { jobs: [{ company: 'Bad', url: 'not-a-url' }] } } },
+      { jsonrpc: '2.0', id: 20, method: 'tools/call', params: { name: 'idlefill_add_jobs', arguments: { project: 'nope', jobs: [FRESH] } } },
+      { jsonrpc: '2.0', id: 21, method: 'tools/call', params: { name: 'unknown-tool', arguments: {} } },
+    ]);
+    const c2 = s2.call;
+
+    // --- remove_jobs ---
+    const rmDry = c2(10);
+    assert.equal(rmDry.p?.ok, true, 'remove dry_run ok');
+    assert.equal(rmDry.p?.dry_run, true, 'remove dry_run flagged');
+    assert.deepEqual(rmDry.p?.removed, [id(FRESH)], 'remove dry_run: the present id is named');
+    assert.deepEqual(rmDry.p?.not_found, [GHOST], 'remove dry_run: the unknown id is named, not an error');
+    assert.equal(rmDry.p?.queue_length, 1, 'remove dry_run: post-removal preview depth');
+
+    const rmReal = c2(11);
+    // If the dry run above had written, this would report removed=[]:
+    // reporting FRESH proves the dry run touched nothing.
+    assert.equal(rmReal.p?.ok, true, 'remove ok (dry run did not write)');
+    assert.deepEqual(rmReal.p?.removed, [id(FRESH)], 'remove: the present id was dropped');
+    assert.deepEqual(rmReal.p?.not_found, [GHOST], 'remove: unknown id reported');
+    assert.equal(rmReal.p?.queue_length, 1, 'remove: queue now 1 deep');
+
+    const rmMissing = c2(12);
+    assert.equal(rmMissing.p?.ok, false, 'remove without job_ids is an error');
+    assert.match(rmMissing.p?.error ?? '', /job_ids/, 'remove: names the missing argument');
+
+    // the post-remove file state, read LIVE by the server:
+    const stRm = c2(15);
+    assert.equal(stRm.p?.projects?.p1?.queue_length, 1, 'post-remove: live file depth is 1');
+    assert.equal(stRm.p?.projects?.p1?.jobs?.[0]?.job_id, id(EXISTING), 'post-remove: the surviving line is EXISTING (order/fields intact)');
+
+    // --- clear_queue ---
+    const clDry = c2(13);
+    assert.equal(clDry.p?.ok, true, 'clear dry_run ok');
+    assert.equal(clDry.p?.dry_run, true, 'clear dry_run flagged');
+    assert.equal(clDry.p?.cleared, 1, 'clear dry_run: would clear the 1 remaining job');
+
+    const clReal = c2(14);
+    // If the dry run had emptied the file, this would report cleared=0.
+    assert.equal(clReal.p?.ok, true, 'clear ok (dry run did not write)');
+    assert.equal(clReal.p?.cleared, 1, 'clear: the job that was there is counted');
+    assert.equal(clReal.p?.queue_length, 0, 'clear: queue is empty');
+    assert.equal(queueLines(dataDir).length, 0, 'clear: the file is empty on disk');
+
+    // --- job_lookup against the ground-truth files (queue now empty) ---
+    const lkDone = c2(16);
+    assert.equal(lkDone.p?.found, true, 'lookup done: found via results history');
+    assert.equal(lkDone.p?.in_queue, false, 'lookup done: not in the (now empty) queue');
+    assert.equal(lkDone.p?.position, null, 'lookup done: no position');
+    assert.equal(lkDone.p?.done, true, 'lookup done: last results line ok:true');
+    assert.equal(lkDone.p?.quarantined, false, 'lookup done: not quarantined');
+    assert.equal(lkDone.p?.results?.length, 1, 'lookup done: one history line');
+    assert.equal(lkDone.p?.results?.[0]?.company, 'DoneX', 'lookup done: history echoes company');
+    assert.match(lkDone.p?.hint ?? '', /done/, 'lookup done: hint explains the state');
+
+    const lkQuar = c2(17);
+    assert.equal(lkQuar.p?.found, true, 'lookup quarantined: found');
+    assert.equal(lkQuar.p?.quarantined, true, 'lookup quarantined: quarantine.jsonl fact');
+    assert.equal(lkQuar.p?.done, false, 'lookup quarantined: its last line is a failure, not done');
+    assert.equal(lkQuar.p?.in_queue, false, 'lookup quarantined: not in the queue');
+    assert.equal(lkQuar.p?.results?.length, 1, 'lookup quarantined: the stale failure line is its history');
+    assert.equal(lkQuar.p?.results?.[0]?.ok, false, 'lookup quarantined: history ok flag');
+    assert.match(lkQuar.p?.hint ?? '', /quarantined/, 'lookup quarantined: hint explains the state');
+
+    const lkGhost = c2(18);
+    assert.equal(lkGhost.p?.ok, true, 'lookup never-seen: ok:true (not an error)');
+    assert.equal(lkGhost.p?.found, false, 'lookup never-seen: found false');
+    assert.equal(lkGhost.p?.in_queue, false, 'lookup never-seen: not in queue');
+    assert.equal(lkGhost.p?.done, false, 'lookup never-seen: no done fact');
+    assert.equal(lkGhost.p?.quarantined, false, 'lookup never-seen: no quarantine fact');
+    assert.match(lkGhost.p?.hint ?? '', /never seen/, 'lookup never-seen: the hint');
+
+    // --- pre-existing error surfaces ---
+    const badUrl = c2(19);
     assert.equal(badUrl.p?.ok, false, 'bad url rejected');
     assert.match(badUrl.p?.error ?? '', /valid http\(s\) url/, 'bad url error message');
-    const unknownProj = call(9);
+    const unknownProj = c2(20);
     assert.equal(unknownProj.p?.ok, false, 'unknown project rejected');
     assert.match(unknownProj.p?.error ?? '', /unknown project/, 'unknown project error message');
 
-    assert.equal(byId[10]?.error?.code, -32602, 'unknown tool → JSON-RPC -32602');
-    if (stderr.trim()) console.log(`server stderr:\n${stderr.trim()}`);
+    assert.equal(s2.byId[21]?.error?.code, -32602, 'unknown tool → JSON-RPC -32602');
+    if (s2.stderr.trim()) console.log(`session 2 stderr:\n${s2.stderr.trim()}`);
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
