@@ -118,8 +118,20 @@ render_plist() {
       print line
     }
   ' "$TEMPLATE" > "$PLIST"
-  # Byte-verify: no template path may survive.
-  if grep -q '/Users/sam/Software/idlefill' "$PLIST"; then
+  # Byte-verify: no template path may survive. The template hardcodes the
+  # MAIN checkout's repo root — when THIS checkout is that repo, the
+  # rendered paths ARE the template literal (the correct values), so the
+  # grep would false-fire; assert the rendered values instead. Any other
+  # checkout (a worktree) must not carry the template literal at all.
+  if [ "$REPO" = "/Users/sam/Software/idlefill" ]; then
+    EXPECTED_BIN="${PROG%% *}"
+    [ -n "$PROG" ] || EXPECTED_BIN="$DEFAULT_BIN"
+    ACTUAL_BIN="$(plutil -extract ProgramArguments.0 raw "$PLIST" 2>/dev/null || true)"
+    if [ "$ACTUAL_BIN" != "$EXPECTED_BIN" ]; then
+      echo "error: rendered plist executable is $ACTUAL_BIN (expected $EXPECTED_BIN)" >&2
+      exit 1
+    fi
+  elif grep -q '/Users/sam/Software/idlefill' "$PLIST"; then
     echo "error: template path survived rendering in $PLIST" >&2
     exit 1
   fi
