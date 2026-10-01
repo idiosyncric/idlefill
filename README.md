@@ -216,11 +216,18 @@ indicator) · Install Update <v> (exception-only).
 - **Install:** `menubar/install.sh` scripts `launchctl bootstrap` for the
   LaunchAgent (`com.sam.idlefill.menubar`) — idempotent: an already-loaded
   label is a clean no-op (no re-bootstrap, no writes), `--reinstall` takes
-  the bootout+bootstrap cycle, `--uninstall` is bootout only. It renders
+  the render + bootout + bootstrap cycle, `--uninstall` is bootout only. It renders
   the live plist from the committed template
   (`menubar/IdlefillMenubar.plist`) with this checkout's repo root in
   every path and creates the log dir. The menu bar survives
-  logout/login (the agent is `RunAtLoad` + `KeepAlive`). It touches only
+  logout/login (the agent is `RunAtLoad` + `KeepAlive`). **`--reinstall` renders FIRST
+  (fail closed, issue #23):** the render + byte-verify happen BEFORE the
+  bootout, and the render lands via a temp file that only replaces the
+  live plist once verified — a render refusal (bad template, missing
+  template) exits with the previously-loaded agent still running. The
+  already-loaded no-op also *reports* drift: when the live agent runs a
+  different binary than this checkout's built bundle, the note says so
+  and points at `--reinstall`. It touches only
   the menubar label, never the daemon's.
 - **Update check:** on launch and every `update_check_minutes` (see the
   config note below; default 360 = 6h) the app checks its update
@@ -262,8 +269,14 @@ indicator) · Install Update <v> (exception-only).
   release asset **and its `.sha256` sidecar**. Either way the install
   verifies the hash before touching anything (a mismatch or missing
   sidecar refuses and keeps the current bundle), swaps
-  `menubar/IdlefillMenubar.app` in place, and `launchctl kickstart -k`s
-  the agent when it is loaded. OFFLINE-TOLERANT: with the network down
+  `menubar/IdlefillMenubar.app` in place, and then takes the loaded
+  LaunchAgent over (issue #23 — the same machinery as Update Code):
+  already on the bundle → `launchctl kickstart -k`; stale inside this
+  repo → render + bootout + bootstrap re-point; outside this repo →
+  never touched. The note reports the outcome (`relaunched` / `agent
+  not loaded: run menubar/install.sh` / `agent NOT re-pointed: …`), and
+  a successful take-over is VERIFIED via `launchctl print` before the
+  note claims it. OFFLINE-TOLERANT: with the network down
   the check says nothing and fails quiet — no dialog, no error row; the
   next cadence tick retries. The edge builds it can install are
   published per push to a tracked branch by `edge.yml` (below); the pure
@@ -294,12 +307,22 @@ indicator) · Install Update <v> (exception-only).
   as Stop), so it never runs against a mid-merge tree or a torn-down
   `node_modules`; `npm ci` runs **only** when `package-lock.json` differs
   between the two revisions (`git diff --quiet old new --
-  package-lock.json`), never while the daemon runs. Then the menu bar
-  bundle is rebuilt (`menubar/build.sh`), and if the launchd label is
-  loaded **and** runs this process's own binary (exact path compare — a
-  stale label pointing elsewhere is a note, never a kill),
-  `launchctl kickstart -k` relaunches the agent on the new code and the
-  note before the kick says `restarting menu bar with new code`. Each
+  `package-lock.json`), never while the daemon runs. Then the menu bar
+  bundle is rebuilt (`menubar/build.sh`), and the loaded LaunchAgent is
+  **taken over** (issue #23 — a stale agent is a repair STEP, never just
+  a note): if the label is loaded and its `ProgramArguments.0` equals
+  this checkout's built bundle executable, `launchctl kickstart -k`
+  relaunches it on the new code; if the label is loaded but runs a
+  DIFFERENT path **inside this repo** (a stale pre-bundle-era path), the
+  agent is RE-POINTED — the committed plist template is rendered (to a
+  temp file, byte-verified, before any bootout) and the label goes
+  through bootout + bootstrap onto the rebuilt bundle. A label whose
+  executable lives OUTSIDE this repo belongs to another checkout and is
+  never killed or re-pointed (the note then says the menu bar was
+  rebuilt; relaunch it). After a kick or a re-point the app VERIFIES
+  `launchctl print` shows the bundle executable — a mismatch is surfaced
+  as a failure, not a success. The note before the take-over says
+  `restarting menu bar with new code`. Each
   completed update appends one line to `logs/idlefill-menubar.log`
   (`<oldsha> → <newsha> <ISO ts> daemon-pid=<pid|none>
   lock-changed=<yes|no>`, rotated at 1 MiB keeping the last 512 KiB —
@@ -448,12 +471,27 @@ ground truth.
   daemon plist points the repo's `node_modules/.bin/tsx` at
   `client/src/index.ts` (working dir `client/`, `KeepAlive SuccessfulExit=false`,
   `ThrottleInterval 30`, a real `PATH`); the menu-bar plist points at
-  `<repo>/menubar/IdlefillMenubar` (building it first via
-  `menubar/build.sh` if the binary is missing). **The plist carries no
+  `<repo>/menubar/IdlefillMenubar.app/Contents/MacOS/IdlefillMenubar`
+  (building the bundle first via `menubar/build.sh` if it is missing).
+  **The plist carries no
   token** — the daemon reads `client/config.json` itself at startup. The
   toggles reflect **real launchctl state** (`launchctl print gui/<uid>/<label>`
   exit 0 = loaded), re-checked every 5s, so a failed bootstrap shows an
   error note and leaves the toggle OFF rather than a stale "on".
+- **Settings drift marker (issue #23).** Each toggle row also shows what
+  its agent ACTUALLY runs — the `ProgramArguments.0` of the LOADED
+  `launchctl print` view (not the on-disk plist, which may not be what
+  launchd loaded). The menu-bar row carries an exception-only **stale**
+  marker when that path differs from this checkout's built bundle
+  executable (`menubar/IdlefillMenubar.app/Contents/MacOS/IdlefillMenubar`):
+  a stale agent becomes visible instead of masquerading as healthy. No
+  mark when healthy (the Exception-Only rule). The marker clears on the
+  next 5s poll after any successful re-point — Update Code, Install
+  Update, or `menubar/install.sh --reinstall` all re-point the agent at
+  the built bundle. Headless coverage: the `desktop/edge-test.sh`
+  `--drift` run (scratch labels via the `IDLEFILL_DESKTOP_TEST` hook —
+  marker ON on drift, agent path shown, marker CLEARS after a
+  bootout+bootstrap re-point).
 - **Repo path resolution:** defaults to `~/Software/idlefill`, overridable
   by the `IDLEFILL_REPO_PATH` env var or the Settings field (persisted to
   `~/Library/Application Support/Idlefill/config.json`). All plist paths,
