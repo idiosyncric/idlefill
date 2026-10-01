@@ -20,8 +20,9 @@
 #   e. otherwise: render (b) + create the log dir (c), then
 #      launchctl bootstrap gui/<uid> <plist>
 #
-# --reinstall = bootout (SINGLE COMBINED target gui/<uid>/<label>; rc 3
-# "No such process" is a clean no-op) then render + bootstrap.
+# --reinstall = render FIRST (fail closed — a render refusal never leaves
+# the loaded agent unloaded), then bootout (SINGLE COMBINED target
+# gui/<uid>/<label>; rc 3 "No such process" is a clean no-op) + bootstrap.
 # --uninstall = bootout only.
 #
 # Guardrail: this script touches ONLY the menubar label — never the
@@ -83,7 +84,11 @@ render_plist() {
   #   2. the log prefix       → the configured log dir
   #   3. the Label value      → the configured label
   #   4. the executable       → the configured program (default: the bundle)
+  # RENDER TO A TEMP FILE and move it into place only after the byte-
+  # verify passes: a refused render must not even corrupt the on-disk
+  # plist of a loaded agent (issue #23 — fail closed at every level).
   mkdir -p "$PLISTDIR" "$LOGDIR"
+  local TMPPLIST="$PLIST.render.tmp"
   awk -v repo="$REPO" -v label="$LABEL" -v logdir="$LOGDIR" -v prog="$PROG" '
     function replacestr(s, old, new,  idx, r) {
       if (old == "" || old == s) return new
@@ -117,7 +122,7 @@ render_plist() {
       if (label != "") line = replacestr(line, tlabel, "<string>" label "</string>")
       print line
     }
-  ' "$TEMPLATE" > "$PLIST"
+  ' "$TEMPLATE" > "$TMPPLIST"
   # Byte-verify: no template path may survive. The template hardcodes the
   # MAIN checkout's repo root — when THIS checkout is that repo, the
   # rendered paths ARE the template literal (the correct values), so the
@@ -126,21 +131,26 @@ render_plist() {
   if [ "$REPO" = "/Users/sam/Software/idlefill" ]; then
     EXPECTED_BIN="${PROG%% *}"
     [ -n "$PROG" ] || EXPECTED_BIN="$DEFAULT_BIN"
-    ACTUAL_BIN="$(plutil -extract ProgramArguments.0 raw "$PLIST" 2>/dev/null || true)"
+    ACTUAL_BIN="$(plutil -extract ProgramArguments.0 raw "$TMPPLIST" 2>/dev/null || true)"
     if [ "$ACTUAL_BIN" != "$EXPECTED_BIN" ]; then
+      rm -f "$TMPPLIST"
       echo "error: rendered plist executable is $ACTUAL_BIN (expected $EXPECTED_BIN)" >&2
       exit 1
     fi
-  elif grep -q '/Users/sam/Software/idlefill' "$PLIST"; then
+  elif grep -q '/Users/sam/Software/idlefill' "$TMPPLIST"; then
+    rm -f "$TMPPLIST"
     echo "error: template path survived rendering in $PLIST" >&2
     exit 1
   fi
   # And the Label must equal the label this script will bootstrap.
-  plutil -extract Label raw "$PLIST" | grep -qx "$LABEL" || {
+  plutil -extract Label raw "$TMPPLIST" | grep -qx "$LABEL" || {
+    rm -f "$TMPPLIST"
     echo "error: rendered plist Label is not $LABEL" >&2
     exit 1
   }
-  chmod 644 "$PLIST"
+  chmod 644 "$TMPPLIST"
+  # Verified — only NOW does the rendered plist replace the live one.
+  mv "$TMPPLIST" "$PLIST"
 }
 
 if [ "$MODE" = "uninstall" ]; then
@@ -156,9 +166,13 @@ fi
 if is_loaded; then
   LIVE_BIN="$(plutil -extract ProgramArguments.0 raw "$PLIST" 2>/dev/null || true)"
   if [ "$MODE" = "reinstall" ]; then
-    echo "==> gui/$UID_NUM/$LABEL is loaded — --reinstall: bootout + bootstrap"
-    bootout
+    echo "==> gui/$UID_NUM/$LABEL is loaded — --reinstall: render + bootout + bootstrap"
+    # RENDER BEFORE BOOTOUT (issue #23 — fail closed): the old order was
+    # bootout → render → bootstrap, so a render refusal (byte-verify,
+    # missing template) left the previously-loaded agent DOWN. Rendering
+    # first means any refusal exits with the agent still loaded.
     render_plist
+    bootout
     launchctl bootstrap "gui/$UID_NUM" "$PLIST"
     echo "reinstalled: $PLIST → gui/$UID_NUM/$LABEL"
   else
