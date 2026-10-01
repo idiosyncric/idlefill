@@ -10,6 +10,43 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { discoverAdapters } from './adapters.js';
 
+/**
+ * Scheduled queue rebuild (issue #3): the daemon runs `command` (a black
+ * box — typically the project's own scan → refresh → queue-rebuild chain)
+ * on a minimum interval since the last run, checked on the poll tick.
+ * Run state persists next to the queue file (`<queue_file>.rebuild.json`),
+ * never in the project repo. `daily_at` is a known follow-up; this step is
+ * `every_minutes` only.
+ */
+export interface ScheduledRebuildConfig {
+  enabled: boolean;
+  /** Black-box command, run via bash -c with the project's cwd (15 min cap). */
+  command: string;
+  /** Minimum minutes between runs. Default 60 when enabled without it. */
+  every_minutes: number;
+}
+
+/** Default cadence when `enabled` is set without `every_minutes`. */
+export const REBUILD_DEFAULT_EVERY_MINUTES = 60;
+
+/**
+ * Parse one project's `scheduled_rebuild` key. Absent/disabled = undefined.
+ * `enabled: true` with a missing/blank command is a config error → treated
+ * as disabled (the daemon must never invent a command to run).
+ */
+export function parseScheduledRebuild(raw: unknown): ScheduledRebuildConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  if (r.enabled !== true) return undefined;
+  const command = typeof r.command === 'string' ? r.command.trim() : '';
+  if (!command) return undefined;
+  const every =
+    typeof r.every_minutes === 'number' && Number.isFinite(r.every_minutes) && r.every_minutes > 0
+      ? r.every_minutes
+      : REBUILD_DEFAULT_EVERY_MINUTES;
+  return { enabled: true, command, every_minutes: every };
+}
+
 export interface ClientProjectConfig {
   name: string;
   /** Path to the job queue file (JSONL, one job per line). */
@@ -52,6 +89,13 @@ export interface ClientProjectConfig {
    * ~90s extract + 15min eval + overhead.
    */
   timeout_seconds?: number;
+  /**
+   * Scheduled queue rebuild (issue #3): when set (and enabled), the daemon
+   * runs `command` on a minimum interval since the last run, checked on the
+   * poll tick. The command is a BLACK BOX — idlefill never parses its
+   * output or the files it touches; the only contract is the exit code.
+   */
+  scheduled_rebuild?: ScheduledRebuildConfig;
 }
 
 export interface ClientConfig {
@@ -174,6 +218,9 @@ export function loadClientConfig(
               typeof p.timeout_seconds === 'number' && Number.isFinite(p.timeout_seconds) && p.timeout_seconds > 0
                 ? p.timeout_seconds
                 : manifest?.timeout_seconds,
+            // Scheduled queue rebuild (issue #3): per-project config key;
+            // undefined = the loop never runs for this project.
+            ...(parseScheduledRebuild(p.scheduled_rebuild) ? { scheduled_rebuild: parseScheduledRebuild(p.scheduled_rebuild) } : {}),
           };
         })
       : [],

@@ -16,7 +16,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import fastify, { type FastifyInstance } from 'fastify';
 import { WebSocketServer } from 'ws';
 import { utcDay, type Arbiter, WATCHED_SERVER_ID } from './arbiter.js';
-import type { ProjectAllocation, QueuePreviewRow, ServerConfig, ServerConnection } from './types.js';
+import type { ProjectAllocation, QueuePreviewRow, RebuildRunState, ServerConfig, ServerConnection } from './types.js';
 
 export interface ApiDeps {
   arbiter: Arbiter;
@@ -62,7 +62,7 @@ function bearer(req: { headers: Record<string, unknown>; query: unknown }): stri
 function projectView(
   arbiter: Arbiter,
   cfg: ServerConfig,
-  clients: { name: string; last_seen: number; projects: { name: string; model: string; estimated_seconds: number; queue_depth: number; queue_preview?: QueuePreviewRow[]; stats?: Record<string, number | string> }[]; version?: string; protocol?: number }[],
+  clients: { name: string; last_seen: number; projects: { name: string; model: string; estimated_seconds: number; queue_depth: number; queue_preview?: QueuePreviewRow[]; stats?: Record<string, number | string>; last_rebuild?: RebuildRunState }[]; version?: string; protocol?: number }[],
   day: string,
   now: number,
   today: Record<string, { finished: number; failed: number }>,
@@ -83,6 +83,9 @@ function projectView(
           queue_preview: alloc?.queue_preview ?? [],
           online: now - c.last_seen < 90_000,
           stats: alloc?.stats ?? {},
+          // Scheduled rebuild run state (issue #3): stored + echoed verbatim
+          // from the client's heartbeat. Absent = never run / not configured.
+          ...(alloc?.last_rebuild ? { last_rebuild: alloc.last_rebuild } : {}),
           // Version handshake (exception-only: absent on pre-version
           // clients, so the row carries the keys only when the client
           // reported them — the dashboard renders them exception-only too).
@@ -256,6 +259,25 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       }
       return out.length > 0 ? out : undefined;
     };
+    // Scheduled rebuild run state (issue #3): client-published display data,
+    // same discipline as stats/preview — stored verbatim, never computed.
+    // Sanitized: every field must be a finite number, else the row is
+    // dropped (a malformed report must not bloat or poison the state file).
+    const cleanRebuild = (raw: unknown): RebuildRunState | undefined => {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+      const r = raw as Record<string, unknown>;
+      const fin = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+      if (!fin(r.last_run_ts) || !fin(r.exit_code) || !fin(r.duration_ms) || !fin(r.queue_before) || !fin(r.queue_after)) {
+        return undefined;
+      }
+      return {
+        last_run_ts: r.last_run_ts,
+        exit_code: r.exit_code,
+        duration_ms: r.duration_ms,
+        queue_before: r.queue_before,
+        queue_after: r.queue_after,
+      };
+    };
     const projects = Array.isArray(body.projects)
       ? body.projects
           .filter((p) => p && typeof p.name === 'string' && p.name.trim() !== '')
@@ -266,6 +288,9 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
             queue_depth: typeof p.queue_depth === 'number' && Number.isFinite(p.queue_depth) ? p.queue_depth : 0,
             queue_preview: cleanPreview((p as { queue_preview?: unknown }).queue_preview),
             stats: cleanStats((p as { stats?: unknown }).stats),
+            ...(cleanRebuild((p as { last_rebuild?: unknown }).last_rebuild)
+              ? { last_rebuild: cleanRebuild((p as { last_rebuild?: unknown }).last_rebuild) }
+              : {}),
           }))
       : undefined;
     // Version handshake (optional — pre-version clients omit both and keep

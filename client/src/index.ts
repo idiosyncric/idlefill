@@ -67,7 +67,7 @@ import * as path from 'node:path';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
-import { loadClientConfig, type ClientConfig, type ClientProjectConfig } from './config.js';
+import { loadClientConfig, type ClientConfig, type ClientProjectConfig, type ScheduledRebuildConfig } from './config.js';
 import { startLlmProxy, waitProxyReady, type LlmProxy } from './proxy.js';
 import { resolveVersion } from './version.js';
 
@@ -358,6 +358,79 @@ export function appendResult(file: string, line: Record<string, unknown>): void 
 }
 
 // ---------------------------------------------------------------------------
+// Scheduled queue rebuild (issue #3)
+// ---------------------------------------------------------------------------
+
+/**
+ * Wall-clock cap for one scheduled rebuild command (issue #3 settled
+ * decision 3): 15 min, reusing runExecutor's timeout machinery (SIGINT the
+ * group, grace, SIGKILL). The command is a BLACK BOX — idlefill never
+ * parses its output or the files it touches; the only contract is the exit
+ * code. A timed-out rebuild records exit_code: -1 (killed by us).
+ */
+export const REBUILD_TIMEOUT_MS = 15 * 60 * 1000;
+
+/**
+ * The persisted run-state shape (issue #3 settled decision 5): auditable,
+ * survives restarts, lives next to the queue file — never in the project
+ * repo. queue_before/after are the depth counts the daemon already knows
+ * (queueDepth); it never parses the rebuild command's output.
+ */
+export interface RebuildRunState {
+  /** Epoch-ms when the run STARTED. */
+  last_run_ts: number;
+  /** Process exit code; -1 = killed by the daemon's timeout. */
+  exit_code: number;
+  duration_ms: number;
+  queue_before: number;
+  queue_after: number;
+}
+
+/** Run-state file path: `<queue_file>.rebuild.json` (next to the queue). */
+export function rebuildStateFile(queueFile: string): string {
+  return `${queueFile}.rebuild.json`;
+}
+
+/** Read the persisted rebuild state (null when missing/corrupt). */
+export function readRebuildState(queueFile: string): RebuildRunState | null {
+  const f = rebuildStateFile(queueFile);
+  if (!existsSync(f)) return null;
+  try {
+    const r = JSON.parse(readFileSync(f, 'utf-8')) as Partial<RebuildRunState>;
+    if (!r || typeof r !== 'object') return null;
+    if (typeof r.last_run_ts !== 'number' || !Number.isFinite(r.last_run_ts)) return null;
+    return {
+      last_run_ts: r.last_run_ts,
+      exit_code: typeof r.exit_code === 'number' && Number.isFinite(r.exit_code) ? r.exit_code : 0,
+      duration_ms: typeof r.duration_ms === 'number' && Number.isFinite(r.duration_ms) ? r.duration_ms : 0,
+      queue_before: typeof r.queue_before === 'number' && Number.isFinite(r.queue_before) ? r.queue_before : 0,
+      queue_after: typeof r.queue_after === 'number' && Number.isFinite(r.queue_after) ? r.queue_after : 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Persist the rebuild run state atomically (tmp + rename, like writeQueue). */
+export function writeRebuildState(queueFile: string, st: RebuildRunState): void {
+  const f = rebuildStateFile(queueFile);
+  mkdirSync(dirname(f), { recursive: true });
+  const tmp = `${f}.tmp-${process.pid}`;
+  writeFileSync(tmp, JSON.stringify(st, null, 2) + '\n');
+  renameSync(tmp, f);
+}
+
+/**
+ * Cadence = MINIMUM interval since the last run (issue #3 settled decision
+ * 2), evaluated against the persisted state so it survives restarts. No
+ * state file (never run) = due. `daily_at` is a known follow-up.
+ */
+export function rebuildDue(state: RebuildRunState | null, everyMinutes: number, now: number): boolean {
+  if (!state) return true;
+  return now - state.last_run_ts >= everyMinutes * 60_000;
+}
+
+// ---------------------------------------------------------------------------
 // HTTP helpers against the arbiter
 // ---------------------------------------------------------------------------
 
@@ -623,6 +696,9 @@ export class ClientDaemon {
     if (this.activeLease) {
       await this.teardown('shutting down', true);
     }
+    // Kill any in-flight scheduled rebuild commands (runExecutor children
+    // are detached process groups — they would otherwise outlive the daemon).
+    for (const ex of this.rebuildExecs.values()) ex.kill('SIGKILL');
     this.running = false;
     this.ws?.close();
     await this.proxy?.stop();
@@ -645,23 +721,31 @@ export class ClientDaemon {
       // last_seen refreshes and queue depths update on every tick. `stats`
       // are client-published (finished/failed today, last job) — the
       // arbiter shows them, it never computes them.
-      projects: this.cfg.projects.map((p) => ({
-        name: p.name,
-        model: p.model,
-        estimated_seconds: p.estimated_seconds ?? 900,
-        queue_depth: queueDepth(p.queue_file),
-        // The first queue rows (priority order) — the arbiter displays them
-        // verbatim on the dashboard's queue page ([project]/[worker]/queue);
-        // it never reads the queue file itself. Best-effort: never throws.
-        queue_preview: queuePreview(p.queue_file, 100),
-        stats: {
-          ...projectStats(p.results_file),
-          queue: queueDepth(p.queue_file),
-          // Jobs that burned all 3 attempts and were moved to
-          // quarantine.jsonl (the operator's eyes go there, not to the queue).
-          quarantined: quarantineCount(this.cfg.state_dir),
-        },
-      })),
+      projects: this.cfg.projects.map((p) => {
+        // Scheduled rebuild run state (issue #3): the arbiter stores it and
+        // echoes it on /api/state (same client-published discipline as
+        // `stats` — it never computes or parses anything). Absent when the
+        // project has no scheduled_rebuild or it has never run.
+        const lastRebuild = readRebuildState(p.queue_file);
+        return {
+          name: p.name,
+          model: p.model,
+          estimated_seconds: p.estimated_seconds ?? 900,
+          queue_depth: queueDepth(p.queue_file),
+          // The first queue rows (priority order) — the arbiter displays them
+          // verbatim on the dashboard's queue page ([project]/[worker]/queue);
+          // it never reads the queue file itself. Best-effort: never throws.
+          queue_preview: queuePreview(p.queue_file, 100),
+          stats: {
+            ...projectStats(p.results_file),
+            queue: queueDepth(p.queue_file),
+            // Jobs that burned all 3 attempts and were moved to
+            // quarantine.jsonl (the operator's eyes go there, not to the queue).
+            quarantined: quarantineCount(this.cfg.state_dir),
+          },
+          ...(lastRebuild ? { last_rebuild: lastRebuild } : {}),
+        };
+      }),
     });
     if (status !== 200 || !body.client_id) {
       throw new Error(`register failed: HTTP ${status} ${JSON.stringify(body).slice(0, 200)}`);
@@ -733,6 +817,12 @@ export class ClientDaemon {
     await this.refreshRegistration();
     if (!this.ws) this.connectWs();
 
+    // Scheduled queue rebuild (issue #3): cadence is checked on every tick,
+    // independent of the lease loop — a rebuild must run even while a job
+    // holds a lease or the box is busy (the queue refills for the NEXT
+    // grant). Fire-and-forget: the tick never waits on the command.
+    void this.maybeRunScheduledRebuilds();
+
     const { status, body } = await api<{
       idle: { idle: boolean; degraded: boolean; reidle_gated: boolean };
       active_leases: { lease_id: string }[];
@@ -803,6 +893,93 @@ export class ClientDaemon {
       if (job) return { project: proj, job };
     }
     return null;
+  }
+
+  // ------------------------------------------------------------------
+  // Scheduled queue rebuild (issue #3)
+  // ------------------------------------------------------------------
+
+  /**
+   * Projects with a rebuild command currently in flight. The ONLY overlap
+   * guard idlefill applies (settled decision 4): one rebuild per project at
+   * a time. Empty-source refusal / queue-clobber defense belongs to the
+   * rebuild command itself (queue-builder-generic, not career-ops-specific).
+   */
+  private readonly rebuildInFlight = new Set<string>();
+  private readonly rebuildExecs = new Map<string, ReturnType<typeof runExecutor>>();
+
+  /**
+   * Cadence check on every poll tick: for each project with
+   * `scheduled_rebuild.enabled`, run the configured command when the
+   * minimum interval since the last run has elapsed (state read from the
+   * run-state file, so the cadence survives restarts). Fire-and-forget —
+   * the tick never blocks on the command, and a rebuild runs regardless of
+   * lease activity.
+   */
+  private async maybeRunScheduledRebuilds(): Promise<void> {
+    for (const proj of this.cfg.projects) {
+      const sr = proj.scheduled_rebuild;
+      if (!sr || !sr.enabled) continue;
+      if (this.rebuildInFlight.has(proj.name)) continue; // overlap guard
+      if (!rebuildDue(readRebuildState(proj.queue_file), sr.every_minutes, Date.now())) continue;
+      void this.runScheduledRebuild(proj, sr);
+    }
+  }
+
+  /**
+   * Run one rebuild: black-box command via bash -c (runExecutor machinery,
+   * 15 min cap, cwd = the project's cwd like the executor), then persist
+   * the run state next to the queue. The daemon NEVER parses the command's
+   * output or touches the queue itself — on a nonzero exit the queue is
+   * left exactly as the command left it and the failure is recorded in the
+   * run state (exit_code ≠ 0). exit_code -1 = killed by our timeout.
+   */
+  private async runScheduledRebuild(proj: ClientProjectConfig, sr: ScheduledRebuildConfig): Promise<void> {
+    this.rebuildInFlight.add(proj.name);
+    const started = Date.now();
+    const queueBefore = queueDepth(proj.queue_file);
+    this.log.info(`scheduled rebuild (${proj.name}): running configured command (cwd=${proj.cwd ?? process.cwd()}, cap ${REBUILD_TIMEOUT_MS / 60000}min)`);
+    try {
+      const ex = runExecutor({
+        command: sr.command,
+        cwd: proj.cwd,
+        timeoutMs: REBUILD_TIMEOUT_MS,
+        onExit: () => {},
+      });
+      this.rebuildExecs.set(proj.name, ex);
+      const outcome = await ex.promise;
+      const exitCode = outcome.timedOut || outcome.signal !== null ? -1 : (outcome.exitCode ?? -1);
+      const queueAfter = queueDepth(proj.queue_file);
+      writeRebuildState(proj.queue_file, {
+        last_run_ts: started,
+        exit_code: exitCode,
+        duration_ms: Date.now() - started,
+        queue_before: queueBefore,
+        queue_after: queueAfter,
+      });
+      if (exitCode === 0) {
+        this.log.info(`scheduled rebuild (${proj.name}): queue ${queueBefore} → ${queueAfter} (exit 0, ${Date.now() - started}ms)`);
+      } else {
+        this.log.info(`scheduled rebuild (${proj.name}) FAILED (exit ${exitCode}) — daemon did not touch the queue (${queueBefore} → ${queueAfter}); failure recorded in ${rebuildStateFile(proj.queue_file)}`);
+      }
+      // Operator audit: the command's output tail (the rebuild chain's own
+      // log lines — kept for the log only; the daemon never parses them).
+      const tail = outcome.outputTail.trim();
+      if (tail) {
+        for (const line of tail.split('\n').slice(-10)) {
+          this.log.info(`scheduled rebuild output (${proj.name}): ${line}`);
+        }
+      }
+      // A successful rebuild rides to the dashboard on the NEXT heartbeat
+      // (register reads the run-state file); no extra API surface.
+    } catch (err) {
+      // runExecutor must not throw, but a rebuild failure must never take
+      // the daemon down with it.
+      this.log.info(`scheduled rebuild (${proj.name}) error: ${err instanceof Error ? err.message : err}`);
+    } finally {
+      this.rebuildInFlight.delete(proj.name);
+      this.rebuildExecs.delete(proj.name);
+    }
   }
 
   private async ensureProxy(): Promise<LlmProxy> {

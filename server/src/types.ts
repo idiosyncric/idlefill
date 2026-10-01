@@ -109,6 +109,30 @@ export interface ProjectAllocation {
    * arbiter stores and displays them — it never computes them.
    */
   stats?: Record<string, number | string>;
+  /**
+   * Scheduled queue rebuild run state (issue #3), published by the client
+   * with the heartbeat when its project has `scheduled_rebuild` enabled and
+   * has run at least once. The arbiter stores + echoes it on /api/state —
+   * it never computes or parses it. Sanitized at registration: finite
+   * numbers only; malformed → dropped.
+   */
+  last_rebuild?: RebuildRunState;
+}
+
+/**
+ * The client's persisted scheduled-rebuild state (issue #3): when the
+ * configured rebuild command last ran, how it ended, and the queue depth
+ * before/after. The client owns the file (`<queue_file>.rebuild.json`);
+ * the arbiter only carries the echo for the dashboard.
+ */
+export interface RebuildRunState {
+  /** Epoch-ms when the run STARTED. */
+  last_run_ts: number;
+  /** Process exit code; -1 = killed by the client's timeout. */
+  exit_code: number;
+  duration_ms: number;
+  queue_before: number;
+  queue_after: number;
 }
 
 /**
@@ -350,7 +374,15 @@ export type EventKind =
   | 'session_override_cleared'
   | 'session_swept'
   | 'job_throttled'
-  | 'job_unthrottled';
+  | 'job_unthrottled'
+  /**
+   * Scheduled queue rebuild (issue #3): the client's rebuild loop ran since
+   * the last heartbeat and reported fresh run state. The arbiter derives the
+   * event from the registration payload (no new API surface) so the operator
+   * sees the queue refilling — `queue 445 → 512 (exit 0)` — without opening
+   * the client log.
+   */
+  | 'rebuild';
 
 export interface EventRecord {
   ts: number;

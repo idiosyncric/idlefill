@@ -200,6 +200,12 @@ export class Arbiter {
       if (reportedIp) existing.reported_ip = reportedIp;
       if (observedIp) existing.observed_ip = observedIp;
       existing.last_seen = seen;
+      // Scheduled rebuild event (issue #3): derived from the heartbeat's
+      // last_rebuild — when a project reports a NEW run (last_run_ts moved),
+      // log `queue 445 → 512 (exit 0)` so the operator sees the queue
+      // refilling in the dashboard without opening the client log. Purely
+      // client-published data; the arbiter never runs or parses rebuilds.
+      if (projects) this.noteRebuilds(existing.projects, projects);
       if (projects) existing.projects = projects;
       // Re-registration is a heartbeat: the version handshake facts track
       // the latest report (a restart from an older/newer checkout updates
@@ -225,9 +231,34 @@ export class Arbiter {
       ...(protocol !== undefined ? { protocol } : {}),
     });
     this.store.appendEvent({ kind: 'client_registered', detail: `${name} (${client_id})` });
+    // A fresh registration that already carries rebuild state (client
+    // restarted mid-cadence) surfaces the last run too — no prior row to
+    // compare against, so every reported run counts as new.
+    if (projects) this.noteRebuilds([], projects);
     this.store.trim();
     this.store.save();
     return { client_id, created: true };
+  }
+
+  /**
+   * Emit a `rebuild` event for every project whose heartbeat-reported
+   * `last_rebuild` is NEWER than what the stored row carries (issue #3).
+   * The comparison is on last_run_ts, so the same run never double-logs
+   * across the 20s re-registration heartbeat, and a client restart that
+   * re-reports its persisted state stays quiet.
+   */
+  private noteRebuilds(prev: ProjectAllocation[], next: ProjectAllocation[]): void {
+    for (const p of next) {
+      const rb = p.last_rebuild;
+      if (!rb) continue;
+      const before = prev.find((x) => x.name === p.name)?.last_rebuild;
+      if (before && before.last_run_ts >= rb.last_run_ts) continue;
+      this.store.appendEvent({
+        kind: 'rebuild',
+        project: p.name,
+        detail: `queue ${rb.queue_before} → ${rb.queue_after} (exit ${rb.exit_code}, ${rb.duration_ms}ms)`,
+      });
+    }
   }
 
   clientIp(clientId: string): string | null {

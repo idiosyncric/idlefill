@@ -938,6 +938,88 @@ test('version handshake: malformed version/protocol values are dropped, never re
 
 
 // ---------------------------------------------------------------------------
+// Scheduled rebuild (issue #3): last_rebuild rides register → /api/state,
+// and a NEW run emits a `rebuild` event (queue 445 → 512 style detail).
+// ---------------------------------------------------------------------------
+
+test('scheduled rebuild: last_rebuild rides register → /api/state; a new run emits a rebuild event', async () => {
+  const rb = { last_run_ts: 1_780_000_000_000, exit_code: 0, duration_ms: 4200, queue_before: 445, queue_after: 512 };
+  const reg = await fetch(`${base}/api/clients/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({
+      name: 'worker-rb',
+      projects: [{ name: 'career-ops', model: 'Qwen3.8-27B', estimated_seconds: 900, queue_depth: 512, last_rebuild: rb }],
+    }),
+  });
+  assert.equal(reg.status, 200);
+
+  const st = (await (await fetch(`${base}/api/state?limit=50`, { headers: auth })).json()) as {
+    projects: { name: string; workers: { client: string; last_rebuild?: typeof rb }[] }[];
+    clients: { name: string; projects: { name: string; last_rebuild?: typeof rb }[] }[];
+    events: { kind: string; project?: string; detail?: string }[];
+  };
+
+  // The run state rides BOTH views: the raw client row and the dashboard's
+  // per-project worker row (the panel row is a follow-up; the data must be
+  // on /api/state).
+  const row = st.clients.find((c) => c.name === 'worker-rb')!;
+  assert.deepEqual(row.projects[0]!.last_rebuild, rb, 'client row echoes last_rebuild verbatim');
+  const proj = st.projects.find((p) => p.name === 'career-ops')!;
+  const w = proj.workers.find((x) => x.client === 'worker-rb')!;
+  assert.deepEqual(w.last_rebuild, rb, 'projectView worker carries last_rebuild');
+
+  // The fresh registration emitted exactly one rebuild event with the
+  // operator-readable depth transition.
+  const rbEvents = st.events.filter((e) => e.kind === 'rebuild' && e.project === 'career-ops');
+  assert.equal(rbEvents.length, 1, 'one rebuild event for the new run');
+  assert.match(rbEvents[0]!.detail!, /queue 445 → 512 \(exit 0/, `rebuild detail shows the refill, got: ${rbEvents[0]!.detail}`);
+
+  // Heartbeat with the SAME last_run_ts: stored, but NO second event (the
+  // 20s re-registration must not spam the log).
+  await fetch(`${base}/api/clients/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ name: 'worker-rb', projects: [{ name: 'career-ops', model: 'Qwen3.8-27B', estimated_seconds: 900, queue_depth: 512, last_rebuild: rb }] }),
+  });
+  const st2 = (await (await fetch(`${base}/api/state?limit=50`, { headers: auth })).json()) as {
+    events: { kind: string; project?: string }[];
+  };
+  assert.equal(st2.events.filter((e) => e.kind === 'rebuild' && e.project === 'career-ops').length, 1, 'the same run never double-logs across heartbeats');
+
+  // A NEWER run (last_run_ts moved) emits a second event.
+  const rb2 = { ...rb, last_run_ts: rb.last_run_ts + 3_600_000, queue_before: 512, queue_after: 600 };
+  await fetch(`${base}/api/clients/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ name: 'worker-rb', projects: [{ name: 'career-ops', model: 'Qwen3.8-27B', estimated_seconds: 900, queue_depth: 600, last_rebuild: rb2 }] }),
+  });
+  const st3 = (await (await fetch(`${base}/api/state?limit=50`, { headers: auth })).json()) as {
+    events: { kind: string; project?: string; detail?: string }[];
+  };
+  const rbEvents3 = st3.events.filter((e) => e.kind === 'rebuild' && e.project === 'career-ops');
+  assert.equal(rbEvents3.length, 2, 'a newer run logs a new event');
+  assert.match(rbEvents3[0]!.detail!, /queue 512 → 600/, 'newest event first');
+
+  // Malformed last_rebuild (non-numeric fields) is dropped, never rejected.
+  const regBad = await fetch(`${base}/api/clients/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({
+      name: 'worker-rb-bad',
+      projects: [{ name: 'career-ops', model: 'm', estimated_seconds: 1, queue_depth: 1, last_rebuild: { last_run_ts: 'yesterday', exit_code: 0, duration_ms: 0, queue_before: 0, queue_after: 0 } }],
+    }),
+  });
+  assert.equal(regBad.status, 200, 'a malformed last_rebuild never rejects the register');
+  const st4 = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: { name: string; projects: Record<string, unknown>[] }[];
+  };
+  const badRow = st4.clients.find((c) => c.name === 'worker-rb-bad')!;
+  assert.ok(!('last_rebuild' in badRow.projects[0]!), 'malformed last_rebuild is dropped');
+});
+
+
+// ---------------------------------------------------------------------------
 // Sessions (#32/#33): HTTP surface — register/heartbeat, /api/state rows,
 // operator override.
 // ---------------------------------------------------------------------------
