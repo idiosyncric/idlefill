@@ -278,6 +278,24 @@ struct ScopeQueueRow {
   let company: String
 }
 
+/** One router-self-registered interactive session (#9), as the arbiter
+ *  publishes it on the state payload's sessions[]. The menubar only
+ *  DISPLAYS sessions (read-only — pause/resume lives on the dashboard);
+ *  the stale verdict and the exception one-liner are computed HERE (pure)
+ *  so the harness (menubar/sessions-test.sh) asserts exactly what
+ *  renders. */
+struct ScopeSession {
+  let token: String
+  let clientName: String?      // the router that registered it, when identified
+  let lastSeen: Double         // epoch-ms (0 = unknown)
+  let lastActivity: Double?    // epoch-ms of the newest request seen (nil = none yet)
+  let overrideLabel: String?   // active operator override ("pause" | "force"; nil = none)
+  let stale: Bool              // now - last_seen > 90_000 (the daemonRunning precedent)
+  /** The exception one-liner (paused / forced / stale sessions only —
+   *  DESIGN.md Exception-Only: a healthy session renders NO row). nil = healthy. */
+  let exceptionLine: String?
+}
+
 /** One project row under the picked machine, as the arbiter publishes it:
  *  the client-reported values + the arbiter's per-project view (workers[],
  *  scheduling, today, budget_today). `me` marks the picked client's own
@@ -372,6 +390,12 @@ enum ScopeView {
     /** The picked project's published queue peek (empty when the worker
      *  publishes no preview — the panel degrades to the depth number). */
     let queuePreview: [ScopeQueueRow]
+    /** Interactive sessions (#9) — global (the watched server's
+     *  interactive traffic, not narrowed by the machine picker). */
+    let sessions: [ScopeSession]
+    /** The sessions count line ("2 active, 1 paused"); nil = no sessions
+     *  registered = the whole sessions block hidden (Exception-Only). */
+    let sessionsCountLine: String?
   }
 
   static func machineLabel(clientId: String?, name: String?) -> String {
@@ -554,6 +578,52 @@ enum ScopeView {
     let failed = pickedProj.map { $0.failed } ?? projects.map { $0.failed }.reduce(0, +)
     let queuePreview = pickedProj?.meQueuePreview ?? []
 
+    // ---- interactive sessions (#9): the arbiter's sessions[] rows, each
+    // carrying its active operator override ({override: "pause"|"force",
+    // until, set_at} or null). Sessions are the watched server's
+    // INTERACTIVE traffic — global, not narrowed by the machine picker
+    // (attribution rides client_name, shown in the one-liner). The menubar
+    // only DISPLAYS them (read-only; pause/resume lives on the dashboard).
+    // The stale verdict mirrors daemonRunning's 90s window.
+    let sessionRows = (payload["sessions"] as? [[String: Any]]) ?? []
+    let sessions: [ScopeSession] = sessionRows.compactMap { s in
+      guard let tok = (s["token"] as? String), !tok.isEmpty else { return nil }
+      let lastSeen = (s["last_seen"] as? Double) ?? 0
+      let stale = nowMs - lastSeen > 90_000
+      let ov = (s["override"] as? [String: Any])?["override"] as? String
+      let label = (ov == "pause" || ov == "force") ? ov : nil
+      let name = (s["client_name"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+      let lastActivity = (s["last_activity"] as? Double).flatMap { $0 == 0 ? nil : $0 }
+      // Exception-only one-liner (DESIGN.md): a healthy session renders NO
+      // row. The session is named by its router's client_name when the
+      // router identified itself, else by a short token prefix.
+      let who = name ?? String(tok.prefix(8)) + "…"
+      var line: String?
+      if label == "pause" { line = "\(who) · paused" }
+      else if label == "force" { line = "\(who) · forced" }
+      else if stale { line = "\(who) · stale" }
+      if line != nil && stale && label != nil { line! += " · stale" }
+      return ScopeSession(token: tok, clientName: name, lastSeen: lastSeen,
+                          lastActivity: lastActivity, overrideLabel: label,
+                          stale: stale, exceptionLine: line)
+    }
+    // The count line (the only always-on sessions row, and only when
+    // sessions exist): plain words, zero buckets omitted —
+    // "2 active, 1 paused". nil = no sessions = NO row at all.
+    let sessionsCountLine: String? = sessions.isEmpty ? nil : {
+      var parts: [String] = []
+      let n: (_ pred: (ScopeSession) -> Bool) -> Int = { f in sessions.filter(f).count }
+      let activeN = n { $0.overrideLabel == nil && !$0.stale }
+      let pausedN = n { $0.overrideLabel == "pause" }
+      let forcedN = n { $0.overrideLabel == "force" }
+      let staleN = n { $0.overrideLabel == nil && $0.stale }
+      if activeN > 0 { parts.append("\(activeN) active") }
+      if pausedN > 0 { parts.append("\(pausedN) paused") }
+      if forcedN > 0 { parts.append("\(forcedN) forced") }
+      if staleN > 0 { parts.append("\(staleN) stale") }
+      return parts.joined(separator: ", ")
+    }()
+
     // ---- the running leases. For a picked client: EVERY active lease of
     // that client (max_concurrent_leases > 1 → all of them). For "all
     // machines": none — the aggregate has no single lease owner to show
@@ -583,7 +653,9 @@ enum ScopeView {
                   finished: finished,
                   failed: failed,
                   leases: leases,
-                  queuePreview: queuePreview)
+                  queuePreview: queuePreview,
+                  sessions: sessions,
+                  sessionsCountLine: sessionsCountLine)
   }
 }
 
@@ -603,6 +675,13 @@ final class AppModel: ObservableObject {
   @Published var today: (finished: Int, failed: Int) = (0, 0)
   @Published var leases: [ScopeLease] = []
   @Published var queuePreview: [ScopeQueueRow] = []
+  /// Interactive sessions (#9) — read-only display (the controls live on
+  /// the dashboard). Global: the watched server's interactive traffic, not
+  /// narrowed by the machine picker.
+  @Published var sessions: [ScopeSession] = []
+  /// The sessions count line ("2 active, 1 paused"); nil = no sessions —
+  /// the whole block hidden (Exception-Only rule).
+  @Published var sessionsCountLine: String? = nil
   @Published var lastSeenS: Int? = nil
   /// Every clients[] row from the last payload (the machine picker's
   /// options; the "all machines" aggregate row is added by viewMachines).
@@ -934,6 +1013,8 @@ final class AppModel: ObservableObject {
     today = (view.finished, view.failed)
     leases = view.leases
     queuePreview = view.queuePreview
+    sessions = view.sessions
+    sessionsCountLine = view.sessionsCountLine
     // The picked project's published token budget ("all projects" sums the
     // parts — the aggregate equals the sum of its parts). Hidden while the
     // scope has no budget rows at all (a fresh arbiter state).
@@ -3007,6 +3088,21 @@ struct ContentView: View {
         // lists them all — today showed only the first).
         ForEach(Array(m.leases.enumerated()), id: \.offset) { _, l in
           KVRow(k: "running", v: leaseRow(l), vcolor: Pal.accent)
+        }
+        // Interactive sessions (#9) — read-only at-a-glance (the controls
+        // live on the dashboard). The count line renders ONLY when
+        // sessions exist (Exception-Only: no sessions = no rows at all);
+        // the one-liners are the EXCEPTION states only (paused / forced /
+        // stale) — a healthy session renders no row. Colors mirror the
+        // dashboard's tags: paused (override) red, forced / stale amber.
+        if let count = m.sessionsCountLine {
+          KVRow(k: "sessions", v: count)
+        }
+        ForEach(Array(m.sessions.enumerated()), id: \.offset) { _, s in
+          if let line = s.exceptionLine {
+            KVRow(k: "", v: line,
+                  vcolor: s.overrideLabel == "pause" ? Pal.err : Pal.warn)
+          }
         }
         // The picked project's published queue peek (a worker publishing
         // no preview degrades to the depth number above).
