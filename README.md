@@ -176,6 +176,71 @@ not the static `ip` in your client config. Tailscale reassigns addresses;
 the observed value tracks that, and the configured value is kept only for
 display/audit (`reported_ip` on the client row).
 
+## Session gate (interactive agent traffic — issue #9)
+
+Several long-context Hermes sessions (TUI, Orca tabs, gateway) share one
+local inference box. The client daemon's loopback proxy doubles as the
+per-Mac **router + gate** for that interactive traffic: sessions register
+with the arbiter by first sight, admission is capacity-limited, and a
+queued or paused session's LLM request is **held at the router, not
+failed** — when it is admitted the held request proceeds and the agent
+continues as if nothing happened.
+
+**Point a Hermes session at the router.** In the session, set its base_url
+to a tokenized router path (one distinct token per session):
+
+```
+/model http://127.0.0.1:11435/s/<token>
+```
+
+The router strips `/s/<token>` and forwards `/v1/...` to `llm_target`.
+First sight of a token registers the session at the arbiter (idempotent,
+with your client identity); traffic is the heartbeat (refreshed at most
+once per ~10s per session, plus on the daemon's poll tick). Desktop-app
+token minting and the model endpoint are follow-ups — for now you set the
+base_url by hand. Plain `/v1/...` traffic (the lease-gated job flow) is
+untouched: exact single-target passthrough, never gated.
+
+**Knobs** (`client/config.json`, same file as `proxy_port`/`llm_target`):
+
+| key | default | meaning |
+| --- | --- | --- |
+| `session_gate` | `true` | turn the router/gate off entirely |
+| `max_active_agent_sessions` | `2` | sessions that may hold the engine at once (FIFO queue beyond that) |
+| `session_hold_cap_ms` | `120000` | max a queued/paused request parks before a retryable `503` + `Retry-After` (~15s + jitter). Hermes' own request timeout is `HERMES_API_TIMEOUT` (default 1800s), so the default cap is far inside it |
+
+**Admission + overrides.** A session holds a slot while it has a request in
+flight; when one finishes, the head of the FIFO queue is admitted and its
+parked request streams through. Operator overrides (arbiter-side, learned
+from the daemon's `/api/state` poll): `pause` holds a session's traffic
+even with free slots; `force` bypasses the slot cap for that session.
+
+```
+curl -X POST $ARBITER/api/sessions/<token>/override -d '{"override":"pause"}'   # hold
+curl -X POST $ARBITER/api/sessions/<token>/override -d '{"override":null}'      # resume
+```
+
+**Fail-open.** If the arbiter is unreachable (registration POST fails,
+state poll down), the gate admits everything and releases every parked
+request. A dead arbiter must never wedge a conversation. Daemon shutdown
+releases parked requests cleanly too.
+
+**Manual acceptance checklist** (the issue's scenario):
+
+1. Set `max_active_agent_sessions: 1` in `client/config.json`, restart the
+   client daemon (`launchctl kickstart -k gui/$(id -u)/com.sam.idlefill.client`).
+2. Session A: `/model http://127.0.0.1:11435/s/sessA`; ask it something
+   long-running. It streams (it holds the only slot).
+3. Session B: `/model http://127.0.0.1:11435/s/sessB`; send a message —
+   it just waits (the request is parked at the router; the dashboard shows
+   B registered, and the client log shows `session sessB first sight`).
+4. Pause A from the dashboard (or the override curl above). A's next
+   request holds; when A's in-flight request finishes, B is admitted and
+   its parked request proceeds — **no message typed into either
+   conversation**. Unpause A when done.
+5. Kill the arbiter (`launchctl`/docker as applicable) and send messages
+   in both sessions: both must keep working (fail-open).
+
 ## The menu bar app (macOS)
 
 `menubar/IdlefillMenubar.swift` is an AppKit `NSStatusItem` + `NSPopover`
