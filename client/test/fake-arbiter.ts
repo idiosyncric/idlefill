@@ -43,8 +43,14 @@ export interface FakeArbiter {
   lastRegister: Record<string, unknown>;
   /** Every register body received, in order. */
   registers: Record<string, unknown>[];
+  /** Every POST /api/sessions/register body received, in order (issue #9). */
+  sessionRegisters: Record<string, unknown>[];
+  /** Session overrides keyed by token (what /api/state reports in sessions[]). */
+  sessionOverrides: Map<string, { override: string; until: number | null }>;
   /** Steer the override directly (the POST /api/clients/:id/override route does this too). */
   setOverride(kind: 'pause' | 'force' | null, until?: number): void;
+  /** Steer a SESSION override directly (mirrors POST /api/sessions/:token/override). */
+  setSessionOverride(token: string, kind: 'pause' | 'force' | null, until?: number): void;
   grant(leaseId: string): void;
   revoke(leaseId: string, reason: string): void;
   nextLeaseId(): string;
@@ -63,6 +69,9 @@ export function startFakeArbiter(): Promise<FakeArbiter> {
     n: 0,
     registered: false,
     registers: [] as Record<string, unknown>[],
+    sessionRegisters: [] as Record<string, unknown>[],
+    sessionTokens: new Set<string>(),
+    sessionOverrides: new Map<string, { override: string; until: number | null }>(),
     clients: new Set<WebSocket>(),
   };
 
@@ -89,6 +98,26 @@ export function startFakeArbiter(): Promise<FakeArbiter> {
         state.registered = true;
         return send(200, { client_id: 'c-test', created: state.registered && state.registers.length === 1 });
       }
+      // Sessions (issue #9): register is idempotent by token (201 created /
+      // 200 refresh), override set/clear per token — mirrors the real
+      // arbiter's /api/sessions surface.
+      if (req.method === 'POST' && url.pathname === '/api/sessions/register') {
+        state.sessionRegisters.push(j);
+        const token = typeof j.token === 'string' ? j.token.trim() : '';
+        if (!token) return send(400, { error: 'token required' });
+        const created = !state.sessionTokens.has(token);
+        state.sessionTokens.add(token);
+        return send(created ? 201 : 200, { created, session: { token } });
+      }
+      const sov = url.pathname.match(/^\/api\/sessions\/([^/]+)\/override$/);
+      if (req.method === 'POST' && sov) {
+        const token = decodeURIComponent(sov[1]!);
+        if (!state.sessionTokens.has(token)) return send(404, { error: 'unknown_session' });
+        const kind = j.override === null ? null : String(j.override);
+        if (kind === null) state.sessionOverrides.delete(token);
+        else state.sessionOverrides.set(token, { override: kind, until: typeof j.until === 'number' ? j.until : null });
+        return send(200, { ok: true, override: state.sessionOverrides.get(token) ?? null });
+      }
       const ov = url.pathname.match(/^\/api\/clients\/[^/]+\/override$/);
       if (req.method === 'POST' && ov) {
         const kind = j.override === null ? null : String(j.override);
@@ -101,6 +130,10 @@ export function startFakeArbiter(): Promise<FakeArbiter> {
           idle: { idle: state.idle, degraded: false, reidle_gated: false },
           active_leases: state.activeLeases.map((id) => ({ lease_id: id })),
           clients: [{ client_id: 'c-test', name: 'test-client', ip: '100.94.165.102', override: state.override }],
+          sessions: [...state.sessionTokens].map((token) => ({
+            token,
+            override: state.sessionOverrides.get(token) ?? null,
+          })),
         });
       }
       if (req.method === 'POST' && url.pathname === '/api/leases') {
@@ -166,8 +199,15 @@ export function startFakeArbiter(): Promise<FakeArbiter> {
         activeLeases: state.activeLeases,
         denyLeaseAfter: state.denyLeaseAfter,
         registers: state.registers,
+        sessionRegisters: state.sessionRegisters,
+        sessionOverrides: state.sessionOverrides,
         get lastRegister() {
           return state.registers[state.registers.length - 1] ?? {};
+        },
+        setSessionOverride(token: string, kind: 'pause' | 'force' | null, until?: number) {
+          state.sessionTokens.add(token);
+          if (kind === null) state.sessionOverrides.delete(token);
+          else state.sessionOverrides.set(token, { override: kind, until: until ?? null });
         },
         grant(id) {
           state.activeLeases.push(id);

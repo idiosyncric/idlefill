@@ -20,6 +20,7 @@
 
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { SESSION_PATH_RE, type SessionGate } from './session-gate.js';
 
 export interface ProxyLogEntry {
   ts: number;
@@ -49,15 +50,29 @@ export function startLlmProxy(opts: {
   port: number;
   target: string;
   host?: string;
+  /**
+   * Session gate (issue #9 Part A). When set, `/s/<token>/...` requests are
+   * routed through it (register + admit-or-hold, then forwarded with the
+   * `/s/<token>` prefix stripped). ALL other paths keep the exact
+   * single-target passthrough below. Without a gate the proxy behaves
+   * precisely as before.
+   */
+  gate?: SessionGate;
 }): LlmProxy {
   const target = new URL(opts.target);
   const log: ProxyLogEntry[] = [];
 
-  const server = http.createServer((req, res) => {
+  /**
+   * Forward `req` to the upstream at `path` (path is req.url for plain
+   * passthrough, or the `/s/<token>`-stripped path for admitted session
+   * traffic). The gate calls this when it admits a session — a parked
+   * request's body was never consumed, so piping it here still works.
+   */
+  const forward = (req: http.IncomingMessage, res: http.ServerResponse, path: string): void => {
     const entry: ProxyLogEntry = {
       ts: Date.now(),
       method: req.method ?? 'GET',
-      path: req.url ?? '/',
+      path,
       req_bytes: 0,
       resp_bytes: 0,
       status: 0,
@@ -75,7 +90,7 @@ export function startLlmProxy(opts: {
         protocol: target.protocol,
         hostname: target.hostname,
         port: target.port || (target.protocol === 'https:' ? 443 : 80),
-        path: req.url,
+        path,
         method: req.method,
         headers,
       },
@@ -140,6 +155,31 @@ export function startLlmProxy(opts: {
       // Fallback record if response/error didn't push (mid-stream reset).
       record();
     });
+  };
+
+  const server = http.createServer((req, res) => {
+    const rawUrl = req.url ?? '/';
+    const m = opts.gate ? SESSION_PATH_RE.exec(rawUrl) : null;
+    if (opts.gate && m) {
+      // Session traffic: /s/<token>/v1/... → gate, forwarded as /v1/...
+      let token = m[1] ?? '';
+      try {
+        token = decodeURIComponent(token);
+      } catch {
+        /* malformed %xx: keep the raw token (arbiter stores it verbatim) */
+      }
+      const stripped = m[2] && m[2].length > 0 ? m[2] : '/';
+      if (!token || token.length > 128) {
+        // Arbiter rule: tokens are ≤128 chars. Reject loudly, don't gate.
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'invalid session token' }));
+        return;
+      }
+      opts.gate.route(req, res, token, stripped, forward);
+      return;
+    }
+    // Everything else (notably plain /v1/... job traffic): exact passthrough.
+    forward(req, res, rawUrl);
   });
 
   server.on('error', (err) => {

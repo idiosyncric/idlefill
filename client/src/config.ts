@@ -112,6 +112,21 @@ export interface ClientConfig {
   proxy_port: number;
   /** LLM target the loopback proxy forwards to. */
   llm_target: string;
+  /**
+   * Session gate (issue #9 Part A): when true (default) the loopback proxy
+   * also acts as the per-Mac router/gate for interactive agent traffic on
+   * `/s/<token>/v1/...` — self-registration, capacity-limited admission,
+   * held (not failed) requests for queued/paused sessions. Optional on the
+   * interface so hand-built ClientConfig fixtures stay valid; the loader
+   * always sets it.
+   */
+  session_gate?: boolean;
+  /** Admission capacity: concurrent agent sessions allowed at the engine. */
+  max_active_agent_sessions?: number;
+  /** Max a queued/paused session's request parks at the router before a
+   * retryable 503 + Retry-After. Must stay under the client's own request
+   * timeout (Hermes: HERMES_API_TIMEOUT default 1800s). */
+  session_hold_cap_ms?: number;
   projects: ClientProjectConfig[];
   /**
    * The true idlefill repo root — the `{repo}` expansion target in executor
@@ -135,6 +150,9 @@ const DEFAULTS = {
   ip: '',
   proxy_port: 11435,
   llm_target: 'http://100.105.225.1:11434',
+  session_gate: true,
+  max_active_agent_sessions: 2,
+  session_hold_cap_ms: 120_000,
 };
 
 export function loadClientConfig(
@@ -189,6 +207,11 @@ export function loadClientConfig(
     ip: str(r.ip, env.IDLEFILL_CLIENT_IP ?? DEFAULTS.ip),
     proxy_port: num(r.proxy_port, DEFAULTS.proxy_port),
     llm_target: str(r.llm_target, DEFAULTS.llm_target),
+    // Session gate (issue #9 Part A). `session_gate` accepts an explicit
+    // boolean; anything else falls back to the default (true).
+    session_gate: typeof r.session_gate === 'boolean' ? r.session_gate : DEFAULTS.session_gate,
+    max_active_agent_sessions: Math.max(1, Math.floor(num(r.max_active_agent_sessions, DEFAULTS.max_active_agent_sessions))),
+    session_hold_cap_ms: Math.max(1000, Math.floor(num(r.session_hold_cap_ms, DEFAULTS.session_hold_cap_ms))),
     projects: Array.isArray(r.projects)
       ? r.projects.map((p: Record<string, unknown>) => {
           const explicitExecutor = String(p.executor ?? '');
