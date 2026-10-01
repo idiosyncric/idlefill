@@ -69,6 +69,7 @@ import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import { loadClientConfig, type ClientConfig, type ClientProjectConfig, type ScheduledRebuildConfig } from './config.js';
 import { startLlmProxy, waitProxyReady, type LlmProxy } from './proxy.js';
+import { SessionGate, type SessionStateRow } from './session-gate.js';
 import { resolveVersion } from './version.js';
 
 const clientDir = dirname(fileURLToPath(import.meta.url));
@@ -620,6 +621,13 @@ export class ClientDaemon {
   private readonly cfg: ClientConfig;
   private readonly hooks: { pollMs: number; killGraceMs: number; log: { info: (msg: string) => void } };
   private proxy: LlmProxy | null = null;
+  /**
+   * Session gate (issue #9 Part A): the router/gate for /s/<token>/ traffic,
+   * live inside the loopback proxy. Null only when session_gate=false.
+   */
+  private gate: SessionGate | null = null;
+  /** Set by the gate to wake the poll loop early (on-demand /api/state). */
+  private stateWake = false;
   private ws: WebSocket | null = null;
   private clientId: string | null = null;
   private running = false;
@@ -677,12 +685,26 @@ export class ClientDaemon {
     return this.hooks.log as RotatingLog;
   }
 
+  /** Loopback proxy base URL once up (tests / operators); null before boot. */
+  get proxyUrl(): string | null {
+    return this.proxy?.base_url ?? null;
+  }
+
+  /** The session gate (issue #9 Part A); null when session_gate=false. */
+  get sessionGate(): SessionGate | null {
+    return this.gate;
+  }
+
   async start(): Promise<void> {
     if (this.running) return;
     this.running = true;
     this.log.info(`client starting: server=${this.cfg.server_url} name=${this.cfg.client_name} ip=${this.cfg.ip || '(not set — using observed)'} projects=${this.cfg.projects.map((p) => p.name).join(',')}`);
     await this.register();
     this.log.info(`registered as ${this.clientId}`);
+    // The session gate must be live from boot — interactive sessions point at
+    // the router whether or not a lease job ever runs. (runJob's ensureProxy
+    // stays as the idempotent path.)
+    await this.ensureProxy();
     this.connectWs();
     this.loop();
   }
@@ -701,6 +723,9 @@ export class ClientDaemon {
     for (const ex of this.rebuildExecs.values()) ex.kill('SIGKILL');
     this.running = false;
     this.ws?.close();
+    // Release the session gate cleanly: parked requests proceed rather than
+    // dying with the daemon.
+    this.gate?.releaseAll();
     await this.proxy?.stop();
   }
 
@@ -805,8 +830,15 @@ export class ClientDaemon {
         await this.tickOnce();
       } catch (err) {
         this.log.info(`tick error: ${err instanceof Error ? err.message : err}`);
+        // Arbiter unreachable (fetch threw): the session gate must fail-open
+        // so interactive traffic never wedges on a dead arbiter.
+        this.gate?.onLinkDown();
       }
-      await sleep(this.hooks.pollMs);
+      // The gate can wake the loop early (new session / parked request needs
+      // fresh override state); otherwise sleep the poll period.
+      const wake = this.stateWake;
+      this.stateWake = false;
+      await sleep(wake ? Math.min(50, this.hooks.pollMs) : this.hooks.pollMs);
     }
   }
 
@@ -827,12 +859,24 @@ export class ClientDaemon {
       idle: { idle: boolean; degraded: boolean; reidle_gated: boolean };
       active_leases: { lease_id: string }[];
       clients?: { client_id: string; override?: { override: string } | null }[];
+      sessions?: SessionStateRow[];
     }>(this.cfg, 'GET', '/api/state');
     if (status !== 200) {
       this.log.info(`state poll HTTP ${status}`);
+      // A non-200 state poll means the arbiter is not serving us (auth is
+      // stable; 5xx/downtime is what lands here): the gate fails open.
+      this.gate?.onLinkDown();
       return;
     }
     const st = body;
+
+    // Session gate (issue #9 Part A): the arbiter is reachable — re-arm the
+    // gate, feed it the operator overrides, and fold the session
+    // heartbeat/refresh into this tick (traffic throttles it to ≤1/10s).
+    if (this.gate) {
+      this.gate.onStatePoll(st.sessions ?? []);
+      this.gate.heartbeat();
+    }
 
     // If our lease vanished server-side (restart/TTL), tear down locally.
     if (this.activeLease && !st.active_leases.some((l) => l.lease_id === this.activeLease?.lease_id)) {
@@ -984,9 +1028,32 @@ export class ClientDaemon {
 
   private async ensureProxy(): Promise<LlmProxy> {
     if (this.proxy) return this.proxy;
-    this.proxy = startLlmProxy({ port: this.cfg.proxy_port, target: this.cfg.llm_target });
+    if (this.cfg.session_gate !== false) {
+      this.gate = new SessionGate({
+        maxActive: this.cfg.max_active_agent_sessions ?? 2,
+        holdCapMs: this.cfg.session_hold_cap_ms ?? 120_000,
+        log: (m) => this.log.info(m),
+        register: async (token) => {
+          const { status } = await api(this.cfg, 'POST', '/api/sessions/register', {
+            token,
+            ...(this.clientId ? { client_id: this.clientId } : {}),
+            client_name: this.cfg.client_name,
+            last_activity: Date.now(),
+          });
+          return status === 200 || status === 201;
+        },
+        // The gate learned something that needs fresh override state (new
+        // session arrived / a request parked): wake the poll loop early.
+        refreshState: () => {
+          this.stateWake = true;
+        },
+      });
+    }
+    this.proxy = startLlmProxy({ port: this.cfg.proxy_port, target: this.cfg.llm_target, ...(this.gate ? { gate: this.gate } : {}) });
     await waitProxyReady(this.proxy.server);
-    this.log.info(`proxy up: ${this.proxy.base_url} → ${this.cfg.llm_target}`);
+    this.log.info(
+      `proxy up: ${this.proxy.base_url} → ${this.cfg.llm_target}${this.gate ? ` (session gate on: max ${this.cfg.max_active_agent_sessions ?? 2} sessions, hold cap ${this.cfg.session_hold_cap_ms ?? 120000}ms)` : ' (session gate off)'}`,
+    );
     return this.proxy;
   }
 
