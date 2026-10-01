@@ -9,7 +9,12 @@
  *   <IDLEFILL_DATA>/queue.jsonl   (default: <repo>/data/queue.jsonl)
  *
  * Queue line format: { "job_id": "<company-slug>-<url-hash8>",
- *                      "payload": { url, company, title, score } }
+ *                      "payload": { url, company, title, score,
+ *                                   estimated_seconds? } }
+ *   estimated_seconds (issue #6, optional): per-job lease-TTL estimate in
+ *   seconds. Passed through ONLY when the source row carries a finite
+ *   number > 0 — never invented here. The client uses it for the lease
+ *   request instead of the project estimate (arbiter clamps the TTL).
  *
  * Rules:
  *   - only `skip === false` entries
@@ -120,15 +125,18 @@ for (const job of pipeline) {
     alreadyDone++;
     continue;
   }
-  lines.push(JSON.stringify({
-    job_id,
-    payload: {
-      url: job.url,
-      company: job.company,
-      title: job.title,
-      score: job.score,
-    },
-  }));
+  const payload = {
+    url: job.url,
+    company: job.company,
+    title: job.title,
+    score: job.score,
+  };
+  // Per-job lease-TTL estimate (issue #6): preserve it only when the
+  // source row already carries a sane value; never invent one.
+  if (typeof job.estimated_seconds === 'number' && Number.isFinite(job.estimated_seconds) && job.estimated_seconds > 0) {
+    payload.estimated_seconds = job.estimated_seconds;
+  }
+  lines.push(JSON.stringify({ job_id, payload }));
   kept++;
 }
 

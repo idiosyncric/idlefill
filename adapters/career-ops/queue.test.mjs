@@ -102,6 +102,33 @@ test('score order is preserved (stable, desc)', () => {
   assert.deepEqual(ids, [jobId('Acme', ACME_FAIL), jobId('Acme', ACME_DONE), jobId('Acme', ACME_QUAR), jobId('Acme', ACME_NEW)]);
 });
 
+test('payload.estimated_seconds (issue #6): preserved when the source row carries a finite >0 number; never invented', () => {
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(data, { recursive: true, force: true });
+  mkdirSync(join(dir, 'data'), { recursive: true });
+  mkdirSync(data, { recursive: true });
+  writeFileSync(
+    join(dir, 'data', 'pipeline-prioritized.json'),
+    JSON.stringify([
+      { company: 'Acme', url: 'https://a.example/est-ok', title: 'T', score: 9, skip: false, estimated_seconds: 120 },
+      { company: 'Acme', url: 'https://a.example/est-str', title: 'T', score: 8, skip: false, estimated_seconds: '300' },
+      { company: 'Acme', url: 'https://a.example/est-neg', title: 'T', score: 7, skip: false, estimated_seconds: -5 },
+      { company: 'Acme', url: 'https://a.example/est-none', title: 'T', score: 6, skip: false },
+    ]),
+  );
+  const res = spawnSync('node', [QUEUE], {
+    env: { ...process.env, CAREER_OPS_ROOT: dir, IDLEFILL_DATA: data },
+    encoding: 'utf-8',
+  });
+  assert.equal(res.status, 0, res.stderr);
+  const lines = readFileSync(join(data, 'queue.jsonl'), 'utf-8').split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l));
+  const byUrl = new Map(lines.map((l) => [l.payload.url, l]));
+  assert.equal(byUrl.get('https://a.example/est-ok')?.payload?.estimated_seconds, 120, 'a sane source estimate rides onto the queue line');
+  assert.equal('estimated_seconds' in (byUrl.get('https://a.example/est-str')?.payload ?? {}), false, 'string estimate is dropped');
+  assert.equal('estimated_seconds' in (byUrl.get('https://a.example/est-neg')?.payload ?? {}), false, 'negative estimate is dropped');
+  assert.equal('estimated_seconds' in (byUrl.get('https://a.example/est-none')?.payload ?? {}), false, 'no source field ⇒ no invented field');
+});
+
 after(() => {
   for (const d of [dir, data]) if (d) rmSync(d, { recursive: true, force: true });
 });
