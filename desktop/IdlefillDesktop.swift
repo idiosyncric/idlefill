@@ -245,6 +245,30 @@ final class AppModel: ObservableObject {
   /** An edge build is awaiting the operator's confirm (set by the branch
    *  check; cleared on confirm / channel change / re-check). */
   @Published var edgePending: Bool = false
+  /** The download's byte progress (0...1) while an edge update downloads;
+   *  nil = no determinate progress (idle, or a phase with no byte count —
+   *  the UI shows a spinner then). Driven by a poll of the URLSessionTask's
+   *  own progress while the zip downloads. */
+  @Published var updateProgress: Double? = nil
+  /** The pin field's visibility (Settings): the field is exception-only —
+   *  it renders when a pin is SET or the operator opened it with "pin".
+   *  The old layout showed channel + branch + pin simultaneously. */
+  @Published var showPinField: Bool = false
+  /** The branch field's visibility (Settings): same exception rule as the
+   *  pin — renders when the tracked branch is NOT the default or the
+   *  operator opened it with "branch". */
+  @Published var showBranchField: Bool = false
+  /** The check watchdog (seconds): a check that never reports back (a
+   *  hung task, a silent delegate miss) must not leave the UI stuck on
+   *  "checking…" forever — the 2026-10-01 incident froze the row on
+   *  "installing … the app will quit and relaunch" while the old process
+   *  outlived the swap. Injectable for the headless harness. */
+  var checkWatchdog: TimeInterval = 60
+  private var watchdogToken = 0
+  /** The last moment a download's byte counter advanced — the watchdog
+   *  re-arms (instead of standing down) while a download is ALIVE: the
+   *  timeout is for a HUNG check, not a slow network. */
+  private var lastProgressAt = Date.distantPast
 
   private(set) var repoRoot: String = AppModel.findRepoRoot()
 
@@ -304,7 +328,50 @@ final class AppModel: ObservableObject {
     guard let c = updaterController else { return }
     updateStatus = "checking for updates…"
     updateChecking = true
+    armWatchdog()
     c.checkForUpdates(nil)
+  }
+
+  /** Arm the check watchdog: if a check is STILL running after
+   *  `checkWatchdog` seconds, stand the UI down with an actionable status
+   *  instead of leaving "checking…"/"installing…" frozen forever (the
+   *  2026-10-01 incident). Token-guarded: a newer check invalidates an
+   *  older timer, and a completed check (updateChecking == false) makes a
+   *  firing timer a no-op — no explicit disarm needed on the happy paths.
+   *  Returns the token: a check's network completion must match it
+   *  (watchdogToken) before touching state — when the watchdog FIRES it
+   *  bumps the token, so the hung fetch's own late timeout (URLSession
+   *  restores its captured prevStatus at ~10s) can never stomp the
+   *  "timed out" row or a newer check's status. */
+  @discardableResult
+  private func armWatchdog() -> Int {
+    watchdogToken += 1
+    let token = watchdogToken
+    DispatchQueue.main.asyncAfter(deadline: .now() + checkWatchdog) { [weak self] in
+      self?.watchdogFire(token: token)
+    }
+    return token
+  }
+
+  /** The watchdog's firing body (a method, not a self-capturing closure —
+   *  the re-arm recursion would otherwise cycle on its own capture). */
+  private func watchdogFire(token: Int) {
+    guard watchdogToken == token, updateChecking else { return }
+    // A download whose byte counter advanced inside the window is ALIVE
+    // (a slow network, not a hung check) — re-check later WITHOUT
+    // bumping the token (the in-flight completion still owns the state).
+    if updateProgress != nil,
+       Date().timeIntervalSince(lastProgressAt) < checkWatchdog {
+      DispatchQueue.main.asyncAfter(deadline: .now() + checkWatchdog) { [weak self] in
+        self?.watchdogFire(token: token)
+      }
+      return
+    }
+    watchdogToken += 1 // invalidate this check's own late completion
+    updateChecking = false
+    updateProgress = nil
+    edgePending = false
+    updateStatus = "update check timed out — try again"
   }
 
   // MARK: update channel — branch (edge) channel (issue #26)
@@ -450,6 +517,7 @@ final class AppModel: ObservableObject {
     let prevStatus = updateStatus
     updateStatus = "checking \(branch) for a new build…"
     updateChecking = true
+    let token = armWatchdog()
     let base = AppModel.updateBase()
     let branchEnc = branch.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? branch
     guard let url = URL(string: "\(base)/api/v1/repos/sam/idlefill/git/refs/heads/\(branchEnc)") else {
@@ -462,6 +530,9 @@ final class AppModel: ObservableObject {
     URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
       guard let self else { return }
       DispatchQueue.main.async {
+        // A watchdog stand-down or a newer check invalidated this one —
+        // its late completion must not stomp the newer state.
+        guard self.watchdogToken == token else { return }
         self.updateChecking = false
         // OFFLINE-TOLERANT: only a GENUINE refs response (2xx) or a
         // genuine 404 (the branch does not exist) changes the status line.
@@ -535,6 +606,7 @@ final class AppModel: ObservableObject {
     let prevStatus = updateStatus
     updateStatus = "checking the pinned build \(marker)…"
     updateChecking = true
+    let token = armWatchdog()
     let base = AppModel.updateBase()
     let tagEnc = marker.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? marker
     guard let url = URL(string: "\(base)/api/v1/repos/sam/idlefill/releases/tags/\(tagEnc)") else {
@@ -547,6 +619,8 @@ final class AppModel: ObservableObject {
     URLSession.shared.dataTask(with: req) { [weak self] _, resp, _ in
       guard let self else { return }
       DispatchQueue.main.async {
+        // A watchdog stand-down or a newer check invalidated this one.
+        guard self.watchdogToken == token else { return }
         self.updateChecking = false
         guard let e = resp as? HTTPURLResponse else {
           // No HTTP response at all — the network is down. The previous
@@ -606,13 +680,14 @@ final class AppModel: ObservableObject {
     guard !branch.isEmpty else { return }
     updateStatus = "downloading the new build…"
     updateChecking = true
+    let token = armWatchdog()
     let base = AppModel.updateBase()
     // PIN mode: the pinned marker is final (no re-fetch — a pin cannot
     // move; the check's verdict stands). TIP mode: re-fetch the tip
     // (it may have moved since the check).
     let pin = updatePin.trimmingCharacters(in: .whitespacesAndNewlines)
     if AppModel.isPinSha(pin) {
-      installEdge(marker: AppModel.pinnedMarker(branch: branch, pin: pin))
+      installEdge(marker: AppModel.pinnedMarker(branch: branch, pin: pin), token: token)
       return
     }
     let branchEnc = branch.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? branch
@@ -625,13 +700,14 @@ final class AppModel: ObservableObject {
     URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
       guard let self else { return }
       DispatchQueue.main.async {
+        guard self.watchdogToken == token else { return }
         guard let tip = AppModel.branchUpdateMarker(data: data, localMarker: self.bakedMarker) else {
           self.updateChecking = false
           self.edgePending = false
           self.updateStatus = "up to date (\(self.bakedMarker))"
           return
         }
-        self.installEdge(marker: tip)
+        self.installEdge(marker: tip, token: token)
       }
     }.resume()
   }
@@ -641,7 +717,7 @@ final class AppModel: ObservableObject {
    *  BEFORE any swap (the menubar's Phase-1 contract, CryptoKit — a
    *  mismatch / missing / malformed sidecar refuses and keeps the current
    *  bundle). Then the swap in a detached helper (below). */
-  private func installEdge(marker: String) {
+  private func installEdge(marker: String, token: Int) {
     let zipName = "Idlefill \(marker).zip"
     let tagEnc = marker.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? marker
     let dlBase = AppModel.updateBase() + "/sam/idlefill/releases/download/\(tagEnc)"
@@ -651,21 +727,50 @@ final class AppModel: ObservableObject {
     try? fm.createDirectory(atPath: tmpDir, withIntermediateDirectories: true)
     let zipDest = tmpDir + "/" + zipName
     let sidecarDest = zipDest + ".sha256"
-    let dl = { (suffix: String, dest: String, done: @escaping (Bool) -> Void) in
+    let dl = { (suffix: String, dest: String, track: Bool, done: @escaping (Bool) -> Void) in
       let enc = suffix.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? suffix
       guard let url = URL(string: "\(dlBase)/\(enc)") else { done(false); return }
-      URLSession.shared.downloadTask(with: url) { tmp, _, _ in
+      // The progress bar's feed (the zip only — the sidecar is a few
+      // bytes): poll the task's own byte counters every 0.25s; expected
+      // <= 0 (no Content-Length) keeps the bar indeterminate (nil). The
+      // poll dies in the completion handler, before done() runs.
+      var poll: Timer? = nil
+      let task = URLSession.shared.downloadTask(with: url) { tmp, _, _ in
+        // The completion runs on the URLSession delegate queue — the
+        // timer lives on the MAIN runloop; invalidate where it lives
+        // (Timer is not thread-safe), ahead of done()'s own main-queue
+        // hop so no stale fraction lands after the caller clears it.
+        if let poll { DispatchQueue.main.async { poll.invalidate() } }
         guard let tmp = tmp else { done(false); return }
         do {
           if fm.fileExists(atPath: dest) { try fm.removeItem(atPath: dest) }
           try fm.moveItem(at: tmp, to: URL(fileURLWithPath: dest))
           done(true)
         } catch { done(false) }
-      }.resume()
+      }
+      if track {
+        poll = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak task] _ in
+          guard let task else { return }
+          let exp = task.countOfBytesExpectedToReceive
+          let got = task.countOfBytesReceived
+          if exp > 0 {
+            DispatchQueue.main.async {
+              self.lastProgressAt = Date()
+              self.updateProgress = Double(got) / Double(exp)
+            }
+          }
+        }
+      }
+      task.resume()
     }
-    dl(zipName, zipDest) { [weak self] ok in
+    dl(zipName, zipDest, true) { [weak self] ok in
       guard let self else { return }
       DispatchQueue.main.async {
+        // The watchdog stood this install down (a dead download) — the
+        // late completion must not resurrect it or stomp the "timed out"
+        // row / a newer check.
+        guard self.watchdogToken == token else { return }
+        self.updateProgress = nil
         guard ok else {
           self.updateChecking = false
           self.edgePending = false
@@ -673,9 +778,10 @@ final class AppModel: ObservableObject {
           return
         }
         self.updateStatus = "downloading the hash…"
-        dl(zipName + ".sha256", sidecarDest) { [weak self] ok in
+        dl(zipName + ".sha256", sidecarDest, false) { [weak self] ok in
           guard let self else { return }
           DispatchQueue.main.async {
+            guard self.watchdogToken == token else { return }
             guard ok,
                   let zipData = try? Data(contentsOf: URL(fileURLWithPath: zipDest)),
                   let sideData = try? Data(contentsOf: URL(fileURLWithPath: sidecarDest)) else {
@@ -734,14 +840,46 @@ final class AppModel: ObservableObject {
     // script shape stays identical either way, so the swap logic is the
     // one thing that gets verified).
     let openLine = noOpen ? ": # headless run — no relaunch" : "open \"$TARGET\""
+    // The quit handshake (the 2026-10-01 fix): the old script fired a
+    // blind `kill -TERM` and moved on after 5s — when the TERM did not
+    // take, the swap replaced the bundle UNDER the still-running old
+    // process, `open` re-activated that stale instance, and the status
+    // line froze on "installing … the app will quit and relaunch"
+    // forever (the update had actually landed). Now: the script signals
+    // READY after unzipping, the APP quits itself when it sees READY
+    // (a GUI app terminating itself is the reliable quit), and the
+    // script waits on the pid with TERM→KILL escalation before swapping.
+    let tmpBase = FileManager.default.temporaryDirectory
+      .appendingPathComponent("idlefill-edge-swap-\(getpid())")
+    let readyFile = tmpBase.path + ".ready"
+    // Self-quit is the production path (the READY handshake). The
+    // headless harness normally disables it (its driver must live to
+    // assert the swap); IDLEFILL_DESKTOP_EDGE_SELFQUIT re-enables JUST
+    // the handshake while NO_OPEN still suppresses the relaunch — the
+    // --selfquit harness case proves the app quits itself and the
+    // script's TERM→KILL escalation never has to fire.
+    let selfQuit = noOpen
+      ? ProcessInfo.processInfo.environment["IDLEFILL_DESKTOP_EDGE_SELFQUIT"] != nil
+      : true
     let script = """
       set -euo pipefail
       T=$(mktemp -d)
       unzip -q -d "$T" "\(zip)"
       [ -d "$T/Idlefill.app" ] || { echo "zip root is not the Idlefill.app bundle"; exit 1; }
-      # Quit the running app ONLY when it is the one that lives in the
-      # target bundle (a name match alone would kill an Idlefill from a
-      # different checkout — the daemon-identity rule, applied to the app).
+      touch "$READY"
+      # Wait for the old app to die: its own quit (the READY handshake) is
+      # the fast path; TERM then KILL escalate so the swap NEVER lands
+      # under a live old process. SELF_PID is only set on the self-quit
+      # path (production); the headless harness has no pid to wait on.
+      if [ -n "${SELF_PID:-}" ]; then
+        for i in $(seq 1 40); do kill -0 "$SELF_PID" 2>/dev/null || break; sleep 0.25; done
+        kill -TERM "$SELF_PID" 2>/dev/null || true
+        for i in $(seq 1 20); do kill -0 "$SELF_PID" 2>/dev/null || break; sleep 0.25; done
+        kill -KILL "$SELF_PID" 2>/dev/null || true
+      fi
+      # Any OTHER Idlefill running from the target bundle (a second
+      # instance the handshake cannot know about) — same identity rule
+      # as before: match the TARGET bundle, never a bare name.
       for pid in $(pgrep -x Idlefill 2>/dev/null || true); do
         exe=$(ps -p "$pid" -o comm= 2>/dev/null || true)
         case "$exe" in
@@ -755,35 +893,63 @@ final class AppModel: ObservableObject {
       rm -rf "$TARGET"
       mv "$TARGET.new" "$TARGET"
       rm -rf "$T"
+      rm -f "$READY"
       \(openLine)
       """
-    let scriptPath = FileManager.default.temporaryDirectory
-      .appendingPathComponent("idlefill-edge-swap-\(getpid()).sh").path
+    let scriptPath = tmpBase.path + ".sh"
     guard (try? script.write(toFile: scriptPath, atomically: true, encoding: .utf8)) != nil else {
       updateStatus = "could not write the install script — \(marker) was NOT installed (the current build was kept)"
       return
     }
     try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: scriptPath)
+    try? FileManager.default.removeItem(atPath: readyFile)
     updateStatus = "installing \(marker) — the app will quit and relaunch"
-    updateChecking = false
+    // Stay in the checking state through the swap: if the helper dies
+    // before the handshake (an unzip failure), the watchdog stands the
+    // UI down instead of freezing on "installing…" (the incident's
+    // symptom). The app normally exits long before the watchdog fires.
+    updateChecking = true
+    armWatchdog()
     edgePending = false
     let helper = Process()
     helper.executableURL = URL(fileURLWithPath: "/bin/bash")
-    // The helper's env carries the TARGET (the script's $TARGET) — the
-    // test hooks are read by the APP (above), not the script, so only
-    // the target crosses. sleep 0.5: let this process's main thread
-    // reach run() before the script's quit step lands; stdio to null (a
-    // Pipe would deadlock the helper if it ever wrote past the 64 KB
-    // buffer).
-    helper.arguments = ["-c", "sleep 0.5; TARGET='\(target)' bash '\(scriptPath)' >/dev/null 2>&1; rm -f '\(scriptPath)'"]
+    // The helper's env carries the TARGET (the script's $TARGET) and the
+    // READY handshake file; the test hooks are read by the APP (above),
+    // not the script, so only the target crosses. sleep 0.5: let this
+    // process's main thread reach run() before the script starts; stdio
+    // to null (a Pipe would deadlock the helper if it ever wrote past
+    // the 64 KB buffer).
+    var env = ProcessInfo.processInfo.environment
+    env["TARGET"] = target
+    env["READY"] = readyFile
+    if selfQuit { env["SELF_PID"] = String(getpid()) } else { env.removeValue(forKey: "SELF_PID") }
+    helper.environment = env
+    helper.arguments = ["-c", "sleep 0.5; bash '\(scriptPath)' >/dev/null 2>&1; rm -f '\(scriptPath)'"]
     helper.standardOutput = FileHandle.nullDevice
     helper.standardError = FileHandle.nullDevice
     do {
       try helper.run()
-      // Deliberately NOT waited on — the helper is the one that quits
-      // this app (the quit step in the swap script).
+      // Deliberately NOT waited on — the helper outlives this app (it
+      // must survive the quit step to finish the swap).
     } catch {
+      updateChecking = false
       updateStatus = "could not start the install helper — \(marker) was NOT installed (the current build was kept)"
+      return
+    }
+    // The self-quit: poll for READY (the script unzipped + verified the
+    // bundle), then terminate cleanly so the swap replaces a dead
+    // bundle. Production only (the headless harness's driver must live
+    // to assert the swap).
+    if selfQuit {
+      Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { timer in
+        if FileManager.default.fileExists(atPath: readyFile) {
+          timer.invalidate()
+          // NSApplication.shared, not NSApp: the headless harness driver
+          // has no AppKit lifecycle (NSApp would be nil → crash); in the
+          // real app `shared` IS the running instance.
+          NSApplication.shared.terminate(nil)
+        }
+      }
     }
   }
 
@@ -1970,49 +2136,85 @@ struct SettingsPanel: View {
 
         DividerLine()
 
-        // The update channel (issue #26): `releases` (the default —
-        // today's Sparkle flow) | `branch` (the branch channel — the
-        // tracked branch's latest published build, an edge marker).
-        // Persisted alongside the repo path (saveUpdateChannel).
+        // The update row (redesigned after the 2026-10-01 stuck-update
+        // incident): ONE line that states where updates come from in
+        // plain words, a compact control, and the pin hidden behind an
+        // "advanced" affordance (it renders only when set or opened —
+        // the old layout showed channel + branch + pin + a three-way
+        // explanation paragraph at once, which read as noise).
         HStack(spacing: 8) {
-          Text("update channel").font(.system(.body, design: .monospaced)).foregroundStyle(Pal.dim)
+          Text("updates").font(.system(.body, design: .monospaced)).foregroundStyle(Pal.dim)
           Picker("", selection: $m.updateChannel) {
             Text("releases").tag("releases")
             Text("branch").tag("branch")
           }
           .labelsHidden()
           .frame(width: 110)
+          // One plain sentence for the selected channel (never both).
+          Text(m.updateChannel == "branch"
+               ? "latest build pushed to \((m.updateBranch.isEmpty ? "main" : m.updateBranch))"
+               : "published releases")
+            .font(.system(size: 11, design: .monospaced))
+            .foregroundStyle(Pal.dim)
+            .lineLimit(1)
+          Spacer(minLength: 4)
+          // The pin (advanced): a tiny toggle that reveals the field;
+          // the field also shows whenever a pin is set (so a pin can
+          // always be cleared).
           if m.updateChannel == "branch" {
-            // The branch the channel tracks (default main) — exception-
-            // only, rendered only while the branch channel is selected.
-            Text("branch").font(.system(.body, design: .monospaced)).foregroundStyle(Pal.dim)
-            TextField("", text: $m.updateBranch)
-              .font(.system(.body, design: .monospaced))
-              .textFieldStyle(.plain)
-              .foregroundStyle(Pal.text)
-              .background(Pal.canvas)
-              .clipShape(RoundedRectangle(cornerRadius: 4))
-              .padding(4)
-              .frame(maxWidth: 200)
-            // The DEVELOPMENT PIN (the branch channel's pinning extension)
-            // — exception-only, beside the branch field: a commit SHA
-            // (7–40 hex) pins the check to that commit's edge build
-            // instead of the branch's tip. Empty = follow the tip;
-            // malformed = cleared on save (tip-following resumes).
-            Text("pin").font(.system(.body, design: .monospaced)).foregroundStyle(Pal.dim)
-            TextField("", text: $m.updatePin, prompt: Text("commit sha").foregroundStyle(Pal.dim))
-              .font(.system(.body, design: .monospaced))
-              .textFieldStyle(.plain)
-              .foregroundStyle(Pal.text)
-              .background(Pal.canvas)
-              .clipShape(RoundedRectangle(cornerRadius: 4))
-              .padding(4)
-              .frame(maxWidth: 200)
+            Button(m.updateBranch == "main" ? "branch" : "edit branch") { m.showBranchField = true }
+              .font(.system(size: 11, design: .monospaced))
+              .buttonStyle(.plain)
+              .foregroundStyle(Pal.dim)
+              .disabled(m.updateBranch != "main")
+            Button(m.updatePin.isEmpty ? "pin" : "edit pin") { m.showPinField = true }
+              .font(.system(size: 11, design: .monospaced))
+              .buttonStyle(.plain)
+              .foregroundStyle(Pal.dim)
+              .disabled(!m.updatePin.isEmpty)
           }
           Button("save") { m.saveUpdateChannel() }
             .font(.system(.body, design: .monospaced))
             .buttonStyle(.plain)
             .foregroundStyle(Pal.accent)
+        }
+        // The branch + pin fields, exception-only: the branch field only
+        // when the tracked branch is NOT the default or "branch" opened
+        // it, the pin field only when opened or set.
+        if m.updateChannel == "branch" && (m.updateBranch != "main" || m.showBranchField || m.showPinField || !m.updatePin.isEmpty) {
+          HStack(spacing: 8) {
+            if m.updateChannel == "branch" && (m.updateBranch != "main" || m.showBranchField) {
+              Text("branch").font(.system(.body, design: .monospaced)).foregroundStyle(Pal.dim)
+              TextField("", text: $m.updateBranch)
+                .font(.system(.body, design: .monospaced))
+                .textFieldStyle(.plain)
+                .foregroundStyle(Pal.text)
+                .background(Pal.canvas)
+                .clipShape(RoundedRectangle(cornerRadius: 4))
+                .padding(4)
+                .frame(maxWidth: 160)
+            }
+            if m.showPinField || !m.updatePin.isEmpty {
+              Text("pin").font(.system(.body, design: .monospaced)).foregroundStyle(Pal.dim)
+              TextField("", text: $m.updatePin, prompt: Text("commit sha — empty follows the branch tip").foregroundStyle(Pal.dim))
+                .font(.system(.body, design: .monospaced))
+                .textFieldStyle(.plain)
+                .foregroundStyle(Pal.text)
+                .background(Pal.canvas)
+                .clipShape(RoundedRectangle(cornerRadius: 4))
+                .padding(4)
+                .frame(maxWidth: 260)
+              // Clear an unwanted pin without saving an empty field past
+              // the visibility rule (empty + closed = tip-following).
+              if !m.updatePin.isEmpty {
+                Button("clear") { m.updatePin = ""; m.showPinField = false; m.saveUpdateChannel() }
+                  .font(.system(size: 11, design: .monospaced))
+                  .buttonStyle(.plain)
+                  .foregroundStyle(Pal.dim)
+              }
+            }
+            Spacer(minLength: 4)
+          }
         }
 
         DividerLine()
@@ -2042,8 +2244,29 @@ struct SettingsPanel: View {
               .frame(maxWidth: .infinity, alignment: .leading)
           }
         }
+        // The update progress (the 2026-10-01 ask): a real bar while an
+        // edge download runs (determinate from the task's byte counts;
+        // indeterminate when the server sends no length), a spinner for
+        // every other in-flight phase (a check, the hash fetch, the
+        // swap handshake). Nothing when idle — Exception-Only.
+        if m.updateChecking {
+          HStack(spacing: 8) {
+            if let frac = m.updateProgress {
+              ProgressView(value: min(max(frac, 0), 1))
+                .progressViewStyle(.linear)
+                .tint(Pal.accent)
+              Text("\(Int((min(max(frac, 0), 1)) * 100))%")
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(Pal.dim)
+                .frame(width: 38, alignment: .trailing)
+            } else {
+              ProgressView().controlSize(.small).tint(Pal.accent)
+            }
+          }
+          .frame(maxWidth: .infinity, alignment: .leading)
+        }
 
-        Text("updates come from the Forgejo repo — the releases channel (appcast.xml, Sparkle) or the branch channel (a build per push to the picked branch) — see the README \"Updating\" section.")
+        Text("updates come from the Forgejo repo — see the README \"Updating\" section.")
           .font(.system(size: 11, design: .monospaced))
           .foregroundStyle(Pal.dim)
           .frame(maxWidth: .infinity, alignment: .leading)

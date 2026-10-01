@@ -141,17 +141,17 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({ message: "The target couldn't be found." }));
     return;
   }
-  if (u === '/releases/download/' + edgeMarker + '/IdlefillMenubar-' + edgeMarker + '.app.zip') {
+  if (u === '/sam/idlefill/releases/download/' + edgeMarker + '/IdlefillMenubar-' + edgeMarker + '.app.zip') {
     res.writeHead(200, { 'Content-Type': 'application/zip' }); res.end(zip); return;
   }
-  if (u === '/releases/download/' + edgeMarker + '/IdlefillMenubar-' + edgeMarker + '.app.zip.sha256') {
+  if (u === '/sam/idlefill/releases/download/' + edgeMarker + '/IdlefillMenubar-' + edgeMarker + '.app.zip.sha256') {
     res.writeHead(200, { 'Content-Type': 'text/plain' }); res.end(good); return;
   }
   // The TAMPERED-sidecar route: a different tag, same zip bytes, bad hash.
-  if (u === '/releases/download/edge-main-0000000/IdlefillMenubar-edge-main-0000000.app.zip') {
+  if (u === '/sam/idlefill/releases/download/edge-main-0000000/IdlefillMenubar-edge-main-0000000.app.zip') {
     res.writeHead(200, { 'Content-Type': 'application/zip' }); res.end(zip); return;
   }
-  if (u === '/releases/download/edge-main-0000000/IdlefillMenubar-edge-main-0000000.app.zip.sha256') {
+  if (u === '/sam/idlefill/releases/download/edge-main-0000000/IdlefillMenubar-edge-main-0000000.app.zip.sha256') {
     res.writeHead(200, { 'Content-Type': 'text/plain' }); res.end(bad); return;
   }
   res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('not found');

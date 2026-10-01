@@ -139,6 +139,9 @@ const server = http.createServer((req, res) => {
   if (m) {
     if (m[1] === 'main') { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(refOf('main', '$SHA40_NEW'))); return; }
     if (m[1] === 'bad')  { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(refOf('bad', '$SHA40_BAD'))); return; }
+    // The HANGING branch route (the watchdog test): headers and body
+    // never arrive — the only exit is the client side standing down.
+    if (m[1] === 'hang') { return; }
     // unknown branch: the live API's exact 404 body.
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ message: "The target couldn't be found." }));
@@ -249,6 +252,25 @@ if CommandLine.arguments.contains("--deadport") {
   if failures > 0 { print("EDGE-DT-FAILURES \(failures)"); exit(1) }
   print("EDGE-DT-DEADPORT-PASS")
   exit(0)
+}
+
+// THE SELF-QUIT HANDSHAKE (the 2026-10-01 stuck-update fix; a third
+// driver invocation, --selfquit, with IDLEFILL_DESKTOP_EDGE_SELFQUIT=1):
+// confirmEdgeInstall() must make the APP QUIT ITSELF when the swap
+// script signals READY — the old blind `kill -TERM` was the incident's
+// root cause. Proof by exit code: NSApplication.terminate exits 0; if
+// the handshake were broken the script's TERM→KILL escalation would
+// kill this process (128+15=143 / 128+9=137). The bash side asserts
+// exit 0 AND the scratch bundle replaced. This block never returns.
+if CommandLine.arguments.contains("--selfquit") {
+  let sm = AppModel()
+  sm.updateChannel = "branch"
+  sm.updateBranch = "main"
+  sm.edgePending = true
+  sm.confirmEdgeInstall()
+  // Spin the runloop forever: the READY timer terminates us (exit 0) or
+  // the script's escalation kills us (143/137). Either way bounded.
+  while true { RunLoop.main.run(until: Date().addingTimeInterval(0.2)) }
 }
 
 // ISSUE #23: the Settings drift marker (headless coverage of the model's
@@ -513,6 +535,36 @@ let gotTipAfterBadPin = waitUntil(timeout: 30) {
 check("d2: a malformed pin -> the tip path unchanged (the tip's offer)",
       gotTipAfterBadPin && md.edgePending == true)
 
+// ------------------- (d3) THE WATCHDOG (the 2026-10-01 stuck-update fix)
+// A check whose fetch NEVER answers (the stub's 'hang' route never
+// responds) must not leave the UI frozen on "checking…" forever — the
+// watchdog stands it down with an actionable status. The watchdog is
+// injected SHORT (2s) so the test does not wait out the URLSession's own
+// 10s timeout (which would restore the previous status first).
+md.checkWatchdog = 2
+md.updatePin = ""
+md.updateBranch = "hang"
+md.updateStatus = "seeded-before-hang"
+md.checkBranchUpdates()
+let watchdogFired = waitUntil(timeout: 15) {
+  !md.updateChecking && (md.updateStatus ?? "").contains("timed out")
+}
+check("d3: a hanging check -> the watchdog stands the UI down (no frozen 'checking…')",
+      watchdogFired && md.edgePending == false && md.updateProgress == nil)
+// The watchdog must NOT fire on a COMPLETED check: arm it, let a real
+// check finish, and the older timer must be a no-op (token + state
+// guards). Back on 'main' with the default watchdog.
+md.checkWatchdog = 3
+md.updateBranch = "main"
+md.checkBranchUpdates()
+let doneFirst = waitUntil(timeout: 30) {
+  !md.updateChecking && (md.updateStatus ?? "").contains("new build")
+}
+Thread.sleep(forTimeInterval: 3.5) // past the armed 3s watchdog
+check("d3: a completed check -> the watchdog is a no-op (status survives)",
+      doneFirst && (md.updateStatus ?? "").contains("new build") && md.updateChecking == false)
+md.checkWatchdog = 60
+
 // --------------------------------- (e) the REAL confirmEdgeInstall()
 // (e) CORRECT sidecar: download + sha256 verified BEFORE the swap, then
 // the swap in the detached helper — the SCRATCH bundle is replaced
@@ -642,6 +694,38 @@ env -i PATH=/usr/bin:/bin \
   IDLEFILL_DESKTOP_EDGE_NO_OPEN=1 \
   "$T/edge-dt-test" --deadport || RC2=$?
 echo "EDGE-DT-DEADPORT-EXIT=$RC2"
+
+# The SELF-QUIT handshake run (the 2026-10-01 fix): SELFQUIT=1 re-enables
+# the READY handshake while NO_OPEN still suppresses the relaunch. The
+# driver confirms an install and spins; the app must terminate ITSELF
+# (exit 0) when the script signals READY — a broken handshake means the
+# script's TERM/KILL escalation killed it (143/137). The scratch bundle
+# must end up replaced (the swap completed after the self-quit). The
+# scratch bundle is reset to CURRENT first (the main run left it NEW).
+echo "==> run (self-quit handshake — the app terminates itself on READY)"
+echo "CURRENT-BUNDLE" > "$T/scratch/Idlefill.app/Contents/MacOS/Idlefill"
+RC4=0
+env -i PATH=/usr/bin:/bin \
+  HOME="$T/home" \
+  IDLEFILL_DESKTOP_CONFIG="$T/homecfg.json" \
+  IDLEFILL_REPO_PATH="$T/repo" \
+  IDLEFILL_UPDATE_BASE="http://127.0.0.1:$PORT" \
+  IDLEFILL_DESKTOP_EDGE_TARGET="$T/scratch/Idlefill.app" \
+  IDLEFILL_DESKTOP_EDGE_NO_OPEN=1 \
+  IDLEFILL_DESKTOP_EDGE_SELFQUIT=1 \
+  "$T/edge-dt-test" --selfquit || RC4=$?
+# The swap is detached — give the helper a moment to land it.
+for i in $(seq 1 40); do
+  grep -q "NEW-EDGE-BUNDLE" "$T/scratch/Idlefill.app/Contents/MacOS/Idlefill" 2>/dev/null && break
+  sleep 0.25
+done
+SQ_OK=1
+[ "$RC4" -eq 0 ] || { echo "FAIL selfquit: driver exit $RC4 (expected 0 — a 143/137 means the handshake failed and the escalation killed it)"; SQ_OK=0; }
+grep -q "NEW-EDGE-BUNDLE" "$T/scratch/Idlefill.app/Contents/MacOS/Idlefill" 2>/dev/null \
+  || { echo "FAIL selfquit: the scratch bundle was NOT replaced"; SQ_OK=0; }
+[ "$SQ_OK" -eq 1 ] && echo "PASS selfquit: the app quit itself on READY + the swap landed"
+echo "EDGE-DT-SELFQUIT-EXIT=$SQ_OK"
+[ "$SQ_OK" -eq 1 ] || RC=1
 
 # The drift-marker run (issue #23): the desktop app's OWN test hook labels
 # (IDLEFILL_DESKTOP_TEST + the label overrides) point the model at the
