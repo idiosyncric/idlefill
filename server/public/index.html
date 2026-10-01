@@ -153,6 +153,18 @@
     cursor: pointer; margin-top: 4px;
   }
   .unthrottle:hover { border-color: var(--accent); }
+  /* Sessions (router-self-registered interactive traffic — exception-only
+     section, hidden while nothing is registered): one row per session —
+     liveness dot, short token (+ the client that registered it), the engine
+     it routes to, the newest request, the state word, and the pause gate.
+     A row with no heartbeat in 90s is stale (dimmed + tag) — the same 90s
+     precedent as worker liveness. */
+  .sess { display: flex; flex-wrap: wrap; gap: 8px; padding: 2px 0; font-size: 12px; align-items: baseline; }
+  .sess .sname { min-width: 96px; font-weight: 600; }
+  .sess .smeta { color: var(--dim); white-space: nowrap; }
+  .sess .sstate { margin-left: auto; font-size: 12px; font-weight: 600; white-space: nowrap; }
+  .sess .gate { margin-left: 8px; }
+  .sess.stale { opacity: 0.55; }
   /* The worker list collapses (the tray chevron's 150ms pattern, applied to
      a per-project toggle). Expanded by default; state per project in
      localStorage (idlefill.projWorkers.<name>). */
@@ -276,6 +288,16 @@
   <section>
     <h2>Projects</h2>
     <div id="projects"><div class="empty">no projects configured</div></div>
+  </section>
+
+  <!-- Sessions — interactive traffic the router self-registered (#32/#33).
+       Exception-only: the section is hidden while no session is registered.
+       The pause gate asks the router to hold that session's traffic (the
+       router enforces admission; the arbiter stores + exposes — the
+       dashboard only displays arbiter truth). -->
+  <section id="sessions-section" style="display:none">
+    <h2>Sessions</h2>
+    <div id="sessions"></div>
   </section>
 
   <!-- Throttled jobs — the anti-thrash backstop (exception-only: the
@@ -619,6 +641,70 @@ function workBlock(p, st) {
 }
 
 // ---------------------------------------------------------------------------
+// Sessions pane — one row per router-self-registered session (#32/#33).
+// The router enforces admission; the dashboard only displays arbiter truth,
+// so the state word is derived from the row's own timestamps + override —
+// never a queue position (the queue lives client-side, not in this payload).
+// ---------------------------------------------------------------------------
+const SESSION_ONLINE_MS = 90_000;  // the 90s liveness precedent (api.ts clients)
+const SESSION_ACTIVE_MS = 30_000;  // "active" = a request seen this recently
+
+// The state word: paused (operator override) > active (online + a recent
+// request) > idle. Stale is NOT a state word — it is the exception tag on a
+// row whose heartbeat lapsed (dimmed), same 90s window as worker liveness.
+function sessStateWord(sess, st) {
+  if (sess.override?.override === "pause") {
+    return { label: "Paused", cls: "warn", note: "paused — the router holds this session's traffic" };
+  }
+  const online = st.now - (sess.last_seen ?? 0) < SESSION_ONLINE_MS;
+  const act = sess.last_activity;
+  if (online && act !== null && act !== undefined && st.now - act < SESSION_ACTIVE_MS) {
+    return { label: "Active", cls: "ok", note: "a request was seen on this session just now" };
+  }
+  return { label: "Idle", cls: "dim", note: "no request seen on this session recently" };
+}
+
+function sessBlock(sess, st) {
+  const stale = st.now - (sess.last_seen ?? 0) >= SESSION_ONLINE_MS;
+  const w = sessStateWord(sess, st);
+  // The token IS the session's identity (the /s/<token> path). It is long and
+  // meaningless to read, so the row shows a short handle and keeps the full
+  // token in the title (the operator matches it against the desktop app).
+  const shortTok = String(sess.token ?? "").slice(0, 8);
+  const nameHtml =
+    '<span class="sname" title="session ' + esc(sess.token) + (sess.client_name ? " — registered by " + esc(sess.client_name) : "") + '">' +
+    esc(shortTok) + (sess.client_name ? ' <span class="smeta">' + esc(sess.client_name) + "</span>" : "") +
+    "</span>";
+  const metaHtml =
+    '<span class="smeta" title="the newest request the router saw on this session">' +
+    (sess.last_activity !== null && sess.last_activity !== undefined
+      ? "last request " + ago(st.now - sess.last_activity)
+      : "no requests yet") +
+    "</span>" +
+    (sess.server_id ? ' <span class="smeta" title="the engine this session routes to">→ ' + esc(sess.server_id) + "</span>" : "");
+  const staleTag = stale
+    ? ' <span class="tag" title="no heartbeat from this session in the last 90s — the router may have dropped it">stale</span>'
+    : "";
+  const gate =
+    '<select class="gate small" data-token="' + esc(sess.token) + '" title="set gate for session ' + esc(sess.token) + '">' +
+    '<option value="paused"' + (sess.override?.override === "pause" ? " selected" : "") + ">" + esc(sessGateLabelText("paused")) + "</option>" +
+    '<option value="running"' + (sess.override?.override !== "pause" ? " selected" : "") + ">" + esc(sessGateLabelText("running")) + "</option>" +
+    "</select>";
+  return '<div class="sess' + (stale ? " stale" : "") + '" data-sess="' + esc(shortTok) + '">' +
+    '<span class="dot ' + (stale ? "off" : "on") + '" title="' + (stale ? "stale (no heartbeat within 90s)" : "live (heartbeat within 90s)") + '"></span>' +
+    nameHtml + metaHtml + staleTag +
+    '<span class="sstate ' + w.cls + '" title="' + esc(w.note) + '">' + esc(w.label) + "</span>" +
+    gate +
+    "</div>";
+}
+
+// Gate option text for a session (the same two-option gate language as the
+// engine / project / worker gates; the live state lives in the state word).
+function sessGateLabelText(mode) {
+  return mode === "paused" ? "Session Paused" : "Session Running";
+}
+
+// ---------------------------------------------------------------------------
 // Header: the live-state word (#status, left) + the global engine gate +
 // the gate token field (the write credential, next to what it enables).
 // ---------------------------------------------------------------------------
@@ -712,6 +798,17 @@ async function refresh() {
         pbox.querySelector('.wlist-toggle[data-proj="' + cssEscape(p.name) + '"]')?.classList.add("collapsed");
       }
     }
+  }
+
+  // --- Sessions (router-self-registered interactive traffic — exception-
+  //     only: the section stays hidden while nothing is registered).
+  const sessBox = $("sessions");
+  const sessRows = st.sessions || [];
+  if (sessRows.length === 0) {
+    $("sessions-section").style.display = "none";
+  } else {
+    $("sessions-section").style.display = "";
+    sessBox.innerHTML = sessRows.map((s) => sessBlock(s, st)).join("");
   }
 
   // --- Throttled jobs (the anti-thrash backstop — exception-only: the
@@ -1081,6 +1178,42 @@ async function setProjectPaused(name, paused) {
   }
 }
 
+// Pause/resume one interactive session (POST /api/sessions/:token/override —
+// the same token-gated write shape as the client override; 'pause' asks the
+// router to hold the session's traffic, null clears the override).
+async function setSessionPaused(sessToken, paused) {
+  const token = gateToken();
+  if (!token) {
+    flashGateMsg("gate needs the arbiter API token — paste it into 'gate token' in the header", "err", true);
+    const inp = $("gate-token");
+    if (inp) {
+      inp.scrollIntoView({ block: "center" });
+      inp.focus({ preventScroll: true });
+    }
+    return false;
+  }
+  const body = paused ? { override: "pause" } : { override: null };
+  try {
+    const res = await fetch("/api/sessions/" + encodeURIComponent(sessToken) + "/override?token=" + encodeURIComponent(token), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      let detail = "HTTP " + res.status;
+      try { detail += ": " + ((await res.json()).error ?? ""); } catch { }
+      flashGateMsg(detail, "err");
+      return false;
+    }
+    flashGateMsg(paused ? "session paused — the router holds its traffic" : "session running — gate open", "ok");
+    refresh();
+    return true;
+  } catch (err) {
+    flashGateMsg("session override failed: " + err.message, "err");
+    return false;
+  }
+}
+
 // Header combobox: applies the mode to EVERY registered worker (the single
 // global gate).
 gateSel.addEventListener("change", async () => {
@@ -1118,6 +1251,15 @@ $("projects").addEventListener("change", async (e) => {
     const ok = await setProjectPaused(projSel.dataset.proj, projSel.value === "paused");
     if (!ok) refresh();
   }
+});
+
+// The sessions pane is rebuilt each refresh, so its gate listener is
+// delegated on the container (the same pattern as the per-worker gates).
+$("sessions").addEventListener("change", async (e) => {
+  const sessSel = e.target.closest("select.gate.small[data-token]");
+  if (!sessSel) return;
+  const ok = await setSessionPaused(sessSel.dataset.token, sessSel.value === "paused");
+  if (!ok) refresh(); // failed change → re-render from server truth (row snaps back)
 });
 
 // gate token input: persist on blur/change (non-empty), clear on empty.
