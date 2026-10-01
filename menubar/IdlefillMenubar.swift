@@ -743,7 +743,7 @@ final class AppModel: ObservableObject {
     }
   }
 
-  static func findRepoRoot() -> String {
+  static func findRepoRoot(bundlePath: String = Bundle.main.bundleURL.path) -> String {
     // Returns the REPO ROOT — the dir that CONTAINS `client/` (every caller
     // does repoRoot + "client/…"). IDLEFILL_CONFIG_FILE is a path to
     // client/config.json, so strip two components to get the repo.
@@ -767,7 +767,7 @@ final class AppModel: ObservableObject {
     // DESCEND into ~/Software/… — the agent then ran token-less, ignored
     // the configured update channel, and checked the wrong channel.)
     let fm = FileManager.default
-    var cand = Bundle.main.bundleURL.path
+    var cand = bundlePath
     for _ in 0..<3 {
       if fm.fileExists(atPath: (cand as NSString).appendingPathComponent("client/config.json")) {
         return cand

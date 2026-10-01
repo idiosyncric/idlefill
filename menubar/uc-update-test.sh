@@ -255,6 +255,25 @@ check("pure: logLine format",
       UpdatePlan.logLine(oldShort: "a1", newShort: "b2", daemonPid: 1234, lockChanged: true, timestamp: "TS")
       == "a1 → b2 TS daemon-pid=1234 lock-changed=yes")
 
+// ============================================ findRepoRoot bundle-shape probe
+// The bundle-launch resolution fix (the LaunchAgent's shape since b495c14):
+// the old single-level assumption resolved a BUNDLE launch to <repo>/menubar,
+// found no client/config.json there, and the agent ran token-less on the
+// wrong channel. The IDLEFILL_CONFIG_FILE env hook short-circuits the probe,
+// so drop it for these checks and restore it after.
+unsetenv("IDLEFILL_CONFIG_FILE")
+check("repoRoot: BUNDLE shape (…/menubar/IdlefillMenubar.app) -> the repo TWO levels up",
+      AppModel.findRepoRoot(bundlePath: "\(T)/repoA/menubar/IdlefillMenubar.app") == "\(T)/repoA")
+check("repoRoot: legacy bare-binary shape (…/menubar) -> the repo ONE level up",
+      AppModel.findRepoRoot(bundlePath: "\(T)/repoA/menubar") == "\(T)/repoA")
+// A bundle launched OUTSIDE any repo (no client/config.json among the three
+// probed candidates) must NOT resolve to a bundle ancestor — it falls back
+// to the operator default checkout (the desktop app's shape).
+check("repoRoot: bundle outside any repo -> the operator default, not a bundle ancestor",
+      AppModel.findRepoRoot(bundlePath: "\(T)/nowhere/menubar/IdlefillMenubar.app")
+        == NSHomeDirectory() + "/Software/idlefill")
+setenv("IDLEFILL_CONFIG_FILE", "\(T)/repoA/client/config.json", 1)
+
 // ===================================================== (b) clean no-delta
 let mA = freshModel("\(T)/A/work")
 mA.updateCode()
