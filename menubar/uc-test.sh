@@ -32,6 +32,34 @@ EOF
 mkdir -p "$T/repo/menubar/IdlefillMenubar.app/Contents/MacOS"
 echo "CURRENT-BUNDLE" > "$T/repo/menubar/IdlefillMenubar.app/Contents/MacOS/IdlefillMenubar"
 printf '<?xml version="1.0"?><plist version="1.0"><dict></dict></plist>' > "$T/repo/menubar/IdlefillMenubar.app/Contents/Info.plist"
+# The committed plist template (the re-point renders it — the shipped one).
+cp "$REPO/menubar/IdlefillMenubar.plist" "$T/repo/menubar/IdlefillMenubar.plist"
+
+# ---- (issue #23) the stale scratch label for the release re-point case ----
+# A SCRATCH label (never the real com.sam.idlefill.menubar) loaded on a
+# DIFFERENT path INSIDE the scratch repo (the bare pre-bundle-era binary).
+# The install must RE-POINT it at the swapped bundle.
+SCRATCH_LABEL="com.sam.idlefill.uc-scratch"
+mkdir -p "$T/plists"
+printf '#!/bin/sh\nexec sleep 3600\n' > "$T/repo/menubar/IdlefillMenubar"
+chmod +x "$T/repo/menubar/IdlefillMenubar"
+cat > "$T/plists/$SCRATCH_LABEL.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>$SCRATCH_LABEL</string>
+    <key>ProgramArguments</key>
+    <array><string>$T/repo/menubar/IdlefillMenubar</string></array>
+    <key>RunAtLoad</key><true/>
+</dict>
+</plist>
+EOF
+launchctl bootout "gui/$(id -u)/$SCRATCH_LABEL" 2>/dev/null || true   # idempotent start
+launchctl bootstrap "gui/$(id -u)" "$T/plists/$SCRATCH_LABEL.plist" || { echo "error: scratch bootstrap failed"; exit 1; }
+trap 'launchctl bootout "gui/$(id -u)/'"$SCRATCH_LABEL"'" 2>/dev/null || true; kill $STUB_PID 2>/dev/null || true; rm -rf "$T"' EXIT
+launchctl print "gui/$(id -u)/$SCRATCH_LABEL" >/dev/null 2>&1 || { echo "error: scratch label not loaded after bootstrap"; exit 1; }
+echo "==> scratch label $SCRATCH_LABEL loaded on the STALE path $T/repo/menubar/IdlefillMenubar"
 
 # ---- the new release's artifact: a fake .app bundle zipped (the .app dir at
 # ---- the zip root — the release convention) + sidecars ----------------------
@@ -92,7 +120,7 @@ setTimeout(() => process.exit(0), 120000);
 EOF
 node "$T/stub.js" > "$T/stub.log" 2>&1 &
 STUB_PID=$!
-trap 'kill $STUB_PID 2>/dev/null || true; rm -rf "$T"' EXIT
+trap 'launchctl bootout "gui/$(id -u)/'"$SCRATCH_LABEL"'" 2>/dev/null || true; kill $STUB_PID 2>/dev/null || true; rm -rf "$T"' EXIT
 for i in $(seq 1 50); do
   grep -q "STUB-UP" "$T/stub.log" 2>/dev/null && break
   sleep 0.2
@@ -123,6 +151,8 @@ func isRefused(_ o: UpdateCheck.Outcome) -> Bool {
 
 let port = "__PORT__"
 let bundleDest = "__BUNDLE__"
+let repoRoot = "__REPO__"
+let scratchLabel = "__SCRATCHLABEL__"
 let goodHash = "__GOODHASH__"
 let badHash = "__BADHASH__"
 let zipPath = "__ZIP__"
@@ -200,11 +230,14 @@ check("c: sidecar parse (non-hex) -> nil",
 // (c) install: CORRECT sidecar -> verifies + swaps the bundle in place.
 // tag "v1" + zip "IdlefillMenubar-1.app.zip" — exactly what downloadRef
 // yields for the bare version "1" (the value updateAvailable would hold).
+// ISSUE #23: the scratch label is loaded on a STALE path inside the repo
+// (the harness bootstrapped it on the bare binary) — this same call must
+// RE-POINT it at the swapped bundle and verify via launchctl print.
 let sem1 = DispatchSemaphore(value: 0)
 var o1: UpdateCheck.Outcome = .refused("not-run")
 UpdateCheck.install(base: "http://127.0.0.1:\(port)", tag: "v1",
                     zipName: "IdlefillMenubar-1.app.zip",
-                    bundleURL: bundleURL, label: "com.sam.idlefill.uc-scratch") {
+                    bundleURL: bundleURL, repoRoot: repoRoot, label: scratchLabel) {
   o1 = $0; sem1.signal()
 }
 if sem1.wait(timeout: .now() + 40) == .success {
@@ -212,6 +245,15 @@ if sem1.wait(timeout: .now() + 40) == .success {
   let after = (try? String(contentsOfFile: bin, encoding: .utf8)) ?? ""
   check("c: correct sidecar -> verified + swapped in place",
         after.hasPrefix("NEW-BUNDLE-1") && !isRefused(o1))
+  check("c: outcome is .installed (agent verified on the swapped bundle)",
+        o1 == .installed)
+  // Issue #23: the LOADED agent now runs the swapped bundle executable.
+  let runs = UpdateFacts.labelRuns(uid: geteuid(), label: scratchLabel)
+  check("c: the stale label was RE-POINTED — launchctl print shows the bundle executable",
+        runs == bin)
+  let rendered = (try? String(contentsOfFile: "__PLISTDIR__/\(scratchLabel).plist", encoding: .utf8)) ?? ""
+  check("c: the rendered plist (from the committed template) carries the bundle executable",
+        rendered.contains("<string>\(bin)</string>") && rendered.contains("<string>\(scratchLabel)</string>"))
 } else {
   failures += 1; print("FAIL c: install (correct sidecar) timed out")
 }
@@ -223,7 +265,7 @@ let sem2 = DispatchSemaphore(value: 0)
 var o2: UpdateCheck.Outcome = .refused("not-run")
 UpdateCheck.install(base: "http://127.0.0.1:\(port)", tag: "v2",
                     zipName: "IdlefillMenubar-2.app.zip",
-                    bundleURL: bundleURL, label: "com.sam.idlefill.uc-scratch") {
+                    bundleURL: bundleURL, repoRoot: repoRoot, label: scratchLabel) {
   o2 = $0; sem2.signal()
 }
 if sem2.wait(timeout: .now() + 40) == .success {
@@ -239,7 +281,7 @@ let sem3 = DispatchSemaphore(value: 0)
 var o3: UpdateCheck.Outcome = .refused("not-run")
 UpdateCheck.install(base: "http://127.0.0.1:\(port)", tag: "v3",
                     zipName: "IdlefillMenubar-3.app.zip",
-                    bundleURL: bundleURL, label: "com.sam.idlefill.uc-scratch") {
+                    bundleURL: bundleURL, repoRoot: repoRoot, label: scratchLabel) {
   o3 = $0; sem3.signal()
 }
 if sem3.wait(timeout: .now() + 40) == .success {
@@ -275,6 +317,9 @@ EOF
 # time).
 sed -e "s|__PORT__|$PORT|" \
     -e "s|__BUNDLE__|$T/repo/menubar/IdlefillMenubar.app|" \
+    -e "s|__REPO__|$T/repo|" \
+    -e "s|__SCRATCHLABEL__|$SCRATCH_LABEL|" \
+    -e "s|__PLISTDIR__|$T/plists|" \
     -e "s|__GOODHASH__|$(cat "$T/good.sidecar")|" \
     -e "s|__BADHASH__|$(cat "$T/bad.sidecar")|" \
     -e "s|__ZIP__|$GOOD|" \
@@ -293,6 +338,7 @@ RC=0
 env -i PATH=/usr/bin:/bin \
   IDLEFILL_CONFIG_FILE="$T/repo/client/config.json" \
   IDLEFILL_UPDATE_BASE="http://127.0.0.1:1" \
+  IDLEFILL_MENUBAR_PLIST_DIR="$T/plists" \
   "$T/uc-test" || RC=$?
 echo "UC-EXIT=$RC"
 exit $RC

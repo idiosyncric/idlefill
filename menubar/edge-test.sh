@@ -362,7 +362,7 @@ check("e: the edge install's ref matches the stub's download routes",
 let sem1 = DispatchSemaphore(value: 0)
 var o1: UpdateCheck.Outcome = .refused("not-run")
 UpdateCheck.install(base: "http://127.0.0.1:\(port)", tag: refEdge.tag, zipName: refEdge.zip,
-                    bundleURL: bundleURL, label: "com.sam.idlefill.edge-scratch") {
+                    bundleURL: bundleURL, repoRoot: "__REPO__", label: "com.sam.idlefill.edge-scratch") {
   o1 = $0; sem1.signal()
 }
 if sem1.wait(timeout: .now() + 40) == .success {
@@ -381,7 +381,7 @@ let refBad = UpdateCheck.downloadRef(version: "edge-main-0000000", isEdge: true)
 let sem2 = DispatchSemaphore(value: 0)
 var o2: UpdateCheck.Outcome = .refused("not-run")
 UpdateCheck.install(base: "http://127.0.0.1:\(port)", tag: refBad.tag, zipName: refBad.zip,
-                    bundleURL: bundleURL, label: "com.sam.idlefill.edge-scratch") {
+                    bundleURL: bundleURL, repoRoot: "__REPO__", label: "com.sam.idlefill.edge-scratch") {
   o2 = $0; sem2.signal()
 }
 if sem2.wait(timeout: .now() + 40) == .success {
@@ -466,6 +466,7 @@ EOF
 GOODHASH="$(cat "$GOOD")"
 sed -e "s|__PORT__|$PORT|g" \
     -e "s|__BUNDLE__|$T/repo/menubar/IdlefillMenubar.app|g" \
+    -e "s|__REPO__|$T/repo|g" \
     -e "s|__GOODHASH__|$GOODHASH|g" \
     -e "s|__SHANEW__|$SHA40_NEW|g" \
     -e "s|__SHAOLDER__|$SHA40_OLDER|g" \

@@ -16,6 +16,7 @@ set -euo pipefail
 T="$(mktemp -d /tmp/uc11.XXXXXX)"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$REPO/menubar/IdlefillMenubar.swift"
+TEMPLATE_SRC="$REPO/menubar/IdlefillMenubar.plist"
 
 echo "==> workdir: $T"
 
@@ -35,15 +36,26 @@ mk_base() { # <dir>
     mkdir -p client/src menubar
     echo 'console.log("idlefill")' > client/src/index.ts
     echo "release A" > RELEASE.txt
-    # The real repo ignores *.log (and its logs/ dirs); the scratch repo must
-    # too, or the logs/ dir updateCode() creates before gate (a) would make
-    # the tree look dirty (status --porcelain: ?? logs/).
-    printf 'logs/\n*.log\nnode_modules/\n' > .gitignore
+    # The real repo ignores *.log (and its logs/ dirs) AND the menubar
+    # build artifacts (the bare pre-bundle binary + the .app bundle); the
+    # scratch repo must too, or the logs/ dir updateCode() creates before
+    # gate (a) — and the (G) case's stale binary / rebuilt bundle — would
+    # make the tree look dirty (status --porcelain: ?? logs/).
+    printf 'logs/\n*.log\nnode_modules/\nmenubar/IdlefillMenubar\nmenubar/IdlefillMenubar.app/\n' > .gitignore
     cat > menubar/build.sh <<'STUB'
 #!/usr/bin/env bash
 echo "STUB-BUILD $PWD"
+# Issue #23: the stub build produces the REAL bundle shape (a launchd-
+# execable script at the bundle executable path) so the re-point case can
+# bootstrap the label onto it and launchctl print can show it.
+mkdir -p "$PWD/menubar/IdlefillMenubar.app/Contents/MacOS"
+printf '#!/bin/sh\nexec sleep 3600\n' > "$PWD/menubar/IdlefillMenubar.app/Contents/MacOS/IdlefillMenubar"
+chmod +x "$PWD/menubar/IdlefillMenubar.app/Contents/MacOS/IdlefillMenubar"
 touch "$PWD/.uc11-build-ran"
 STUB
+    # The committed plist template (the repair renders it) — the REAL one,
+    # so the render + byte-verify exercise the shipped template.
+    cp "$TEMPLATE_SRC" menubar/IdlefillMenubar.plist
     git add -A; git commit -qm A
     git remote add origin "$dir/origin.git"
     git push -q -u origin main )
@@ -91,6 +103,35 @@ git -C "$T/E/work" remote set-url origin "file:///$T/E/does-not-exist.git"   # (
 mk_base "$T/F"
 advance "$T/F" RELEASE.txt "remote B"
 ( cd "$T/F/work"; echo "local-only" >> RELEASE.txt; git add -A; git commit -qm "local D" ) # (f) diverged
+mk_base "$T/G"
+advance "$T/G" RELEASE.txt "release G"                    # (G) issue #23: delta + STALE scratch label
+
+# ---- (G) the stale scratch label (issue #23 criterion 1/5) ----------------
+# A SCRATCH label (never the real com.sam.idlefill.menubar) bootstrapped
+# pointing at a DIFFERENT path INSIDE the G/work repo (the bare pre-bundle-
+# era binary). The update must RE-POINT it at the rebuilt bundle.
+SCRATCH_LABEL="com.sam.idlefill.uc11-scratch"
+mkdir -p "$T/plists" "$T/G/work/menubar"
+printf '#!/bin/sh\nexec sleep 3600\n' > "$T/G/work/menubar/IdlefillMenubar"
+chmod +x "$T/G/work/menubar/IdlefillMenubar"
+cat > "$T/plists/$SCRATCH_LABEL.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>$SCRATCH_LABEL</string>
+    <key>ProgramArguments</key>
+    <array><string>$T/G/work/menubar/IdlefillMenubar</string></array>
+    <key>RunAtLoad</key><true/>
+</dict>
+</plist>
+EOF
+launchctl bootout "gui/$(id -u)/$SCRATCH_LABEL" 2>/dev/null || true   # idempotent start
+launchctl bootstrap "gui/$(id -u)" "$T/plists/$SCRATCH_LABEL.plist" || { echo "error: scratch bootstrap failed"; exit 1; }
+# Leave NO scratch agent behind, whatever happens.
+trap 'launchctl bootout "gui/$(id -u)/'"$SCRATCH_LABEL"'" 2>/dev/null || true' EXIT
+launchctl print "gui/$(id -u)/$SCRATCH_LABEL" >/dev/null 2>&1 || { echo "error: scratch label not loaded after bootstrap"; exit 1; }
+echo "==> scratch label $SCRATCH_LABEL loaded on the STALE path $T/G/work/menubar/IdlefillMenubar"
 
 # ---- scratch config (so AppModel init targets a dead port, no real net) --
 mkdir -p "$T/repoA/client"
@@ -125,6 +166,7 @@ let T = "__T__"
 let PROD_REPO = "__PROD_REPO__"
 let PROD_PIDS = "__PROD_PIDS__"
 let WORKTREE = "__WORKTREE__"
+let SCRATCH_LABEL = "__SCRATCH_LABEL__"
 
 func fileExists(_ p: String) -> Bool { FileManager.default.fileExists(atPath: p) }
 func readFile(_ p: String) -> String { (try? String(contentsOfFile: p, encoding: .utf8)) ?? "" }
@@ -155,43 +197,60 @@ func shortSha(_ rev: String, _ repo: String) -> String? { UpdateFacts.shortSha(r
 // ============================================================ pure decision
 let pNoDaemon = UpdatePlan.plan(UpdatePlan.Input(treeClean: true, fetchOk: true, isAncestor: true, hasDelta: true,
                                                  lockChanged: false, daemonPids: [], labelLoaded: false,
-                                                 thisIsLabelBinary: false, currentShortSha: "aaa"))
+                                                 labelRunsBundle: false, labelUnderRepo: false, currentShortSha: "aaa"))
 check("pure: no-daemon -> proceed, no startDaemon", pNoDaemon.gate == .proceed && !pNoDaemon.steps.contains(.startDaemon))
 check("pure: no-daemon -> no install (lock unchanged)", !pNoDaemon.steps.contains(.install))
 check("pure: no-daemon -> note says no restart", pNoDaemon.note.contains("daemon was not running — no restart"))
 let pDaemon = UpdatePlan.plan(UpdatePlan.Input(treeClean: true, fetchOk: true, isAncestor: true, hasDelta: true,
                                                lockChanged: false, daemonPids: [4242], labelLoaded: false,
-                                               thisIsLabelBinary: false, currentShortSha: "aaa"))
+                                               labelRunsBundle: false, labelUnderRepo: false, currentShortSha: "aaa"))
 check("pure: daemon running -> startDaemon present", pDaemon.steps.contains(.startDaemon))
 check("pure: daemon running -> note has no restart clause", !pDaemon.note.contains("daemon was not running"))
 let pLock = UpdatePlan.plan(UpdatePlan.Input(treeClean: true, fetchOk: true, isAncestor: true, hasDelta: true,
                                              lockChanged: true, daemonPids: [], labelLoaded: false,
-                                             thisIsLabelBinary: false, currentShortSha: "aaa"))
+                                             labelRunsBundle: false, labelUnderRepo: false, currentShortSha: "aaa"))
 check("pure: lock changed -> install present", pLock.steps.contains(.install))
 let pKick = UpdatePlan.plan(UpdatePlan.Input(treeClean: true, fetchOk: true, isAncestor: true, hasDelta: true,
                                              lockChanged: false, daemonPids: [], labelLoaded: true,
-                                             thisIsLabelBinary: true, currentShortSha: "aaa"))
-check("pure: label loaded + label binary -> kick present", pKick.steps.contains(.kickMenubar))
+                                             labelRunsBundle: true, labelUnderRepo: true, currentShortSha: "aaa"))
+check("pure: label loaded + runs the bundle -> kick present", pKick.steps.contains(.kickMenubar))
+check("pure: label loaded + runs the bundle -> no repair step", !pKick.steps.contains(.repairAgent))
 let pNoKick = UpdatePlan.plan(UpdatePlan.Input(treeClean: true, fetchOk: true, isAncestor: true, hasDelta: true,
                                                lockChanged: false, daemonPids: [], labelLoaded: true,
-                                               thisIsLabelBinary: false, currentShortSha: "aaa"))
-check("pure: label loaded but NOT the label binary -> no kick (note only)", !pNoKick.steps.contains(.kickMenubar))
+                                               labelRunsBundle: false, labelUnderRepo: false, currentShortSha: "aaa"))
+check("pure: label loaded but NOT this repo (foreign) -> no kick, no repair (note only)",
+      !pNoKick.steps.contains(.kickMenubar) && !pNoKick.steps.contains(.repairAgent))
+check("pure: foreign label -> note says relaunch", pNoKick.note.contains("relaunch it to run the new code"))
+// Issue #23: a STALE label inside this repo becomes a REPAIR step, not a note.
+let pRepair = UpdatePlan.plan(UpdatePlan.Input(treeClean: true, fetchOk: true, isAncestor: true, hasDelta: true,
+                                               lockChanged: false, daemonPids: [], labelLoaded: true,
+                                               labelRunsBundle: false, labelUnderRepo: true, currentShortSha: "aaa"))
+check("pure: stale label inside this repo -> repairAgent step present", pRepair.steps.contains(.repairAgent))
+check("pure: stale label inside this repo -> no kick step", !pRepair.steps.contains(.kickMenubar))
+check("pure: stale label inside this repo -> NO relaunch-it note", !pRepair.note.contains("relaunch it to run the new code"))
+check("pure: repair comes after buildMenubar",
+      pRepair.steps.firstIndex(of: .repairAgent)! > pRepair.steps.firstIndex(of: .buildMenubar)!)
+check("pure: pathUnderRepo — inside true, sibling-prefix false, exact root true, outside false",
+      UpdatePlan.pathUnderRepo("/r/menubar/x", repoRoot: "/r")
+        && UpdatePlan.pathUnderRepo("/r", repoRoot: "/r")
+        && !UpdatePlan.pathUnderRepo("/r2/menubar/x", repoRoot: "/r")
+        && !UpdatePlan.pathUnderRepo("/other/x", repoRoot: "/r/"))
 check("pure: dirty -> refuse, no steps",
       UpdatePlan.plan(UpdatePlan.Input(treeClean: false, fetchOk: true, isAncestor: true, hasDelta: true,
                                        lockChanged: false, daemonPids: [], labelLoaded: false,
-                                       thisIsLabelBinary: false, currentShortSha: "a")).gate == .refuse(.dirty))
+                                       labelRunsBundle: false, labelUnderRepo: false, currentShortSha: "a")).gate == .refuse(.dirty))
 check("pure: fetch fail -> refuse, no steps",
       UpdatePlan.plan(UpdatePlan.Input(treeClean: true, fetchOk: false, isAncestor: true, hasDelta: true,
                                        lockChanged: false, daemonPids: [], labelLoaded: false,
-                                       thisIsLabelBinary: false, currentShortSha: "a")).gate == .refuse(.fetch))
+                                       labelRunsBundle: false, labelUnderRepo: false, currentShortSha: "a")).gate == .refuse(.fetch))
 check("pure: diverged -> refuse, no steps",
       UpdatePlan.plan(UpdatePlan.Input(treeClean: true, fetchOk: true, isAncestor: false, hasDelta: true,
                                        lockChanged: false, daemonPids: [], labelLoaded: false,
-                                       thisIsLabelBinary: false, currentShortSha: "a")).gate == .refuse(.diverged))
+                                       labelRunsBundle: false, labelUnderRepo: false, currentShortSha: "a")).gate == .refuse(.diverged))
 check("pure: no delta -> noOp",
       UpdatePlan.plan(UpdatePlan.Input(treeClean: true, fetchOk: true, isAncestor: true, hasDelta: false,
                                        lockChanged: false, daemonPids: [], labelLoaded: false,
-                                       thisIsLabelBinary: false, currentShortSha: "abc1234")).gate == .noOp)
+                                       labelRunsBundle: false, labelUnderRepo: false, currentShortSha: "abc1234")).gate == .noOp)
 check("pure: logLine format",
       UpdatePlan.logLine(oldShort: "a1", newShort: "b2", daemonPid: 1234, lockChanged: true, timestamp: "TS")
       == "a1 → b2 TS daemon-pid=1234 lock-changed=yes")
@@ -268,6 +327,30 @@ check("(f) NOTHING written (no merge)", !logF.contains("git merge"))
 check("(f) local commit untouched (still diverged)",
       shortSha("HEAD", "\(T)/F/work") != shortSha("origin/main", "\(T)/F/work"))
 
+// ==================================================== (G) issue #23: stale
+// label INSIDE the repo -> the update RE-POINTS it (repair step), the
+// agent ends loaded running the rebuilt bundle, and there is NO
+// "relaunch it" note. The scratch label (bootstrapped by the harness on a
+// stale path under G/work) is the ONLY label this touches.
+let gAfter  = shortSha("main", "\(T)/G/origin.git") ?? "?"
+let mG = freshModel("\(T)/G/work")
+mG.updateCode()
+let logG = readFile(logOf("\(T)/G"))
+check("(G) merge applied", shortSha("HEAD", "\(T)/G/work") == gAfter)
+check("(G) build ran (stub produced the bundle)", fileExists("\(T)/G/work/menubar/IdlefillMenubar.app/Contents/MacOS/IdlefillMenubar"))
+check("(G) NO relaunch-it note (the repair is a step, not a note)",
+      !(mG.updateNote ?? "").contains("relaunch it"))
+check("(G) the take-over note (restarting menu bar with new code)",
+      (mG.updateNote ?? "").contains("restarting menu bar with new code"))
+check("(G) log shows the bootout + bootstrap re-point",
+      logG.contains("launchctl bootout gui/") && logG.contains("launchctl bootstrap gui/"))
+let wantG = "\(T)/G/work/menubar/IdlefillMenubar.app/Contents/MacOS/IdlefillMenubar"
+let runsG = UpdateFacts.labelRuns(uid: geteuid(), label: SCRATCH_LABEL)
+check("(G) the LOADED agent now runs the rebuilt bundle (launchctl print)", runsG == wantG)
+check("(G) the rendered scratch plist carries the bundle executable",
+      readFile("\(T)/plists/\(SCRATCH_LABEL).plist").contains("<string>\(wantG)</string>"))
+check("(G) deployedRevision = new sha", mG.deployedRevision == gAfter)
+
 // ==================================================== rotation unit case
 let rotLog = "\(T)/rot/idlefill-menubar.log"
 try? FileManager.default.createDirectory(atPath: (rotLog as NSString).deletingLastPathComponent,
@@ -297,10 +380,11 @@ exit(0)
 SWIFT
 
 # Bake run-time values into the driver.
-sed -e "s|__T__|$T|" \
-    -e "s|__PROD_REPO__|$PROD_REPO|" \
-    -e "s|__PROD_PIDS__|$PROD_PIDS|" \
-    -e "s|__WORKTREE__|$T/repoA|" \
+sed -e "s|__T__|$T|g" \
+    -e "s|__PROD_REPO__|$PROD_REPO|g" \
+    -e "s|__PROD_PIDS__|$PROD_PIDS|g" \
+    -e "s|__WORKTREE__|$T/repoA|g" \
+    -e "s|__SCRATCH_LABEL__|$SCRATCH_LABEL|g" \
     "$T/main.swift" > "$T/main.baked.swift"
 mv "$T/main.baked.swift" "$T/main.swift"
 
@@ -313,7 +397,8 @@ RC=0
 env -i PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin \
   IDLEFILL_CONFIG_FILE="$T/repoA/client/config.json" \
   IDLEFILL_UPDATE_BASE="http://127.0.0.1:1" \
-  IDLEFILL_MENUBAR_LABEL="com.sam.idlefill.uc11-scratch" \
+  IDLEFILL_MENUBAR_LABEL="$SCRATCH_LABEL" \
+  IDLEFILL_MENUBAR_PLIST_DIR="$T/plists" \
   "$T/uc11" || RC=$?
 echo "UC11-EXIT=$RC"
 
