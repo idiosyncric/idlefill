@@ -825,9 +825,14 @@ the estimate, because the client's estimate is a first-run guess; and the
 cap at the (per-project or global) `lease_ttl_seconds` means the estimate
 can only make a lease expire SOONER, never later — preemption, budget, and
 anti-thrash see strictly less staleness, never more. With no estimate (or
-≤0) the lease keeps the full static TTL, exactly as before. Today the
-client sends its per-project `estimated_seconds ?? 900` and the default
-TTL is 1800, so `min(900×2, 1800) = 1800` — zero behavior change until an
+≤0) the lease keeps the full static TTL, exactly as before. The client
+sends a PER-JOB estimate when the queue line carries one (issue #6):
+`payload.estimated_seconds` on the queue line — a finite number > 0 — wins
+over the per-project `estimated_seconds ?? 900`, so one long job no longer
+inherits a short project default (or vice versa). The career-ops queue
+builder passes the field through only when its source row already carries
+a sane value; it never invents one. Today the default is still
+`min(900×2, 1800) = 1800` — zero behavior change until an
 operator tunes it: set `estimated_seconds` close to the job's real duration
 in the CLIENT config (`client/config.json` `projects[].estimated_seconds` —
 the dashboard's per-project settings editor exposes only the arbiter-side
