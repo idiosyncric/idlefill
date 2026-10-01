@@ -756,20 +756,35 @@ final class AppModel: ObservableObject {
       let root = (parent as NSString).deletingLastPathComponent
       if !(parent.isEmpty || root.isEmpty) { return root }
     }
-    // The binary ships at <repo>/menubar/IdlefillMenubar. bundleURL points at
-    // the executable's own directory (…/menubar), so the repo root is one
-    // level up. Works no matter where the app is launched from (double-
-    // clicked, launchd, any cwd); the home walk below is a fallback.
+    // The binary ships at <repo>/menubar/IdlefillMenubar.app — bundleURL
+    // points at the BUNDLE (…/menubar/IdlefillMenubar.app), so the repo
+    // root is TWO levels up. The legacy bare-binary shape (…/menubar/
+    // IdlefillMenubar, pre-bundle) puts bundleURL at <repo>/menubar — ONE
+    // level up. Probe bundleURL and its two parents: the first candidate
+    // that carries client/config.json wins. (The old single-level
+    // assumption was a real bug: a bundle launch resolved to <repo>/
+    // menubar, found no config there, and the home walk below cannot
+    // DESCEND into ~/Software/… — the agent then ran token-less, ignored
+    // the configured update channel, and checked the wrong channel.)
     let fm = FileManager.default
-    let repo = (Bundle.main.bundleURL.path as NSString).deletingLastPathComponent
-    if fm.fileExists(atPath: (repo as NSString).appendingPathComponent("client/config.json")) {
-      return repo
+    var cand = Bundle.main.bundleURL.path
+    for _ in 0..<3 {
+      if fm.fileExists(atPath: (cand as NSString).appendingPathComponent("client/config.json")) {
+        return cand
+      }
+      let parent = (cand as NSString).deletingLastPathComponent
+      if parent == cand { break }
+      cand = parent
     }
-    // Fallback: walk up from $HOME looking for a repo that carries
-    // client/config.json (the gitignored client config). Bounded: no
-    // infinite loops. Note this can only find repos AT or ABOVE $HOME —
-    // a repo nested under it (e.g. ~/Software/idlefill) needs the binary
-    // location above or IDLEFILL_CONFIG_FILE.
+    // Fallback: the operator's standard checkout location (the desktop
+    // app's default — same shape), then a bounded walk UP from $HOME.
+    // Note the walk can only find repos AT or ABOVE $HOME — a repo nested
+    // under it (e.g. ~/Software/idlefill) needs the binary location above,
+    // this default, or IDLEFILL_CONFIG_FILE.
+    let def = (NSHomeDirectory() as NSString).appendingPathComponent("Software/idlefill")
+    if fm.fileExists(atPath: (def as NSString).appendingPathComponent("client/config.json")) {
+      return def
+    }
     var dir = NSHomeDirectory()
     for _ in 0..<14 {
       if fm.fileExists(atPath: (dir as NSString).appendingPathComponent("client/config.json")) {
