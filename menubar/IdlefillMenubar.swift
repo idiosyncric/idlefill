@@ -1368,14 +1368,20 @@ final class AppModel: ObservableObject {
   //      note says so).
   //   6. rebuild the menu bar bundle (menubar/build.sh — the honest
   //      shape: the running menu bar cannot re-exec its own binary in
-  //      place). When the launchd label is loaded AND the label runs the
-  //      bundle we just rebuilt (ProgramArguments.0 == the bundle's own
-  //      executable path), `launchctl kickstart -k` relaunches the agent
-  //      on the new binary and this process exits with the note
-  //      "restarting menu bar with new code"; otherwise (dev run, or a
-  //      stale label pointing elsewhere — e.g. a bare-binary plist from
-  //      before the bundle era) the note says "menu bar rebuilt —
-  //      relaunch it to run the new code" and NO process is killed.
+  //      place), then take over the LaunchAgent (issue #23 — the loaded
+  //      agent must end RUNNING the rebuilt bundle): when the label's
+  //      ProgramArguments.0 already equals the bundle's executable,
+  //      `launchctl kickstart -k` relaunches the agent on the new binary
+  //      and this process exits with the note "restarting menu bar with
+  //      new code"; when the label is loaded but STALE (points at an old
+  //      path inside this repo — e.g. a bare-binary plist from before the
+  //      bundle era), the plan appends a REPAIR step: render the
+  //      committed plist template + bootout + bootstrap re-points it at
+  //      the rebuilt bundle. A label pointing OUTSIDE this repo belongs
+  //      to another checkout — never killed, never re-pointed (the note
+  //      says relaunch). After any kick/bootstrap the executor verifies
+  //      `launchctl print` shows the bundle executable — a mismatch is a
+  //      surfaced failure, not a success.
   //   7. record: one line per completed update appended to
   //      logs/idlefill-menubar.log (rotated — never deleted, never
   //      truncated to empty), and deployedRevision = the merged HEAD.
@@ -1385,7 +1391,6 @@ final class AppModel: ObservableObject {
     let logDir = (repo as NSString).appendingPathComponent("logs")
     try? FileManager.default.createDirectory(atPath: logDir, withIntermediateDirectories: true)
     let logFile = (logDir as NSString).appendingPathComponent("idlefill-menubar.log")
-    let kickLabel = "gui/\(geteuid())/\(UpdatePlan.label)"
 
     // ---- gate (a): the tree must be clean (bounded — a wedged git must
     // not hang the panel; a timeout is a refusal, not a pass). Tracked
@@ -1483,13 +1488,41 @@ final class AppModel: ObservableObject {
         let buildSh = (repo as NSString).appendingPathComponent("menubar/build.sh")
         ok = gatedRun(["/bin/bash", buildSh], cwd: repo, log: logFile).isOK
         if !ok { updateNote = "menu bar build failed — see logs/idlefill-menubar.log" }
-      case .kickMenubar:
-        // Set BEFORE the kick (the issue's requirement): launchd re-runs
-        // the (rebuilt) bundle on the same path — this process exits and
-        // the new binary takes over.
+      case .kickMenubar, .repairAgent:
+        // Issue #23: the loaded agent must END RUNNING the freshly built
+        // bundle. The label already runs it → kickstart -k (today's
+        // behavior). A stale label inside this repo → render the committed
+        // template + bootout + bootstrap (the repair). Either way the note
+        // is set BEFORE the take-over (the issue's requirement): launchd
+        // re-runs the rebuilt bundle on the same path — this process exits
+        // and the new binary takes over. A label outside this repo is
+        // another checkout's agent: never killed, never re-pointed.
         updateNote = "restarting menu bar with new code"
-        ok = gatedRun(["/bin/launchctl", "kickstart", "-k", kickLabel], cwd: repo, log: logFile).isOK
-        if !ok { updateNote = "menu bar rebuilt — relaunch it to run the new code (kickstart failed)" }
+        let take = LaunchAgent.takeOver(repo: repo, label: UpdatePlan.label, log: logFile)
+        switch take {
+        case .kicked, .repaired:
+          // Post-kick verify (issue #23 item 2): the LOADED service's
+          // ProgramArguments.0 must equal the just-built bundle executable.
+          // A mismatch is a repair FAILURE surfaced on the status row —
+          // never a silent success.
+          let want = UpdateFacts.bundleExecutable(repo: repo)
+          let got = UpdateFacts.labelRuns(uid: geteuid(), label: UpdatePlan.label)
+          if got != want {
+            updateNote = "menu bar agent did not end up on the rebuilt bundle (launchctl shows \(got ?? "<nothing>")) — check 'launchctl print gui/\(geteuid())/\(UpdatePlan.label)'"
+            ok = false
+          } else {
+            ok = true
+          }
+        case .notLoaded:
+          updateNote = "menu bar rebuilt — relaunch it to run the new code (agent not loaded)"
+          ok = false
+        case .foreign:
+          updateNote = "menu bar rebuilt — the loaded agent runs another checkout's binary; relaunch it yourself"
+          ok = false
+        case .failed(let why):
+          updateNote = "menu bar rebuilt — agent re-point failed: \(why)"
+          ok = false
+        }
       }
       return ok
     }
@@ -1524,8 +1557,8 @@ final class AppModel: ObservableObject {
     UpdateLog.append(line, at: logFile)
     deployedRevision = newShort
     let lastStep: UpdatePlan.Step? = plan.steps.last
-    let didKick = lastStep == .kickMenubar
-    if !didKick {
+    let didTakeOver = lastStep == .kickMenubar || lastStep == .repairAgent
+    if !didTakeOver {
       var finalNote = UpdatePlan.note(for: plan.gate)
       if plan.input.daemonPids.isEmpty {
         finalNote += " (daemon was not running — no restart)"
@@ -1724,7 +1757,8 @@ final class AppModel: ObservableObject {
       tag: ref.tag,
       zipName: ref.zip,
       bundleURL: AppModel.menubarBundleURL(),
-      label: "com.sam.idlefill.menubar"
+      repoRoot: repoRoot,
+      label: UpdatePlan.label
     ) { [weak self] outcome in
       guard let self else { return }
       DispatchQueue.main.async {
@@ -1735,6 +1769,12 @@ final class AppModel: ObservableObject {
           self.updateChannel = nil
         case .notLoaded:
           self.updateNote = "installed \(version) — agent not loaded: run menubar/install.sh"
+          self.updateAvailable = nil
+          self.updateChannel = nil
+        case .agentFailed(let why):
+          // The bundle IS swapped; the agent did not end on it. Surface it
+          // (issue #23: a mismatch is a repair failure, not a success).
+          self.updateNote = "installed \(version) — agent NOT re-pointed: \(why)"
           self.updateAvailable = nil
           self.updateChannel = nil
         case .refused:
@@ -2077,17 +2117,29 @@ enum UpdateCheck {
 
   // -- install (phase 1: sha256-verified swap) -----------------------------
 
-  enum Outcome { case installed, notLoaded, refused(String) }
+  enum Outcome: Equatable {
+    case installed     // swapped + the agent verified on the swapped bundle
+    case notLoaded     // swapped; nothing loaded under the label (install.sh's job)
+    case refused(String)   // hash/sidecar/swap refusal — the current bundle kept
+    case agentFailed(String) // swapped, but the agent take-over/verify failed
+                              // (issue #23: a mismatch is surfaced, not success)
+  }
 
   /** Download `<base>/releases/download/<tag>/<zipName>` + the sidecar
    *  (`<zipName>.sha256`) to a temp dir, verify the hash, then swap the
    *  bundle in place (a temp dir next to the target, then a rename — no
-   *  partial-bundle window) and `launchctl kickstart -k gui/<uid>/<label>`
-   *  when the agent is loaded. A hash mismatch, a missing/malformed
-   *  sidecar, or a failed swap REFUSES: the current bundle is untouched
-   *  and the refusal reason is returned. */
+   *  partial-bundle window), and take over the LaunchAgent (issue #23):
+   *  already running this repo's bundle → `kickstart -k`; a stale label
+   *  INSIDE this repo → render the committed template + bootout +
+   *  bootstrap (re-point at the swapped bundle); a label outside this
+   *  repo belongs to another checkout — never touched. After a successful
+   *  kick/bootstrap, `launchctl print` must show ProgramArguments.0 ==
+   *  the swapped bundle executable — a mismatch is `.agentFailed`, not
+   *  success. A hash mismatch, a missing/malformed sidecar, or a failed
+   *  swap REFUSES: the current bundle is untouched and the refusal reason
+   *  is returned. */
   static func install(base: String, tag: String, zipName: String,
-                      bundleURL: URL, label: String,
+                      bundleURL: URL, repoRoot: String, label: String,
                       completion: @escaping (Outcome) -> Void) {
     let tagEnc = tag.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? tag
     let tmpDir = FileManager.default.temporaryDirectory
@@ -2154,19 +2206,26 @@ enum UpdateCheck {
           completion(.refused("swap failed: \(error.localizedDescription) — the current build was kept"))
           return
         }
-        // Relaunch the agent when it is loaded; otherwise note it.
-        let uid = geteuid()
-        let kick = Process()
-        kick.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        kick.arguments = ["kickstart", "-k", "gui/\(uid)/\(label)"]
-        kick.standardOutput = FileHandle.nullDevice
-        kick.standardError = FileHandle.nullDevice
-        do {
-          try kick.run()
-          kick.waitUntilExit()
-          completion(kick.terminationStatus == 0 ? .installed : .notLoaded)
-        } catch {
+        // Issue #23: re-point, don't just note. The loaded agent must end
+        // RUNNING the swapped bundle (kick / repair / never-touch-foreign),
+        // then the post-kick verify confirms the LOADED service's
+        // ProgramArguments.0 equals the bundle executable.
+        let take = LaunchAgent.takeOver(repo: repoRoot, label: label)
+        switch take {
+        case .kicked, .repaired:
+          let want = UpdateFacts.bundleExecutable(repo: repoRoot)
+          let got = UpdateFacts.labelRuns(uid: geteuid(), label: label)
+          if got == want {
+            completion(.installed)
+          } else {
+            completion(.agentFailed("launchctl shows \(got ?? "<nothing>") — not the installed bundle"))
+          }
+        case .notLoaded:
           completion(.notLoaded)
+        case .foreign:
+          completion(.agentFailed("the loaded agent runs another checkout's binary — not re-pointed"))
+        case .failed(let why):
+          completion(.agentFailed(why))
         }
       }
     }
@@ -2206,7 +2265,16 @@ enum UpdatePlan {
     var lockChanged: Bool       // package-lock.json differs old..new
     var daemonPids: [Int]       // the current daemon PID set (may be empty)
     var labelLoaded: Bool       // launchctl print gui/<uid>/<label> exit 0
-    var thisIsLabelBinary: Bool // this process is the binary the label runs
+    var labelRunsBundle: Bool   // the label's ProgramArguments.0 == the bundle
+                                // executable this update builds (the kick case)
+    var labelUnderRepo: Bool    // the label's ProgramArguments.0 lives under
+                                // the repo root being updated — the REPAIR
+                                // gate (issue #23). A label pointing at
+                                // ANOTHER checkout is that checkout's agent:
+                                // re-pointing it here would hijack it, so it
+                                // stays a note (the same safety the old kick
+                                // gate gave via thisIsLabelBinary, widened
+                                // only to "this repo").
     var currentShortSha: String?
   }
 
@@ -2233,6 +2301,11 @@ enum UpdatePlan {
     case startDaemon    // start() — the same control path as Restart
     case buildMenubar   // bash menubar/build.sh (rebuild the bundle)
     case kickMenubar    // launchctl kickstart -k gui/<uid>/<label> (relaunch)
+    case repairAgent    // issue #23: the loaded agent runs a STALE path
+                        // inside this repo — render the committed plist
+                        // template + bootout + bootstrap (re-point it at
+                        // the freshly built bundle), then verify. A repair
+                        // STEP, never a note.
   }
 
   /** The plan: gate + steps + note. Built by `init(input:)`. */
@@ -2263,9 +2336,19 @@ enum UpdatePlan {
    *       needed; the note says so. Starting a daemon that was
    *       intentionally off would surprise the operator.)
    *    5. buildMenubar (always — the menu bar's own code must update)
-   *    6. kickMenubar  (only when labelLoaded AND thisIsLabelBinary —
-   *       otherwise the note says "rebuild — relaunch it"; no kill of a
-   *       process that is not the label's)
+   *    6. the agent take-over (issue #23 — the loaded agent must end
+   *       RUNNING the freshly built bundle, not merely be noted):
+   *        - labelLoaded && labelRunsBundle → kickMenubar (today's
+   *          behavior — the label already points at the rebuilt bundle)
+   *        - labelLoaded && !labelRunsBundle && labelUnderRepo →
+   *          repairAgent (a stale label INSIDE this repo: render the
+   *          committed plist template + bootout + bootstrap re-points it
+   *          at the rebuilt bundle — a repair step, not a note)
+   *        - anything else (not loaded, or the label belongs to ANOTHER
+   *          checkout) → no kill, no hijack: the note says relaunch.
+   *       Every take-over step is followed by the executor's post-kick
+   *       verify (launchctl print shows the bundle executable) — a
+   *       mismatch is a repair failure, not a success.
    */
   static func plan(_ input: Input) -> Plan {
     // (a) tree
@@ -2289,10 +2372,14 @@ enum UpdatePlan {
     if input.lockChanged { steps.append(.install) }
     if !input.daemonPids.isEmpty { steps.append(.startDaemon) }
     steps.append(.buildMenubar)
-    if input.labelLoaded && input.thisIsLabelBinary { steps.append(.kickMenubar) }
+    if input.labelLoaded && input.labelRunsBundle {
+      steps.append(.kickMenubar)
+    } else if input.labelLoaded && input.labelUnderRepo {
+      steps.append(.repairAgent)
+    }
     var note = "updated"
     if input.daemonPids.isEmpty { note += " (daemon was not running — no restart)" }
-    if !(input.labelLoaded && input.thisIsLabelBinary) {
+    if !(input.labelLoaded && (input.labelRunsBundle || input.labelUnderRepo)) {
       note += " — menu bar rebuilt; relaunch it to run the new code"
     }
     return Plan(input: input, gate: .proceed, steps: steps, note: note)
@@ -2307,6 +2394,17 @@ enum UpdatePlan {
     case .noOp:              return "already up to date"
     case .proceed:           return "updated"
     }
+  }
+
+  /** Does `path` live under `repoRoot` (the repair-safety gate, issue
+   *  #23)? A label whose executable sits inside the repo being updated is
+   *  THIS checkout's agent (possibly a stale path within it) — re-pointing
+   *  it is a repair. A label outside the repo belongs to another checkout
+   *  (e.g. the real label while a worktree runs the update) — never
+   *  touched. Pure so the harness asserts the gate directly. */
+  static func pathUnderRepo(_ path: String, repoRoot: String) -> Bool {
+    let root = repoRoot.hasSuffix("/") ? String(repoRoot.dropLast()) : repoRoot
+    return path == root || path.hasPrefix(root + "/")
   }
 
   // -- pure helpers over the gate facts (no side effects) ------------------
@@ -2437,14 +2535,6 @@ enum UpdateFacts {
     return nil
   }
 
-  /** This process's own executable path (a bundle run is its bundle's
-   *  executable; a bare-binary run is that bare path). */
-  static func thisBinary() -> String {
-    Bundle.main.bundleURL.path.hasSuffix(".app")
-      ? Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/IdlefillMenubar").path
-      : (Bundle.main.executablePath ?? "/")
-  }
-
   /** Run a command and return ONLY its termination status (no log, no
    *  capture) — the "probe" primitive for the read-only gate facts. A
    *  failed spawn returns non-zero, so `== 0` reads as "the probe held".
@@ -2469,6 +2559,13 @@ enum UpdateFacts {
     }
   }
 
+  /** The bundle executable this checkout's build produces — the path a
+   *  healthy agent's ProgramArguments.0 must equal (menubar/build.sh's
+   *  output; the committed plist template renders exactly this). */
+  static func bundleExecutable(repo: String) -> String {
+    (repo as NSString).appendingPathComponent("menubar/IdlefillMenubar.app/Contents/MacOS/IdlefillMenubar")
+  }
+
   /** Assemble the full `UpdatePlan.Input` from the live system. Returns
    *  nil only when the CURRENT revision cannot be read (no git / not a
    *  repo / no HEAD) — the caller then aborts with a note. `origin/main`
@@ -2482,11 +2579,19 @@ enum UpdateFacts {
    *  fact bundle for the pure decision once the gates have been checked
    *  in order. */
   static func gather(repo: String, uid: UInt32 = geteuid(),
-                     label: String = UpdatePlan.label,
-                     thisBin: String? = thisBinary()) -> UpdatePlan.Input? {
+                     label: String = UpdatePlan.label) -> UpdatePlan.Input? {
     guard let old = shortSha("HEAD", cwd: repo) else { return nil }
     let loaded = labelLoaded(uid: uid, label: label)
-    let thisIsLabelBinary = loaded && (labelRuns(uid: uid, label: label) == thisBin)
+    // Issue #23 facts: the label's CURRENT executable decides kick vs
+    // repair vs note. The compare is against the BUNDLE executable this
+    // checkout builds (not this process's own binary — the update rebuilds
+    // the bundle, and the agent must end on THAT). The repair gate is
+    // repo-scoped: a label outside this repo belongs to another checkout
+    // and is never re-pointed (the old kick gate's safety, kept).
+    let runs = loaded ? labelRuns(uid: uid, label: label) : nil
+    let bundleExe = bundleExecutable(repo: repo)
+    let labelRunsBundle = loaded && (runs == bundleExe)
+    let labelUnderRepo = loaded && (runs.map { UpdatePlan.pathUnderRepo($0, repoRoot: repo) } ?? false)
     let pids = AppModel.daemonPIDs(repo: repo)
     let clean = gitStatusClean(repo: repo)
     // origin/main present (fetched): the real delta facts. Absent (a fresh
@@ -2499,12 +2604,150 @@ enum UpdateFacts {
         hasDelta: old != new,
         lockChanged: lockDelta(old: old, new: new, cwd: repo),
         daemonPids: pids, labelLoaded: loaded,
-        thisIsLabelBinary: thisIsLabelBinary, currentShortSha: old)
+        labelRunsBundle: labelRunsBundle, labelUnderRepo: labelUnderRepo,
+        currentShortSha: old)
     }
     return UpdatePlan.Input(
       treeClean: clean, fetchOk: true, isAncestor: false, hasDelta: false,
       lockChanged: false, daemonPids: pids, labelLoaded: loaded,
-      thisIsLabelBinary: thisIsLabelBinary, currentShortSha: old)
+      labelRunsBundle: labelRunsBundle, labelUnderRepo: labelUnderRepo,
+      currentShortSha: old)
+  }
+}
+
+/** The menubar LaunchAgent re-point machinery (issue #23). Shared by the
+ *  Update Code executor (the `.repairAgent` step) and the release install
+ *  (`UpdateCheck.install`) so both update paths treat the loaded agent as
+ *  "runs this checkout's freshly built bundle" and REPAIR it when it
+ *  doesn't — instead of merely noting the drift.
+ *
+ *  A repair renders the COMMITTED plist template (`menubar/IdlefillMenubar
+ *  .plist`) with this checkout's values — the same substitution
+ *  `menubar/install.sh` performs — then `bootout` + `bootstrap`. The
+ *  render happens BEFORE the bootout (fail closed: a render refusal never
+ *  leaves the previously-loaded agent unloaded). The repair is gated:
+ *  only a label whose current executable lives INSIDE the repo being
+ *  updated is re-pointed — a label pointing at another checkout belongs
+ *  to that checkout and is never hijacked (the same safety the old kick
+ *  gate gave, widened only to "this repo").
+ *
+ *  Test hooks (inert in production, same names as install.sh's):
+ *  `IDLEFILL_MENUBAR_PLIST_DIR` re-points where the rendered plist lands
+ *  (the harness uses a scratch dir, never ~/Library/LaunchAgents). */
+enum LaunchAgent {
+  enum Takeover {
+    case kicked          // the label already ran the bundle — kickstart -k
+    case repaired        // stale label inside this repo — render + bootout + bootstrap
+    case notLoaded       // nothing loaded under this label
+    case foreign         // loaded, but its executable lives OUTSIDE this repo
+    case failed(String)  // a step failed (kick / bootout / bootstrap / render)
+  }
+
+  /** Where the rendered plist lands: `IDLEFILL_MENUBAR_PLIST_DIR` (test
+   *  hook) or ~/Library/LaunchAgents (production). */
+  static func plistDir() -> String {
+    let hook = ProcessInfo.processInfo.environment["IDLEFILL_MENUBAR_PLIST_DIR"]
+    return (hook?.isEmpty == false) ? hook!
+      : ((NSHomeDirectory() as NSString).appendingPathComponent("Library/LaunchAgents"))
+  }
+
+  /** Render the committed template with this checkout's values (the same
+   *  substitutions install.sh does: the repo-root prefix into every path,
+   *  the Label value). Returns the rendered plist's path, or nil on any
+   *  failure (missing template, write failure, byte-verify refusal). The
+   *  byte-verify mirrors install.sh's: when this checkout IS the template's
+   *  hardcoded repo the rendered paths legitimately equal the template
+   *  literal, so assert the rendered ProgramArguments.0 + Label instead;
+   *  any other checkout must not carry the template literal at all. */
+  static func renderPlist(repo: String, label: String) -> String? {
+    let template = (repo as NSString).appendingPathComponent("menubar/IdlefillMenubar.plist")
+    guard let raw = try? String(contentsOfFile: template, encoding: .utf8) else { return nil }
+    let trepo = "/Users/sam/Software/idlefill"
+    var out = raw.replacingOccurrences(of: trepo, with: repo)
+    out = out.replacingOccurrences(of: "<string>com.sam.idlefill.menubar</string>",
+                                   with: "<string>\(label)</string>")
+    // Byte-verify the render.
+    let bundleExe = UpdateFacts.bundleExecutable(repo: repo)
+    let binTag = "<string>\(bundleExe)</string>"
+    guard out.contains(binTag), out.contains("<string>\(label)</string>") else { return nil }
+    if repo != trepo, out.contains(trepo) { return nil }
+    // launchd refuses to start a job whose log paths do not exist.
+    try? FileManager.default.createDirectory(
+      atPath: (repo as NSString).appendingPathComponent("logs"),
+      withIntermediateDirectories: true)
+    let dir = plistDir()
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    let path = (dir as NSString).appendingPathComponent("\(label).plist")
+    do { try out.write(toFile: path, atomically: true, encoding: .utf8) } catch { return nil }
+    return path
+  }
+
+  /** `launchctl bootout gui/<uid>/<label>` — the SINGLE combined target
+   *  (the two-arg form fails rc=5). rc 3 "No such process" = not loaded =
+   *  a clean no-op. */
+  static func bootout(label: String, uid: UInt32, log: String?) -> Bool {
+    let rc = runLogged(["/bin/launchctl", "bootout", "gui/\(uid)/\(label)"], log: log)
+    return rc == 0 || rc == 3
+  }
+
+  /** `launchctl bootstrap gui/<uid> <plist>`. */
+  static func bootstrap(plist: String, uid: UInt32, log: String?) -> Bool {
+    runLogged(["/bin/launchctl", "bootstrap", "gui/\(uid)", plist], log: log) == 0
+  }
+
+  /** The full re-point: RENDER FIRST (fail closed — a render refusal
+   *  leaves the loaded agent untouched), then bootout + bootstrap. */
+  static func repair(repo: String, label: String, uid: UInt32 = geteuid(), log: String? = nil) -> Bool {
+    guard let plist = renderPlist(repo: repo, label: label) else { return false }
+    guard bootout(label: label, uid: uid, log: log) else { return false }
+    return bootstrap(plist: plist, uid: uid, log: log)
+  }
+
+  /** The take-over decision for a loaded agent (issue #23): already on
+   *  the bundle → kick; stale inside this repo → repair; outside this
+   *  repo → foreign (never touched); not loaded → notLoaded. After a
+   *  successful kick/bootstrap the caller verifies `labelRuns` against
+   *  the bundle executable (a mismatch is a failure, not a success). */
+  static func takeOver(repo: String, label: String, uid: UInt32 = geteuid(), log: String? = nil) -> Takeover {
+    guard UpdateFacts.labelLoaded(uid: uid, label: label) else { return .notLoaded }
+    let runs = UpdateFacts.labelRuns(uid: uid, label: label)
+    let bundleExe = UpdateFacts.bundleExecutable(repo: repo)
+    if runs == bundleExe {
+      let rc = runLogged(["/bin/launchctl", "kickstart", "-k", "gui/\(uid)/\(label)"], log: log)
+      return rc == 0 ? .kicked : .failed("kickstart failed (exit \(rc))")
+    }
+    guard UpdatePlan.pathUnderRepo(runs ?? "", repoRoot: repo) else { return .foreign }
+    return repair(repo: repo, label: label, uid: uid, log: log) ? .repaired
+      : .failed("render/bootout/bootstrap re-point failed")
+  }
+
+  /** Run + log a command the way updateCode's gatedRun does (the update
+   *  log records what a repair did). Returns the exit status. */
+  @discardableResult
+  static func runLogged(_ cmd: [String], log: String?) -> Int32 {
+    let tmp = (NSTemporaryDirectory() as NSString)
+      .appendingPathComponent("idlefill-launchagent-\(getpid())-\(Int(Date().timeIntervalSince1970 * 1000)).txt")
+    FileManager.default.createFile(atPath: tmp, contents: nil)
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: cmd[0])
+    p.arguments = Array(cmd.dropFirst())
+    var env = ProcessInfo.processInfo.environment
+    env["PATH"] = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", env["PATH"] ?? ""].joined(separator: ":")
+    p.environment = env
+    // Temp file, never a Pipe (the 64 KB deadlock class — launchctl print
+    // output is small but the rule is the class fix).
+    let h = FileHandle(forWritingAtPath: tmp)
+    if let h { p.standardOutput = h; p.standardError = h }
+    do { try p.run() } catch { if let h { try? h.close() }; return 255 }
+    p.waitUntilExit()
+    if let h { try? h.close() }
+    let rc = p.terminationStatus
+    if let log {
+      let data = (try? Data(contentsOf: URL(fileURLWithPath: tmp))) ?? Data()
+      UpdateLog.appendCommand(cmd: cmd, data: data, exit: Int(rc), at: log)
+    }
+    return rc
   }
 }
 
@@ -2552,6 +2795,24 @@ enum UpdateLog {
     guard fd >= 0 else { return }
     defer { close(fd) }
     _ = keep.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+  }
+
+  /** Append one command's record (the `$ cmd … [exit N]` shape the update
+   *  log uses) — the shared form AppModel.gatedRun and LaunchAgent.runLogged
+   *  both write, so a repair is auditable in the same log. */
+  static func appendCommand(cmd: [String], data: Data, exit: Int, at path: String) {
+    rotateIfNeeded(path: path)
+    let dir = (path as NSString).deletingLastPathComponent
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    // 3-arg open + O_APPEND (the mode-0000 + truncate pitfalls — see the
+    // appendLog note in AppModel): create with 0o644, write at the true end.
+    let fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+    guard fd >= 0 else { return }
+    defer { close(fd) }
+    var bytes = Data("\n$ \(cmd.joined(separator: " "))".utf8)
+    bytes.append(data)
+    bytes.append(Data("\n[exit \(exit)]\n".utf8))
+    _ = bytes.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
   }
 
   /** ISO-8601 UTC timestamp, e.g. `2026-09-30T12:34:56Z`. */
