@@ -154,6 +154,41 @@ test('grant → run → success → usage(ok) → result appended → queue shri
   assert.match(readQueueLines()[0]!, /job-2/);
 });
 
+test('score-ordered dispatch: the daemon leases the HIGHEST-score job even when the file head is a lower-score job (issue #2 gap 1)', async () => {
+  // The add_jobs reality: older low-score lines first on disk, a fresh
+  // high-score job appended at the tail. FIFO would lease low-first;
+  // priority dispatch must lease high-first.
+  setExecutor(`${nodeBin} ${join(here, 'fixtures', 'sleep-exec.mjs')} {payload_file} {result_file}`);
+  arb.idle = true;
+  mkQueue([{ id: 'prio-low', score: 11 }, { id: 'prio-mid', score: 40 }, { id: 'prio-high', score: 95 }]);
+  const before = arb.leaseRequests.length; // cumulative across tests
+  const d = makeDaemon();
+  await d.start();
+  const deadline = Date.now() + 8000;
+  while (Date.now() < deadline) {
+    if (arb.leaseRequests.length > before) break;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  const first = arb.leaseRequests[before];
+  assert.ok(first, 'the daemon requested a lease');
+  assert.equal(first!.job_id, 'prio-high', 'the FIRST lease request is the highest-score job, not the file head');
+  // Block any second lease while the first settles (the executor sleeps
+  // 150ms; the poll loop cannot claim again until it finishes).
+  arb.idle = false;
+  const settle = Date.now() + 8000;
+  while (Date.now() < settle) {
+    if (readResults().some((r) => r.job_id === 'prio-high') && readQueueLines().length === 2) break;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  await d.stop();
+  arb.idle = true;
+
+  // Selection-only: the queue file's on-disk order is NOT rewritten. The
+  // high job left (success), the two lower lines remain in file order.
+  const remaining = readQueueLines().map((l) => JSON.parse(l).job_id);
+  assert.deepEqual(remaining, ['prio-low', 'prio-mid'], 'remaining lines keep their on-disk file order (no re-sort-on-disk)');
+});
+
 test('failed executor: job stays in the queue; a failed result line + error_detail are appended', async () => {
   // executor that exits non-zero (node exits 1 on a throw) and prints a
   // marker to stderr — the marker must ride along as error_detail.

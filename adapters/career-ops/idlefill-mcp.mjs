@@ -242,6 +242,17 @@ function dedupeBatch(toAdd) {
   return { batch, dups };
 }
 
+/** Echo the STORED job identity (not the raw input) so the caller can verify
+ *  what actually landed in the queue file (issue #2, gap 3). */
+function addedEcho(jobs) {
+  return jobs.map((j) => ({
+    job_id: j.job_id,
+    url: j.payload.url,
+    company: j.payload.company,
+    title: j.payload.title,
+  }));
+}
+
 function addJobs(args) {
   const cfg = loadClientConfig();
   if (cfg.__error) return { ok: false, error: cfg.__error };
@@ -280,7 +291,7 @@ function addJobs(args) {
       ok: true,
       project,
       dry_run: true,
-      added: plan0.fresh.map((j) => j.job_id),
+      added: addedEcho(plan0.fresh),
       skipped_in_queue: plan0.skippedQueue,
       skipped_done: plan0.skippedDone,
       skipped_quarantined: plan0.skippedQuarantined,
@@ -306,7 +317,7 @@ function addJobs(args) {
       return {
         ok: true,
         project,
-        added: plan.fresh.map((j) => j.job_id),
+        added: addedEcho(plan.fresh),
         skipped_in_queue: plan.skippedQueue,
         skipped_done: plan.skippedDone,
         skipped_quarantined: plan.skippedQuarantined,
@@ -648,7 +659,8 @@ const TOOLS = [
     name: 'idlefill_add_jobs',
     description:
       'Add one or more job openings to an idlefill project queue so the idlefill client daemon evaluates them whenever the local LLM server is idle. ' +
-      'Each job: { url (required, http(s)), company?, title?, score? (number 0-100, for ordering context), extra? (free object) }. ' +
+      'Each job: { url (required, http(s)), company?, title?, score? (number 0-100 — the daemon dispatches highest-score-first, FIFO tiebreak), extra? (free object) }. ' +
+      'The response echoes each stored job as { job_id, url, company, title } so the caller can verify what landed. ' +
       'A job is skipped when it is already in the queue, its last result is ok:true, or it was quarantined; duplicates within the batch collapse to one. ' +
       'The response names each skip (skipped_in_queue / skipped_done / skipped_quarantined). dry_run=true previews without writing. ' +
       'The daemon picks up new lines on its next idle grant — no restart.',

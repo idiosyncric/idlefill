@@ -205,7 +205,13 @@ test('idlefill-mcp: stdio sessions — add/status/results(echo)/lookup + remove/
     // --- add_jobs ---
     const dry = call(3);
     assert.equal(dry.p?.ok, true, 'dry_run ok');
-    assert.deepEqual(dry.p?.added, [id(FRESH)], 'dry_run: only FRESH would be added');
+    // Gap 3 (issue #2): `added` echoes the STORED job — {job_id, url, company,
+    // title} — not bare ids, so the caller can verify what landed.
+    assert.deepEqual(
+      dry.p?.added,
+      [{ job_id: id(FRESH), url: FRESH.url, company: FRESH.company, title: FRESH.title }],
+      'dry_run: only FRESH would be added, echoed with its stored fields',
+    );
     assert.equal(dry.p?.skipped_duplicate, 1, 'dry_run: the in-batch dup is the only duplicate');
     assert.deepEqual(dry.p?.skipped_in_queue, [id(EXISTING)], 'dry_run: the already-queued job is named');
     assert.deepEqual(dry.p?.skipped_done, [id(ALREADY_DONE)], 'dry_run: done job skipped');
@@ -217,7 +223,11 @@ test('idlefill-mcp: stdio sessions — add/status/results(echo)/lookup + remove/
 
     const real = call(4);
     assert.equal(real.p?.ok, true, 'add ok');
-    assert.deepEqual(real.p?.added, [id(FRESH)], 'add: exactly FRESH landed');
+    assert.deepEqual(
+      real.p?.added,
+      [{ job_id: id(FRESH), url: FRESH.url, company: FRESH.company, title: FRESH.title }],
+      'add: exactly FRESH landed, echoed with its stored fields',
+    );
     assert.equal(real.p?.queue_length, 2, 'add: queue depth reported');
 
     const readd = call(5);
@@ -234,6 +244,21 @@ test('idlefill-mcp: stdio sessions — add/status/results(echo)/lookup + remove/
     assert.equal(qAfter[0]?.job_id, id(EXISTING), 'existing line untouched, order preserved');
     assert.equal(qAfter[1]?.job_id, id(FRESH), 'the added line is second (appended)');
     assert.equal(qAfter[1]?.payload?.source, 'mcp', 'the new line carries source: mcp');
+
+    // Gap 3 (issue #2): the `added` echo must match what ACTUALLY landed in
+    // the queue file — byte-compare every echoed field against the stored
+    // line (the phantom-job guard: a typo'd identity is visible here).
+    const echo = real.p?.added;
+    assert.ok(Array.isArray(echo) && echo.length === 1, 'added is an array of stored-job objects');
+    const storedFresh = qAfter.find((j) => j.job_id === id(FRESH));
+    assert.ok(storedFresh, 'the echoed job_id exists in the queue file');
+    assert.equal(echo[0].job_id, storedFresh.job_id, 'echo job_id === stored job_id');
+    assert.equal(echo[0].url, storedFresh.payload.url, 'echo url === stored payload.url');
+    assert.equal(echo[0].company, storedFresh.payload.company, 'echo company === stored payload.company');
+    assert.equal(echo[0].title, storedFresh.payload.title, 'echo title === stored payload.title');
+    // The dry_run echo (same batch) matches the same stored line — the
+    // preview promised exactly what the real write stored.
+    assert.deepEqual(dry.p?.added, echo, 'dry_run echo === real echo === stored values');
 
     // --- queue_status (file view + best-effort arbiter error) ---
     const st = call(6);

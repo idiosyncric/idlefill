@@ -186,15 +186,16 @@ export interface QueuePreviewRow {
 }
 
 /**
- * The first N lines of the queue file as display rows. Order in the file is
- * priority order (highest score first, appended work last), so the preview
- * IS the "next up" list the dashboard's queue page shows. Best-effort: a
- * missing/corrupt file yields [] — the preview is display data and must
- * never break registration.
+ * The first N jobs in DISPATCH order as display rows. Dispatch order is
+ * priorityOrder (highest score first, ties in file order) — the same helper
+ * nextJob uses — so what the dashboard's queue page shows IS the "next up"
+ * list, even when the queue file's on-disk order is not score-sorted
+ * (add_jobs appends to the tail). Best-effort: a missing/corrupt file
+ * yields [] — the preview is display data and must never break registration.
  */
 export function queuePreview(file: string, limit = 50): QueuePreviewRow[] {
   try {
-    const jobs = readQueue(file).slice(0, Math.max(1, Math.min(500, limit)));
+    const jobs = priorityOrder(readQueue(file)).slice(0, Math.max(1, Math.min(500, limit)));
     return jobs.map((j) => {
       const pl = (j.payload ?? {}) as Record<string, unknown>;
       const title = typeof pl.title === 'string' && pl.title.trim() !== ''
@@ -238,8 +239,29 @@ export function writeQueue(file: string, jobs: QueueJob[]): void {
   renameSync(tmp, file);
 }
 
+/**
+ * Dispatch order for a batch of queue jobs: highest payload.score first,
+ * ties keep file order (FIFO tiebreak — Array.prototype.sort is stable).
+ * A null/undefined/non-number score sorts last (treated as -Infinity).
+ * Pure: returns a NEW array and never mutates the input — the queue file's
+ * on-disk order is never rewritten (issue #2: add_jobs appends to the tail,
+ * so file order alone would make `score` do nothing).
+ */
+export function priorityOrder(jobs: QueueJob[]): QueueJob[] {
+  const scoreOf = (j: QueueJob): number => {
+    const s = j.payload?.score;
+    return typeof s === 'number' && Number.isFinite(s) ? s : -Infinity;
+  };
+  return [...jobs].sort((a, b) => {
+    const sa = scoreOf(a);
+    const sb = scoreOf(b);
+    if (sa === sb) return 0;
+    return sa > sb ? -1 : 1;
+  });
+}
+
 export function nextJob(file: string): QueueJob | null {
-  return readQueue(file)[0] ?? null;
+  return priorityOrder(readQueue(file))[0] ?? null;
 }
 
 /** Number of jobs currently in the queue file (0 when missing/corrupt-free empty). */
@@ -774,7 +796,7 @@ export class ClientDaemon {
 
   // ------------------------------------------------------------------
 
-  /** Next job for any configured project (queue order). */
+  /** Next job for any configured project (priority order: highest score first). */
   private async claimNextJob(): Promise<{ project: ClientProjectConfig; job: QueueJob } | null> {
     for (const proj of this.cfg.projects) {
       const job = nextJob(proj.queue_file);
