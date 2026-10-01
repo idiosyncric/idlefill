@@ -7,10 +7,11 @@
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildApi, attachWebSocket } from './api.js';
-import { Arbiter } from './arbiter.js';
+import { Arbiter, WATCHED_SERVER_ID } from './arbiter.js';
 import { loadConfig } from './config.js';
 import { IdleDetector, makeRealActivityFetcher, makeRealLogMtimeSource } from './idle.js';
 import { StateStore } from './state.js';
+import type { ServerConnection } from './types.js';
 
 const entryDir = dirname(fileURLToPath(import.meta.url));
 
@@ -18,15 +19,23 @@ async function main(): Promise<void> {
   const cfg = loadConfig(entryDir);
 
   const store = new StateStore(cfg.state_file);
-  const detector = new IdleDetector({
-    fetchActivity: makeRealActivityFetcher(),
-    logMtime: makeRealLogMtimeSource(),
-    llama_swap_url: cfg.llama_swap_url,
-    activity_path: cfg.activity_path,
-    log_glob: cfg.log_glob,
-    idle_seconds: cfg.idle_seconds,
-  });
-  const arbiter = new Arbiter(store, cfg, detector);
+
+  // Per-engine idle watching (#38): one detector per declared server row.
+  // The watched server keeps the config's log_glob; other rows use their
+  // own row.log_glob (absent = log signal disabled for that engine).
+  const fetchActivity = makeRealActivityFetcher();
+  const logMtime = makeRealLogMtimeSource();
+  const makeDetector = (row: ServerConnection): IdleDetector =>
+    new IdleDetector({
+      fetchActivity,
+      logMtime,
+      llama_swap_url: row.url,
+      activity_path: row.activity_path,
+      log_glob: row.log_glob ?? (row.id === WATCHED_SERVER_ID ? cfg.log_glob : ''),
+      idle_seconds: cfg.idle_seconds,
+    });
+
+  const arbiter = new Arbiter(store, cfg, new Map(), { detectorFactory: makeDetector });
 
   // Persisted operator settings re-hydrate onto the live config objects:
   //  - project rows (pause state + per-project grant-knob overrides) replace

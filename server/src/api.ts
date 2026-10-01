@@ -15,7 +15,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import fastify, { type FastifyInstance } from 'fastify';
 import { WebSocketServer } from 'ws';
-import { utcDay, type Arbiter } from './arbiter.js';
+import { utcDay, type Arbiter, WATCHED_SERVER_ID } from './arbiter.js';
 import type { ProjectAllocation, QueuePreviewRow, ServerConfig, ServerConnection } from './types.js';
 
 export interface ApiDeps {
@@ -142,24 +142,13 @@ function todayTotals(leases: { project: string; status: string; ended_at?: numbe
 
 /**
  * The declared inference-server connections with their models expanded into
- * the queueable-resource rows the dashboard renders. The row whose url +
- * activity_path match the watched feed carries `watched: true` and the live
- * signal object (the arbiter watches exactly one feed today — other rows are
- * declared inventory and carry no live signal).
+ * the queueable-resource rows the dashboard renders. EVERY watched server
+ * carries its live signal object (the arbiter polls one detector per server
+ * row); a row whose source has no detector yet carries `signal: null` and
+ * is fail-closed for grants.
  */
 function serverView(arbiter: Arbiter, cfg: ServerConfig, now: number) {
   const s = arbiter['store'].state;
-  const sig = arbiter['detector'].signal(now);
-  const lastAct = s.last_activity;
-  const signal = {
-    idle: sig.idle,
-    idle_for_s: sig.idle_for_s,
-    last_activity: lastAct ? { ...lastAct, age_s: Math.max(0, Math.round((now - lastAct.ts) / 1000)) } : null,
-    last_log_write_age_s: s.last_log_write ? Math.max(0, Math.round((now - s.last_log_write) / 1000)) : null,
-    degraded: s.signal_degraded,
-    degraded_reason: s.degraded_reason,
-    reidle_gated: arbiter.reidleGated(),
-  };
   const activeClients = new Set(arbiter.activeLeases(now).map((l) => l.client_name));
   const runningModels = new Set<string>();
   const queuedByModel = new Map<string, number>();
@@ -172,11 +161,28 @@ function serverView(arbiter: Arbiter, cfg: ServerConfig, now: number) {
     }
   }
   return s.servers.map((row: ServerConnection) => {
-    const watched = row.url === cfg.llama_swap_url && row.activity_path === cfg.activity_path;
+    const sig = arbiter.serverSignal(row.id, now);
+    const lastAct = sig?.last_activity ?? null;
+    const signal = sig
+      ? {
+          idle: sig.idle,
+          idle_for_s: sig.idle_for_s,
+          last_activity: lastAct ? { ...lastAct, age_s: Math.max(0, Math.round((now - lastAct.ts) / 1000)) } : null,
+          last_log_write_age_s: sig.last_log_write ? Math.max(0, Math.round((now - sig.last_log_write) / 1000)) : null,
+          degraded: sig.signal_degraded,
+          degraded_reason: sig.degraded_reason,
+          reidle_gated: arbiter.reidleGated(row.id),
+          // Session folding (#32): the newest session activity on this server.
+          session_last_activity_age_s: (() => {
+            const a = arbiter.sessionActivityOn(row.id, now);
+            return a === null ? null : Math.max(0, Math.round((now - a) / 1000));
+          })(),
+        }
+      : null;
     return {
       ...row,
-      watched,
-      signal: watched ? signal : null,
+      watched: sig !== null,
+      signal,
       models: row.models.map((m) => ({ name: m, running: runningModels.has(m), queued: queuedByModel.get(m) ?? 0 })),
     };
   });
@@ -312,6 +318,8 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       project?: string;
       job_id?: string;
       estimated_seconds?: number;
+      /** Engine to run on (per-engine admission, #38). Absent = watched server. */
+      server_id?: string;
     };
     if (!body.client_id || !body.project || !body.job_id) {
       return reply.code(400).send({ error: 'client_id, project and job_id are required' });
@@ -325,6 +333,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       project: String(body.project),
       job_id: String(body.job_id),
       estimated_seconds: typeof body.estimated_seconds === 'number' ? body.estimated_seconds : 0,
+      ...(typeof body.server_id === 'string' && body.server_id.trim() !== '' ? { server_id: body.server_id.trim() } : {}),
     });
     if (!res.ok || !res.lease) {
       return reply.code(409).send({ reason: res.reason ?? 'unknown' });
@@ -334,6 +343,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       client_id: res.lease.client_id,
       project: res.lease.project,
       job_id: res.lease.job_id,
+      ...(res.lease.server_id ? { server_id: res.lease.server_id } : {}),
       granted_at: res.lease.granted_at,
       expires_at: res.lease.expires_at,
       ttl_seconds: Math.round((res.lease.expires_at - res.lease.granted_at) / 1000),
@@ -466,6 +476,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       name?: string;
       url?: string;
       activity_path?: string;
+      log_glob?: string;
       models?: string[];
       peers?: string[];
     };
@@ -474,6 +485,65 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       return reply.code(res.reason === 'unknown_server' ? 404 : 400).send({ error: res.reason ?? 'invalid' });
     }
     return { ok: true, created: res.created, server: res.server };
+  });
+
+  // ------------------------------------------------------------------
+  // Sessions (router-self-registered interactive traffic — #32/#33)
+  // ------------------------------------------------------------------
+
+  /**
+   * Register/heartbeat a session (idempotent on token). The router calls
+   * this on first sight of a /s/<token> path and refreshes it with each
+   * heartbeat, reporting the newest request time it saw on the session.
+   */
+  app.post('/api/sessions/register', async (req, reply) => {
+    const body = (req.body ?? {}) as {
+      token?: string;
+      client_id?: string;
+      client_name?: string;
+      server_id?: string;
+      last_activity?: number;
+    };
+    const token = typeof body.token === 'string' ? body.token.trim() : '';
+    if (!token) return reply.code(400).send({ error: 'token required' });
+    const res = arbiter.registerSession(token, {
+      ...(body.client_id ? { client_id: String(body.client_id) } : {}),
+      ...(body.client_name ? { client_name: String(body.client_name) } : {}),
+      ...(body.server_id ? { server_id: String(body.server_id) } : {}),
+      ...(typeof body.last_activity === 'number' && Number.isFinite(body.last_activity) ? { last_activity: body.last_activity } : {}),
+    });
+    if (!res.ok) return reply.code(400).send({ error: res.reason ?? 'invalid' });
+    return reply.code(res.created ? 201 : 200).send({ created: res.created, session: res.session });
+  });
+
+  app.get('/api/sessions', async () => {
+    const now = Date.now();
+    return {
+      sessions: arbiter.listSessions().map((sess) => ({
+        ...sess,
+        override: arbiter.activeSessionOverride(sess.token, now),
+      })),
+    };
+  });
+
+  /**
+   * Operator override for a session: { override: "pause" | "force" | null,
+   * until?: epoch_ms }. Same shape as the client override (#32). 'pause'
+   * asks the router to hold that session's traffic. 404 for an unknown
+   * session token.
+   */
+  app.post('/api/sessions/:token/override', async (req, reply) => {
+    const token = decodeURIComponent((req.params as { token: string }).token);
+    const body = (req.body ?? {}) as { override?: 'pause' | 'force' | null; until?: number };
+    if (!token.trim()) return reply.code(400).send({ error: 'session token required' });
+    const ov = body.override;
+    if (ov !== 'pause' && ov !== 'force' && ov !== null) {
+      return reply.code(400).send({ error: 'override must be "pause", "force", or null (clear)' });
+    }
+    const until = typeof body.until === 'number' && Number.isFinite(body.until) ? body.until : undefined;
+    const res = arbiter.setSessionOverride(token.trim(), ov, until);
+    if (!res.ok) return reply.code(404).send({ error: res.reason ?? 'unknown_session' });
+    return { ok: true, override: res.override ?? null };
   });
 
   // ------------------------------------------------------------------
@@ -487,8 +557,19 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     const now = Date.now();
     const active = arbiter.activeLeases();
     const day = new Date().toISOString().slice(0, 10);
-    const sig = arbiter['detector'].signal(now);
-    const lastAct = s.last_activity;
+    // The top-level `idle` block is the WATCHED server's view (per-server
+    // detail rides `servers[]`). A watched row without a detector reads
+    // degraded (fail-closed).
+    const sig = arbiter.serverSignal(WATCHED_SERVER_ID, now) ?? {
+      now,
+      idle: false,
+      idle_for_s: null,
+      last_activity: null,
+      last_log_write: null,
+      signal_degraded: true,
+      degraded_reason: 'no detector for the watched server',
+    };
+    const lastAct = sig.last_activity ?? s.last_activity;
     const lastActAgo = lastAct ? Math.max(0, Math.round((now - lastAct.ts) / 1000)) : null;
     const limit = queryLimit(req);
 
@@ -510,6 +591,11 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       // Client rows carry their active operator override (if any), so the
       // dashboard and clients can see pause/force state without a second call.
       clients: s.clients.map((c) => ({ ...c, override: arbiter.activeOverride(c.client_id, now) })),
+      // Interactive sessions (#32/#33) with their active operator override.
+      sessions: arbiter.listSessions().map((sess) => ({
+        ...sess,
+        override: arbiter.activeSessionOverride(sess.token, now),
+      })),
       // Anti-thrash: the jobs currently throttled (persisted; newest last).
       // Empty list when nothing is throttled — the dashboard renders this
       // as the exception-only "Throttled jobs" section.

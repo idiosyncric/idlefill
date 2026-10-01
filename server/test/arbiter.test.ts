@@ -956,3 +956,212 @@ test('/api/state lease rows still carry expires_at + estimated_seconds (shape un
   assert.ok(rawLease.granted_at && rawLease.granted_at < rawLease.expires_at, 'granted_at < expires_at');
   rmSync(h.dir, { recursive: true, force: true });
 });
+
+
+// ==================================================================
+// Per-engine admission + sessions (#38/#32/#33)
+// ==================================================================
+
+/**
+ * Multi-server harness: two declared servers, each with its own fake
+ * detector. Server A is the watched one (WATCHED_SERVER_ID); B is added
+ * via upsertServerConnection (the API path).
+ */
+function makeMultiHarness(opts: { maxLeases?: number; idleSeconds?: number } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'idlefill-multi-'));
+  const store = new StateStore(join(dir, 'state.json'));
+  const cfg: ServerConfig = {
+    listen: 0,
+    api_tokens: ['t'],
+    llama_swap_url: 'http://fake-a',
+    activity_path: '/api/metrics/activity',
+    log_glob: '',
+    idle_seconds: opts.idleSeconds ?? 300,
+    poll_ms: 15000,
+    lease_ttl_seconds: 1800,
+    lease_ttl_safety_factor: 2,
+    lease_ttl_floor_seconds: 60,
+    max_concurrent_leases: opts.maxLeases ?? 1,
+    job_fail_threshold: 5,
+    job_cooldown_seconds: 300,
+    projects: [{ name: 'career-ops', paused: false, daily_token_cap: 100000 }],
+    state_file: join(dir, 'state.json'),
+  };
+  const detA = new FakeDetector();
+  detA.idleSeconds = cfg.idle_seconds;
+  const arbiter = new Arbiter(store, cfg, detA as unknown as ConstructorParameters<typeof Arbiter>[2]);
+  arbiter.registerClient('mac', undefined, '100.94.165.102');
+  const up = arbiter.upsertServerConnection({ name: 'gpu-box', url: 'http://fake-b' });
+  const serverB = up.server!.id;
+  const detB = new FakeDetector();
+  detB.idleSeconds = cfg.idle_seconds;
+  // Inject B's detector (a production arbiter builds it via detectorFactory).
+  (arbiter as unknown as { detectors: Map<string, unknown> }).detectors.set(serverB, detB);
+  return { dir, store, cfg, arbiter, detA, detB, serverB, client: store.state.clients[0]! };
+}
+
+test('per-engine: a lease on server A does not consume server B\u2019s slot', () => {
+  const h = makeMultiHarness();
+  h.detA.entries = mkEntries([400]);
+  h.detB.entries = mkEntries([400], 'ip:10.0.0.8');
+  const rA = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'j-a', estimated_seconds: 60, now: T0 });
+  assert.equal(rA.ok, true, `A grant expected, got ${JSON.stringify(rA)}`);
+  assert.equal(rA.lease!.server_id, 'srv-watched', 'lease records its engine');
+  const rB = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'j-b', estimated_seconds: 60, now: T0, server_id: h.serverB });
+  assert.equal(rB.ok, true, `B grant expected (per-engine cap), got ${JSON.stringify(rB)}`);
+  // A second lease on A is busy; on B it is busy too — the cap is per server.
+  const rA2 = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'j-a2', estimated_seconds: 60, now: T0 });
+  assert.equal(rA2.reason, 'busy');
+  const rB2 = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'j-b2', estimated_seconds: 60, now: T0, server_id: h.serverB });
+  assert.equal(rB2.reason, 'busy');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('per-engine: unknown server_id is refused (unknown_server)', () => {
+  const h = makeMultiHarness();
+  h.detA.entries = mkEntries([400]);
+  const r = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'j-x', estimated_seconds: 60, now: T0, server_id: 'srv-nope' });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, 'unknown_server');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('per-engine: a server with no detector is fail-closed for grants', () => {
+  const h = makeMultiHarness();
+  h.detA.entries = mkEntries([400]);
+  // Remove B\u2019s detector: the row exists but has no signal source.
+  (h.arbiter as unknown as { detectors: Map<string, unknown> }).detectors.delete(h.serverB);
+  const r = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'j-x', estimated_seconds: 60, now: T0, server_id: h.serverB });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, 'not_idle', 'no signal = idle cannot be proven');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('per-engine: a preempt on A arms A\u2019s reidle gate but never B\u2019s', async () => {
+  const h = makeMultiHarness();
+  h.detA.entries = mkEntries([400]);
+  h.detB.entries = mkEntries([400], 'ip:10.0.0.8');
+  const rA = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'j-a', estimated_seconds: 60, now: T0 });
+  assert.equal(rA.ok, true);
+  // Foreign activity on A post-grant → preempt on the next tick.
+  h.detA.entries = mkEntries([0], 'ip:10.0.0.9');
+  await h.arbiter.tick(T0 + 1000);
+  assert.ok(h.arbiter.reidleGated('srv-watched'), 'A gate armed');
+  assert.ok(!h.arbiter.reidleGated(h.serverB), 'B gate untouched');
+  // B can still grant while A is gated.
+  const rB = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'j-b', estimated_seconds: 60, now: T0 + 1000, server_id: h.serverB });
+  assert.equal(rB.ok, true, `B grants while A is reidle-gated, got ${JSON.stringify(rB)}`);
+  // A stays gated until a full-idle verdict on A.
+  const rA2 = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'j-a2', estimated_seconds: 60, now: T0 + 2000 });
+  assert.equal(rA2.reason, 'not_idle');
+  h.detA.entries = mkEntries([400]); // A quiet again
+  await h.arbiter.tick(T0 + 301_000);
+  const rA3 = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'j-a3', estimated_seconds: 60, now: T0 + 301_000 });
+  assert.equal(rA3.ok, true, 'A re-grants after its own full idle');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('legacy lease without server_id belongs to the watched server', () => {
+  const h = makeMultiHarness();
+  h.detA.entries = mkEntries([400]);
+  h.detB.entries = mkEntries([400], 'ip:10.0.0.8');
+  // Simulate a pre-per-engine state file: strip server_id from the lease.
+  const r = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'j-old', estimated_seconds: 60, now: T0 });
+  assert.equal(r.ok, true);
+  delete r.lease!.server_id;
+  // The cap on the watched server sees it; B does not.
+  const rA2 = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'j-a2', estimated_seconds: 60, now: T0 });
+  assert.equal(rA2.reason, 'busy');
+  const rB = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'j-b', estimated_seconds: 60, now: T0, server_id: h.serverB });
+  assert.equal(rB.ok, true);
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('sessions: a live session on a server defeats idle for grants (#32)', () => {
+  const h = makeMultiHarness();
+  h.detA.entries = mkEntries([400]); // feed says idle
+  h.detB.entries = mkEntries([400], 'ip:10.0.0.8');
+  h.arbiter.registerSession('s-abc', { client_id: h.client.client_id, last_activity: T0 - 60_000, now: T0 });
+  const r = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'j-1', estimated_seconds: 60, now: T0 });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, 'not_idle', 'session activity within idle_seconds is interactive traffic');
+  // A session on B does NOT block A.
+  const rB = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'j-b', estimated_seconds: 60, now: T0, server_id: h.serverB });
+  assert.equal(rB.ok, true, 'session on the watched server never gates B');
+  // force does not bypass a live session either.
+  h.arbiter.setClientOverride('mac', 'force');
+  const rf = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'j-f', estimated_seconds: 60, now: T0 });
+  assert.equal(rf.ok, false);
+  assert.equal(rf.reason, 'not_idle', 'force never collides with a live session');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('sessions: session activity post-grant preempts the lease even when the feed exempts it (#32)', async () => {
+  const h = makeMultiHarness();
+  h.detA.entries = mkEntries([400]);
+  const r = h.arbiter.requestLease({ client_id: h.client.client_id, project: 'career-ops', job_id: 'j-1', estimated_seconds: 600, now: T0 });
+  assert.equal(r.ok, true);
+  // The router shares the lease holder\u2019s IP — the feed exempts session
+  // traffic. The session row is direct evidence and preempts anyway.
+  h.arbiter.registerSession('s-live', { client_id: h.client.client_id, last_activity: T0 + 5_000, now: T0 + 5_000 });
+  const { revoked } = await h.arbiter.tick(T0 + 6_000);
+  assert.equal(revoked.length, 1);
+  assert.equal(revoked[0]!.reason, 'preempted');
+  assert.equal(revoked[0]!.lease.lease_id, r.lease!.lease_id);
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('sessions: register is idempotent on token; last_activity keeps the max', () => {
+  const h = makeMultiHarness();
+  const r1 = h.arbiter.registerSession('s-tok', { client_name: 'mac', last_activity: T0, now: T0 });
+  assert.equal(r1.created, true);
+  const r2 = h.arbiter.registerSession('s-tok', { last_activity: T0 - 10_000, now: T0 + 1000 });
+  assert.equal(r2.created, false);
+  assert.equal(r2.session!.last_activity, T0, 'never rewinds');
+  const r3 = h.arbiter.registerSession('s-tok', { last_activity: T0 + 500, now: T0 + 2000 });
+  assert.equal(r3.session!.last_activity, T0 + 500);
+  assert.equal(h.arbiter.listSessions().length, 1);
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('sessions: operator override set/clear/expiry (same shape as client overrides)', () => {
+  const h = makeMultiHarness();
+  const NOW = Date.now();
+  h.arbiter.registerSession('s-ovr', { now: NOW });
+  assert.equal(h.arbiter.setSessionOverride('s-nope', 'pause').ok, false);
+  const set = h.arbiter.setSessionOverride('s-ovr', 'pause', NOW + 10_000);
+  assert.equal(set.ok, true);
+  assert.equal(h.arbiter.activeSessionOverride('s-ovr', NOW + 5_000)?.override, 'pause');
+  assert.equal(h.arbiter.activeSessionOverride('s-ovr', NOW + 10_000), null, 'until auto-expires');
+  h.arbiter.setSessionOverride('s-ovr', 'force');
+  assert.equal(h.arbiter.activeSessionOverride('s-ovr', NOW + 20_000)?.override, 'force');
+  h.arbiter.setSessionOverride('s-ovr', null);
+  assert.equal(h.arbiter.activeSessionOverride('s-ovr', NOW + 20_000), null);
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('sessions: stale rows are swept on tick; fresh rows survive', async () => {
+  const h = makeMultiHarness();
+  h.arbiter.registerSession('s-old', { now: T0 });
+  h.arbiter.registerSession('s-new', { now: T0 });
+  // Two hours later: the old row (last_seen T0) is stale; refresh s-new first.
+  h.arbiter.registerSession('s-new', { now: T0 + 2 * 3_600_000 });
+  await h.arbiter.tick(T0 + 2 * 3_600_000);
+  const toks = h.arbiter.listSessions().map((s) => s.token);
+  assert.ok(!toks.includes('s-old'), 'stale session swept');
+  assert.ok(toks.includes('s-new'), 'heartbeat keeps the row');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('upsertServerConnection: created rows inherit log_glob support + duplicate guard', () => {
+  const h = makeMultiHarness();
+  const up = h.arbiter.upsertServerConnection({ name: 'vllm', url: 'http://fake-c', log_glob: '/logs/req-*.jsonl' });
+  assert.equal(up.ok, true);
+  assert.equal(up.server!.log_glob, '/logs/req-*.jsonl');
+  const dupe = h.arbiter.upsertServerConnection({ name: 'vllm2', url: 'http://fake-c' });
+  assert.equal(dupe.ok, false);
+  const patch = h.arbiter.upsertServerConnection({ id: up.server!.id, models: ['llama-3'] });
+  assert.equal(patch.ok, true);
+  assert.deepEqual(patch.server!.models, ['llama-3']);
+  rmSync(h.dir, { recursive: true, force: true });
+});

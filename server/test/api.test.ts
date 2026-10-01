@@ -935,3 +935,82 @@ test('version handshake: malformed version/protocol values are dropped, never re
   assert.equal(row2.version, '9.9.9', 'a later valid report updates the row');
   assert.equal(row2.protocol, 0, 'protocol 0 is in range and kept');
 });
+
+
+// ---------------------------------------------------------------------------
+// Sessions (#32/#33): HTTP surface — register/heartbeat, /api/state rows,
+// operator override.
+// ---------------------------------------------------------------------------
+
+test('sessions: register creates (201), heartbeat updates (200), /api/state lists with override', async () => {
+  const reg = await fetch(`${base}/api/sessions/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ token: 's-http-1', client_id: clientId, last_activity: Date.now() - 5000 }),
+  });
+  assert.equal(reg.status, 201, 'first sight creates the row');
+  const created = (await reg.json()) as { created: boolean; session: { token: string } };
+  assert.equal(created.created, true);
+  assert.equal(created.session.token, 's-http-1');
+
+  const hb = await fetch(`${base}/api/sessions/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ token: 's-http-1' }),
+  });
+  assert.equal(hb.status, 200, 'heartbeat is idempotent');
+
+  const st = (await (await fetch(`${base}/api/state?limit=5`, { headers: auth })).json()) as {
+    sessions: { token: string; override: unknown }[];
+  };
+  const row = st.sessions.find((x) => x.token === 's-http-1');
+  assert.ok(row, 'session rides /api/state');
+  assert.equal(row.override, null);
+
+  const bad = await fetch(`${base}/api/sessions/register`, { method: 'POST', headers: auth, body: JSON.stringify({}) });
+  assert.equal(bad.status, 400, 'token required');
+});
+
+test('sessions: operator override via API — set, expose, clear; 404 unknown token', async () => {
+  await fetch(`${base}/api/sessions/register`, { method: 'POST', headers: auth, body: JSON.stringify({ token: 's-http-2' }) });
+
+  const set = await fetch(`${base}/api/sessions/s-http-2/override`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ override: 'pause' }),
+  });
+  assert.equal(set.status, 200);
+
+  const list = (await (await fetch(`${base}/api/sessions`, { headers: auth })).json()) as {
+    sessions: { token: string; override: { override: string } | null }[];
+  };
+  assert.equal(list.sessions.find((x) => x.token === 's-http-2')?.override?.override, 'pause');
+
+  const st = (await (await fetch(`${base}/api/state?limit=5`, { headers: auth })).json()) as {
+    sessions: { token: string; override: { override: string } | null }[];
+  };
+  assert.equal(st.sessions.find((x) => x.token === 's-http-2')?.override?.override, 'pause', 'state view carries it too');
+
+  const bad = await fetch(`${base}/api/sessions/s-nope/override`, { method: 'POST', headers: auth, body: JSON.stringify({ override: 'pause' }) });
+  assert.equal(bad.status, 404, 'unknown session token');
+
+  const invalid = await fetch(`${base}/api/sessions/s-http-2/override`, { method: 'POST', headers: auth, body: JSON.stringify({ override: 'bogus' }) });
+  assert.equal(invalid.status, 400);
+
+  const clr = await fetch(`${base}/api/sessions/s-http-2/override`, { method: 'POST', headers: auth, body: JSON.stringify({ override: null }) });
+  assert.equal(clr.status, 200);
+  const st2 = (await (await fetch(`${base}/api/state?limit=5`, { headers: auth })).json()) as {
+    sessions: { token: string; override: unknown }[];
+  };
+  assert.equal(st2.sessions.find((x) => x.token === 's-http-2')?.override, null);
+});
+
+test('leases: server_id round-trips through POST /api/leases (unknown engine = 409)', async () => {
+  const bad = await fetch(`${base}/api/leases`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ client_id: clientId, project: 'career-ops', job_id: 'j-srv', estimated_seconds: 60, server_id: 'srv-nope' }),
+  });
+  assert.equal(bad.status, 409);
+  assert.equal(((await bad.json()) as { reason: string }).reason, 'unknown_server');
+});

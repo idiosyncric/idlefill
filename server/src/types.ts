@@ -125,6 +125,12 @@ export interface ServerConnection {
   /** Inference-server (llama-swap) base URL. */
   url: string;
   activity_path: string;
+  /**
+   * Per-server log-mtime glob (the second idle signal; see IdleDetector).
+   * Absent = the log signal is disabled for this server. The watched
+   * server's row inherits cfg.log_glob at boot.
+   */
+  log_glob?: string;
   /** Models that can run concurrently on this server (separate queueable resources). */
   models: string[];
   /** llama-swap `peer:` backends routed behind this entry point (display only). */
@@ -188,6 +194,44 @@ export interface ClientOverride {
   set_at: number;
 }
 
+/**
+ * A router-self-registered interactive session (#33): the router creates
+ * the row on first sight of a `/s/<token>` path and refreshes it with
+ * heartbeats. Sessions are INTERACTIVE traffic (#32): `last_activity`
+ * folds into the server's idle verdict and preempts background leases on
+ * that server — the lease-holder IP exemption never covers session
+ * traffic. Session admission itself is capacity-only (the router admits
+ * directly); the arbiter tracks the rows for visibility, idle folding, and
+ * operator overrides.
+ */
+export interface SessionRecord {
+  /** The /s/<token> path token (minted by the desktop app / router). */
+  token: string;
+  /** The client (router) that registered it, when it identified itself. */
+  client_id?: string;
+  client_name?: string;
+  /** Engine it routes to. Absent = the watched server. */
+  server_id?: string;
+  registered_at: number;
+  /** Epoch-ms of the most recent heartbeat — liveness. */
+  last_seen: number;
+  /** Epoch-ms of the newest request seen on this session (null = none yet). */
+  last_activity: number | null;
+}
+
+/**
+ * Operator override for a session — the same shape as ClientOverride
+ * (#32: the override vocabulary generalizes). 'pause' tells the router to
+ * hold that session's traffic (the router enforces; the arbiter stores +
+ * exposes). 'until' auto-expires like the client override.
+ */
+export interface SessionOverride {
+  token: string;
+  override: 'pause' | 'force';
+  until: number | null;
+  set_at: number;
+}
+
 export type LeaseStatus = 'active' | 'finished' | 'revoked' | 'expired';
 
 export interface Lease {
@@ -196,6 +240,15 @@ export interface Lease {
   client_name: string;
   /** IP the arbiter exempts from the idle calc while THIS lease is active. */
   exempt_ip: string;
+  /**
+   * The inference-server (engine) this lease runs on — the per-engine
+   * admission dimension (#38/#35): idle verdicts, the post-revocation
+   * reidle gate, the concurrency cap, and preemption are all evaluated
+   * against THIS server's signal, not a global one. Absent on leases
+   * persisted before the per-engine core: they belong to the watched
+   * server (the only one that existed then).
+   */
+  server_id?: string;
   project: string;
   job_id: string;
   estimated_seconds: number;
@@ -291,6 +344,11 @@ export type EventKind =
   | 'project_settings_updated'
   | 'server_connection_added'
   | 'server_connection_updated'
+  | 'session_registered'
+  | 'session_paused'
+  | 'session_forced'
+  | 'session_override_cleared'
+  | 'session_swept'
   | 'job_throttled'
   | 'job_unthrottled';
 
@@ -338,6 +396,14 @@ export interface ArbiterState {
    * entry is trimmed on the next tick (client not found).
    */
   overrides: Record<string, ClientOverride>;
+  /**
+   * Router-self-registered interactive sessions (#33). Sessions are
+   * interactive traffic (#32): their last_activity folds into the server
+   * idle verdict and preempts background leases.
+   */
+  sessions: SessionRecord[];
+  /** Operator overrides for sessions, keyed by token (same shape as client overrides). */
+  session_overrides: Record<string, SessionOverride>;
   leases: Lease[];
   /** Project name -> UTC date -> usage. */
   budgets: Record<string, Record<UtcDate, BudgetEntry>>;

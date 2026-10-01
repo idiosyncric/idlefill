@@ -1,25 +1,45 @@
 /**
- * Arbiter — the lease state machine on top of the IdleDetector.
+ * Arbiter — the lease state machine on top of per-server IdleDetectors.
+ *
+ * PER-ENGINE ADMISSION (#38/#35): every lease belongs to a server row
+ * (`server_id`; absent on pre-per-engine leases = the watched server).
+ * The idle verdict, the post-revocation reidle gate, the concurrency cap,
+ * and preemption are all evaluated against THAT server's signal — two
+ * engines never gate each other. A server row with no detector is
+ * fail-closed for grants (no signal = idle cannot be proven); the
+ * client-side fail-open lives in the router, not here.
+ *
+ * SESSIONS (#32): session rows (self-registered by the router on first
+ * sight of a /s/<token> path) are INTERACTIVE traffic. Their reported
+ * activity folds into the server's idle verdict and preempts background
+ * leases on that server — even when the session belongs to a
+ * lease-holding client (the IP exemption never covers session traffic).
+ * Session admission itself is capacity-only (the router admits directly);
+ * the arbiter tracks sessions + operator overrides for visibility/control.
  *
  * States per lease: active → finished | revoked | expired.
  *
  * Grant (requestLease):
- *   - system idle (detector verdict; the detector never reports idle while
- *     degraded, so "no grants while degraded" falls out of the same check)
- *   - active lease count < max_concurrent_leases
+ *   - server known (else 'unknown_server')
+ *   - that server idle (detector verdict; the detector never reports idle
+ *     while degraded, so "no grants while degraded" falls out of the same
+ *     check) AND no session active on it within idle_seconds
+ *   - active lease count ON THAT SERVER < max_concurrent_leases
  *   - project exists, not paused
  *   - project's UTC-day output tokens < daily_token_cap
- *   - no post-revocation reidle gate armed (see below)
+ *   - no post-revocation reidle gate armed ON THAT SERVER (see below)
  *
- * Revoke (on each idle poll):
+ * Revoke (on each idle poll, per server):
  *   - TTL expiry (status expired, reason ttl_expired)
- *   - preempt: NOT idle, not degraded, and the newest NON-EXEMPT activity
- *     entry post-dates the lease's grant. Exempt = the active leases'
- *     owner IPs, so the lease holder's own traffic can never preempt it.
+ *   - preempt: NOT idle, and the newest NON-EXEMPT activity on the lease's
+ *     server post-dates the lease's grant. Exempt = the active leases'
+ *     owner IPs, so the lease holder's own traffic can never preempt it —
+ *     EXCEPT session traffic, which always counts (see above).
  *
- * After ANY revocation the system must go idle again (full idle_seconds)
- * before the next grant: `reidleAfter` arms on revocation and disarms only
- * when a later poll reports a full idle — no burst of re-grants.
+ * After ANY revocation the SERVER must go idle again (full idle_seconds)
+ * before its next grant: a per-server `reidleAfter` arms on revocation and
+ * disarms only when a later poll reports that server fully idle — no burst
+ * of re-grants.
  *
  * Usage accounting: the FIRST usage/finish report for a lease adds the
  * reported tokens to the project's UTC-day counter (day = the report day);
@@ -31,9 +51,22 @@
 import { randomBytes } from 'node:crypto';
 import type { IdleDetector } from './idle.js';
 import { activeLeaseExemptIps } from './idle.js';
-import type { IdleSignal, JobThrottle } from './types.js';
+import type { IdleSignal, JobThrottle, SessionOverride, SessionRecord } from './types.js';
 import type { StateStore } from './state.js';
 import type { ClientOverride, Lease, ProjectAllocation, ServerConfig, ServerConnection, UtcDate } from './types.js';
+
+/**
+ * The id of the seeded watched-server row (cfg.llama_swap_url). Leases and
+ * sessions without an explicit server_id belong to it — that is the only
+ * server that existed before the per-engine core, so old state files load
+ * unchanged.
+ */
+export const WATCHED_SERVER_ID = 'srv-watched';
+
+/** The server a lease belongs to (absent server_id = the watched server). */
+export function leaseServerId(lease: { server_id?: string }): string {
+  return lease.server_id ?? WATCHED_SERVER_ID;
+}
 
 export type LeaseRejectionReason =
   | 'not_idle'
@@ -42,6 +75,7 @@ export type LeaseRejectionReason =
   | 'budget_exhausted'
   | 'unknown_project'
   | 'unknown_client'
+  | 'unknown_server'
   | 'client_paused'
   | 'job_throttled'
   | 'job_cooldown';
@@ -61,8 +95,21 @@ export interface TickResult {
 export class Arbiter {
   private readonly store: StateStore;
   private readonly cfg: ServerConfig;
-  /** Armed after any revocation; disarmed by the next full-idle verdict. */
-  private reidleAfter: number | null = null;
+  /**
+   * Per-server idle detectors, keyed by server_id (the watched server is
+   * WATCHED_SERVER_ID). A server row with no detector is fail-closed for
+   * grants: no signal means idle cannot be proven.
+   */
+  private detectors: Map<string, IdleDetector>;
+  /** Optional factory so servers added via the API get a detector too. */
+  private readonly detectorFactory?: (row: ServerConnection) => IdleDetector;
+  /**
+   * Per-server post-revocation reidle gates: server_id -> armed-at epoch-ms.
+   * Armed when a lease on that server is revoked/expired; disarmed when a
+   * later poll reports THAT server fully idle. One engine's preempt never
+   * gates another engine's grants (#35: queues and gates are per-engine).
+   */
+  private reidleAfter = new Map<string, number>();
   /**
    * Per-(project, job_id) ok:false usage-report counts (anti-thrash).
    * In-memory: TTL expirations never count here (a dead client is an
@@ -80,13 +127,30 @@ export class Arbiter {
    */
   private jobCooldownUntil = new Map<string, number>();
 
-  constructor(store: StateStore, cfg: ServerConfig, private detector: IdleDetector) {
+  /** Stale-session sweep window: rows not seen for an hour are dropped. */
+  private static readonly SESSION_STALE_MS = 3_600_000;
+
+  constructor(
+    store: StateStore,
+    cfg: ServerConfig,
+    detectors: IdleDetector | Map<string, IdleDetector>,
+    opts?: { detectorFactory?: (row: ServerConnection) => IdleDetector },
+  ) {
     this.store = store;
     this.cfg = cfg;
+    this.detectors = detectors instanceof Map ? detectors : new Map([[WATCHED_SERVER_ID, detectors]]);
+    this.detectorFactory = opts?.detectorFactory;
     // A fresh Arbiter must see the seeded server inventory, not just one
     // that went through index.ts: the API/tests construct the arbiter
     // directly. Idempotent — a non-empty state file is left untouched.
     this.ensureServersSeeded();
+    // Hydrate a detector for every declared server row that lacks one
+    // (state file loaded at boot; rows added while the arbiter was down).
+    if (this.detectorFactory) {
+      for (const row of this.store.state.servers) {
+        if (!this.detectors.has(row.id)) this.detectors.set(row.id, this.detectorFactory(row));
+      }
+    }
   }
 
   // ------------------------------------------------------------------
@@ -246,7 +310,10 @@ export class Arbiter {
     project: string;
     job_id: string;
     estimated_seconds: number;
+    /** Engine to run on; absent = the watched server (single-engine legacy). */
+    server_id?: string;
     now?: number;
+    /** Explicit signal override (tests / single-server callers). */
     signal?: IdleSignal;
   }): LeaseGrantResult {
     const now = params.now ?? Date.now();
@@ -255,7 +322,21 @@ export class Arbiter {
     const client = s.clients.find((c) => c.client_id === params.client_id);
     if (!client) return { ok: false, reason: 'unknown_client' };
 
-    const sig = params.signal ?? this.detector.signal(now);
+    // Per-engine admission: the lease belongs to a declared server row.
+    const serverId = params.server_id ?? WATCHED_SERVER_ID;
+    const server = s.servers.find((x) => x.id === serverId);
+    if (!server) return { ok: false, reason: 'unknown_server' };
+
+    // The server's own idle verdict. An explicit `signal` applies only to
+    // the watched server (legacy single-signal callers/tests); every other
+    // server is judged by its own detector — and a server with no detector
+    // is fail-closed: idle cannot be proven, so no grants.
+    const det = this.detectors.get(serverId);
+    if (!det && params.signal === undefined && serverId !== WATCHED_SERVER_ID) {
+      return { ok: false, reason: 'not_idle' };
+    }
+    const sig = params.signal ?? det?.signal(now);
+    if (!sig) return { ok: false, reason: 'not_idle' };
 
     // A 'pause' override is a hard stop for that client — it is reported
     // preferentially (before idle/busy) so the operator's decision is the
@@ -288,15 +369,28 @@ export class Arbiter {
     // degraded signal means the activity data itself is unreliable and a
     // forced grant on stale data is exactly the interactive-traffic
     // collision the arbiter exists to prevent.
+    //
+    // SESSION FOLDING (#32): a session active on this server within
+    // idle_seconds is interactive traffic — it defeats idle JUST LIKE a feed
+    // entry does, and a 'force' override does NOT bypass it (force bypasses
+    // the detector's idle verdict for BACKGROUND pressure; live interactive
+    // sessions are the exact collision force must never create). Reidle is
+    // per-server: one engine's revocation never gates another's grants.
+    const sessionBusy = this.sessionActivityOn(serverId, now);
     const forced = this.activeOverride(params.client_id, now)?.override === 'force';
     if (!forced) {
       if (!sig.idle) return { ok: false, reason: 'not_idle' };
-      // Post-revocation reidle rule: after any revocation, require a fresh
-      // full idle before the next grant (a regrant in the same poll would let
-      // a burst of backfill follow a preempt).
-      if (this.reidleAfter !== null) return { ok: false, reason: 'not_idle' };
-    } else if (sig.signal_degraded) {
-      // Force ≠ "grant on stale data": degraded still blocks (see above).
+      if (sessionBusy !== null && now - sessionBusy < this.effectiveIdleSeconds(params.project) * 1000) {
+        return { ok: false, reason: 'not_idle' };
+      }
+      // Post-revocation reidle rule (per server): after any revocation on
+      // THIS server, require a fresh full idle before its next grant (a
+      // regrant in the same poll would let a burst of backfill follow a
+      // preempt).
+      if (this.reidleAfter.has(serverId)) return { ok: false, reason: 'not_idle' };
+    } else if (sig.signal_degraded || sessionBusy !== null) {
+      // Force ≠ "grant on stale data" (degraded) and ≠ "collide with a live
+      // session" (sessionBusy within the idle window blocks even force).
       return { ok: false, reason: 'not_idle' };
     }
 
@@ -306,8 +400,11 @@ export class Arbiter {
     if (project.paused) return { ok: false, reason: 'project_paused' };
 
     // Per-project grant knobs override the globals (unset = inherit).
+    // The concurrency cap is PER SERVER: leases on another engine never
+    // occupy this engine's slot.
     const maxLeases = project.max_concurrent_leases ?? this.cfg.max_concurrent_leases;
-    if (active.length >= maxLeases) return { ok: false, reason: 'busy' };
+    const activeHere = active.filter((l) => leaseServerId(l) === serverId);
+    if (activeHere.length >= maxLeases) return { ok: false, reason: 'busy' };
 
     const used = this.projectTokensOut(params.project, utcDay(now));
     if (used >= project.daily_token_cap) return { ok: false, reason: 'budget_exhausted' };
@@ -331,6 +428,7 @@ export class Arbiter {
       client_id: client.client_id,
       client_name: client.name,
       exempt_ip: client.ip,
+      server_id: serverId,
       project: project.name,
       job_id: String(params.job_id ?? ''),
       estimated_seconds: est,
@@ -355,45 +453,88 @@ export class Arbiter {
   // Tick (called once per idle poll by the main loop)
   // ------------------------------------------------------------------
 
+  /**
+   * One poll cycle across ALL watched servers. Each server's detector is
+   * polled with the shared lease-IP exemption set; revocation decisions
+   * (TTL, preempt) are made per lease against ITS server's signal. The
+   * returned `signal` is the watched server's (the legacy single-signal
+   * view the boot log and TickResult consumers use).
+   */
   async tick(now?: number): Promise<TickResult> {
     const nowMs = now ?? Date.now();
-    const exempt = activeLeaseExemptIps(this.store.state.leases, nowMs);
-    const signal = await this.detector.poll(nowMs, exempt);
-
-    // Mirror the detector's degraded transition into state + events.
     const s = this.store.state;
-    if (signal.signal_degraded !== s.signal_degraded) {
-      s.signal_degraded = signal.signal_degraded;
-      s.degraded_reason = signal.degraded_reason;
+    const exempt = activeLeaseExemptIps(s.leases, nowMs);
+
+    // Poll every server's detector. A poll error is contained: that server
+    // simply has no fresh signal this round (its leases are not judged from
+    // stale data, and grants there stay fail-closed).
+    const signals = new Map<string, IdleSignal>();
+    for (const [serverId, det] of this.detectors) {
+      try {
+        signals.set(serverId, await det.poll(nowMs, exempt));
+      } catch {
+        /* no signal this round for this server */
+      }
+    }
+
+    // Mirror the WATCHED server's degraded transition into the top-level
+    // state fields + events (those fields predate multi-engine and are the
+    // dashboard header's watched-server view; per-server detail rides
+    // serverView).
+    const watched = signals.get(WATCHED_SERVER_ID);
+    if (watched && watched.signal_degraded !== s.signal_degraded) {
+      s.signal_degraded = watched.signal_degraded;
+      s.degraded_reason = watched.degraded_reason;
       this.store.appendEvent({
-        kind: signal.signal_degraded ? 'signal_degraded' : 'signal_recovered',
-        detail: signal.degraded_reason ?? undefined,
+        kind: watched.signal_degraded ? 'signal_degraded' : 'signal_recovered',
+        detail: watched.degraded_reason ?? undefined,
       });
     }
-    s.last_activity = signal.last_activity;
-    s.last_log_write = signal.last_log_write;
+    if (watched) {
+      s.last_activity = watched.last_activity;
+      s.last_log_write = watched.last_log_write;
+    }
 
     const revoked: { lease: Lease; reason: string }[] = [];
+    /** Servers that had a lease end this round (per-server reidle arming). */
+    const endedOn = new Set<string>();
 
     for (const lease of s.leases) {
       if (lease.status !== 'active') continue;
+      const serverId = leaseServerId(lease);
 
       // 1. TTL expiry.
       if (nowMs >= lease.expires_at) {
         this.endLease(lease, 'expired', 'ttl_expired', nowMs);
         revoked.push({ lease, reason: 'ttl_expired' });
+        endedOn.add(serverId);
         continue;
       }
 
-      // 2. Preempt: system is NOT idle because of FOREIGN (non-exempt)
-      //    activity that appeared after this lease was granted.
-      //    - degraded: don't judge from stale signals (skip).
-      //    - if idle: nothing preempts.
-      //    - a non-exempt entry OLDER than the grant (stale) does not revoke.
-      if (!signal.signal_degraded && !signal.idle && signal.last_activity) {
-        if (signal.last_activity.ts >= lease.granted_at) {
+      // 2. Session preempt (#32): a session's own activity on THIS server
+      //    post-dating the grant preempts the lease — even when the feed
+      //    exempts it (the router shares the lease holder's IP) and even
+      //    when the feed is degraded (a session row is direct evidence of
+      //    interactive traffic, not stale data).
+      const sessAct = this.sessionActivityOn(serverId);
+      if (sessAct !== null && sessAct >= lease.granted_at) {
+        this.endLease(lease, 'revoked', 'preempted', nowMs);
+        revoked.push({ lease, reason: 'preempted' });
+        endedOn.add(serverId);
+        continue;
+      }
+
+      // 3. Feed preempt: the server is NOT idle because of FOREIGN
+      //    (non-exempt) activity that appeared after this lease was
+      //    granted. No signal for this server: don't judge from stale
+      //    signals (skip). A non-exempt entry OLDER than the grant does
+      //    not revoke.
+      const sig = signals.get(serverId);
+      if (sig && !sig.signal_degraded && !sig.idle && sig.last_activity) {
+        if (sig.last_activity.ts >= lease.granted_at) {
           this.endLease(lease, 'revoked', 'preempted', nowMs);
           revoked.push({ lease, reason: 'preempted' });
+          endedOn.add(serverId);
         }
       }
     }
@@ -407,22 +548,177 @@ export class Arbiter {
       if (gone) delete s.overrides[cid];
     }
 
-    // Reidle bookkeeping: any revocation (preempt or TTL) arms the gate;
-    // a later full-idle verdict disarms it.
-    if (revoked.length > 0) {
-      this.reidleAfter = nowMs;
-    } else if (signal.idle && this.reidleAfter !== null) {
-      this.reidleAfter = null;
+    // Sweep session overrides (expired) and stale session rows (a router
+    // that stopped heartbeating; the row's last_activity already stops
+    // folding once it ages past idle_seconds, the sweep just bounds state).
+    for (const [tok, o] of Object.entries(s.session_overrides)) {
+      if (o.until !== null && nowMs >= o.until) delete s.session_overrides[tok];
+    }
+    const before = s.sessions.length;
+    s.sessions = s.sessions.filter((sess) => nowMs - sess.last_seen < Arbiter.SESSION_STALE_MS);
+    if (s.sessions.length !== before) this.store.appendEvent({ kind: 'session_swept', detail: `${before - s.sessions.length} stale session row(s) swept` });
+
+    // Reidle bookkeeping (PER SERVER): any lease end on a server arms that
+    // server's gate; a later poll where THAT server is fully idle — feed
+    // idle AND no session activity within idle_seconds — disarms it.
+    for (const serverId of endedOn) this.reidleAfter.set(serverId, nowMs);
+    for (const serverId of [...this.reidleAfter.keys()]) {
+      // Never disarm on the same round it armed (a TTL expiry on an idle
+      // server must still wait for the NEXT poll's full-idle verdict).
+      if (endedOn.has(serverId)) continue;
+      const sig = signals.get(serverId);
+      const sessAct = this.sessionActivityOn(serverId, nowMs);
+      const sessQuiet = sessAct === null || nowMs - sessAct >= this.cfg.idle_seconds * 1000;
+      if (sig && sig.idle && sessQuiet) this.reidleAfter.delete(serverId);
     }
 
     this.store.trim();
     this.store.save();
-    return { revoked, signal };
+    return {
+      revoked,
+      signal:
+        watched ??
+        signals.values().next().value ?? {
+          now: nowMs,
+          idle: false,
+          idle_for_s: null,
+          last_activity: null,
+          last_log_write: null,
+          signal_degraded: true,
+          degraded_reason: 'no detectors',
+        },
+    };
   }
 
-  /** True when a grant is currently blocked by the post-revocation reidle rule. */
-  reidleGated(): boolean {
-    return this.reidleAfter !== null;
+  /**
+   * True when a grant is currently blocked by the post-revocation reidle
+   * rule. Per-server: pass the server_id (default: the watched server).
+   */
+  reidleGated(serverId: string = WATCHED_SERVER_ID): boolean {
+    return this.reidleAfter.has(serverId);
+  }
+
+  /** The live idle signal for one server (null when it has no detector). */
+  serverSignal(serverId: string, now?: number): IdleSignal | null {
+    return this.detectors.get(serverId)?.signal(now ?? Date.now()) ?? null;
+  }
+
+  // ------------------------------------------------------------------
+  // Sessions (router-self-registered interactive traffic — #32/#33)
+  // ------------------------------------------------------------------
+
+  /**
+   * Register/heartbeat a session (idempotent on token). The router calls
+   * this on first sight of a /s/<token> path and refreshes it with each
+   * heartbeat; `last_activity` is the newest request the router saw on the
+   * session (kept as the max — never rewound).
+   */
+  registerSession(
+    token: string,
+    opts: { client_id?: string; client_name?: string; server_id?: string; last_activity?: number; now?: number },
+  ): { ok: boolean; reason?: string; created: boolean; session?: SessionRecord } {
+    const t = typeof token === 'string' ? token.trim() : '';
+    if (!t || t.length > 128) return { ok: false, reason: 'token required (≤128 chars)', created: false };
+    const nowMs = opts.now ?? Date.now();
+    const s = this.store.state;
+    const existing = s.sessions.find((x) => x.token === t);
+    if (existing) {
+      existing.last_seen = nowMs;
+      if (opts.client_id) existing.client_id = opts.client_id;
+      if (opts.client_name) existing.client_name = opts.client_name;
+      if (opts.server_id) existing.server_id = opts.server_id;
+      if (typeof opts.last_activity === 'number' && Number.isFinite(opts.last_activity)) {
+        existing.last_activity = Math.max(existing.last_activity ?? 0, opts.last_activity);
+      }
+      this.store.save();
+      return { ok: true, created: false, session: existing };
+    }
+    const session: SessionRecord = {
+      token: t,
+      ...(opts.client_id ? { client_id: opts.client_id } : {}),
+      ...(opts.client_name ? { client_name: opts.client_name } : {}),
+      ...(opts.server_id ? { server_id: opts.server_id } : {}),
+      registered_at: nowMs,
+      last_seen: nowMs,
+      last_activity: typeof opts.last_activity === 'number' && Number.isFinite(opts.last_activity) ? opts.last_activity : null,
+    };
+    s.sessions.push(session);
+    this.store.appendEvent({ kind: 'session_registered', detail: `${t}${session.client_name ? ` (${session.client_name})` : ''}${session.server_id ? ` → ${session.server_id}` : ''}` });
+    this.store.trim();
+    this.store.save();
+    return { ok: true, created: true, session };
+  }
+
+  /** All session rows, newest registration last — for /api/state. */
+  listSessions(): SessionRecord[] {
+    return [...this.store.state.sessions].sort((a, b) => a.registered_at - b.registered_at);
+  }
+
+  /**
+   * The newest session activity (epoch-ms) on a server, or null. Feeds the
+   * idle folding (#32): session traffic defeats idle and preempts leases
+   * even when the engine feed exempts it (same-IP router).
+   */
+  sessionActivityOn(serverId: string, _now?: number): number | null {
+    let newest: number | null = null;
+    for (const sess of this.store.state.sessions) {
+      if (leaseServerId(sess) !== serverId) continue;
+      if (sess.last_activity !== null && (newest === null || sess.last_activity > newest)) newest = sess.last_activity;
+    }
+    return newest;
+  }
+
+  /** The session override in force for a token at `now`, or null (expired → null). */
+  activeSessionOverride(token: string, now?: number): SessionOverride | null {
+    const n = now ?? Date.now();
+    const o = this.store.state.session_overrides[token];
+    if (!o) return null;
+    if (o.until !== null && n >= o.until) return null;
+    return o;
+  }
+
+  /**
+   * Set (replace) or clear (override: null) the operator override for a
+   * session token. Same shape/semantics as client overrides (#32): 'pause'
+   * asks the router to hold that session's traffic; 'force' is the
+   * operator's explicit go-ahead. Persists + records an event.
+   */
+  setSessionOverride(
+    token: string,
+    override: 'pause' | 'force' | null,
+    until?: number,
+  ): { ok: boolean; reason?: string; override?: SessionOverride | null } {
+    const s = this.store.state;
+    const session = s.sessions.find((x) => x.token === token);
+    if (!session) return { ok: false, reason: 'unknown_session' };
+    if (override !== null && until !== undefined) {
+      const n = Date.now();
+      if (!Number.isFinite(until) || until <= n) return { ok: false, reason: 'until_must_be_in_the_future' };
+    }
+    if (override === null) {
+      const had = s.session_overrides[session.token];
+      delete s.session_overrides[session.token];
+      if (had) {
+        this.store.appendEvent({ kind: 'session_override_cleared', detail: `${session.token}: ${had.override} cleared` });
+      }
+      this.store.trim();
+      this.store.save();
+      return { ok: true, override: null };
+    }
+    const o: SessionOverride = { token: session.token, override, until: until ?? null, set_at: Date.now() };
+    s.session_overrides[session.token] = o;
+    this.store.appendEvent({
+      kind: override === 'pause' ? 'session_paused' : 'session_forced',
+      detail: `${session.token}${o.until ? ` (until ${new Date(o.until).toISOString().slice(11, 16)}Z)` : ''}`,
+    });
+    this.store.trim();
+    this.store.save();
+    return { ok: true, override: o };
+  }
+
+  /** Effective idle threshold for a project (per-project override wins). */
+  private effectiveIdleSeconds(project: string): number {
+    return this.cfg.projects.find((p) => p.name === project)?.idle_seconds ?? this.cfg.idle_seconds;
   }
 
   // ------------------------------------------------------------------
@@ -691,10 +987,11 @@ export class Arbiter {
     if (s.servers.length > 0) return;
     const nowMs = Date.now();
     s.servers.push({
-      id: 'srv-watched',
+      id: WATCHED_SERVER_ID,
       name: this.cfg.server_name ?? 'llama-swap',
       url: this.cfg.llama_swap_url,
       activity_path: this.cfg.activity_path,
+      ...(this.cfg.log_glob ? { log_glob: this.cfg.log_glob } : {}),
       models: [...(this.cfg.server_models ?? [])],
       peers: [...(this.cfg.server_peers ?? [])],
       configured_at: nowMs,
@@ -706,15 +1003,17 @@ export class Arbiter {
   /**
    * Add (no `id`) or patch-update (with `id`) a declared server connection.
    * Create requires name + url; an update patches only the fields provided
-   * (at least one must change). Pure inventory: the arbiter keeps watching
-   * its single configured feed — a declared row is where a future
-   * multi-feed core will point the watcher.
+   * (at least one must change). A created row gets its OWN idle detector
+   * when the arbiter was built with a detectorFactory (per-engine
+   * admission, #38): the arbiter now watches EVERY declared server, and a
+   * row without a detector (factory absent) is fail-closed for grants.
    */
   upsertServerConnection(input: {
     id?: string;
     name?: string;
     url?: string;
     activity_path?: string;
+    log_glob?: string;
     models?: string[];
     peers?: string[];
   }): { ok: boolean; reason?: string; created: boolean; server?: ServerConnection } {
@@ -736,10 +1035,15 @@ export class Arbiter {
       if (typeof input.url === 'string' && input.url.trim() !== '') touch(() => void (row.url = input.url!.trim()));
       if (typeof input.activity_path === 'string' && input.activity_path.trim() !== '')
         touch(() => void (row.activity_path = input.activity_path!.trim()));
+      if (typeof input.log_glob === 'string') touch(() => void (row.log_glob = input.log_glob!.trim()));
       if (models) touch(() => void (row.models = models));
       if (peers) touch(() => void (row.peers = peers));
-      if (!changed) return { ok: false, reason: 'nothing to update (provide name, url, activity_path, models, or peers)', created: false };
+      if (!changed) return { ok: false, reason: 'nothing to update (provide name, url, activity_path, log_glob, models, or peers)', created: false };
       row.updated_at = nowMs;
+      // A url/activity/log_glob change moves the signal source: rebuild the
+      // detector so the watcher follows the row (cheap; detectors are
+      // stateless pollers over injected sources).
+      if (this.detectorFactory) this.detectors.set(row.id, this.detectorFactory(row));
       this.store.appendEvent({ kind: 'server_connection_updated', detail: `${row.name} (${row.url})` });
       this.store.trim();
       this.store.save();
@@ -758,12 +1062,17 @@ export class Arbiter {
       name,
       url,
       activity_path: activityPath,
+      ...(typeof input.log_glob === 'string' && input.log_glob.trim() !== '' ? { log_glob: input.log_glob.trim() } : {}),
       models: models ?? [],
       peers: peers ?? [],
       configured_at: nowMs,
       updated_at: nowMs,
     };
     s.servers.push(server);
+    // Per-engine watching: the new row gets its own idle detector when a
+    // factory is wired. Without one the row stays signal-less and grants
+    // there are fail-closed until a detector exists.
+    if (this.detectorFactory) this.detectors.set(server.id, this.detectorFactory(server));
     this.store.appendEvent({ kind: 'server_connection_added', detail: `${name} (${url})` });
     this.store.trim();
     this.store.save();
