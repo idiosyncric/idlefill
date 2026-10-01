@@ -24,13 +24,21 @@ export interface FakeArbiter {
   /** Flip idle/busy (drives the client's grant decisions). */
   idle: boolean;
   /** Leases the client has requested. */
-  leaseRequests: { project: string; job_id: string; client_id: string }[];
+  leaseRequests: { project: string; job_id: string; client_id: string; estimated_seconds?: number }[];
   /** Usage/finish reports in order. */
   usageReports: UsageReport[];
   /** Currently active lease ids (mirrors what GET /api/state reports). */
   activeLeases: string[];
   /** Operator override reported in GET /api/state clients[] (null = none). */
   override: { override: string; until: number | null } | null;
+  /**
+   * Test seam: cap the number of GRANTS per job_id. A lease POST for a job
+   * already at its cap is denied (409) regardless of idle — the deterministic
+   * way to stop the daemon's immediate retry of a failed job (the old
+   * "flip idle=false when the failure report lands" raced the 50ms poll and
+   * occasionally let a second grant through, burning attempts: 2).
+   */
+  denyLeaseAfter: Map<string, number>;
   /** The most recent POST /api/clients/register body (heartbeat with queue depths). */
   lastRegister: Record<string, unknown>;
   /** Every register body received, in order. */
@@ -47,9 +55,11 @@ export function startFakeArbiter(): Promise<FakeArbiter> {
   const state = {
     idle: true,
     override: null as { override: string; until: number | null } | null,
-    leaseRequests: [] as { project: string; job_id: string; client_id: string }[],
+    leaseRequests: [] as { project: string; job_id: string; client_id: string; estimated_seconds?: number }[],
     usageReports: [] as UsageReport[],
     activeLeases: [] as string[],
+    denyLeaseAfter: new Map<string, number>(),
+    grantsByJob: new Map<string, number>(),
     n: 0,
     registered: false,
     registers: [] as Record<string, unknown>[],
@@ -94,8 +104,22 @@ export function startFakeArbiter(): Promise<FakeArbiter> {
         });
       }
       if (req.method === 'POST' && url.pathname === '/api/leases') {
-        state.leaseRequests.push({ project: j.project, job_id: j.job_id, client_id: j.client_id });
+        state.leaseRequests.push({
+          project: j.project,
+          job_id: j.job_id,
+          client_id: j.client_id,
+          estimated_seconds: j.estimated_seconds,
+        });
         if (!state.idle) return send(409, { reason: 'not_idle' });
+        // Per-job grant cap (test seam): a job at its cap is denied even
+        // while idle, so tests that must observe exactly ONE attempt are
+        // deterministic instead of racing the daemon's 50ms re-poll.
+        const cap = state.denyLeaseAfter.get(j.job_id);
+        if (cap !== undefined) {
+          const g = (state.grantsByJob.get(j.job_id) ?? 0) + 1;
+          state.grantsByJob.set(j.job_id, g);
+          if (g > cap) return send(409, { reason: 'test_grant_cap' });
+        }
         const lease_id = `l-fake-${++state.n}`;
         state.activeLeases.push(lease_id);
         return send(201, { lease_id, client_id: j.client_id, project: j.project, job_id: j.job_id, granted_at: Date.now(), expires_at: Date.now() + 1800_000, ttl_seconds: 1800 });
@@ -140,6 +164,7 @@ export function startFakeArbiter(): Promise<FakeArbiter> {
         leaseRequests: state.leaseRequests,
         usageReports: state.usageReports,
         activeLeases: state.activeLeases,
+        denyLeaseAfter: state.denyLeaseAfter,
         registers: state.registers,
         get lastRegister() {
           return state.registers[state.registers.length - 1] ?? {};

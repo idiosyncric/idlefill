@@ -12,6 +12,9 @@
  *   - busy arbiter (idle=false) → no lease request is even made
  *   - client-pause override → the daemon stops requesting leases
  *   - force override → the daemon requests a lease while the box is busy
+ *   - per-job lease TTL (issue #6): payload.estimated_seconds on the queue
+ *     line rides on the lease POST; missing/garbage falls back to the
+ *     project estimate
  *   - clean failure (exit 0, result ok:false) → usage ok:false, job KEPT in
  *     the queue with attempts: 1
  *   - retry policy: attempts 1 → 2 → 3; on the 3rd failure the job leaves
@@ -47,10 +50,14 @@ let queueFile: string;
 let resultsFile: string;
 let cfg: ClientConfig;
 
-function mkQueue(jobs: { id: string; url?: string; company?: string; title?: string; score?: number }[]): void {
-  const lines = jobs.map((j) =>
-    JSON.stringify({ job_id: j.id, payload: { url: j.url ?? `https://example.com/${j.id}`, company: j.company ?? 'C', title: j.title ?? 'T', score: j.score ?? 1 } } satisfies QueueJob),
-  );
+function mkQueue(jobs: { id: string; url?: string; company?: string; title?: string; score?: number; est?: unknown }[]): void {
+  const lines = jobs.map((j) => {
+    const payload: QueueJob['payload'] = { url: j.url ?? `https://example.com/${j.id}`, company: j.company ?? 'C', title: j.title ?? 'T', score: j.score ?? 1 };
+    // `est` is deliberately `unknown`: tests feed garbage (string/negative)
+    // through the JSON round-trip to prove the client's fallback.
+    if (j.est !== undefined) payload.estimated_seconds = j.est as number;
+    return JSON.stringify({ job_id: j.id, payload } satisfies QueueJob);
+  });
   writeFileSync(queueFile, lines.join('\n') + (lines.length ? '\n' : ''));
 }
 
@@ -332,6 +339,37 @@ test('force override: daemon requests a lease while the box is busy', async () =
 });
 
 // ---------------------------------------------------------------------------
+// Per-job lease TTL (issue #6): payload.estimated_seconds on the queue line
+// ---------------------------------------------------------------------------
+
+test('per-job TTL: payload.estimated_seconds drives the lease POST; garbage falls back to the project value', async () => {
+  arb.idle = true;
+  setExecutor(`${nodeBin} ${join(here, 'fixtures', 'sleep-exec.mjs')} {payload_file} {result_file}`); // project est = 10
+  mkQueue([
+    { id: 'job-est-ok', est: 120 }, // finite > 0 ⇒ wins
+    { id: 'job-est-none' }, // missing ⇒ project value
+    { id: 'job-est-str', est: '300' }, // string ⇒ project value
+    { id: 'job-est-neg', est: -5 }, // negative ⇒ project value
+  ]);
+  const d = makeDaemon();
+  await d.start();
+  // All four jobs run sequentially (success path shrinks the queue each time).
+  const deadline = Date.now() + 12000;
+  while (Date.now() < deadline) {
+    if (readQueueLines().length === 0 && arb.leaseRequests.filter((r) => r.job_id.startsWith('job-est-')).length >= 4) break;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  await d.stop();
+
+  const req = (id: string) => arb.leaseRequests.find((r) => r.job_id === id);
+  assert.ok(req('job-est-ok') && req('job-est-none') && req('job-est-str') && req('job-est-neg'), 'all four jobs requested leases');
+  assert.equal(req('job-est-ok')!.estimated_seconds, 120, 'queue line payload.estimated_seconds rides on the lease POST');
+  assert.equal(req('job-est-none')!.estimated_seconds, 10, 'no job-level estimate ⇒ project estimated_seconds');
+  assert.equal(req('job-est-str')!.estimated_seconds, 10, 'string estimate is garbage ⇒ project value');
+  assert.equal(req('job-est-neg')!.estimated_seconds, 10, 'negative estimate is garbage ⇒ project value');
+});
+
+// ---------------------------------------------------------------------------
 // Clean failures, retry policy, token accounting
 // ---------------------------------------------------------------------------
 
@@ -339,26 +377,27 @@ test('clean failure (exit 0, result ok:false): usage ok:false, job KEPT in queue
   arb.idle = true; // (the force test leaves it busy)
   setExecutor(`${nodeBin} ${join(here, 'fixtures', 'fail-exec.mjs')} {payload_file} {result_file}`);
   mkQueue([{ id: 'job-cf' }]);
+  // Deterministic single attempt: the fake arbiter denies any SECOND grant
+  // for this job (the old "flip idle=false when the failure report lands"
+  // raced the daemon's 50ms re-poll and occasionally burned attempts: 2).
+  arb.denyLeaseAfter.set('job-cf', 1);
   const before = arb.usageReports.length; // usageReports is cumulative across tests
   const d = makeDaemon();
   await d.start();
-  // The daemon re-grants a failed job on the next tick — flip busy as soon
-  // as the failure report lands so the attempts count is stable at 1 while
-  // we assert (the retry path itself is covered by the retry-policy test).
   const deadline = Date.now() + 8000;
   let line: string | null = null;
   let rep: Record<string, unknown> | null = null;
   while (Date.now() < deadline) {
-    if (arb.usageReports.slice(before).some((u) => u.body.ok === false)) {
-      arb.idle = false; // block the immediate retry for a stable snapshot
+    rep = arb.usageReports.slice(before).find((u) => u.body.ok === false)?.body ?? null;
+    if (rep) {
       await new Promise((r) => setTimeout(r, 30)); // let the attempts bump land
       line = readQueueLines().find((l) => l.includes('job-cf')) ?? null;
-      rep = arb.usageReports.slice(before).find((u) => u.body.ok === false)!.body;
-      if (line && rep) break;
+      if (line) break;
     }
     await new Promise((r) => setTimeout(r, 10));
   }
   await d.stop();
+  arb.denyLeaseAfter.delete('job-cf');
   assert.ok(line && rep, 'clean failure: usage reported and job still queued');
   assert.equal(rep.ok, false);
   assert.equal(rep.error, 'extract_failed', 'the result line\'s error rides along');

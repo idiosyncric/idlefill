@@ -151,8 +151,27 @@ export interface QueueJob {
     company?: string;
     title?: string;
     score?: number;
+    /**
+     * Per-job lease-TTL estimate in seconds (issue #6). Only a finite
+     * number > 0 counts; anything else falls back to the project's
+     * `estimated_seconds`. The arbiter clamps the resulting TTL to
+     * [lease_ttl_floor, effective lease_ttl_seconds], so this can only
+     * make a lease expire SOONER than the project default, never later.
+     */
+    estimated_seconds?: number;
     [k: string]: unknown;
   };
+}
+
+/**
+ * The job-level TTL estimate for a lease request (issue #6): the queue
+ * line's `payload.estimated_seconds` when it is a finite number > 0.
+ * Strings, negatives, NaN, null, missing — all ignored (undefined), so
+ * the caller falls back to the project estimate.
+ */
+export function jobEstimatedSeconds(job: QueueJob): number | undefined {
+  const e = job.payload?.estimated_seconds;
+  return typeof e === 'number' && Number.isFinite(e) && e > 0 ? e : undefined;
 }
 
 /** Preview row the client publishes for the dashboard's queue page. */
@@ -739,7 +758,10 @@ export class ClientDaemon {
       client_id: this.clientId,
       project: proj.name,
       job_id: job.job.job_id,
-      estimated_seconds: proj.estimated_seconds ?? 900,
+      // Per-job TTL (issue #6): the queue line's payload.estimated_seconds
+      // wins when it's a finite number > 0; otherwise the project estimate.
+      // The arbiter clamps the TTL to [floor, effective lease_ttl_seconds].
+      estimated_seconds: jobEstimatedSeconds(job.job) ?? proj.estimated_seconds ?? 900,
     });
     if (res.status === 201 && res.body.lease_id) {
       this.log.info(`GRANT lease ${res.body.lease_id} for ${job.job.job_id}`);
