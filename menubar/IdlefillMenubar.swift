@@ -2246,7 +2246,15 @@ enum UpdateCheck {
     let sidecarDest = zipDest + ".sha256"
     let dl = { (name: String, dest: String, done: @escaping (Bool, String?) -> Void) in
       let encodedName = name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? name
-      guard let url = URL(string: "\(base)/releases/download/\(tagEnc)/\(encodedName)") else {
+      // The repo path is PART of the download route (Gitea's form is
+      // /{owner}/{repo}/releases/download/{tag}/{file} — the API routes
+      // above carry it too). Omitting it 404s on the REAL server while a
+      // stub mounted at its root serves the bytes anyway: the download
+      // then "succeeds" with the 11-byte "Not found." body and only the
+      // sha256 sidecar check refuses it, so the update silently never
+      // installs. (Reproduced live 2026-10-01: the menubar sat on
+      // edge-main-3ee6d5c through four published edge builds.)
+      guard let url = URL(string: "\(base)/sam/idlefill/releases/download/\(tagEnc)/\(encodedName)") else {
         done(false, "bad url for \(name)")
         return
       }

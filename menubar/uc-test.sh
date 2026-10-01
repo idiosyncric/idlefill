@@ -97,19 +97,19 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify(releases));
     return;
   }
-  if (u === '/releases/download/v1/IdlefillMenubar-1.app.zip') {
+  if (u === '/sam/idlefill/releases/download/v1/IdlefillMenubar-1.app.zip') {
     res.writeHead(200, { 'Content-Type': 'application/zip' }); res.end(zip); return;
   }
-  if (u === '/releases/download/v1/IdlefillMenubar-1.app.zip.sha256') {
+  if (u === '/sam/idlefill/releases/download/v1/IdlefillMenubar-1.app.zip.sha256') {
     res.writeHead(200, { 'Content-Type': 'text/plain' }); res.end(good); return;
   }
-  if (u === '/releases/download/v2/IdlefillMenubar-2.app.zip') {
+  if (u === '/sam/idlefill/releases/download/v2/IdlefillMenubar-2.app.zip') {
     res.writeHead(200, { 'Content-Type': 'application/zip' }); res.end(zip); return; // same bytes
   }
-  if (u === '/releases/download/v2/IdlefillMenubar-2.app.zip.sha256') {
+  if (u === '/sam/idlefill/releases/download/v2/IdlefillMenubar-2.app.zip.sha256') {
     res.writeHead(200, { 'Content-Type': 'text/plain' }); res.end(bad); return;
   }
-  if (u === '/releases/download/v3/IdlefillMenubar-3.app.zip') {
+  if (u === '/sam/idlefill/releases/download/v3/IdlefillMenubar-3.app.zip') {
     res.writeHead(200, { 'Content-Type': 'application/zip' }); res.end(zip); return;
   }
   // v3: NO sidecar route at all (missing sidecar -> refuse)
