@@ -145,6 +145,9 @@ test('grant → run → success → usage(ok) → result appended → queue shri
   const use = arb.usageReports[0]!.body;
   assert.equal(use.ok, true, `usage ok=true, got ${JSON.stringify(use)}`);
   assert.equal(use.tokens_out, 100, 'executor-reported tokens flow through');
+  // Issue #4: the success-path usage body carries the result line's score so
+  // the arbiter can store the per-job outcome row.
+  assert.equal(use.score, 4.2, 'the usage POST body carries the score from the result line');
 
   const results = readResults();
   assert.equal(results.length, 1, 'one result line appended');

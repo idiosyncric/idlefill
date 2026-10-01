@@ -51,7 +51,7 @@
 import { randomBytes } from 'node:crypto';
 import type { IdleDetector } from './idle.js';
 import { activeLeaseExemptIps } from './idle.js';
-import type { IdleSignal, JobThrottle, SessionOverride, SessionRecord } from './types.js';
+import type { IdleSignal, JobResultRow, JobThrottle, SessionOverride, SessionRecord } from './types.js';
 import type { StateStore } from './state.js';
 import type { ClientOverride, Lease, ProjectAllocation, ServerConfig, ServerConnection, UtcDate } from './types.js';
 
@@ -778,6 +778,11 @@ export class Arbiter {
      * record and rides the `lease_finished` event (truncated).
      */
     error_detail?: string;
+    /**
+     * Client-reported score from the result line (issue #4). number|null;
+     * anything else (missing, garbage) stores as null.
+     */
+    score?: number | null;
     now?: number;
   }): { ok: boolean; reason?: string; lease?: Lease } {
     const nowMs = params.now ?? Date.now();
@@ -800,6 +805,13 @@ export class Arbiter {
       this.addBudget(lease.project, utcDay(nowMs), lease.tokens_out, lease.tokens_in);
       lease.usage_counted = true;
     }
+
+    // Per-job outcome row (issue #4): the LAST reported outcome for
+    // (project, job_id), written on EVERY usage report — a later report
+    // (re-grant, or a duplicate finish with fresher numbers) REPLACES the
+    // row. ts is the server receive time, so the fake-clock tests stay
+    // deterministic and the eviction order is the arbiter's own timeline.
+    this.recordJobResult(lease.project, lease.job_id, params.ok, params.score, lease.tokens_out, lease.tokens_in, params.ok ? null : params.error ?? 'failed', nowMs);
 
     if (lease.status === 'active') {
       // First terminal transition.
@@ -893,6 +905,59 @@ export class Arbiter {
         detail: `${jobId}: ${count} failures (last: ${error}) — no more grants until unthrottled`,
       });
     }
+  }
+
+  /**
+   * Per-job outcome row (issue #4): store the LAST reported outcome for
+   * (project, job_id) — the same `project::job_id` key shape as the
+   * throttle rows. Latest-only: a newer report replaces the row. After the
+   * write, evict the oldest-by-ts rows beyond `resultsPerProjectCap` for
+   * that project so the state file stays bounded.
+   */
+  private recordJobResult(
+    project: string,
+    jobId: string,
+    ok: boolean,
+    score: number | null | undefined,
+    tokensOut: number,
+    tokensIn: number,
+    error: string | null,
+    nowMs: number,
+  ): void {
+    const s = this.store.state;
+    const row: JobResultRow = {
+      project,
+      job_id: jobId,
+      ok,
+      score: typeof score === 'number' && Number.isFinite(score) ? score : null,
+      tokens_out: tokensOut,
+      tokens_in: tokensIn,
+      error: error ?? null,
+      ts: new Date(nowMs).toISOString(),
+    };
+    s.results[this.jobKey(project, jobId)] = row;
+    // Cap per project: keep the newest `resultsPerProjectCap` rows by ts.
+    const cap = this.store.resultsPerProjectCap;
+    const mine = Object.entries(s.results).filter(([, r]) => r.project === project);
+    if (mine.length > cap) {
+      mine.sort((a, b) => Date.parse(a[1].ts) - Date.parse(b[1].ts));
+      for (const [key] of mine.slice(0, mine.length - cap)) delete s.results[key];
+    }
+  }
+
+  /**
+   * Result rows for a project (issue #4), NEWEST FIRST. `jobId` filters to
+   * one job; `limit` caps the page. The GET /api/projects/:name/results
+   * route is the only consumer — rows are deliberately NOT embedded in
+   * /api/state.
+   */
+  projectResults(project: string, opts: { limit?: number; job_id?: string } = {}): JobResultRow[] {
+    const rows = Object.values(this.store.state.results).filter(
+      (r) => r.project === project && (!opts.job_id || r.job_id === opts.job_id),
+    );
+    rows.sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts));
+    const limit = opts.limit ?? 20;
+    return rows.slice(0, Math.max(1, limit));
   }
 
   /**

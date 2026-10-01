@@ -120,6 +120,7 @@ test('bad token is rejected on every API route (401)', async () => {
     ['POST', '/api/projects/career-ops'],
     ['GET', '/api/state'],
     ['POST', '/api/projects/career-ops/jobs/job-x/unthrottle'],
+    ['GET', '/api/projects/career-ops/results'],
   ] as const) {
     const res = await fetch(`${base}${path}`, {
       method,
@@ -1095,4 +1096,98 @@ test('leases: server_id round-trips through POST /api/leases (unknown engine = 4
   });
   assert.equal(bad.status, 409);
   assert.equal(((await bad.json()) as { reason: string }).reason, 'unknown_server');
+});
+
+// ---------------------------------------------------------------------------
+// Per-job results over REST (issue #4): usage reports store the last outcome
+// per (project, job_id); GET /api/projects/:name/results serves it newest
+// first. (The storage semantics — replace, cap — are covered in
+// arbiter.test.ts; this block is the wire contract.)
+// ---------------------------------------------------------------------------
+
+/** Grant + finish one job over HTTP; returns the lease id. */
+async function finishJob(jobId: string, usage: Record<string, unknown>): Promise<string> {
+  const lease = await fetch(`${base}/api/leases`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ client_id: clientId, project: 'career-ops', job_id: jobId, estimated_seconds: 60 }),
+  });
+  assert.equal(lease.status, 201, `grant for ${jobId}: ${await lease.clone().text()}`);
+  const leaseId = ((await lease.json()) as { lease_id: string }).lease_id;
+  const use = await fetch(`${base}/api/leases/${leaseId}/usage`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify(usage),
+  });
+  assert.equal(use.status, 200, `usage for ${jobId}`);
+  // ts is server-receive time at ms resolution; pace the reports so the
+  // newest-first assertions can't collide on one millisecond.
+  await new Promise((r) => setTimeout(r, 5));
+  return leaseId;
+}
+
+test('results endpoint: score rides the usage body → row stored; newest-first, limit, job_id filter, 404, auth gate', async () => {
+  // Quiet feed so the grants are clean.
+  entries.length = 0;
+  entries.push(...mkEntries([400], 'ip:10.0.0.9', Date.now()));
+  await det.poll(Date.now(), new Set());
+  // The sessions test above left s-http-1 with fresh last_activity on the
+  // WATCHED server — session activity within idle_seconds defeats the idle
+  // verdict, and last_activity only ever moves forward (Math.max), so the
+  // only lever is the heartbeat's server_id reassignment: move the session
+  // row off the watched engine (a supported register field) so its activity
+  // no longer folds into this server's idle calc.
+  await fetch(`${base}/api/sessions/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ token: 's-http-1', server_id: 'srv-unwatched' }),
+  });
+
+  // Three jobs, finished in order (small token counts — the project's daily
+  // cap is 10k and earlier tests already spent some).
+  await finishJob('res-1', { ok: true, tokens_out: 10, tokens_in: 20, score: 3.5 });
+  await finishJob('res-2', { ok: false, error: 'executor_exit_1', tokens_out: 5 });
+  await finishJob('res-3', { ok: true, tokens_out: 7, score: 9.25 });
+
+  const res = await fetch(`${base}/api/projects/career-ops/results`, { headers: auth });
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as { project: string; count: number; results: Record<string, unknown>[] };
+  assert.equal(body.project, 'career-ops');
+  assert.ok(Array.isArray(body.results), 'results is an array');
+  assert.equal(body.count, body.results.length, 'count mirrors the page length');
+
+  // The three new rows are the newest; order is newest-first.
+  const mine = body.results.filter((r) => String(r.job_id).startsWith('res-'));
+  assert.deepEqual(mine.map((r) => r.job_id), ['res-3', 'res-2', 'res-1'], 'newest first');
+  const r3 = mine[0]!;
+  assert.equal(r3.ok, true);
+  assert.equal(r3.score, 9.25, 'the usage-body score is stored on the row');
+  assert.equal(r3.tokens_out, 7);
+  assert.equal(r3.error, null, 'success row: error null');
+  assert.equal(typeof r3.ts, 'string', 'ts is an ISO string');
+  const r2 = mine[1]!;
+  assert.equal(r2.ok, false);
+  assert.equal(r2.error, 'executor_exit_1', 'failure row carries the error');
+  assert.equal(r2.score, null, 'failure path without score ⇒ null');
+
+  // A SECOND report for the same job replaces the row (latest-only).
+  await finishJob('res-1', { ok: true, tokens_out: 11, score: 8 });
+  const res2 = await fetch(`${base}/api/projects/career-ops/results?job_id=res-1`, { headers: auth });
+  const b2 = (await res2.json()) as { count: number; results: Record<string, unknown>[] };
+  assert.equal(b2.count, 1, 'job_id filter: exactly one row for the job');
+  assert.equal(b2.results[0]!.job_id, 'res-1');
+  assert.equal(b2.results[0]!.score, 8, 'the second report REPLACED the row (latest-only)');
+
+  // limit: the newest N only.
+  const lim = (await (await fetch(`${base}/api/projects/career-ops/results?limit=2`, { headers: auth })).json()) as { count: number; results: { job_id: string }[] };
+  assert.equal(lim.count, 2, 'limit=2 returns two rows');
+  assert.deepEqual(lim.results.map((r) => r.job_id), ['res-1', 'res-3'], 'limit takes the newest rows (res-1 was just re-reported)');
+
+  // Unknown project → 404 like sibling project routes.
+  const nf = await fetch(`${base}/api/projects/nope-project/results`, { headers: auth });
+  assert.equal(nf.status, 404);
+
+  // Auth gate: the anonymous /api/state exception does NOT extend here.
+  const anon = await fetch(`${base}/api/projects/career-ops/results`);
+  assert.equal(anon.status, 401, 'results are token-gated (no anonymous read)');
 });

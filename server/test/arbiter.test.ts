@@ -75,9 +75,9 @@ function mkEntries(secAgo: number[], src = 'ip:10.0.0.9', base = T0): ActivityEn
   }));
 }
 
-function makeHarness(opts: { ttl?: number; cap?: number; maxLeases?: number; idleSeconds?: number; jobFailThreshold?: number; jobCooldownSeconds?: number; safetyFactor?: number; floorSeconds?: number } = {}) {
+function makeHarness(opts: { ttl?: number; cap?: number; maxLeases?: number; idleSeconds?: number; jobFailThreshold?: number; jobCooldownSeconds?: number; safetyFactor?: number; floorSeconds?: number; resultsCap?: number } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'idlefill-arbiter-'));
-  const store = new StateStore(join(dir, 'state.json'));
+  const store = new StateStore(join(dir, 'state.json'), opts.resultsCap !== undefined ? { resultsPerProjectCap: opts.resultsCap } : {});
   const cfg: ServerConfig = {
     listen: 0,
     api_tokens: ['t'],
@@ -1163,5 +1163,114 @@ test('upsertServerConnection: created rows inherit log_glob support + duplicate 
   const patch = h.arbiter.upsertServerConnection({ id: up.server!.id, models: ['llama-3'] });
   assert.equal(patch.ok, true);
   assert.deepEqual(patch.server!.models, ['llama-3']);
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// Per-job results (issue #4): the arbiter stores the LAST reported outcome
+// per (project, job_id) from usage reports — the verdict the budget counters
+// never carried. Latest-only per job, newest 200 rows per project kept.
+// ---------------------------------------------------------------------------
+
+test('results: a usage report with score stores the outcome row (ok, score, tokens, ts)', () => {
+  const h = makeHarness();
+  h.det.entries = mkEntries([400]);
+  const g = grant(h, T0, 'job-r1');
+  assert.ok(g.ok, `grant: ${JSON.stringify(g)}`);
+  h.arbiter.finishLease({ lease_id: g.lease!.lease_id, ok: true, tokens_out: 120, tokens_in: 40, score: 7.5, now: T0 + 1000 });
+
+  const row = h.store.state.results['career-ops::job-r1'];
+  assert.ok(row, 'the result row is stored under the project::job_id key');
+  assert.equal(row.project, 'career-ops');
+  assert.equal(row.job_id, 'job-r1');
+  assert.equal(row.ok, true);
+  assert.equal(row.score, 7.5, 'the usage payload score lands on the row');
+  assert.equal(row.tokens_out, 120);
+  assert.equal(row.tokens_in, 40);
+  assert.equal(row.error, null, 'a success row carries no error');
+  assert.equal(row.ts, new Date(T0 + 1000).toISOString(), 'ts = server receive time (ISO)');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('results: a failed report stores ok:false + error; a missing or garbage score stores null', () => {
+  const h = makeHarness();
+  h.det.entries = mkEntries([400]);
+
+  const g1 = grant(h, T0, 'job-rf');
+  assert.ok(g1.ok);
+  h.arbiter.finishLease({ lease_id: g1.lease!.lease_id, ok: false, error: 'executor_exit_1', tokens_out: 5, now: T0 + 1000 });
+  const fail = h.store.state.results['career-ops::job-rf']!;
+  assert.equal(fail.ok, false);
+  assert.equal(fail.error, 'executor_exit_1');
+  assert.equal(fail.score, null, 'no score in the payload ⇒ null');
+
+  // A garbage (non-number) score is stored as null, never rejected.
+  const g2 = grant(h, T0 + 60_000, 'job-rg');
+  assert.ok(g2.ok);
+  h.arbiter.finishLease({ lease_id: g2.lease!.lease_id, ok: true, score: 'high' as unknown as number, now: T0 + 61_000 });
+  assert.equal(h.store.state.results['career-ops::job-rg']!.score, null, 'garbage score ⇒ null');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('results: a second report for the same (project, job) REPLACES the row (latest-only)', () => {
+  const h = makeHarness();
+  h.det.entries = mkEntries([400]);
+
+  const g1 = grant(h, T0, 'job-re');
+  assert.ok(g1.ok);
+  h.arbiter.finishLease({ lease_id: g1.lease!.lease_id, ok: false, error: 'executor_exit_1', score: null, now: T0 + 1000 });
+  const first = h.store.state.results['career-ops::job-re']!;
+  assert.equal(first.ok, false);
+
+  // The retry succeeds: the row is REPLACED, not appended (latest-only).
+  // Spaced past the 300s failure cooldown.
+  const g2 = grant(h, T0 + 400_000, 'job-re');
+  assert.ok(g2.ok, `re-grant after a failure past the cooldown: ${JSON.stringify(g2)}`);
+  h.arbiter.finishLease({ lease_id: g2.lease!.lease_id, ok: true, tokens_out: 90, score: 6.1, now: T0 + 401_000 });
+
+  const rows = Object.values(h.store.state.results).filter((r) => r.job_id === 'job-re');
+  assert.equal(rows.length, 1, 'one row per (project, job_id) — the second report replaced the first');
+  assert.equal(rows[0]!.ok, true);
+  assert.equal(rows[0]!.score, 6.1);
+  assert.equal(rows[0]!.ts, new Date(T0 + 401_000).toISOString(), 'the row carries the NEW report time');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('results: cap eviction keeps the newest 200 rows per project (oldest by ts evicted)', () => {
+  const h = makeHarness();
+  h.det.entries = mkEntries([400]);
+  assert.equal(h.store.resultsPerProjectCap, 200, 'the default per-project cap is 200');
+
+  // 205 distinct jobs, each granted + finished (0 tokens so the daily budget
+  // never gates the next grant).
+  for (let i = 0; i < 205; i++) {
+    const at = T0 + i * 1000;
+    const g = grant(h, at, `job-cap-${i}`);
+    assert.ok(g.ok, `grant ${i}: ${JSON.stringify(g)}`);
+    h.arbiter.finishLease({ lease_id: g.lease!.lease_id, ok: true, score: i, now: at + 500 });
+  }
+
+  const rows = Object.values(h.store.state.results);
+  assert.equal(rows.length, 200, 'capped at 200 rows for the project');
+  const ids = new Set(rows.map((r) => r.job_id));
+  for (let i = 0; i < 5; i++) assert.ok(!ids.has(`job-cap-${i}`), `the oldest row (job-cap-${i}) was evicted`);
+  for (let i = 5; i < 205; i++) assert.ok(ids.has(`job-cap-${i}`), `the newest 200 rows survive (job-cap-${i})`);
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('results: projectResults orders newest-first and honors limit + job_id filter', () => {
+  const h = makeHarness();
+  h.det.entries = mkEntries([400]);
+  for (const [job, at] of [['job-a', 1000], ['job-b', 2000], ['job-c', 3000]] as const) {
+    const g = grant(h, T0, job);
+    assert.ok(g.ok);
+    h.arbiter.finishLease({ lease_id: g.lease!.lease_id, ok: true, score: 1, now: T0 + at });
+  }
+
+  const all = h.arbiter.projectResults('career-ops');
+  assert.deepEqual(all.map((r) => r.job_id), ['job-c', 'job-b', 'job-a'], 'newest first');
+  assert.deepEqual(h.arbiter.projectResults('career-ops', { limit: 2 }).map((r) => r.job_id), ['job-c', 'job-b'], 'limit takes the newest N');
+  assert.deepEqual(h.arbiter.projectResults('career-ops', { job_id: 'job-b' }).map((r) => r.job_id), ['job-b'], 'job_id filters to one job');
+  assert.deepEqual(h.arbiter.projectResults('nope-proj'), [], 'a project with no rows returns empty (the ROUTE 404s on unknown project)');
   rmSync(h.dir, { recursive: true, force: true });
 });

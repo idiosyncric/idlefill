@@ -73,7 +73,7 @@
   },
   {
     "name": "idlefill_results",
-    "description": "Show recent evaluation results from a project (newest first): job_id, ok, score, error, company, title, tokens_out, timestamp, report path. company/title are present on rows written by the career-ops executor; rows from other executors may lack them (null).",
+    "description": "Show recent evaluation results from a project (newest first): job_id, ok, score, error, company, title, tokens_out, timestamp, report path. company/title are present on rows written by the career-ops executor; rows from other executors may lack them (null). source:\"local\" reads the local results file; when it is missing/empty the tool falls back to the arbiter's stored outcomes (source:\"arbiter\"; company/title/report_path null there).",
     "inputSchema": {
       "type": "object",
       "properties": {

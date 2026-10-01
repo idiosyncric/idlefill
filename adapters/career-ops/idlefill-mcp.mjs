@@ -544,7 +544,31 @@ function queueStatus(args) {
   return out;
 }
 
-function results(args) {
+/**
+ * Arbiter-backed results page (issue #4): GET /api/projects/<p>/results with
+ * the client's token + server_url (same config the arbiterState read uses).
+ * Returns the shaped rows, or { error } — callers treat an error as "no
+ * arbiter data" exactly like an unreachable arbiterState.
+ */
+async function arbiterResults(cfg, project, limit) {
+  const url =
+    (cfg.server_url || '').replace(/\/$/, '') +
+    `/api/projects/${encodeURIComponent(project)}/results?limit=${limit}`;
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 4000);
+  try {
+    const res = await fetch(url, { headers: { authorization: `Bearer ${cfg.token}` }, signal: ctrl.signal });
+    if (!res.ok) return { error: `arbiter ${res.status}` };
+    const body = await res.json();
+    return { results: Array.isArray(body.results) ? body.results : [] };
+  } catch (e) {
+    return { error: `arbiter unreachable: ${e.message}` };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function results(args) {
   const cfg = loadClientConfig();
   if (cfg.__error) return { ok: false, error: cfg.__error };
   const project = String(args.project || defaultProject(cfg) || '');
@@ -552,28 +576,50 @@ function results(args) {
   if (!paths) return { ok: false, error: `unknown project "${project}" — adapters: ${discoverAdapters().join(', ') || '(none)'}` };
   const limit = Math.max(1, Math.min(200, Number(args.limit) || 20));
   const f = paths.results_file;
-  if (!existsSync(f)) return { ok: true, project, results: [], note: 'no results yet' };
-  const lines = readFileSync(f, 'utf-8').split('\n').filter((l) => l.trim());
-  const out = [];
-  for (let i = lines.length - 1; i >= 0 && out.length < limit; i--) {
-    try {
-      const r = JSON.parse(lines[i]);
-      out.push({
-        job_id: r.job_id,
-        ok: r.ok === true,
-        score: r.score ?? null,
-        error: r.error || null,
-        company: typeof r.company === 'string' && r.company !== '' ? r.company : null,
-        title: typeof r.title === 'string' && r.title !== '' ? r.title : null,
-        tokens_out: r.tokens_out ?? null,
-        ts: r.ts || null,
-        report_path: r.report_path || null,
-      });
-    } catch {
-      /* skip corrupt line */
+  let out = [];
+  if (existsSync(f)) {
+    const lines = readFileSync(f, 'utf-8').split('\n').filter((l) => l.trim());
+    for (let i = lines.length - 1; i >= 0 && out.length < limit; i--) {
+      try {
+        const r = JSON.parse(lines[i]);
+        out.push({
+          job_id: r.job_id,
+          ok: r.ok === true,
+          score: r.score ?? null,
+          error: r.error || null,
+          company: typeof r.company === 'string' && r.company !== '' ? r.company : null,
+          title: typeof r.title === 'string' && r.title !== '' ? r.title : null,
+          tokens_out: r.tokens_out ?? null,
+          ts: r.ts || null,
+          report_path: r.report_path || null,
+        });
+      } catch {
+        /* skip corrupt line */
+      }
     }
   }
-  return { ok: true, project, count: out.length, results: out };
+  if (out.length > 0) return { ok: true, project, source: 'local', count: out.length, results: out };
+  // Local file missing or empty (issue #4): fall back to the arbiter's
+  // stored outcomes so a remote MCP client (whose MCP server points at a
+  // different machine than the client's data dir) sees the same data as a
+  // local one. company/title/report_path are not stored on the arbiter —
+  // null there. Arbiter unreachable/error → today's "no results yet".
+  const ar = await arbiterResults(cfg, project, limit);
+  if (!ar.error && ar.results.length > 0) {
+    const rows = ar.results.map((r) => ({
+      job_id: r.job_id ?? null,
+      ok: r.ok === true,
+      score: typeof r.score === 'number' ? r.score : null,
+      error: r.error ?? null,
+      company: null,
+      title: null,
+      tokens_out: r.tokens_out ?? null,
+      ts: r.ts ?? null,
+      report_path: null,
+    }));
+    return { ok: true, project, source: 'arbiter', count: rows.length, results: rows };
+  }
+  return { ok: true, project, results: [], note: 'no results yet' };
 }
 
 // ---------------------------------------------------------------------------
@@ -858,7 +904,8 @@ const TOOLS = [
     name: 'idlefill_results',
     description:
       'Show recent evaluation results from a project (newest first): job_id, ok, score, error, company, title, tokens_out, timestamp, report path. ' +
-      'company/title are present on rows written by the career-ops executor; rows from other executors may lack them (null).',
+      'company/title are present on rows written by the career-ops executor; rows from other executors may lack them (null). ' +
+      'source:"local" reads the local results file; when it is missing/empty the tool falls back to the arbiter\'s stored outcomes (source:"arbiter"; company/title/report_path null there).',
     inputSchema: {
       type: 'object',
       properties: {

@@ -1058,7 +1058,7 @@ export class ClientDaemon {
       const partial = this.proxyStats();
       const cause = outcome.timedOut ? 'timeout' : 'preempted';
       this.log.info(`executor stopped (${cause}) — reporting partial usage out=${partial.tokens_out}`);
-      await this.reportUsage(leaseId, { ok: false, error: cause, error_detail: outcome.outputTail.slice(-1000), ...partial });
+      await this.reportUsage(leaseId, { ok: false, error: cause, error_detail: outcome.outputTail.slice(-1000), score: null, ...partial });
       this.registerFailure(proj, job, cause);
       this.activeLease = null;
       return;
@@ -1071,7 +1071,7 @@ export class ClientDaemon {
     if (outcome.exitCode !== 0) {
       const error = `executor_exit_${outcome.exitCode}`;
       this.log.info(`executor exit ${outcome.exitCode} — job failed: ${error}`);
-      await this.reportUsage(leaseId, { ok: false, error, error_detail: outcome.outputTail.slice(-1000), ...this.proxyStats() });
+      await this.reportUsage(leaseId, { ok: false, error, error_detail: outcome.outputTail.slice(-1000), score: null, ...this.proxyStats() });
       const attempts = this.registerFailure(proj, job, error);
       appendResult(proj.results_file, {
         ok: false,
@@ -1108,7 +1108,7 @@ export class ClientDaemon {
       // Clean failure (exit 0): the proxy saw what the job did use —
       // report it with the failure (and the child's output tail) so the
       // budget stays honest and the failure's WHY survives on the arbiter.
-      await this.reportUsage(leaseId, { ok: false, error, error_detail: outcome.outputTail.slice(-1000), ...partial });
+      await this.reportUsage(leaseId, { ok: false, error, error_detail: outcome.outputTail.slice(-1000), score: null, ...partial });
       this.registerFailure(proj, job, error);
       this.activeLease = null;
       return;
@@ -1118,7 +1118,11 @@ export class ClientDaemon {
     // fallback when the result lacks them.
     const tokensOut = num(result.tokens_out) > 0 ? num(result.tokens_out) : partial.tokens_out;
     const tokensIn = num(result.tokens_in) > 0 ? num(result.tokens_in) : partial.tokens_in;
-    await this.reportUsage(leaseId, { ok: true, tokens_out: tokensOut, tokens_in: tokensIn });
+    // Score (issue #4): the result line's score rides the usage body so the
+    // arbiter can store the per-job outcome row. null when the executor's
+    // line lacks one.
+    const score = typeof result.score === 'number' && Number.isFinite(result.score) ? result.score : null;
+    await this.reportUsage(leaseId, { ok: true, tokens_out: tokensOut, tokens_in: tokensIn, score });
     appendResult(proj.results_file, { ...result, job_id: job.job_id, ts: new Date().toISOString() });
     removeJob(proj.queue_file, job.job_id);
     this.log.info(`finished ${job.job_id} (score=${result.score ?? 'n/a'}, out=${tokensOut}) — queue now ${readQueue(proj.queue_file).length} jobs`);
@@ -1186,7 +1190,7 @@ export class ClientDaemon {
         const partial = this.proxyStats();
         if (preempt) {
           this.log.info(`teardown complete (${reason}) — reporting usage {ok:false, error:"${reason}"} out=${partial.tokens_out}`);
-          await this.reportUsage(leaseId, { ok: false, error: reason, error_detail: outcome.outputTail.slice(-1000), ...partial });
+          await this.reportUsage(leaseId, { ok: false, error: reason, error_detail: outcome.outputTail.slice(-1000), score: null, ...partial });
         }
         this.activeLease = null;
         this.executor = null;
@@ -1219,7 +1223,7 @@ export class ClientDaemon {
 
   private async reportUsage(
     leaseId: string,
-    body: { ok: boolean; error?: string; error_detail?: string; tokens_out?: number; tokens_in?: number },
+    body: { ok: boolean; error?: string; error_detail?: string; tokens_out?: number; tokens_in?: number; score?: number | null },
   ): Promise<void> {
     try {
       const res = await api<{ ok?: boolean }>(this.cfg, 'POST', `/api/leases/${leaseId}/usage`, body);

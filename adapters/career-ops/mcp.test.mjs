@@ -32,6 +32,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import http from 'node:http';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -947,6 +948,122 @@ test('idlefill-mcp issue #15 (unit): discoverToolModules — adapter glob, env s
       /re-declares core tool "idlefill_add_jobs"/,
       'core tool cannot be overridden by a module',
     );
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Issue #4: idlefill_results arbiter fallback. When the LOCAL results file
+// is missing/empty the tool falls back to GET /api/projects/<p>/results on
+// the arbiter (source:"arbiter"); when the local file has rows the arbiter
+// is NOT consulted (source:"local"). A stub arbiter on loopback proves the
+// request (path, token) and serves the rows.
+// ---------------------------------------------------------------------------
+
+function startStubArbiter(rows) {
+  const hits = [];
+  const server = http.createServer((req, res) => {
+    hits.push({ url: req.url, auth: req.headers['authorization'] ?? '' });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ project: 'p1', count: rows.length, results: rows }));
+  });
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      resolve({
+        url: `http://127.0.0.1:${server.address().port}`,
+        hits,
+        close: () => new Promise((r) => server.close(r)),
+      });
+    });
+  });
+}
+
+test('idlefill-mcp issue #4: results arbiter fallback — empty local file → source:"arbiter"; local rows → source:"local" (arbiter untouched)', async () => {
+  const stub = await startStubArbiter([
+    { project: 'p1', job_id: 'arb-1', ok: true, score: 8.5, tokens_out: 120, tokens_in: 4000, error: null, ts: '2026-09-29T12:00:00.000Z' },
+    { project: 'p1', job_id: 'arb-2', ok: false, score: null, tokens_out: 5, tokens_in: 10, error: 'executor_exit_1', ts: '2026-09-29T11:00:00.000Z' },
+  ]);
+  const scratch = mkdtempSync(join(tmpdir(), 'idlefill-mcp-arbresults-'));
+  const clientDir = join(scratch, 'client');
+  const dataDir = join(scratch, 'data');
+  mkdirSync(clientDir, { recursive: true });
+  mkdirSync(dataDir, { recursive: true });
+  writeFileSync(
+    join(clientDir, 'config.json'),
+    JSON.stringify({
+      server_url: stub.url,
+      token: 'stub-token-1',
+      name: 'arbresults-test',
+      projects: [{ name: 'p1', queue_file: '../data/queue.jsonl', results_file: '../data/results.jsonl' }],
+    }),
+    'utf-8',
+  );
+
+  try {
+    // --- Case 1: NO local results file → arbiter fallback ---
+    const s1 = await driveServer(clientDir, [
+      { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 't', version: '0' } } },
+      { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'idlefill_results', arguments: { project: 'p1', limit: 10 } } },
+    ]);
+    const r1 = s1.call(2);
+    assert.notEqual(r1.isError, true, 'fallback results call is not an error');
+    assert.equal(r1.p?.ok, true, 'fallback ok');
+    assert.equal(r1.p?.source, 'arbiter', 'source marks the arbiter fallback');
+    assert.equal(r1.p?.count, 2, 'both stub rows returned');
+    assert.equal(r1.p?.results?.[0]?.job_id, 'arb-1', 'arbiter rows carried through');
+    assert.equal(r1.p?.results?.[0]?.score, 8.5, 'score carried from the arbiter row');
+    assert.equal(r1.p?.results?.[1]?.error, 'executor_exit_1', 'error carried on the failed row');
+    assert.equal(r1.p?.results?.[0]?.company, null, 'company is null on arbiter rows (not stored there)');
+    assert.equal(stub.hits.length, 1, 'exactly one arbiter request');
+    assert.ok(stub.hits[0].url.startsWith('/api/projects/p1/results?limit=10'), `results route + limit: ${stub.hits[0].url}`);
+    assert.match(stub.hits[0].auth, /^Bearer stub-token-1$/, 'the client token rides the fallback request');
+
+    // --- Case 2: local file present with rows → source:"local", arbiter untouched ---
+    writeFileSync(
+      join(dataDir, 'results.jsonl'),
+      JSON.stringify({ ok: true, job_id: 'local-1', score: 4.2, tokens_out: 100, ts: '2026-09-28T10:00:00.000Z' }) + '\n',
+      'utf-8',
+    );
+    const hitsBefore = stub.hits.length;
+    const s2 = await driveServer(clientDir, [
+      { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 't', version: '0' } } },
+      { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'idlefill_results', arguments: { project: 'p1' } } },
+    ]);
+    const r2 = s2.call(2);
+    assert.equal(r2.p?.source, 'local', 'local rows mark source:"local"');
+    assert.equal(r2.p?.count, 1);
+    assert.equal(r2.p?.results?.[0]?.job_id, 'local-1');
+    assert.equal(stub.hits.length, hitsBefore, 'the arbiter was NOT consulted when the local file has rows');
+  } finally {
+    await stub.close();
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('idlefill-mcp issue #4: results fallback with an unreachable arbiter keeps the "no results yet" shape', async () => {
+  const scratch = mkdtempSync(join(tmpdir(), 'idlefill-mcp-noarb-'));
+  const clientDir = join(scratch, 'client');
+  mkdirSync(clientDir, { recursive: true });
+  writeFileSync(
+    join(clientDir, 'config.json'),
+    JSON.stringify({
+      server_url: 'http://127.0.0.1:1', // nothing listens
+      token: 'x',
+      name: 'noarb-test',
+      projects: [{ name: 'p1', queue_file: '../data/queue.jsonl', results_file: '../data/results.jsonl' }],
+    }),
+    'utf-8',
+  );
+  try {
+    const s = await driveServer(clientDir, [
+      { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 't', version: '0' } } },
+      { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'idlefill_results', arguments: { project: 'p1' } } },
+    ]);
+    const r = s.call(2);
+    assert.equal(r.p?.ok, true, 'unreachable arbiter is not an error');
+    assert.equal(r.p?.note, 'no results yet', 'today\'s behavior unchanged when both sources are empty');
+    assert.equal(r.p?.source, undefined, 'no source key on the no-results shape');
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }

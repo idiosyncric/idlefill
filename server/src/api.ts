@@ -384,6 +384,8 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       error?: string;
       /** Last ≤1000 chars of the executor's combined output (crash stderr). */
       error_detail?: string;
+      /** Client-reported score from the result line (issue #4); null on failure paths. */
+      score?: number | null;
     };
     const res = arbiter.finishLease({
       lease_id: id,
@@ -395,6 +397,9 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       // combined output). Truncated server-side in finishLease; stored on
       // the lease record and the lease_finished event.
       error_detail: typeof body.error_detail === 'string' ? body.error_detail : undefined,
+      // Score (issue #4): number|null from the client's result line. A
+      // non-number (garbage) stores as null — never rejected.
+      score: typeof body.score === 'number' && Number.isFinite(body.score) ? body.score : null,
     });
     if (!res.ok) return reply.code(404).send({ error: res.reason ?? 'unknown_lease' });
     return { ok: true, lease: { lease_id: id, tokens_out: res.lease?.tokens_out, tokens_in: res.lease?.tokens_in, status: res.lease?.status } };
@@ -479,6 +484,34 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     const res = arbiter.unthrottleJob(name, job_id);
     if (!res.ok) return reply.code(404).send({ error: res.reason ?? 'unknown_project' });
     return { ok: true, project: name, job_id, was_throttled: res.was_throttled };
+  });
+
+  /**
+   * Per-job outcomes (issue #4): the LAST reported result per (project,
+   * job_id), newest first. `limit` defaults to 20, capped at 200 (the MCP
+   * results tool's discipline); `job_id` filters to one job. Unknown
+   * project → 404 like sibling project routes. Token-gated by the /api/*
+   * hook (NOT the anonymous /api/state exception). Response shape mirrors
+   * the MCP idlefill_results tool. /api/state deliberately stays lean —
+   * this route is the results surface.
+   */
+  app.get('/api/projects/:name/results', async (req, reply) => {
+    const name = decodeURIComponent((req.params as { name: string }).name);
+    if (!cfg.projects.find((p) => p.name === name)) {
+      return reply.code(404).send({ error: 'unknown_project' });
+    }
+    let limit: unknown = null;
+    const q = req.query;
+    if (typeof q === 'string') limit = new URLSearchParams(q).get('limit');
+    else if (q !== null && typeof q === 'object') limit = (q as Record<string, unknown>).limit;
+    const n = typeof limit === 'string' ? Number.parseInt(limit, 10) : Number.NaN;
+    const capped = Number.isInteger(n) && n >= 1 ? Math.min(200, n) : 20;
+    const jobId = typeof q === 'object' && q !== null ? (q as Record<string, unknown>).job_id : undefined;
+    const results = arbiter.projectResults(name, {
+      limit: capped,
+      ...(typeof jobId === 'string' && jobId !== '' ? { job_id: jobId } : {}),
+    });
+    return { project: name, count: results.length, results };
   });
 
   // ------------------------------------------------------------------

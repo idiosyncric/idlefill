@@ -15,6 +15,8 @@ export interface StateStoreOpts {
   leaseHistoryCap?: number;
   /** Cap for the event log kept in memory/file. */
   eventCap?: number;
+  /** Cap for result rows kept PER PROJECT (issue #4). */
+  resultsPerProjectCap?: number;
 }
 
 export function emptyState(): ArbiterState {
@@ -26,6 +28,7 @@ export function emptyState(): ArbiterState {
     sessions: [],
     session_overrides: {},
     throttled_jobs: {},
+    results: {},
     leases: [],
     budgets: {},
     events: [],
@@ -41,12 +44,15 @@ export class StateStore {
   private readonly file: string;
   private readonly leaseHistoryCap: number;
   private readonly eventCap: number;
+  /** Result rows kept per project (issue #4) — read by the arbiter on write. */
+  readonly resultsPerProjectCap: number;
   state: ArbiterState;
 
   constructor(file: string, opts: StateStoreOpts = {}) {
     this.file = file;
     this.leaseHistoryCap = opts.leaseHistoryCap ?? 500;
     this.eventCap = opts.eventCap ?? 500;
+    this.resultsPerProjectCap = opts.resultsPerProjectCap ?? 200;
     this.state = this.load();
   }
 
@@ -75,6 +81,9 @@ export class StateStore {
         // Tolerate state files from before per-job throttling (anti-thrash)
         // existed.
         throttled_jobs: raw.throttled_jobs && typeof raw.throttled_jobs === 'object' ? raw.throttled_jobs : base.throttled_jobs,
+        // Tolerate state files from before per-job result rows (issue #4)
+        // existed.
+        results: raw.results && typeof raw.results === 'object' ? raw.results : base.results,
         leases: Array.isArray(raw.leases) ? raw.leases : base.leases,
         budgets: raw.budgets && typeof raw.budgets === 'object' ? raw.budgets : base.budgets,
         events: Array.isArray(raw.events) ? raw.events : base.events,

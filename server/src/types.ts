@@ -342,6 +342,28 @@ export interface JobThrottle {
   last_failed_at: number;
 }
 
+/**
+ * The LAST reported outcome for a (project, job_id) pair (issue #4). Written
+ * by `finishLease` from the client's usage report — the arbiter previously
+ * counted usage into the budget but kept no per-job verdict, so the
+ * dashboard and remote MCP clients could not see what actually happened to
+ * the work. Latest-only per job (a newer report REPLACES the row); capped at
+ * the newest 200 rows per project so state.json stays bounded.
+ */
+export interface JobResultRow {
+  project: string;
+  job_id: string;
+  ok: boolean;
+  /** Client-reported score from the result line (usage payload `score`); null when absent. */
+  score: number | null;
+  tokens_out: number;
+  tokens_in: number;
+  /** Failure cause on ok:false (e.g. `executor_exit_1`); null on success. */
+  error: string | null;
+  /** Server receive time (ISO) — the arbiter's clock, not the client's. */
+  ts: string;
+}
+
 export interface IdleSignal {
   now: number;
   idle: boolean;
@@ -421,6 +443,14 @@ export interface ArbiterState {
    * (the state file is the only persistence).
    */
   throttled_jobs: Record<string, JobThrottle>;
+  /**
+   * Last reported outcome per (project, job_id) (issue #4), keyed like
+   * `throttled_jobs` (`project::job_id`). Written on every usage report in
+   * finishLease; latest-only per job, newest 200 rows per project kept.
+   * Served by GET /api/projects/:name/results — deliberately NOT embedded
+   * in /api/state (that endpoint stays lean).
+   */
+  results: Record<string, JobResultRow>;
   /**
    * Operator overrides (pause/force), keyed by client_id. A client that
    * unregisters is re-registered under the SAME name with a NEW client_id,
