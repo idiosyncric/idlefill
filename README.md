@@ -15,6 +15,33 @@ Two parts:
   `idlefill/data/` — never in the project repos it works for (career-ops is
   strictly read-only).
 
+## Install
+
+Prereqs: Node 22+ and npm. No special network required — just a reachable
+arbiter (the server) for the client to point at.
+
+```bash
+git clone https://github.com/idiosyncric/idlefill
+cd idlefill
+npm install                    # at the repo root (npm workspaces)
+
+# 1. Server (the arbiter)
+cp server/config.example.json server/config.json   # set api_tokens to something real
+cd server && npm run dev                           # tsx src/index.ts, reads ./config.json
+
+# 2. Client (the machine that runs the work)
+cd ../client
+cp config.example.json config.json                 # set server_url to your arbiter
+                                                   # (http://<arbiter-host>:8787) and
+                                                   # token to match the server's api_tokens
+npm run start                                      # tsx src/index.ts
+```
+
+Both `config.json` files are gitignored — the examples are the starting
+point. The dashboard is then at `http://<arbiter-host>:8787/`. For the
+Docker path and the rest of the deployment internals, see Quickstart and
+Architecture below.
+
 ## Phase status
 
 | Phase | Scope | Status |
