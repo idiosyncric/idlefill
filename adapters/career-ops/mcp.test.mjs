@@ -20,6 +20,13 @@
  * job_ids error), clear_queue (dry_run + real), job_lookup (in-queue with
  * position + payload, done, quarantined, never-seen; best-effort arbiter
  * error), unknown tool → JSON-RPC error.
+ *
+ * Issue #14 adds two policy sessions: per-project mcp block (allow_write:false
+ * hides + blocks with byte-unchanged queue; tools subset in policy order with
+ * unknown names warned once on stderr; enabled:false excluded from every
+ * enumeration), no-param tools/list union with most-restrictive annotations,
+ * notifications/tools/list_changed on set change, and IDLEFILL_MCP_READ_ONLY=1
+ * blocking every write tool for every project.
  */
 
 import { test } from 'node:test';
@@ -43,10 +50,11 @@ function urlHash8(url) {
 // Must match idlefill-mcp.mjs jobIdFor: <company-slug>-<sha256(url)[0:8]>.
 const jobId = (company, url) => `${slug(company || 'unknown')}-${urlHash8(url)}`;
 
-/** Spawn the server, send a batch of JSON-RPC messages, return {byId, call, stderr}. */
-async function driveServer(clientDir, requests) {
+/** Spawn the server, send a batch of JSON-RPC messages, return {byId, notes, call, stderr}.
+ *  `env` (optional) merges extra environment for the child (issue #14 tests). */
+async function driveServer(clientDir, requests, env) {
   const child = spawn('node', [MCP], {
-    env: { ...process.env, IDLEFILL_CLIENT_DIR: clientDir },
+    env: { ...process.env, IDLEFILL_CLIENT_DIR: clientDir, ...(env || {}) },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   const lines = [];
@@ -73,6 +81,7 @@ async function driveServer(clientDir, requests) {
   await closed;
 
   const byId = {};
+  const notes = [];
   for (const l of lines) {
     let m;
     try {
@@ -81,6 +90,7 @@ async function driveServer(clientDir, requests) {
       continue;
     }
     if (m.id !== undefined) byId[m.id] = m;
+    else if (m.method) notes.push(m);
   }
   const call = (id) => {
     const m = byId[id];
@@ -92,7 +102,7 @@ async function driveServer(clientDir, requests) {
     }
     return { isError: m?.result?.isError, p };
   };
-  return { byId, call, stderr: stderrBuf.join('') };
+  return { byId, notes, call, stderr: stderrBuf.join('') };
 }
 
 /** The queue file's live lines (empty when missing or empty). */
@@ -410,6 +420,223 @@ test('idlefill-mcp: stdio sessions — add/status/results(echo)/lookup + remove/
 
     assert.equal(s2.byId[21]?.error?.code, -32602, 'unknown tool → JSON-RPC -32602');
     if (s2.stderr.trim()) console.log(`session 2 stderr:\n${s2.stderr.trim()}`);
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Issue #14 — per-project MCP tool policy (mcp block, tools/list filtering,
+// tools/call enforcement, IDLEFILL_MCP_READ_ONLY, mcp.enabled:false,
+// listChanged). Same hermetic-stdio harness: real process, scratch client dir.
+// ---------------------------------------------------------------------------
+
+test('idlefill-mcp issue #14: per-project tool policy — hide + enforce + read-only env + enabled:false', async () => {
+  const scratch = mkdtempSync(join(tmpdir(), 'idlefill-mcp-policy-'));
+  const clientDir = join(scratch, 'client');
+  const dataDir = join(scratch, 'data');
+  mkdirSync(clientDir, { recursive: true });
+  mkdirSync(dataDir, { recursive: true });
+
+  const FRESH = { url: 'https://example.com/policy-1', company: 'PolicyCo', title: 'Policy job' };
+  const seedQueue = (file) =>
+    writeFileSync(
+      join(dataDir, file),
+      JSON.stringify({ job_id: jobId(FRESH.company, FRESH.url), payload: { ...FRESH, source: 'seed' } }) + '\n',
+      'utf-8',
+    );
+  seedQueue('queue-p1.jsonl');
+  seedQueue('queue-ro.jsonl');
+  seedQueue('queue-sub.jsonl');
+  seedQueue('queue-off.jsonl');
+  writeFileSync(join(dataDir, 'results-p1.jsonl'), '', 'utf-8');
+
+  // p1: no mcp block (today's behavior). ro: allow_write:false.
+  // sub: explicit subset (policy order; bogus_tool unknown → dropped + warned
+  // once). off: mcp.enabled:false → invisible to the MCP server entirely.
+  writeFileSync(
+    join(clientDir, 'config.json'),
+    JSON.stringify({
+      server_url: 'http://127.0.0.1:1',
+      token: 'not-a-real-token',
+      name: 'policy-test',
+      projects: [
+        { name: 'p1', queue_file: '../data/queue-p1.jsonl', results_file: '../data/results-p1.jsonl' },
+        { name: 'ro', queue_file: '../data/queue-ro.jsonl', results_file: '../data/results-ro.jsonl', mcp: { allow_write: false } },
+        { name: 'sub', queue_file: '../data/queue-sub.jsonl', results_file: '../data/results-sub.jsonl', mcp: { tools: ['idlefill_results', 'idlefill_queue_status', 'bogus_tool', 'bogus_tool'] } },
+        { name: 'off', queue_file: '../data/queue-off.jsonl', results_file: '../data/results-off.jsonl', mcp: { enabled: false } },
+      ],
+    }),
+    'utf-8',
+  );
+
+  const roQueueBefore = readFileSync(join(dataDir, 'queue-ro.jsonl'));
+  const offQueueBefore = readFileSync(join(dataDir, 'queue-off.jsonl'));
+
+  try {
+    const s = await driveServer(clientDir, [
+      { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '0' } } },
+      // tools/list per project (policy-resolved)
+      { jsonrpc: '2.0', id: 2, method: 'tools/list', params: { project: 'ro' } },
+      { jsonrpc: '2.0', id: 3, method: 'tools/list', params: { project: 'sub' } },
+      { jsonrpc: '2.0', id: 4, method: 'tools/list', params: { project: 'off' } },
+      // tools/list with no param: union across enabled projects
+      { jsonrpc: '2.0', id: 5, method: 'tools/list' },
+      // repeat of id 5 — identical set → NO list_changed notification
+      { jsonrpc: '2.0', id: 6, method: 'tools/list' },
+      // enforcement at the call site (hidden ≠ allowed)
+      { jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'idlefill_add_jobs', arguments: { project: 'ro', jobs: [FRESH] } } },
+      { jsonrpc: '2.0', id: 8, method: 'tools/call', params: { name: 'idlefill_remove_jobs', arguments: { project: 'ro', job_ids: [jobId(FRESH.company, FRESH.url)] } } },
+      { jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'idlefill_clear_queue', arguments: { project: 'ro' } } },
+      // a read tool for ro still works
+      { jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'idlefill_queue_status', arguments: { project: 'ro' } } },
+      // sub: tool outside the subset is blocked; inside the subset works
+      { jsonrpc: '2.0', id: 11, method: 'tools/call', params: { name: 'idlefill_job_lookup', arguments: { project: 'sub', job_id: 'x-1' } } },
+      { jsonrpc: '2.0', id: 12, method: 'tools/call', params: { name: 'idlefill_results', arguments: { project: 'sub' } } },
+      // disabled project: unknown-project error must NOT enumerate it
+      { jsonrpc: '2.0', id: 13, method: 'tools/call', params: { name: 'idlefill_add_jobs', arguments: { project: 'off', jobs: [FRESH] } } },
+      // queue_status enumeration excludes the disabled project
+      { jsonrpc: '2.0', id: 14, method: 'tools/call', params: { name: 'idlefill_queue_status', arguments: {} } },
+    ]);
+    const { byId, notes, call, stderr } = s;
+
+    // --- initialize advertises listChanged + the policy extension ---
+    assert.equal(byId[1]?.result?.capabilities?.tools?.listChanged, true, 'initialize: listChanged true');
+    assert.match(byId[1]?.result?.instructions ?? '', /params\.project/, 'initialize instructions document the params.project extension');
+
+    // --- tools/list for allow_write:false: write tools hidden ---
+    const roTools = byId[2]?.result?.tools || [];
+    assert.deepEqual(
+      roTools.map((t) => t.name),
+      ['idlefill_queue_status', 'idlefill_results', 'idlefill_job_lookup'],
+      'ro: write tools not in tools/list',
+    );
+    assert.ok(roTools.every((t) => t.annotations?.readOnlyHint === true && t.annotations?.destructiveHint === false), 'ro: annotations reflect effective read-only permission');
+
+    // --- tools/list for the explicit subset: exact set, POLICY order ---
+    assert.deepEqual(
+      byId[3]?.result?.tools?.map((t) => t.name),
+      ['idlefill_results', 'idlefill_queue_status'],
+      'sub: exactly the configured subset, in the policy order (not static order)',
+    );
+
+    // --- unknown tool name in mcp.tools: warned once on stderr, dropped ---
+    const warnLines = stderr.split('\n').filter((l) => l.includes('bogus_tool'));
+    assert.equal(warnLines.length, 1, 'unknown tool name reported exactly once on stderr');
+    assert.match(warnLines[0] ?? '', /unknown tool name "bogus_tool"/, 'stderr names the offending tool');
+
+    // --- disabled project: empty tool list ---
+    assert.deepEqual(byId[4]?.result?.tools, [], 'off (enabled:false): no tools listed');
+
+    // --- no-param tools/list: union across enabled projects ---
+    assert.deepEqual(
+      byId[5]?.result?.tools?.map((t) => t.name),
+      ['idlefill_add_jobs', 'idlefill_queue_status', 'idlefill_results', 'idlefill_remove_jobs', 'idlefill_clear_queue', 'idlefill_job_lookup'],
+      'no-param list: union of enabled projects (p1 keeps the write tools visible)',
+    );
+    const unionWrites = byId[5]?.result?.tools?.filter((t) => ['idlefill_add_jobs', 'idlefill_remove_jobs', 'idlefill_clear_queue'].includes(t.name)) || [];
+    assert.ok(unionWrites.length === 3 && unionWrites.every((t) => t.annotations?.readOnlyHint === true), 'no-param list: write annotations most-restrictive (ro cannot write)');
+
+    // --- listChanged notification: fired when the set changed, not when identical ---
+    const changed = notes.filter((n) => n.method === 'notifications/tools/list_changed');
+    // id2→id3 changed, id3→id4 changed, id4→id5 changed, id5→id6 identical (no note)
+    assert.equal(changed.length, 3, 'notifications/tools/list_changed fired on each differing list, not on the identical repeat');
+
+    // --- enforcement: hidden write tools still BLOCKED at the call site ---
+    const add = call(7);
+    assert.equal(add.isError, true, 'ro add_jobs → isError');
+    assert.match(add.p?.error ?? '', /^write not allowed for project "ro" \(mcp\.allow_write\)$/, 'ro add_jobs: reason names the governing field');
+    assert.equal(call(8).isError, true, 'ro remove_jobs → isError');
+    assert.match(call(8).p?.error ?? '', /mcp\.allow_write/, 'ro remove_jobs: governing field named');
+    assert.equal(call(9).isError, true, 'ro clear_queue → isError');
+    assert.match(call(9).p?.error ?? '', /mcp\.allow_write/, 'ro clear_queue: governing field named');
+
+    // The queue file is BYTE-UNCHANGED after all three blocked writes.
+    assert.deepEqual(readFileSync(join(dataDir, 'queue-ro.jsonl')), roQueueBefore, 'ro: queue file byte-identical after blocked writes');
+
+    // --- read tools unaffected for the read-only project ---
+    assert.equal(call(10).p?.ok, true, 'ro: read tool still works');
+
+    // --- subset enforcement: outside blocked, inside allowed ---
+    const outside = call(11);
+    assert.equal(outside.isError, true, 'sub job_lookup (outside subset) → isError');
+    assert.match(outside.p?.error ?? '', /^tool "idlefill_job_lookup" not in mcp\.tools for project "sub"$/, 'sub: reason names mcp.tools + project');
+    assert.equal(call(12).p?.ok, true, 'sub results (inside subset) works');
+
+    // --- enabled:false: excluded from enumeration + error message ---
+    const offCall = call(13);
+    assert.equal(offCall.isError, true, 'off add_jobs → isError');
+    assert.match(offCall.p?.error ?? '', /unknown project "off"/, 'off: unknown project error');
+    assert.ok(!/client config knows: [^;]*\boff\b/.test(offCall.p?.error ?? ''), 'off: not listed in the unknown-project message');
+    assert.match(offCall.p?.error ?? '', /p1, ro, sub/, 'off: enabled projects ARE listed');
+    assert.deepEqual(readFileSync(join(dataDir, 'queue-off.jsonl')), offQueueBefore, 'off: queue file untouched (daemon may still drain it; MCP never touches it)');
+
+    const stAll = call(14);
+    assert.deepEqual(Object.keys(stAll.p?.projects || {}), ['p1', 'ro', 'sub'], 'queue_status enumeration excludes enabled:false project');
+
+    if (stderr.trim() && warnLines.length === 1) {
+      /* the expected warning; anything else on stderr is noise to surface */
+      const rest = stderr.split('\n').filter((l) => l.trim() && !l.includes('bogus_tool'));
+      if (rest.length) console.log(`policy session unexpected stderr:\n${rest.join('\n')}`);
+    } else if (stderr.trim()) {
+      console.log(`policy session stderr:\n${stderr.trim()}`);
+    }
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('idlefill-mcp issue #14: IDLEFILL_MCP_READ_ONLY=1 blocks every write tool for every project', async () => {
+  const scratch = mkdtempSync(join(tmpdir(), 'idlefill-mcp-ro-env-'));
+  const clientDir = join(scratch, 'client');
+  const dataDir = join(scratch, 'data');
+  mkdirSync(clientDir, { recursive: true });
+  mkdirSync(dataDir, { recursive: true });
+
+  const FRESH = { url: 'https://example.com/env-ro-1', company: 'EnvCo', title: 'Env job' };
+  writeFileSync(
+    join(dataDir, 'queue.jsonl'),
+    JSON.stringify({ job_id: jobId(FRESH.company, FRESH.url), payload: { ...FRESH, source: 'seed' } }) + '\n',
+    'utf-8',
+  );
+  // p1 has NO mcp block (would allow everything) — the env flag overrides it.
+  writeFileSync(
+    join(clientDir, 'config.json'),
+    JSON.stringify({
+      server_url: 'http://127.0.0.1:1',
+      token: 'not-a-real-token',
+      name: 'env-ro-test',
+      projects: [{ name: 'p1', queue_file: '../data/queue.jsonl', results_file: '../data/results.jsonl' }],
+    }),
+    'utf-8',
+  );
+  const queueBefore = readFileSync(join(dataDir, 'queue.jsonl'));
+
+  try {
+    const s = await driveServer(clientDir, [
+      { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '0' } } },
+      { jsonrpc: '2.0', id: 2, method: 'tools/list' },
+      { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'idlefill_add_jobs', arguments: { project: 'p1', jobs: [{ url: 'https://example.com/env-ro-2', company: 'EnvCo', title: 'Blocked' }] } } },
+      { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'idlefill_remove_jobs', arguments: { project: 'p1', job_ids: [jobId(FRESH.company, FRESH.url)] } } },
+      { jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'idlefill_clear_queue', arguments: { project: 'p1' } } },
+      { jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'idlefill_queue_status', arguments: { project: 'p1' } } },
+    ], { IDLEFILL_MCP_READ_ONLY: '1' });
+    const { byId, call } = s;
+
+    assert.match(byId[1]?.result?.instructions ?? '', /READ-ONLY mode \(IDLEFILL_MCP_READ_ONLY=1\)/, 'initialize instructions advertise read-only mode');
+    assert.deepEqual(
+      byId[2]?.result?.tools?.map((t) => t.name),
+      ['idlefill_queue_status', 'idlefill_results', 'idlefill_job_lookup'],
+      'read-only env: write tools hidden from tools/list even with no mcp block',
+    );
+    for (const id of [3, 4, 5]) {
+      const c = call(id);
+      assert.equal(c.isError, true, `read-only env: write tool call id ${id} isError`);
+      assert.match(c.p?.error ?? '', /read-only mode \(IDLEFILL_MCP_READ_ONLY\)/, `read-only env: error names the env flag (id ${id})`);
+    }
+    assert.deepEqual(readFileSync(join(dataDir, 'queue.jsonl')), queueBefore, 'read-only env: queue file byte-unchanged');
+    assert.equal(call(6).p?.ok, true, 'read-only env: read tools still work');
+    if (s.stderr.trim()) console.log(`env-ro session stderr:\n${s.stderr.trim()}`);
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }

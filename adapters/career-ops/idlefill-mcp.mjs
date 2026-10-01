@@ -13,6 +13,14 @@
  *   idlefill_job_lookup    exact job_id lookup: queue position, results
  *                          history, done/quarantined facts, running/throttled
  *
+ * Per-project tool policy (issue #14): a project's config entry may carry an
+ * optional `mcp` block — { enabled?, tools?, allow_write? } — that selects the
+ * tools visible to that project and whether its write tools are allowed.
+ * tools/list accepts an optional params.project (nonstandard extension) and
+ * returns the policy-resolved set; tools/call enforces the same policy
+ * (isError + the governing field named). IDLEFILL_MCP_READ_ONLY=1 blocks every
+ * write-bearing tool for every project (operator escape hatch).
+ *
  * Transport: MCP over stdio — newline-delimited JSON per the MCP stdio spec
  * (JSON-RPC 2.0). No dependencies — Node builtins only; runs under plain
  * `node`.
@@ -69,18 +77,134 @@ function loadClientConfig() {
   return { __error: `no client config found in ${CLIENT_DIR} (config.json)` };
 }
 
-/** Map project name → {queue_file, results_file} from the client config. */
-function projectPaths(cfg) {
-  const map = new Map();
+/** Raw project entries from the client config (name-valid, in config order). */
+function projectEntries(cfg) {
+  const out = [];
   const projects = Array.isArray(cfg.projects) ? cfg.projects : [];
   for (const p of projects) {
     if (!p || typeof p.name !== 'string' || !p.name) continue;
+    out.push(p);
+  }
+  return out;
+}
+
+/** Map project name → {queue_file, results_file} from the client config.
+ *  Projects with mcp.enabled:false are EXCLUDED here (issue #14): the MCP
+ *  server never sees them (not in any enumeration, not in the unknown-project
+ *  message, not a default). The daemon's own config loader is untouched —
+ *  it still drains their queues. */
+function projectPaths(cfg) {
+  const map = new Map();
+  for (const p of projectEntries(cfg)) {
+    if (!projectEnabled(p)) continue;
     map.set(p.name, {
       queue_file: resolve(CLIENT_DIR, String(p.queue_file || '../data/queue.jsonl')),
       results_file: resolve(CLIENT_DIR, String(p.results_file || '../data/results.jsonl')),
     });
   }
   return map;
+}
+
+// ---------------------------------------------------------------------------
+// Per-project MCP tool policy (issue #14) — resolved at tools/list, enforced
+// at tools/call. Optional `mcp` block per projects[] entry:
+//   { enabled?: bool, tools?: string[], allow_write?: bool }
+// A project with no mcp block behaves exactly as before (all tools).
+// ---------------------------------------------------------------------------
+
+/** WRITE-bearing tools: every one of these mutates the queue file. */
+const WRITE_TOOLS = new Set(['idlefill_add_jobs', 'idlefill_remove_jobs', 'idlefill_clear_queue']);
+
+/** Operator escape hatch: read-only for EVERY project regardless of config. */
+const READ_ONLY_MODE = process.env.IDLEFILL_MCP_READ_ONLY === '1';
+
+/** The project's optional mcp block ({} when absent or malformed). */
+function mcpBlock(p) {
+  const m = p && typeof p === 'object' ? p.mcp : null;
+  return m && typeof m === 'object' && !Array.isArray(m) ? m : {};
+}
+
+function projectEnabled(p) {
+  return mcpBlock(p).enabled !== false;
+}
+
+/** Unknown tool names in mcp.tools: reported once per process on stderr,
+ *  dropped — never fatal (issue #14 acceptance). */
+const warnedUnknownToolNames = new Set();
+
+/** The ordered tool names visible to one project entry (policy order). */
+function visibleToolsFor(p) {
+  const m = mcpBlock(p);
+  let list;
+  if (Array.isArray(m.tools)) {
+    list = [];
+    for (const t of m.tools) {
+      if (typeof t !== 'string' || !t) continue;
+      if (!(t in TOOL_IMPL)) {
+        if (!warnedUnknownToolNames.has(t)) {
+          warnedUnknownToolNames.add(t);
+          process.stderr.write(`idlefill-mcp: ignoring unknown tool name "${t}" in mcp.tools for project "${p.name}"\n`);
+        }
+        continue;
+      }
+      list.push(t);
+    }
+  } else {
+    list = TOOLS.map((t) => t.name);
+  }
+  const allowWrite = !READ_ONLY_MODE && m.allow_write !== false;
+  if (!allowWrite) list = list.filter((t) => !WRITE_TOOLS.has(t));
+  return list;
+}
+
+/**
+ * Call-site enforcement (issue #14: enforce, do not merely hide). Returns the
+ * error string when the call is disallowed, null when allowed. Unknown or
+ * disabled projects return null — the tool's own unknown-project error fires
+ * (and its enumeration already excludes disabled projects).
+ */
+function enforceToolPolicy(name, project, cfg) {
+  const entry = projectEntries(cfg).find((p) => p.name === project);
+  if (!entry || !projectEnabled(entry)) return null;
+  const m = mcpBlock(entry);
+  const isWrite = WRITE_TOOLS.has(name);
+  if (isWrite && READ_ONLY_MODE) return `read-only mode (IDLEFILL_MCP_READ_ONLY): write not allowed for project "${project}"`;
+  if (isWrite && m.allow_write === false) return `write not allowed for project "${project}" (mcp.allow_write)`;
+  if (!visibleToolsFor(entry).includes(name)) return `tool "${name}" not in mcp.tools for project "${project}"`;
+  return null;
+}
+
+/** Tool shape for a tools/list response: static schema + EFFECTIVE annotations. */
+function shapeToolForList(name, effectiveWritable) {
+  const base = TOOLS.find((t) => t.name === name);
+  const writable = effectiveWritable !== undefined ? effectiveWritable : WRITE_TOOLS.has(name);
+  return { ...base, annotations: { readOnlyHint: !writable, destructiveHint: writable } };
+}
+
+/**
+ * tools/list with no params.project (settled decision #4): the UNION of the
+ * enabled projects' visible sets, with annotations reflecting the
+ * MOST-RESTRICTIVE effective permission (a write tool that some project may
+ * not write is annotated as not-writable). Deterministic: union order is the
+ * static TOOLS order.
+ */
+function unionToolsForList(cfg) {
+  const entries = projectEntries(cfg).filter(projectEnabled);
+  // No configured (enabled) projects: no policy source exists — publish the
+  // full static table exactly as today (calls still resolve via adapter
+  // discovery / the unknown-project error).
+  if (entries.length === 0) return TOOLS.map((t) => shapeToolForList(t.name));
+  const visible = new Set();
+  for (const p of entries) for (const t of visibleToolsFor(p)) visible.add(t);
+  return TOOLS.map((t) => t.name)
+    .filter((n) => visible.has(n))
+    .map((n) => {
+      // Most-restrictive: a write tool is annotated writable only when EVERY
+      // enabled project may write it (a tool some project cannot write is not
+      // reliably writable in the no-context union view).
+      const writable = entries.every((p) => visibleToolsFor(p).includes(n));
+      return shapeToolForList(n, WRITE_TOOLS.has(n) ? writable : false);
+    });
 }
 
 /**
@@ -802,6 +926,11 @@ const TOOL_IMPL = {
 const SERVER_INFO = { name: 'idlefill', version: '1.0.0' };
 const PROTOCOL_VERSION = '2024-11-05';
 
+// listChanged (issue #14): the fingerprint of the last tools/list response
+// sent on this connection; a differing response is followed by
+// notifications/tools/list_changed on the same channel.
+let lastToolsListFingerprint = null;
+
 let lineBuf = '';
 const utf8 = new StringDecoder('utf-8');
 
@@ -826,19 +955,48 @@ async function handle(msg) {
     case 'initialize':
       respond(id, {
         protocolVersion: params?.protocolVersion || PROTOCOL_VERSION,
-        capabilities: { tools: { listChanged: false } },
+        capabilities: { tools: { listChanged: true } },
         serverInfo: SERVER_INFO,
         instructions:
           'idlefill schedules background work on a local LLM server while it is idle. ' +
-          'idlefill_add_jobs enqueues work; idlefill_queue_status shows queues + running state; idlefill_results shows finished evaluations.',
+          'idlefill_add_jobs enqueues work; idlefill_queue_status shows queues + running state; idlefill_results shows finished evaluations. ' +
+          'Tool availability is a per-project policy (client config projects[].mcp): tools/list accepts an optional params.project (nonstandard extension) and returns that project\'s effective tool set; tools/call enforces the same policy. ' +
+          (READ_ONLY_MODE
+            ? 'This server is running in READ-ONLY mode (IDLEFILL_MCP_READ_ONLY=1): every write-bearing tool is blocked for every project.'
+            : 'Set IDLEFILL_MCP_READ_ONLY=1 on the server process to block every write-bearing tool for every project.'),
       });
       return;
     case 'notifications/initialized':
     case 'notifications/cancelled':
       return;
-    case 'tools/list':
-      respond(id, { tools: TOOLS });
+    case 'tools/list': {
+      // Policy-resolved listing (issue #14). params.project (nonstandard
+      // extension, advertised in initialize) selects one project's effective
+      // set; with no param, the union across enabled projects with
+      // most-restrictive annotations.
+      let shaped;
+      const cfg = loadClientConfig();
+      if (cfg.__error) {
+        shaped = TOOLS.map((t) => shapeToolForList(t.name));
+      } else if (params && typeof params.project === 'string' && params.project) {
+        const entry = projectEntries(cfg).find((p) => p.name === params.project);
+        if (!entry || !projectEnabled(entry)) {
+          shaped = [];
+        } else {
+          shaped = visibleToolsFor(entry).map((n) => shapeToolForList(n));
+        }
+      } else {
+        shaped = unionToolsForList(cfg);
+      }
+      respond(id, { tools: shaped });
+      // listChanged: notify when this response differs from the last one sent.
+      const fingerprint = JSON.stringify(shaped);
+      if (lastToolsListFingerprint !== null && lastToolsListFingerprint !== fingerprint) {
+        send({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' });
+      }
+      lastToolsListFingerprint = fingerprint;
       return;
+    }
     case 'tools/call': {
       const name = params?.name;
       const impl = TOOL_IMPL[name];
@@ -846,6 +1004,19 @@ async function handle(msg) {
         if (isNotification) return;
         fail(id, -32602, `unknown tool: ${name}`);
         return;
+      }
+      // Enforce the per-project policy at the call site (issue #14: enforce,
+      // do not merely hide). Resolve the project exactly as the tool would.
+      const cfg = loadClientConfig();
+      if (!cfg.__error) {
+        const args0 = params?.arguments || {};
+        const project = String(args0.project || defaultProject(cfg) || '');
+        const denied = enforceToolPolicy(name, project, cfg);
+        if (denied) {
+          log(`policy block tool=${name} project=${project}: ${denied}`);
+          respond(id, { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: denied }, null, 2) }], isError: true });
+          return;
+        }
       }
       try {
         const result = await impl(params?.arguments || {});
