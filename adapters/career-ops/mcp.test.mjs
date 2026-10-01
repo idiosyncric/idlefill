@@ -641,3 +641,313 @@ test('idlefill-mcp issue #14: IDLEFILL_MCP_READ_ONLY=1 blocks every write tool f
     rmSync(scratch, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Issue #15 — tool-module extension point (discovered tools). Same hermetic
+// harness: real stdio process, scratch dirs, no ports. The committed fixture
+// (test-fixtures/hello-tool/idlefill-mcp-tools.mjs) is copied into a scratch
+// dir so "remove the file → gone from tools/list" is provable without editing
+// the repo. Origin (a) (the adapters/<dir> glob) is proven at unit level
+// against discoverToolModules with a scratch repoRoot — the server has no
+// repo-root override env, so a full-process test of (a) is impossible without
+// touching the real repo (deviation noted in ISSUE15-REPORT.md).
+// ---------------------------------------------------------------------------
+
+const FIXTURE_HELLO = join(__dirname, 'test-fixtures', 'hello-tool', 'idlefill-mcp-tools.mjs');
+
+/** Spawn the server expecting a STARTUP failure: returns {code, stderr}. */
+async function driveStartup(env) {
+  const child = spawn('node', [MCP], {
+    env: { ...process.env, IDLEFILL_MCP_TOOLS: undefined, ...(env || {}) },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const stderrBuf = [];
+  child.stderr.on('data', (d) => stderrBuf.push(d.toString()));
+  child.stdin.end();
+  const code = await new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      child.kill();
+      resolve(null);
+    }, 10_000);
+    child.on('close', (c) => {
+      clearTimeout(timer);
+      resolve(c);
+    });
+  });
+  return { code, stderr: stderrBuf.join('') };
+}
+
+test('idlefill-mcp issue #15: discovered hello tool — listed, callable, gone when the file is removed', async () => {
+  const scratch = mkdtempSync(join(tmpdir(), 'idlefill-mcp-modules-'));
+  const clientDir = join(scratch, 'client');
+  const dataDir = join(scratch, 'data');
+  mkdirSync(clientDir, { recursive: true });
+  mkdirSync(dataDir, { recursive: true });
+  writeFileSync(
+    join(clientDir, 'config.json'),
+    JSON.stringify({
+      server_url: 'http://127.0.0.1:1',
+      token: 'not-a-real-token',
+      name: 'modules-test',
+      projects: [{ name: 'p1', queue_file: '../data/queue.jsonl', results_file: '../data/results.jsonl' }],
+    }),
+    'utf-8',
+  );
+
+  // The fixture lives in the repo; work from a scratch copy so removal is
+  // provable (and the committed fixture is never mutated). IDLEFILL_MCP_TOOLS
+  // points at the fixture DIRECTORY: deleting the module file inside it must
+  // remove the tool from the list without breaking startup.
+  const fixtureDir = join(scratch, 'hello-tool');
+  const fixtureCopy = join(fixtureDir, 'idlefill-mcp-tools.mjs');
+  mkdirSync(fixtureDir, { recursive: true });
+  writeFileSync(fixtureCopy, readFileSync(FIXTURE_HELLO));
+
+  const CORE = ['idlefill_add_jobs', 'idlefill_queue_status', 'idlefill_results', 'idlefill_remove_jobs', 'idlefill_clear_queue', 'idlefill_job_lookup'];
+  const reqs = [
+    { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '0' } } },
+    { jsonrpc: '2.0', id: 2, method: 'tools/list' },
+    { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'hello', arguments: { name: 'idlefill' } } },
+    { jsonrpc: '2.0', id: 4, method: 'ping' },
+  ];
+
+  try {
+    // Session 1: fixture present → hello listed + callable.
+    const s1 = await driveServer(clientDir, reqs, { IDLEFILL_MCP_TOOLS: fixtureDir });
+    const names1 = s1.byId[2]?.result?.tools?.map((t) => t.name) || [];
+    assert.deepEqual(names1, [...CORE, 'hello'], 'discovered tool appended after core, sorted by name');
+    const hello = s1.call(3);
+    assert.equal(hello.isError, false, 'hello call not an error');
+    assert.equal(hello.p?.ok, true, 'hello returns ok');
+    assert.equal(hello.p?.hello, 'hello idlefill', 'hello returns its content');
+    assert.equal(hello.p?.tool, 'hello', 'call() received the tool name');
+    assert.equal(hello.p?.project, 'p1', 'ctx.project resolved by the server (sole configured project)');
+    assert.deepEqual(hello.p?.known_projects, ['p1'], 'ctx.paths is the resolved projectPaths map');
+    assert.equal(hello.p?.arbiter_is_function, true, 'ctx.arbiter supplied');
+    assert.equal(hello.p?.log_is_function, true, 'ctx.log supplied');
+    if (s1.stderr.trim()) console.log(`modules session 1 stderr:\n${s1.stderr.trim()}`);
+
+    // Session 2: fixture file removed → hello gone, core intact. No edit to
+    // idlefill-mcp.mjs anywhere in this test.
+    rmSync(fixtureCopy);
+    const s2 = await driveServer(clientDir, reqs, { IDLEFILL_MCP_TOOLS: fixtureDir });
+    assert.deepEqual(
+      s2.byId[2]?.result?.tools?.map((t) => t.name) || [],
+      CORE,
+      'removed fixture: tools/list back to core only',
+    );
+    assert.equal(s2.byId[3]?.error?.code, -32602, 'removed fixture: hello call → unknown tool');
+    if (s2.stderr.trim()) console.log(`modules session 2 stderr:\n${s2.stderr.trim()}`);
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('idlefill-mcp issue #15: startup failures — duplicate name in one origin names both paths; api too new refused', async () => {
+  const scratch = mkdtempSync(join(tmpdir(), 'idlefill-mcp-badmod-'));
+  const modA = join(scratch, 'mod-a.mjs');
+  const modB = join(scratch, 'mod-b.mjs');
+  const modNew = join(scratch, 'mod-new.mjs');
+  writeFileSync(modA, 'export default { api: 1, tools: [{ name: "dupe", inputSchema: { type: "object" } }], call: async () => ({ ok: true }) };\n', 'utf-8');
+  writeFileSync(modB, 'export default { api: 1, tools: [{ name: "dupe", inputSchema: { type: "object" } }], call: async () => ({ ok: true }) };\n', 'utf-8');
+  writeFileSync(modNew, 'export default { api: 999, tools: [{ name: "future", inputSchema: { type: "object" } }], call: async () => ({ ok: true }) };\n', 'utf-8');
+
+  try {
+    // Duplicate tool name across two module files of one origin: nonzero exit,
+    // the error names BOTH paths.
+    const dup = await driveStartup({ IDLEFILL_MCP_TOOLS: `${modA}:${modB}` });
+    assert.notEqual(dup.code, 0, 'duplicate tool name → nonzero exit');
+    assert.match(dup.stderr, /duplicate tool name "dupe"/, 'duplicate error names the tool');
+    assert.ok(dup.stderr.includes(modA) && dup.stderr.includes(modB), 'duplicate error names both paths');
+
+    // api above MODULE_API: refused with an actionable message.
+    const future = await driveStartup({ IDLEFILL_MCP_TOOLS: modNew });
+    assert.notEqual(future.code, 0, 'api too new → nonzero exit');
+    assert.match(future.stderr, /targets api 999, but this server speaks MODULE_API 1/, 'api error states both versions');
+    assert.match(future.stderr, /update idlefill-mcp\.mjs/, 'api error is actionable');
+
+    // A module that fails to import is also a startup failure.
+    const broken = join(scratch, 'broken.mjs');
+    writeFileSync(broken, 'export default { tools: [', 'utf-8');
+    const bad = await driveStartup({ IDLEFILL_MCP_TOOLS: broken });
+    assert.notEqual(bad.code, 0, 'unparseable module → nonzero exit');
+    assert.match(bad.stderr, /failed to import/, 'import failure is reported');
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('idlefill-mcp issue #15: throwing module handler → isError naming the module, server stays up', async () => {
+  const scratch = mkdtempSync(join(tmpdir(), 'idlefill-mcp-throw-'));
+  const clientDir = join(scratch, 'client');
+  mkdirSync(clientDir, { recursive: true });
+  writeFileSync(
+    join(clientDir, 'config.json'),
+    JSON.stringify({ server_url: 'http://127.0.0.1:1', token: 'x', name: 'throw-test', projects: [] }),
+    'utf-8',
+  );
+  const mod = join(scratch, 'boom-tool.mjs');
+  writeFileSync(
+    mod,
+    'export default { api: 1, tools: [{ name: "boom", inputSchema: { type: "object" } }], call: async () => { throw new Error("handler exploded"); } };\n',
+    'utf-8',
+  );
+
+  try {
+    const s = await driveServer(clientDir, [
+      { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '0' } } },
+      { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'boom', arguments: {} } },
+      // the server must still answer after the module threw
+      { jsonrpc: '2.0', id: 3, method: 'ping' },
+      { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'boom', arguments: {} } },
+    ], { IDLEFILL_MCP_TOOLS: mod });
+    const boom = s.call(2);
+    assert.equal(boom.isError, true, 'throwing handler → isError: true');
+    assert.match(boom.p ?? s.byId[2]?.result?.content?.[0]?.text ?? '', /handler exploded/, 'the module error message surfaces');
+    assert.ok((s.byId[2]?.result?.content?.[0]?.text || '').includes(mod), 'the error names the module path');
+    assert.equal(s.byId[3]?.result !== undefined, true, 'server stays up: ping answered after the throw');
+    assert.equal(s.call(4).isError, true, 'server still serving: second throw also handled');
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('idlefill-mcp issue #15: core tool schemas byte-identical to tools.golden.json', async () => {
+  const scratch = mkdtempSync(join(tmpdir(), 'idlefill-mcp-golden-'));
+  const clientDir = join(scratch, 'client');
+  mkdirSync(clientDir, { recursive: true });
+  writeFileSync(
+    join(clientDir, 'config.json'),
+    JSON.stringify({
+      server_url: 'http://127.0.0.1:1',
+      token: 'x',
+      name: 'golden-test',
+      projects: [{ name: 'p1', queue_file: '../data/queue.jsonl', results_file: '../data/results.jsonl' }],
+    }),
+    'utf-8',
+  );
+  const golden = readFileSync(join(__dirname, 'tools.golden.json'), 'utf-8');
+  const CORE_NAMES = JSON.parse(golden).map((t) => t.name);
+
+  try {
+    // No IDLEFILL_MCP_TOOLS: the listing is core-only. The core subset of
+    // tools/list must byte-match the committed golden file.
+    const s = await driveServer(clientDir, [
+      { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '0' } } },
+      { jsonrpc: '2.0', id: 2, method: 'tools/list' },
+    ]);
+    const listed = s.byId[2]?.result?.tools || [];
+    const coreSubset = listed.filter((t) => CORE_NAMES.includes(t.name));
+    assert.equal(JSON.stringify(coreSubset, null, 2) + '\n', golden, 'core tools/list schemas byte-identical to golden');
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('idlefill-mcp issue #15: discovered write tool flows through the per-project policy (#14)', async () => {
+  const scratch = mkdtempSync(join(tmpdir(), 'idlefill-mcp-polmod-'));
+  const clientDir = join(scratch, 'client');
+  const dataDir = join(scratch, 'data');
+  mkdirSync(clientDir, { recursive: true });
+  mkdirSync(dataDir, { recursive: true });
+  writeFileSync(
+    join(clientDir, 'config.json'),
+    JSON.stringify({
+      server_url: 'http://127.0.0.1:1',
+      token: 'x',
+      name: 'polmod-test',
+      projects: [
+        { name: 'open', queue_file: '../data/queue-open.jsonl', results_file: '../data/results-open.jsonl' },
+        { name: 'ro', queue_file: '../data/queue-ro.jsonl', results_file: '../data/results-ro.jsonl', mcp: { allow_write: false } },
+      ],
+    }),
+    'utf-8',
+  );
+  // A discovered WRITE tool (annotations say so) — the policy must hide and
+  // block it for allow_write:false exactly like the core write tools.
+  const mod = join(scratch, 'writey-tool.mjs');
+  writeFileSync(
+    mod,
+    'export default {\n' +
+      '  api: 1,\n' +
+      '  tools: [{ name: "writey", inputSchema: { type: "object" }, annotations: { readOnlyHint: false, destructiveHint: true } }],\n' +
+      '  call: async () => ({ ok: true, wrote: true }),\n' +
+      '};\n',
+    'utf-8',
+  );
+
+  try {
+    const s = await driveServer(clientDir, [
+      { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '0' } } },
+      { jsonrpc: '2.0', id: 2, method: 'tools/list', params: { project: 'ro' } },
+      { jsonrpc: '2.0', id: 3, method: 'tools/list', params: { project: 'open' } },
+      { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'writey', arguments: { project: 'ro' } } },
+      { jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'writey', arguments: { project: 'open' } } },
+    ], { IDLEFILL_MCP_TOOLS: mod });
+
+    const roNames = s.byId[2]?.result?.tools?.map((t) => t.name) || [];
+    assert.ok(!roNames.includes('writey'), 'discovered write tool hidden from allow_write:false project');
+    const openNames = s.byId[3]?.result?.tools?.map((t) => t.name) || [];
+    assert.ok(openNames.includes('writey'), 'discovered write tool visible to the open project');
+
+    const blocked = s.call(4);
+    assert.equal(blocked.isError, true, 'discovered write tool blocked at the call site for ro');
+    assert.match(blocked.p?.error ?? '', /write not allowed for project "ro" \(mcp\.allow_write\)/, 'policy reason identical to core write tools');
+    assert.equal(s.call(5).p?.ok, true, 'discovered write tool works for the open project');
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('idlefill-mcp issue #15 (unit): discoverToolModules — adapter glob, env shadowing, core collision, sort', async () => {
+  const { discoverToolModules, MODULE_API } = await import('./mcp-tools-registry.mjs');
+  const scratch = mkdtempSync(join(tmpdir(), 'idlefill-mcp-unit-'));
+  // A scratch repoRoot with two adapter dirs: one carries the default
+  // idlefill-mcp-tools.mjs (origin a), one names its module via the manifest's
+  // idlefill.mcp_tools field.
+  const repoRoot = join(scratch, 'repo');
+  const adir = join(repoRoot, 'adapters', 'alpha');
+  const bdir = join(repoRoot, 'adapters', 'beta');
+  mkdirSync(adir, { recursive: true });
+  mkdirSync(bdir, { recursive: true });
+  writeFileSync(join(adir, 'package.json'), JSON.stringify({ name: 'x', idlefill: { name: 'alpha', executor: 'node x.mjs' } }), 'utf-8');
+  writeFileSync(join(adir, 'idlefill-mcp-tools.mjs'), 'export default { api: 1, tools: [{ name: "zeta_tool", inputSchema: { type: "object" } }, { name: "alpha_tool", inputSchema: { type: "object" } }], call: async () => ({ ok: true }) };\n', 'utf-8');
+  writeFileSync(join(bdir, 'package.json'), JSON.stringify({ name: 'y', idlefill: { name: 'beta', executor: 'node y.mjs', mcp_tools: 'custom-tools.mjs' } }), 'utf-8');
+  writeFileSync(join(bdir, 'custom-tools.mjs'), 'export default { api: 1, tools: [{ name: "shadowed", inputSchema: { type: "object" } }], call: async () => ({ ok: true, from: "adapter" }) };\n', 'utf-8');
+  // Origin (b): an env module with the same "shadowed" name + its own tool.
+  const envMod = join(scratch, 'env-tool.mjs');
+  writeFileSync(envMod, 'export default { api: 1, tools: [{ name: "shadowed", inputSchema: { type: "object" } }, { name: "env_tool", inputSchema: { type: "object" } }], call: async () => ({ ok: true, from: "env" }) };\n', 'utf-8');
+
+  try {
+    const { tools, shadowed } = await discoverToolModules({
+      repoRoot,
+      extraPaths: [envMod],
+      coreNames: ['idlefill_add_jobs'],
+    });
+    assert.deepEqual(
+      tools.map((t) => t.def.name),
+      ['alpha_tool', 'env_tool', 'shadowed', 'zeta_tool'],
+      'merged set sorted by name (readdir order irrelevant)',
+    );
+    assert.equal(shadowed.length, 1, 'adapter name shadows the env module');
+    assert.equal(shadowed[0].name, 'shadowed', 'shadow report names the shadowed tool');
+    assert.ok(shadowed[0].winner.includes(bdir) && shadowed[0].loser === envMod, 'shadow report names winner + loser paths');
+    // The surviving "shadowed" entry is the adapter one (beta's manifest-named
+    // module — proving the idlefill.mcp_tools field is honoured).
+    const sh = tools.find((t) => t.def.name === 'shadowed');
+    assert.ok(sh.modulePath.includes(bdir), 'adapter module wins the shadowed name');
+    // MODULE_API is exported and >= 1 (settled decision #5).
+    assert.ok(MODULE_API >= 1, 'MODULE_API starts at 1');
+
+    // Core-name collision: startup error, not a silent overwrite.
+    const coreMod = join(scratch, 'core-clash.mjs');
+    writeFileSync(coreMod, 'export default { api: 1, tools: [{ name: "idlefill_add_jobs", inputSchema: { type: "object" } }], call: async () => ({}) };\n', 'utf-8');
+    await assert.rejects(
+      () => discoverToolModules({ repoRoot, extraPaths: [coreMod], coreNames: ['idlefill_add_jobs'] }),
+      /re-declares core tool "idlefill_add_jobs"/,
+      'core tool cannot be overridden by a module',
+    );
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});

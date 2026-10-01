@@ -1,0 +1,175 @@
+[
+  {
+    "name": "idlefill_add_jobs",
+    "description": "Add one or more job openings to an idlefill project queue so the idlefill client daemon evaluates them whenever the local LLM server is idle. Each job: { url (required, http(s)), company?, title?, score? (number 0-100 — the daemon dispatches highest-score-first, FIFO tiebreak), extra? (free object) }. The response echoes each stored job as { job_id, url, company, title } so the caller can verify what landed. A job is skipped when it is already in the queue, its last result is ok:true, or it was quarantined; duplicates within the batch collapse to one. The response names each skip (skipped_in_queue / skipped_done / skipped_quarantined). dry_run=true previews without writing. The daemon picks up new lines on its next idle grant — no restart.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "description": "idlefill project name (default: the sole configured project or adapter)"
+        },
+        "jobs": {
+          "type": "array",
+          "description": "jobs to enqueue",
+          "items": {
+            "type": "object",
+            "properties": {
+              "url": {
+                "type": "string"
+              },
+              "company": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "score": {
+                "type": "number"
+              },
+              "extra": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "url"
+            ]
+          }
+        },
+        "dry_run": {
+          "type": "boolean",
+          "description": "preview only, do not write the queue file"
+        }
+      },
+      "required": [
+        "jobs"
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true
+    }
+  },
+  {
+    "name": "idlefill_queue_status",
+    "description": "Show the idlefill queue(s): queue depth, a PREVIEW of the first jobs (default 10, raise with limit up to 200) with retry attempts, plus — when the arbiter is reachable — the idle signal, the project pause/budget state, connected workers, and any job currently running.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "description": "project to focus the arbiter part on (default: the sole configured project or adapter)"
+        },
+        "limit": {
+          "type": "number",
+          "description": "how many queued jobs to preview, 1-200 (default 10)"
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false
+    }
+  },
+  {
+    "name": "idlefill_results",
+    "description": "Show recent evaluation results from a project (newest first): job_id, ok, score, error, company, title, tokens_out, timestamp, report path. company/title are present on rows written by the career-ops executor; rows from other executors may lack them (null).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "description": "default: the sole configured project or adapter"
+        },
+        "limit": {
+          "type": "number",
+          "description": "how many lines, 1-200 (default 20)"
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false
+    }
+  },
+  {
+    "name": "idlefill_remove_jobs",
+    "description": "Drop one or more jobs from an idlefill project queue by EXACT job_id (no fuzzy match). Unknown job ids are reported (not_found), not an error. dry_run=true previews without writing. Only the queue file is touched: removing a job that is CURRENTLY RUNNING does not cancel its lease — the lease settles on its own and the job is simply no longer re-queued. Use idlefill_queue_status or idlefill_job_lookup to list job_ids first.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "description": "idlefill project name (default: the sole configured project or adapter)"
+        },
+        "job_ids": {
+          "type": "array",
+          "description": "exact job_ids to drop from the queue",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dry_run": {
+          "type": "boolean",
+          "description": "preview only, do not write the queue file"
+        }
+      },
+      "required": [
+        "job_ids"
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true
+    }
+  },
+  {
+    "name": "idlefill_clear_queue",
+    "description": "Empty an idlefill project queue (remove every queued job). dry_run=true previews the count without writing. Only the queue file is touched: in-flight leases settle on their own. Results/quarantine files are never modified.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "description": "idlefill project name (default: the sole configured project or adapter)"
+        },
+        "dry_run": {
+          "type": "boolean",
+          "description": "preview only, do not write the queue file"
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true
+    }
+  },
+  {
+    "name": "idlefill_job_lookup",
+    "description": "Find a job by EXACT job_id (identity is <company-slug>-<sha256(url)[0:8]> — no fuzzy search, it would mislead). Returns in_queue + 1-based queue position + the job payload (url/company/title/score/attempts), its results history (last N lines: ok/score/error/ts/report_path), and the done/quarantined ground-truth facts. When the arbiter is reachable it also reports whether the job is running (lease) or throttled. A job this arbiter never saw returns {ok:true, found:false} with a hint (it may be done or quarantined — those facts are returned either way).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "description": "idlefill project name (default: the sole configured project or adapter)"
+        },
+        "job_id": {
+          "type": "string",
+          "description": "the exact job_id to look up"
+        },
+        "limit": {
+          "type": "number",
+          "description": "how many results lines to include, 1-100 (default 20)"
+        }
+      },
+      "required": [
+        "job_id"
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false
+    }
+  }
+]

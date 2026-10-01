@@ -18,7 +18,11 @@
  *     "payload_fields": ["url","company","title"],  // job.payload keys forwarded
  *     "result_hint": ["ok","tokens_out","tokens_in","score","report_path","error"],
  *     "estimated_seconds": 900,
- *     "timeout_seconds": 1200
+ *     "timeout_seconds": 1200,
+ *     "mcp_tools": "idlefill-mcp-tools.mjs"  // optional: names the adapter's
+ *                                            // MCP tool module (issue #15);
+ *                                            // the MCP server reads this, the
+ *                                            // daemon ignores it
  *   }
  *
  * cwd is deliberately NOT manifest material: it is machine-specific and stays

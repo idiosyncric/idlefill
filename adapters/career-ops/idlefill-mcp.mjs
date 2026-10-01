@@ -21,6 +21,16 @@
  * (isError + the governing field named). IDLEFILL_MCP_READ_ONLY=1 blocks every
  * write-bearing tool for every project (operator escape hatch).
  *
+ * Tool modules (issue #15): the tool table is extensible. At STARTUP the
+ * server discovers tool modules — ES modules default-exporting
+ * { api?, tools, call } — at (a) adapters/<dir>/idlefill-mcp-tools.mjs (an
+ * adapter manifest's idlefill.mcp_tools field may name another file) and
+ * (b) IDLEFILL_MCP_TOOLS (":"-separated paths). (a) shadows (b). Discovered
+ * tools merge with the core set — tools/list = (core ∪ discovered) ∩ policy —
+ * and flow through the same per-project policy. A duplicate tool name within
+ * one origin, a module re-declaring a core tool, a module whose api exceeds
+ * MODULE_API, or a module that fails to import aborts startup (exit nonzero).
+ *
  * Transport: MCP over stdio — newline-delimited JSON per the MCP stdio spec
  * (JSON-RPC 2.0). No dependencies — Node builtins only; runs under plain
  * `node`.
@@ -42,6 +52,7 @@ import { createHash } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { StringDecoder } from 'node:string_decoder';
+import { discoverToolModules, parseToolPathsEnv } from './mcp-tools-registry.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, '..', '..');
@@ -110,10 +121,28 @@ function projectPaths(cfg) {
 // at tools/call. Optional `mcp` block per projects[] entry:
 //   { enabled?: bool, tools?: string[], allow_write?: bool }
 // A project with no mcp block behaves exactly as before (all tools).
+// Discovered tool modules (issue #15) flow through this policy unchanged: the
+// merged set (core ∪ discovered) is filtered/enforced exactly like core.
 // ---------------------------------------------------------------------------
 
-/** WRITE-bearing tools: every one of these mutates the queue file. */
+/** WRITE-bearing core tools: every one of these mutates the queue file. */
 const WRITE_TOOLS = new Set(['idlefill_add_jobs', 'idlefill_remove_jobs', 'idlefill_clear_queue']);
+
+// --- merged tool table (issue #15) -----------------------------------------
+// DISCOVERED is populated once at startup (before serving) by
+// discoverToolModules; each entry is { def, modulePath, call }. A discovered
+// tool counts as WRITE-BEARING when its annotations say readOnlyHint:false or
+// destructiveHint:true — the policy then treats it exactly like a core write
+// tool (settled decision #8).
+let DISCOVERED = [];
+let discoveredByName = new Map();
+let discoveredWrite = new Set();
+
+const allToolDefs = () => [...TOOLS, ...DISCOVERED.map((d) => d.def)];
+const allToolNames = () => allToolDefs().map((t) => t.name);
+const toolDef = (name) => (name in TOOL_IMPL ? TOOLS.find((t) => t.name === name) : discoveredByName.get(name)?.def);
+const knownTool = (name) => name in TOOL_IMPL || discoveredByName.has(name);
+const isWriteTool = (name) => WRITE_TOOLS.has(name) || discoveredWrite.has(name);
 
 /** Operator escape hatch: read-only for EVERY project regardless of config. */
 const READ_ONLY_MODE = process.env.IDLEFILL_MCP_READ_ONLY === '1';
@@ -140,7 +169,7 @@ function visibleToolsFor(p) {
     list = [];
     for (const t of m.tools) {
       if (typeof t !== 'string' || !t) continue;
-      if (!(t in TOOL_IMPL)) {
+      if (!knownTool(t)) {
         if (!warnedUnknownToolNames.has(t)) {
           warnedUnknownToolNames.add(t);
           process.stderr.write(`idlefill-mcp: ignoring unknown tool name "${t}" in mcp.tools for project "${p.name}"\n`);
@@ -150,10 +179,10 @@ function visibleToolsFor(p) {
       list.push(t);
     }
   } else {
-    list = TOOLS.map((t) => t.name);
+    list = allToolNames();
   }
   const allowWrite = !READ_ONLY_MODE && m.allow_write !== false;
-  if (!allowWrite) list = list.filter((t) => !WRITE_TOOLS.has(t));
+  if (!allowWrite) list = list.filter((t) => !isWriteTool(t));
   return list;
 }
 
@@ -167,7 +196,7 @@ function enforceToolPolicy(name, project, cfg) {
   const entry = projectEntries(cfg).find((p) => p.name === project);
   if (!entry || !projectEnabled(entry)) return null;
   const m = mcpBlock(entry);
-  const isWrite = WRITE_TOOLS.has(name);
+  const isWrite = isWriteTool(name);
   if (isWrite && READ_ONLY_MODE) return `read-only mode (IDLEFILL_MCP_READ_ONLY): write not allowed for project "${project}"`;
   if (isWrite && m.allow_write === false) return `write not allowed for project "${project}" (mcp.allow_write)`;
   if (!visibleToolsFor(entry).includes(name)) return `tool "${name}" not in mcp.tools for project "${project}"`;
@@ -176,8 +205,8 @@ function enforceToolPolicy(name, project, cfg) {
 
 /** Tool shape for a tools/list response: static schema + EFFECTIVE annotations. */
 function shapeToolForList(name, effectiveWritable) {
-  const base = TOOLS.find((t) => t.name === name);
-  const writable = effectiveWritable !== undefined ? effectiveWritable : WRITE_TOOLS.has(name);
+  const base = toolDef(name);
+  const writable = effectiveWritable !== undefined ? effectiveWritable : isWriteTool(name);
   return { ...base, annotations: { readOnlyHint: !writable, destructiveHint: writable } };
 }
 
@@ -186,24 +215,25 @@ function shapeToolForList(name, effectiveWritable) {
  * enabled projects' visible sets, with annotations reflecting the
  * MOST-RESTRICTIVE effective permission (a write tool that some project may
  * not write is annotated as not-writable). Deterministic: union order is the
- * static TOOLS order.
+ * merged table order — core tools in their static order, then discovered
+ * tools sorted by name (issue #15).
  */
 function unionToolsForList(cfg) {
   const entries = projectEntries(cfg).filter(projectEnabled);
   // No configured (enabled) projects: no policy source exists — publish the
-  // full static table exactly as today (calls still resolve via adapter
+  // full merged table exactly as today (calls still resolve via adapter
   // discovery / the unknown-project error).
-  if (entries.length === 0) return TOOLS.map((t) => shapeToolForList(t.name));
+  if (entries.length === 0) return allToolDefs().map((t) => shapeToolForList(t.name));
   const visible = new Set();
   for (const p of entries) for (const t of visibleToolsFor(p)) visible.add(t);
-  return TOOLS.map((t) => t.name)
+  return allToolNames()
     .filter((n) => visible.has(n))
     .map((n) => {
       // Most-restrictive: a write tool is annotated writable only when EVERY
       // enabled project may write it (a tool some project cannot write is not
       // reliably writable in the no-context union view).
       const writable = entries.every((p) => visibleToolsFor(p).includes(n));
-      return shapeToolForList(n, WRITE_TOOLS.has(n) ? writable : false);
+      return shapeToolForList(n, isWriteTool(n) ? writable : false);
     });
 }
 
@@ -970,14 +1000,15 @@ async function handle(msg) {
     case 'notifications/cancelled':
       return;
     case 'tools/list': {
-      // Policy-resolved listing (issue #14). params.project (nonstandard
+      // Policy-resolved listing (issue #14) over the MERGED table
+      // (core ∪ discovered, issue #15). params.project (nonstandard
       // extension, advertised in initialize) selects one project's effective
       // set; with no param, the union across enabled projects with
       // most-restrictive annotations.
       let shaped;
       const cfg = loadClientConfig();
       if (cfg.__error) {
-        shaped = TOOLS.map((t) => shapeToolForList(t.name));
+        shaped = allToolDefs().map((t) => shapeToolForList(t.name));
       } else if (params && typeof params.project === 'string' && params.project) {
         const entry = projectEntries(cfg).find((p) => p.name === params.project);
         if (!entry || !projectEnabled(entry)) {
@@ -1000,7 +1031,8 @@ async function handle(msg) {
     case 'tools/call': {
       const name = params?.name;
       const impl = TOOL_IMPL[name];
-      if (!impl) {
+      const discovered = discoveredByName.get(name);
+      if (!impl && !discovered) {
         if (isNotification) return;
         fail(id, -32602, `unknown tool: ${name}`);
         return;
@@ -1008,9 +1040,10 @@ async function handle(msg) {
       // Enforce the per-project policy at the call site (issue #14: enforce,
       // do not merely hide). Resolve the project exactly as the tool would.
       const cfg = loadClientConfig();
+      let project = '';
       if (!cfg.__error) {
         const args0 = params?.arguments || {};
-        const project = String(args0.project || defaultProject(cfg) || '');
+        project = String(args0.project || defaultProject(cfg) || '');
         const denied = enforceToolPolicy(name, project, cfg);
         if (denied) {
           log(`policy block tool=${name} project=${project}: ${denied}`);
@@ -1019,10 +1052,27 @@ async function handle(msg) {
         }
       }
       try {
-        const result = await impl(params?.arguments || {});
+        let result;
+        if (impl) {
+          result = await impl(params?.arguments || {});
+        } else {
+          // Discovered tool module (issue #15): the server supplies the full
+          // call context — the module never resolves config or paths itself.
+          const ctx = {
+            project,
+            paths: projectPaths(cfg),
+            config: cfg,
+            arbiter: () => arbiterState(cfg),
+            log: (msg) => process.stderr.write(`idlefill-mcp[${name}]: ${msg}\n`),
+          };
+          result = await discovered.call(name, params?.arguments || {}, ctx);
+        }
         respond(id, { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }], isError: result && result.ok === false });
       } catch (e) {
-        respond(id, { content: [{ type: 'text', text: `error: ${e.message}` }], isError: true });
+        // A throwing module handler is an isError result naming the module —
+        // the server process stays up (issue #15 acceptance).
+        const where = discovered ? ` (tool module ${discovered.modulePath})` : '';
+        respond(id, { content: [{ type: 'text', text: `error: ${e.message}${where}` }], isError: true });
       }
       return;
     }
@@ -1056,8 +1106,49 @@ function onData(chunk) {
   }
 }
 
-process.stdin.on('data', onData);
-process.stdin.on('end', () => process.exit(0));
-process.on('SIGTERM', () => process.exit(0));
-process.on('SIGINT', () => process.exit(0));
-log('idlefill-mcp server started (stdio)');
+/**
+ * Startup (issue #15): tool-module discovery runs BEFORE serving — a discovery
+ * failure (duplicate within one origin, core-name collision, api too new,
+ * module import throws) exits nonzero with the message on stderr. Success
+ * populates the merged table; only then does stdin get attached.
+ */
+async function main() {
+  // Golden-file regeneration: `node idlefill-mcp.mjs --dump-core-tools`
+  // prints the core tools exactly as tools/list shapes them (issue #15
+  // settled decision #6). Not part of serving.
+  if (process.argv.includes('--dump-core-tools')) {
+    process.stdout.write(JSON.stringify(TOOLS.map((t) => shapeToolForList(t.name)), null, 2) + '\n');
+    process.exit(0);
+  }
+  try {
+    const { tools, shadowed } = await discoverToolModules({
+      repoRoot: REPO_ROOT,
+      extraPaths: parseToolPathsEnv(process.env.IDLEFILL_MCP_TOOLS),
+      coreNames: TOOLS.map((t) => t.name),
+    });
+    DISCOVERED = tools;
+    discoveredByName = new Map(tools.map((t) => [t.def.name, t]));
+    // A discovered tool is WRITE-BEARING when its annotations say so — the
+    // per-project policy (#14) then filters/blocks it exactly like core.
+    discoveredWrite = new Set(
+      tools
+        .filter((t) => t.def.annotations && (t.def.annotations.readOnlyHint === false || t.def.annotations.destructiveHint === true))
+        .map((t) => t.def.name),
+    );
+    for (const s of shadowed) {
+      process.stderr.write(`idlefill-mcp: tool "${s.name}" from ${s.loser} shadowed by the same name in ${s.winner}\n`);
+    }
+    if (DISCOVERED.length) log(`tool modules: ${DISCOVERED.map((d) => `${d.def.name} (${d.modulePath})`).join(', ')}`);
+  } catch (e) {
+    process.stderr.write(`idlefill-mcp: startup failed: ${e.message}\n`);
+    log(`startup failed: ${e.stack || e}`);
+    process.exit(1);
+  }
+  process.stdin.on('data', onData);
+  process.stdin.on('end', () => process.exit(0));
+  process.on('SIGTERM', () => process.exit(0));
+  process.on('SIGINT', () => process.exit(0));
+  log('idlefill-mcp server started (stdio)');
+}
+
+main();

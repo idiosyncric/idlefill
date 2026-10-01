@@ -1018,6 +1018,45 @@ as an MCP server pointing at the file, e.g.:
 Test: `node --test adapters/career-ops/mcp.test.mjs` (drives the real
 process over stdio against scratch ground-truth files).
 
+### Extending the MCP server with tool modules (issue #15)
+
+The server's tool table is an extension point: a **tool module** is an ES
+module that default-exports `{ api, tools, call }` — `api` is the
+server↔module contract version it targets (`MODULE_API` in
+`adapters/career-ops/mcp-tools-registry.mjs`, currently 1; a module declaring
+a higher `api` aborts startup with an actionable message), `tools` is the
+array of JSON Schema tool definitions exactly as `tools/list` requires, and
+`call(name, args, ctx)` is the handler. `ctx` is supplied by the server —
+`{ project, paths, config, arbiter, log }` — so a module never resolves the
+client config itself and never opens a file by a hand-computed path.
+
+Discovery runs once at startup, two origins searched in order:
+
+1. `adapters/<dir>/idlefill-mcp-tools.mjs` — one bounded scan, same depth as
+   the adapter registry. An adapter ships its module with the adapter; the
+   optional `idlefill.mcp_tools` manifest field names a different file.
+2. `IDLEFILL_MCP_TOOLS` — a `:`-separated path list (absolute or relative)
+   for out-of-tree tools. A path may be a module file or a directory holding
+   `idlefill-mcp-tools.mjs`.
+
+Names from (1) shadow names from (2) (reported on stderr). A duplicate tool
+name within one origin, a module re-declaring a core tool, an api-too-new
+module, or a module that fails to import aborts startup (exit nonzero, the
+message on stderr names both offending paths for duplicates). The published
+set is `(core ∪ discovered) ∩ policy` — discovered tools flow through the
+per-project `mcp` policy (#14) unchanged, and a discovered tool whose
+annotations say `readOnlyHint:false` / `destructiveHint:true` is treated as
+write-bearing (blocked for `allow_write:false` projects exactly like the core
+write tools). Registration order is sorted by name, so the list never depends
+on readdir order. A throwing module handler is reported as `isError: true`
+naming the module; the server stays up.
+
+The core tools' JSON Schemas are pinned in `adapters/career-ops/tools.golden.json`
+(regenerate: `node adapters/career-ops/idlefill-mcp.mjs --dump-core-tools`);
+the test byte-compares the core subset of `tools/list` against it. The
+fixture `adapters/career-ops/test-fixtures/hello-tool/` is the reference
+module. The `register(api)` module shape is deliberately out of scope.
+
 ## Conventions
 
 See `AGENTS.md`. Short version: Node 22, ESM, `node --test` (run via tsx for
