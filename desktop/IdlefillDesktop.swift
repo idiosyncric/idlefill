@@ -207,6 +207,17 @@ final class AppModel: ObservableObject {
   @Published var menubarLoaded = false
   @Published var daemonNote: String? = nil
   @Published var menubarNote: String? = nil
+  /** Issue #23: the executable each loaded agent ACTUALLY runs (the
+   *  LOADED service's ProgramArguments.0 from `launchctl print` — not the
+   *  on-disk plist). nil while the label is not loaded. The Settings rows
+   *  show these so a stale agent is distinguishable from a healthy one. */
+  @Published var daemonRuns: String? = nil
+  @Published var menubarRuns: String? = nil
+  /** Exception-Only (DESIGN.md): true ONLY when the loaded menubar agent
+   *  runs a DIFFERENT executable than this checkout's built bundle. No
+   *  mark when healthy; clears after a successful re-point (the state is
+   *  re-read from real launchd on every poll). */
+  @Published var menubarStale = false
 
   // auto-update (Sparkle + the edge channel)
   @Published var updateStatus: String? = nil
@@ -1269,26 +1280,75 @@ final class AppModel: ObservableObject {
 
   /** Is the label loaded in our gui domain? exit 0 = loaded. */
   func isLoaded(_ label: String) -> Bool {
+    launchctlPrint(label) != nil
+  }
+
+  /** The LOADED service's ProgramArguments.0 (issue #23) — parsed from
+   *  `launchctl print gui/<uid>/<label>` (the LOADED view, NOT the
+   *  on-disk plist — plutil reads a file that may not be what launchd
+   *  actually loaded). nil when the label is not loaded or the block is
+   *  unreadable. */
+  func runningExecutable(_ label: String) -> String? {
+    launchctlPrint(label).flatMap { firstArgument($0) }
+  }
+
+  /// Run `launchctl print gui/<uid>/<label>`, returning its stdout when
+  /// the label is loaded (exit 0), nil otherwise. Temp-file capture (the
+  /// 64 KB Pipe-deadlock class — print output is small but the rule is
+  /// the class fix).
+  private func launchctlPrint(_ label: String) -> String? {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
     p.arguments = ["print", "gui/\(uid)/\(label)"]
     let tmp = tempFile("idlefill-desktop-lc-\(getpid())-\(label.replacingOccurrences(of: ".", with: "_"))")
-    guard let out = FileHandle(forWritingAtPath: tmp) else { return false }
+    guard let out = FileHandle(forWritingAtPath: tmp) else { return nil }
     p.standardOutput = out
     p.standardError = FileHandle.nullDevice
     do { try p.run() } catch {
       try? out.close(); try? FileManager.default.removeItem(atPath: tmp)
-      return false
+      return nil
     }
     p.waitUntilExit()
     try? out.close()
-    try? FileManager.default.removeItem(atPath: tmp)
-    return p.terminationStatus == 0
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+    guard p.terminationStatus == 0 else { return nil }
+    return (try? String(contentsOfFile: tmp, encoding: .utf8)) ?? ""
+  }
+
+  /** The executable this checkout's menubar bundle build produces — the
+   *  path a healthy menubar agent must run (menubar/build.sh's output;
+   *  the committed plist template renders exactly this). */
+  func menubarBundleExecutable() -> String {
+    (repoRoot as NSString)
+      .appendingPathComponent("menubar/IdlefillMenubar.app/Contents/MacOS/IdlefillMenubar")
   }
 
   func refreshLaunchdState() {
-    daemonLoaded = isLoaded(daemonLabel)
-    menubarLoaded = isLoaded(menubarLabel)
+    // One `launchctl print` per label — loaded-ness AND the running
+    // executable come from the same LOADED view.
+    let dPrint = launchctlPrint(daemonLabel)
+    let mPrint = launchctlPrint(menubarLabel)
+    daemonLoaded = dPrint != nil
+    menubarLoaded = mPrint != nil
+    // Issue #23: surface WHAT each agent runs. The drift marker is
+    // exception-only: it fires only when the loaded menubar agent runs a
+    // different executable than this checkout's built bundle — a stale
+    // agent becomes visible instead of masquerading as healthy.
+    daemonRuns = dPrint.flatMap { firstArgument($0) }
+    menubarRuns = mPrint.flatMap { firstArgument($0) }
+    menubarStale = menubarLoaded && (menubarRuns != menubarBundleExecutable())
+  }
+
+  /// The first ProgramArguments entry from a `launchctl print` dump.
+  private func firstArgument(_ printOutput: String) -> String? {
+    guard let start = printOutput.range(of: "arguments = {") else { return nil }
+    let rest = printOutput[start.upperBound...]
+    for line in rest.split(separator: "\n") {
+      let t = line.trimmingCharacters(in: .whitespaces)
+      if t == "}" { return nil }
+      if !t.isEmpty { return t }
+    }
+    return nil
   }
 
   /** Run a command, capturing stdout/stderr to a TEMP FILE (a Pipe +
@@ -1450,8 +1510,13 @@ final class AppModel: ObservableObject {
 
   // MARK: menu bar agent
 
+  /** The executable this checkout's menubar bundle build produces — the
+   *  path a healthy menubar agent must run (menubar/build.sh's output;
+   *  the committed plist template renders exactly this). Issue #23: the
+   *  desktop's own plist renders THIS path (the bundle era), so a
+   *  desktop-installed agent never reads as stale against its own build. */
   func menubarBinaryPath() -> String {
-    (repoRoot as NSString).appendingPathComponent("menubar/IdlefillMenubar")
+    menubarBundleExecutable()
   }
 
   func menubarPlistXML() -> String {
@@ -1837,6 +1902,15 @@ struct SettingsPanel: View {
         }
         .toggleStyle(SwitchToggleStyle(tint: Pal.accent))
         .controlSize(.small)
+        // Issue #23: the toggle row carries the agent's ACTUAL running
+        // executable (the LOADED launchctl view) — a stale agent is no
+        // longer indistinguishable from a healthy one.
+        if let runs = m.daemonRuns {
+          Text("runs: \(runs)").font(.system(size: 11, design: .monospaced))
+            .foregroundStyle(Pal.dim)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .textSelection(.enabled)
+        }
 
         Toggle(isOn: Binding(
           get: { m.menubarLoaded },
@@ -1846,6 +1920,27 @@ struct SettingsPanel: View {
         }
         .toggleStyle(SwitchToggleStyle(tint: Pal.accent))
         .controlSize(.small)
+        if let runs = m.menubarRuns {
+          Text("runs: \(runs)").font(.system(size: 11, design: .monospaced))
+            .foregroundStyle(Pal.dim)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .textSelection(.enabled)
+        }
+        // The stale marker (issue #23) — EXCEPTION-ONLY (DESIGN.md): it
+        // appears only when the loaded menubar agent runs a different
+        // executable than this checkout's built bundle. No mark when
+        // healthy; it clears on the next poll after a successful
+        // re-point (Update Code / Install Update / install.sh).
+        if m.menubarStale {
+          HStack(spacing: 6) {
+            Text("stale").font(.system(size: 11, weight: .semibold, design: .monospaced))
+              .foregroundStyle(Pal.warn)
+            Text("the agent does not run this checkout's built bundle — Update Code or Install Update re-points it")
+              .font(.system(size: 11, design: .monospaced))
+              .foregroundStyle(Pal.dim)
+          }
+          .frame(maxWidth: .infinity, alignment: .leading)
+        }
 
         if let note = m.daemonNote {
           Text(note).font(.system(.caption, design: .monospaced)).foregroundStyle(Pal.err)

@@ -48,6 +48,32 @@ mkdir -p "$T/scratch/Idlefill.app/Contents/MacOS"
 echo "CURRENT-BUNDLE" > "$T/scratch/Idlefill.app/Contents/MacOS/Idlefill"
 printf '<?xml version="1.0"?><plist version="1.0"><dict></dict></plist>' > "$T/scratch/Idlefill.app/Contents/Info.plist"
 
+# ---- issue #23 drift-marker fixtures (the --drift run) -------------------
+# A scratch REPO whose built-bundle path exists (a sleep script standing
+# in for the menubar bundle executable), a STALE executable elsewhere, and
+# two SCRATCH launchd labels bootstrapped via the desktop app's own
+# IDLEFILL_DESKTOP_TEST hook labels. The menubar label starts on the
+# STALE path; the harness then re-bootstraps it on the bundle path to
+# prove the marker clears after a re-point. NEVER the real labels.
+DT_MB_LABEL="com.sam.idlefill.dt-drift-mb"
+DT_DA_LABEL="com.sam.idlefill.dt-drift-daemon"
+mkdir -p "$T/drepo/menubar/IdlefillMenubar.app/Contents/MacOS" "$T/stale" "$T/plists" "$T/plists-good"
+printf '#!/bin/sh\nexec sleep 3600\n' > "$T/drepo/menubar/IdlefillMenubar.app/Contents/MacOS/IdlefillMenubar"
+printf '#!/bin/sh\nexec sleep 3600\n' > "$T/stale/IdlefillMenubar"
+chmod +x "$T/drepo/menubar/IdlefillMenubar.app/Contents/MacOS/IdlefillMenubar" "$T/stale/IdlefillMenubar"
+mk_dt_plist() { # <dir> <label> <prog…>
+  { printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0">\n<dict>\n  <key>Label</key><string>%s</string>\n  <key>ProgramArguments</key>\n  <array>\n' "$2"
+    for a in "${@:3}"; do printf '    <string>%s</string>\n' "$a"; done
+    printf '  </array>\n  <key>RunAtLoad</key><true/>\n</dict>\n</plist>\n'; } > "$1/$2.plist"
+}
+mk_dt_plist "$T/plists" "$DT_MB_LABEL" "$T/stale/IdlefillMenubar"
+mk_dt_plist "$T/plists" "$DT_DA_LABEL" /bin/sleep 3600
+mk_dt_plist "$T/plists-good" "$DT_MB_LABEL" "$T/drepo/menubar/IdlefillMenubar.app/Contents/MacOS/IdlefillMenubar"
+launchctl bootout "gui/$(id -u)/$DT_MB_LABEL" 2>/dev/null || true
+launchctl bootout "gui/$(id -u)/$DT_DA_LABEL" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$T/plists/$DT_MB_LABEL.plist" || { echo "error: drift mb bootstrap failed"; exit 1; }
+launchctl bootstrap "gui/$(id -u)" "$T/plists/$DT_DA_LABEL.plist" || { echo "error: drift daemon bootstrap failed"; launchctl bootout "gui/$(id -u)/$DT_MB_LABEL" 2>/dev/null || true; exit 1; }
+
 # ---- the edge release's artifact: a fake Idlefill.app bundle zipped
 # ---- (bundle at the zip root — the release convention) + sidecars ------
 # The edge zip is named "Idlefill <marker>.zip" (a SPACE — the edge
@@ -140,7 +166,7 @@ setTimeout(() => process.exit(0), 180000);
 EOF
 node "$T/stub.js" > "$T/stub.log" 2>&1 &
 STUB_PID=$!
-trap 'kill $STUB_PID 2>/dev/null || true; rm -rf "$T"' EXIT
+trap 'launchctl bootout "gui/'"$(id -u)"'/'"$DT_MB_LABEL"'" 2>/dev/null || true; launchctl bootout "gui/'"$(id -u)"'/'"$DT_DA_LABEL"'" 2>/dev/null || true; kill $STUB_PID 2>/dev/null || true; rm -rf "$T"' EXIT
 for i in $(seq 1 50); do
   grep -q "STUB-UP" "$T/stub.log" 2>/dev/null && break
   sleep 0.2
@@ -222,6 +248,56 @@ if CommandLine.arguments.contains("--deadport") {
           && (dm.updateStatus ?? "").contains("not published") == false)
   if failures > 0 { print("EDGE-DT-FAILURES \(failures)"); exit(1) }
   print("EDGE-DT-DEADPORT-PASS")
+  exit(0)
+}
+
+// ISSUE #23: the Settings drift marker (headless coverage of the model's
+// own read/render functions — the live GUI eyeball is the owner's step).
+// The harness bootstrapped two SCRATCH labels (never the real ones): the
+// menubar label on a STALE path, the daemon label on /bin/sleep. The
+// model's refreshLaunchdState() must report what each agent ACTUALLY
+// runs (the LOADED launchctl view) and set menubarStale only on drift;
+// after a re-point (bootout + bootstrap on the bundle path — what Update
+// Code / Install Update do), the marker must clear.
+if CommandLine.arguments.contains("--drift") {
+  let stalePath = "__DTSTALE__"
+  let bundlePath = "__DTBUNDLE__"
+  let goodPlist = "__DTGOODPLIST__"
+  let mbLabel = "__DTMBLABEL__"
+  let daLabel = "__DTDALABEL__"
+  let uidNum = getuid()
+
+  let dm2 = AppModel()   // init() runs refreshLaunchdState()
+  check("drift: the scratch menubar label is loaded", dm2.menubarLoaded)
+  check("drift: the scratch daemon label is loaded", dm2.daemonLoaded)
+  check("drift: the row shows the menubar agent's ACTUAL running path (the stale one)",
+        dm2.menubarRuns == stalePath)
+  check("drift: the row shows the daemon agent's actual running path",
+        dm2.daemonRuns == "/bin/sleep")
+  check("drift: the stale marker is ON (exception fires on drift)", dm2.menubarStale)
+  check("drift: the expected bundle path is this checkout's built bundle executable",
+        dm2.menubarBundleExecutable() == bundlePath)
+
+  // Simulate the re-point exactly as the update paths do it: bootout the
+  // stale label, bootstrap the rendered plist pointing at the bundle.
+  let bo = Process(); bo.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+  bo.arguments = ["bootout", "gui/\(uidNum)/\(mbLabel)"]
+  bo.standardOutput = FileHandle.nullDevice; bo.standardError = FileHandle.nullDevice
+  try? bo.run(); bo.waitUntilExit()
+  let bs = Process(); bs.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+  bs.arguments = ["bootstrap", "gui/\(uidNum)", goodPlist]
+  bs.standardOutput = FileHandle.nullDevice; bs.standardError = FileHandle.nullDevice
+  try? bs.run(); bs.waitUntilExit()
+  let repointed = waitUntil(timeout: 15) {
+    dm2.refreshLaunchdState()
+    return dm2.menubarLoaded && dm2.menubarRuns == bundlePath
+  }
+  check("drift: after the re-point the agent runs the bundle executable", repointed)
+  check("drift: the stale marker CLEARS after the re-point", dm2.menubarStale == false)
+  check("drift: healthy -> no marker (Exception-Only rule)", dm2.menubarLoaded && !dm2.menubarStale)
+
+  if failures > 0 { print("EDGE-DT-FAILURES \(failures)"); exit(1) }
+  print("EDGE-DT-DRIFT-PASS")
   exit(0)
 }
 
@@ -516,9 +592,14 @@ sed -e "s|__PORT__|$PORT|g" \
     -e "s|__SHANEW__|$SHA40_NEW|g" \
     -e "s|__SHABAD__|$SHA40_BAD|g" \
     -e "s|__SCRATCH__|$T/scratch|g" \
+    -e "s|__DTSTALE__|$T/stale/IdlefillMenubar|g" \
+    -e "s|__DTBUNDLE__|$T/drepo/menubar/IdlefillMenubar.app/Contents/MacOS/IdlefillMenubar|g" \
+    -e "s|__DTGOODPLIST__|$T/plists-good/$DT_MB_LABEL.plist|g" \
+    -e "s|__DTMBLABEL__|$DT_MB_LABEL|g" \
+    -e "s|__DTDALABEL__|$DT_DA_LABEL|g" \
     "$T/main.swift" > "$T/main.baked.swift"
 mv "$T/main.baked.swift" "$T/main.swift"
-grep -qE '__PORT__|__SHA|__SCRATCH__' "$T/main.swift" && { echo "error: a placeholder survived the bake"; exit 1; }
+grep -qE '__PORT__|__SHA|__SCRATCH__|__DT' "$T/main.swift" && { echo "error: a placeholder survived the bake"; exit 1; }
 
 echo "==> swiftc (real source minus @main + driver)"
 swiftc -O \
@@ -562,4 +643,30 @@ env -i PATH=/usr/bin:/bin \
   "$T/edge-dt-test" --deadport || RC2=$?
 echo "EDGE-DT-DEADPORT-EXIT=$RC2"
 
-exit $(( RC + RC2 ))
+# The drift-marker run (issue #23): the desktop app's OWN test hook labels
+# (IDLEFILL_DESKTOP_TEST + the label overrides) point the model at the
+# two scratch labels the harness bootstrapped; IDLEFILL_REPO_PATH makes
+# the scratch drepo "this checkout" so the expected bundle path is the
+# fixture's. The driver asserts the marker ON on drift, then re-points
+# (bootout + bootstrap on the bundle path) and asserts it CLEARS.
+echo "==> run (drift marker — the scratch-label launchd view)"
+RC3=0
+env -i PATH=/usr/bin:/bin \
+  HOME="$T/home" \
+  IDLEFILL_DESKTOP_CONFIG="$T/homecfg-drift.json" \
+  IDLEFILL_REPO_PATH="$T/drepo" \
+  IDLEFILL_DESKTOP_TEST="$T/plists-unused" \
+  IDLEFILL_DESKTOP_TEST_LABEL_MENUBAR="$DT_MB_LABEL" \
+  IDLEFILL_DESKTOP_TEST_LABEL_DAEMON="$DT_DA_LABEL" \
+  IDLEFILL_DESKTOP_EDGE_NO_OPEN=1 \
+  "$T/edge-dt-test" --drift || RC3=$?
+echo "EDGE-DT-DRIFT-EXIT=$RC3"
+
+# Post-run proof: the scratch labels are gone (boot them out here — the
+# trap repeats it idempotently for crash paths).
+launchctl bootout "gui/$(id -u)/$DT_MB_LABEL" 2>/dev/null || true
+launchctl bootout "gui/$(id -u)/$DT_DA_LABEL" 2>/dev/null || true
+launchctl print "gui/$(id -u)/$DT_MB_LABEL" >/dev/null 2>&1 && { echo "error: scratch mb label still loaded"; exit 1; }
+launchctl print "gui/$(id -u)/$DT_DA_LABEL" >/dev/null 2>&1 && { echo "error: scratch daemon label still loaded"; exit 1; }
+
+exit $(( RC + RC2 + RC3 ))
