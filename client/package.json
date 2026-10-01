@@ -9,7 +9,7 @@
     "start": "tsx src/index.ts",
     "dev": "tsx src/index.ts",
     "version": "tsx src/index.ts --version",
-    "test": "tsx --test test/proxy.test.ts test/lease-loop.test.ts test/sigint.test.ts test/group-kill.test.ts test/version-handshake.test.ts"
+    "test": "tsx --test test/proxy.test.ts test/lease-loop.test.ts test/sigint.test.ts test/group-kill.test.ts test/version-handshake.test.ts test/adapter-registry.test.ts"
   },
   "dependencies": {
     "ws": "^8.18.0"

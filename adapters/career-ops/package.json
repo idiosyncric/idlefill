@@ -4,6 +4,16 @@
   "private": true,
   "type": "module",
   "description": "idlefill adapter for the career-ops pipeline queue (read-only against career-ops)",
+  "idlefill": {
+    "name": "career-ops",
+    "version": "0.1.0",
+    "protocol": 1,
+    "executor": "node {repo}/adapters/career-ops/eval.mjs {payload_file} {result_file}",
+    "payload_fields": ["url", "company", "title"],
+    "result_hint": ["ok", "job_id", "tokens_out", "tokens_in", "score", "report_path", "error", "error_detail"],
+    "estimated_seconds": 900,
+    "timeout_seconds": 1200
+  },
   "scripts": {
     "build-queue": "node queue.mjs",
     "test": "node --test queue.test.mjs mcp.test.mjs"

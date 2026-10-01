@@ -140,11 +140,17 @@ export interface QueueJob {
    * while an in-flight queue accumulates the count.
    */
   attempts?: number;
+  /**
+   * The job's payload. The vocabulary is the adapter's: the adapter manifest
+   * declares which keys reach the executor (payload_fields, issue #13). The
+   * career-ops keys stay typed as optional conveniences (display fallbacks,
+   * queue preview); adapters with their own vocabulary carry any keys.
+   */
   payload: {
-    url: string;
-    company: string;
-    title: string;
-    score: number;
+    url?: string;
+    company?: string;
+    title?: string;
+    score?: number;
     [k: string]: unknown;
   };
 }
@@ -529,6 +535,18 @@ export class ClientDaemon {
    */
   private checkExecutorScript(): void {
     for (const proj of this.cfg.projects) {
+      // Unknown adapter name (issue #13): FATAL, same posture as a missing
+      // script — the client stays registered/online-but-inactive.
+      if (proj.adapter_error) {
+        this.executorBroken = true;
+        this.log.info(`FATAL: ${proj.adapter_error}`);
+        return;
+      }
+      if (!proj.executor) {
+        this.executorBroken = true;
+        this.log.info(`FATAL: project "${proj.name}" has no executor (set projects[].executor or a valid projects[].adapter)`);
+        return;
+      }
       const expanded = proj.executor.replaceAll('{repo}', this.cfg.repo_root);
       const script = executorScriptPath(expanded, proj.cwd);
       if (!script) continue; // no script to check (builtin command, non-node, …)
@@ -782,14 +800,15 @@ export class ClientDaemon {
       }
     }
     const proxy = await this.ensureProxy();
-    const payload = {
-      job_id: job.job_id,
-      url: job.payload.url,
-      company: job.payload.company,
-      title: job.payload.title,
-      model: proj.model,
-      proxy_base_url: `${proxy.base_url}/v1`,
-    };
+    // Payload vocabulary (issue #13): the core owns job_id/model/proxy_base_url;
+    // the adapter manifest's payload_fields declares which job.payload keys are
+    // forwarded, in order. Default = the career-ops trio, keeping the payload
+    // byte-identical for manifest-less configs.
+    const fields = proj.payload_fields ?? ['url', 'company', 'title'];
+    const payload: Record<string, unknown> = { job_id: job.job_id };
+    for (const f of fields) payload[f] = (job.payload as Record<string, unknown>)[f];
+    payload.model = proj.model;
+    payload.proxy_base_url = `${proxy.base_url}/v1`;
     writeFileSync(payloadFile, JSON.stringify(payload));
 
     const command = proj.executor

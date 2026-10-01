@@ -29,7 +29,7 @@
  * job added here is the same identity the builder and the daemon use.
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -80,11 +80,52 @@ function projectPaths(cfg) {
       results_file: resolve(CLIENT_DIR, String(p.results_file || '../data/results.jsonl')),
     });
   }
-  // Default (the only project today): the repo data dir.
-  if (!map.has('career-ops')) {
-    map.set('career-ops', { queue_file: join(DATA_DIR, 'queue.jsonl'), results_file: join(DATA_DIR, 'results.jsonl') });
-  }
   return map;
+}
+
+/**
+ * Adapter registry (issue #13) — dependency-free mirror of
+ * client/src/adapters.ts: one bounded scan of adapters/<name>/package.json
+ * for an "idlefill" manifest key. Used to resolve the default project and to
+ * make the unknown-project error registry-driven (no adapter name baked in).
+ */
+function discoverAdapters() {
+  const names = [];
+  try {
+    for (const e of readdirSync(join(REPO_ROOT, 'adapters'), { withFileTypes: true })) {
+      if (!e.isDirectory()) continue;
+      const pkgFile = join(REPO_ROOT, 'adapters', e.name, 'package.json');
+      if (!existsSync(pkgFile)) continue;
+      let raw;
+      try {
+        raw = JSON.parse(readFileSync(pkgFile, 'utf-8'));
+      } catch {
+        continue;
+      }
+      const m = raw && typeof raw === 'object' ? raw.idlefill : null;
+      if (m && typeof m === 'object' && typeof m.executor === 'string' && m.executor.trim() !== '') {
+        names.push(typeof m.name === 'string' && m.name.trim() !== '' ? m.name : e.name);
+      }
+    }
+  } catch {
+    /* no adapters dir: empty registry */
+  }
+  return names;
+}
+
+/**
+ * Default project when the tool call omits `project`: the sole configured
+ * project, else the sole registered adapter, else null (the caller must name
+ * one — no adapter name is hardcoded).
+ */
+function defaultProject(cfg) {
+  const configured = [...projectPaths(cfg).keys()];
+  if (configured.length === 1) return configured[0];
+  if (configured.length === 0) {
+    const adapters = discoverAdapters();
+    if (adapters.length === 1) return adapters[0];
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -204,9 +245,9 @@ function dedupeBatch(toAdd) {
 function addJobs(args) {
   const cfg = loadClientConfig();
   if (cfg.__error) return { ok: false, error: cfg.__error };
-  const project = String(args.project || 'career-ops');
+  const project = String(args.project || defaultProject(cfg) || '');
   const paths = projectPaths(cfg).get(project);
-  if (!paths) return { ok: false, error: `unknown project "${project}" — client config knows: ${[...projectPaths(cfg).keys()].join(', ')}` };
+  if (!paths) return { ok: false, error: `unknown project "${project}" — client config knows: ${[...projectPaths(cfg).keys()].join(', ') || '(none)'}; adapters: ${discoverAdapters().join(', ') || '(none)'}` };
 
   const input = Array.isArray(args.jobs) ? args.jobs : [args.jobs];
   if (!input.length) return { ok: false, error: 'jobs (or jobs[0]) is required' };
@@ -321,7 +362,7 @@ function queueStatus(args) {
     if (st && st.error) {
       out.arbiter = { error: st.error };
     } else if (st) {
-      const proj = String(args.project || 'career-ops');
+      const proj = String(args.project || defaultProject(cfg) || '');
       const p = st.projects?.find((x) => x.name === proj);
       out.arbiter = {
         idle: st.idle ? { idle: st.idle.idle, degraded: st.idle.degraded, idle_seconds: st.idle.idle_seconds, last_activity: st.idle.last_activity } : null,
@@ -341,9 +382,9 @@ function queueStatus(args) {
 function results(args) {
   const cfg = loadClientConfig();
   if (cfg.__error) return { ok: false, error: cfg.__error };
-  const project = String(args.project || 'career-ops');
+  const project = String(args.project || defaultProject(cfg) || '');
   const paths = projectPaths(cfg).get(project);
-  if (!paths) return { ok: false, error: `unknown project "${project}"` };
+  if (!paths) return { ok: false, error: `unknown project "${project}" — adapters: ${discoverAdapters().join(', ') || '(none)'}` };
   const limit = Math.max(1, Math.min(200, Number(args.limit) || 20));
   const f = paths.results_file;
   if (!existsSync(f)) return { ok: true, project, results: [], note: 'no results yet' };
@@ -397,9 +438,9 @@ function writeQueueVerified(file, plan, verify, logLabel) {
 }
 
 function resolveProject(cfg, projectArg) {
-  const project = String(projectArg || 'career-ops');
+  const project = String(projectArg || defaultProject(cfg) || '');
   const paths = projectPaths(cfg).get(project);
-  if (!paths) return { error: `unknown project "${project}" — client config knows: ${[...projectPaths(cfg).keys()].join(', ')}` };
+  if (!paths) return { error: `unknown project "${project}" — client config knows: ${[...projectPaths(cfg).keys()].join(', ') || '(none)'}; adapters: ${discoverAdapters().join(', ') || '(none)'}` };
   return { project, paths };
 }
 
@@ -614,7 +655,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        project: { type: 'string', description: 'idlefill project name (default career-ops)' },
+        project: { type: 'string', description: 'idlefill project name (default: the sole configured project or adapter)' },
         jobs: {
           type: 'array',
           description: 'jobs to enqueue',
@@ -642,7 +683,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        project: { type: 'string', description: 'project to focus the arbiter part on (default career-ops)' },
+        project: { type: 'string', description: 'project to focus the arbiter part on (default: the sole configured project or adapter)' },
         limit: { type: 'number', description: 'how many queued jobs to preview, 1-200 (default 10)' },
       },
     },
@@ -655,7 +696,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        project: { type: 'string', description: 'default career-ops' },
+        project: { type: 'string', description: 'default: the sole configured project or adapter' },
         limit: { type: 'number', description: 'how many lines, 1-200 (default 20)' },
       },
     },
@@ -671,7 +712,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        project: { type: 'string', description: 'idlefill project name (default career-ops)' },
+        project: { type: 'string', description: 'idlefill project name (default: the sole configured project or adapter)' },
         job_ids: {
           type: 'array',
           description: 'exact job_ids to drop from the queue',
@@ -690,7 +731,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        project: { type: 'string', description: 'idlefill project name (default career-ops)' },
+        project: { type: 'string', description: 'idlefill project name (default: the sole configured project or adapter)' },
         dry_run: { type: 'boolean', description: 'preview only, do not write the queue file' },
       },
     },
@@ -706,7 +747,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        project: { type: 'string', description: 'idlefill project name (default career-ops)' },
+        project: { type: 'string', description: 'idlefill project name (default: the sole configured project or adapter)' },
         job_id: { type: 'string', description: 'the exact job_id to look up' },
         limit: { type: 'number', description: 'how many results lines to include, 1-100 (default 20)' },
       },

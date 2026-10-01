@@ -1,0 +1,20 @@
+{
+  "name": "idlefill-adapter-noop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "idlefill acceptance fixture adapter: sleeps, reports tokens, declares its own payload vocabulary (issue #13)",
+  "idlefill": {
+    "name": "noop",
+    "version": "0.1.0",
+    "protocol": 1,
+    "executor": "node {repo}/adapters/noop/eval.mjs {payload_file} {result_file}",
+    "payload_fields": ["target", "note"],
+    "result_hint": ["ok", "job_id", "tokens_out", "tokens_in", "echo"],
+    "estimated_seconds": 5,
+    "timeout_seconds": 30
+  },
+  "scripts": {
+    "test": "node --test noop.test.mjs"
+  }
+}

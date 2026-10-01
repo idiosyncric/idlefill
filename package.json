@@ -7,7 +7,8 @@
   "workspaces": [
     "server",
     "client",
-    "adapters/career-ops"
+    "adapters/career-ops",
+    "adapters/noop"
   ],
   "scripts": {
     "test": "npm test --workspaces --if-present",

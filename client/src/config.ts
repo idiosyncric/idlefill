@@ -8,6 +8,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { discoverAdapters } from './adapters.js';
 
 export interface ClientProjectConfig {
   name: string;
@@ -24,8 +25,24 @@ export interface ClientProjectConfig {
    * placeholders (plus {repo} for the idlefill repo root — expanded to the
    * TRUE repo root in BOTH the dev and dist layouts; see ClientConfig.repo_root).
    * Run via bash -c.
+   *
+   * Issue #13 precedence: an explicit `executor` here always wins (the
+   * escape hatch); otherwise `adapter` resolves through the registry
+   * (adapters/<name>/package.json "idlefill" manifest) to the manifest's
+   * executor template. When the adapter name is unknown, `adapter_error` is
+   * set and this stays empty — the daemon fails fast at startup.
    */
   executor: string;
+  /** Adapter name selected instead of hand-writing an executor template. */
+  adapter?: string;
+  /** Set at load time when `adapter` names nothing in the registry. */
+  adapter_error?: string;
+  /**
+   * Keys of job.payload forwarded into the executor's input file (the core
+   * keeps job_id/model/proxy_base_url). Resolved from the adapter manifest;
+   * defaults to the career-ops vocabulary for manifest-less configs.
+   */
+  payload_fields?: string[];
   /** Estimate passed to the arbiter at grant time. */
   estimated_seconds?: number;
   /**
@@ -115,6 +132,12 @@ export function loadClientConfig(
   }
   const r = raw ?? {};
 
+  // Adapter registry (issue #13): one bounded scan of <repoRoot>/adapters/*/
+  // package.json. Resolution precedence per project: explicit `executor`
+  // wins (escape hatch) > `adapter` manifest > unknown adapter = FATAL at
+  // startup (adapter_error set; the daemon registers but requests no leases).
+  const adapters = discoverAdapters(repoRoot);
+
   return {
     server_url: str(r.server_url, DEFAULTS.server_url),
     token: str(r.token, env.IDLEFILL_CLIENT_TOKEN ?? DEFAULTS.token),
@@ -123,16 +146,36 @@ export function loadClientConfig(
     proxy_port: num(r.proxy_port, DEFAULTS.proxy_port),
     llm_target: str(r.llm_target, DEFAULTS.llm_target),
     projects: Array.isArray(r.projects)
-      ? r.projects.map((p: Record<string, unknown>) => ({
-          name: String(p.name ?? ''),
-          queue_file: resolve(clientPkgDir, String(p.queue_file ?? '')),
-          results_file: resolve(clientPkgDir, String(p.results_file ?? '')),
-          model: String(p.model ?? 'Qwen3.8-27B'),
-          cwd: p.cwd ? resolve(String(p.cwd)) : undefined,
-          executor: String(p.executor ?? ''),
-          estimated_seconds: typeof p.estimated_seconds === 'number' ? p.estimated_seconds : 900,
-          timeout_seconds: typeof p.timeout_seconds === 'number' && Number.isFinite(p.timeout_seconds) && p.timeout_seconds > 0 ? p.timeout_seconds : undefined,
-        }))
+      ? r.projects.map((p: Record<string, unknown>) => {
+          const explicitExecutor = String(p.executor ?? '');
+          const adapterName = typeof p.adapter === 'string' && p.adapter.trim() !== '' ? p.adapter : undefined;
+          const manifest = adapterName ? adapters.get(adapterName) : undefined;
+          const adapterError =
+            adapterName && !manifest
+              ? `unknown adapter "${adapterName}" — registry has: ${[...adapters.keys()].join(', ') || '(none)'}`
+              : undefined;
+          const executor = explicitExecutor || manifest?.executor || '';
+          return {
+            name: String(p.name ?? ''),
+            queue_file: resolve(clientPkgDir, String(p.queue_file ?? '')),
+            results_file: resolve(clientPkgDir, String(p.results_file ?? '')),
+            model: String(p.model ?? 'Qwen3.8-27B'),
+            cwd: p.cwd ? resolve(String(p.cwd)) : undefined,
+            executor,
+            ...(adapterName ? { adapter: adapterName } : {}),
+            ...(adapterError ? { adapter_error: adapterError } : {}),
+            // payload_fields / estimates: manifest defaults, config wins.
+            ...(manifest?.payload_fields ? { payload_fields: manifest.payload_fields } : {}),
+            estimated_seconds:
+              typeof p.estimated_seconds === 'number'
+                ? p.estimated_seconds
+                : manifest?.estimated_seconds ?? 900,
+            timeout_seconds:
+              typeof p.timeout_seconds === 'number' && Number.isFinite(p.timeout_seconds) && p.timeout_seconds > 0
+                ? p.timeout_seconds
+                : manifest?.timeout_seconds,
+          };
+        })
       : [],
     repo_root: repoRoot,
     state_dir: resolve(clientPkgDir, 'data'),
