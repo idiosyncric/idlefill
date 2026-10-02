@@ -1033,12 +1033,17 @@ export class ClientDaemon {
         maxActive: this.cfg.max_active_agent_sessions ?? 2,
         holdCapMs: this.cfg.session_hold_cap_ms ?? 120_000,
         log: (m) => this.log.info(m),
-        register: async (token) => {
+        register: async (token, gate) => {
           const { status } = await api(this.cfg, 'POST', '/api/sessions/register', {
             token,
             ...(this.clientId ? { client_id: this.clientId } : {}),
             client_name: this.cfg.client_name,
             last_activity: Date.now(),
+            // Gate-state visibility: the router's queue truth for this
+            // session at heartbeat time. null (idle) ⇒ NO gate block — the
+            // arbiter then CLEARS any stored gate for the token. An old
+            // arbiter ignores the extra field (back-compat).
+            ...(gate ? { gate } : {}),
           });
           return status === 200 || status === 201;
         },
