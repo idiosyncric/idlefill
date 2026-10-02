@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "24b7ce72-b1f5-4c0b-a3a6-be42aa70ff72",
+  "status": "current",
+  "command": "deliver",
+  "type": "architecture",
+  "input": "/Users/sam/Software/idlefill/.archify/architecture-idlefill-session-gate-20260930-153023/candidate.json",
+  "output": "/Users/sam/Software/idlefill/.archify/architecture-idlefill-session-gate-20260930-153023/session-gate.html",
+  "specification": {
+    "sha256": "1b602375b2025d59489fd3ee63add7bd5f3cafccc6d85d97dd3ce289b4630631",
+    "bytes": 6017
+  },
+  "artifact": {
+    "sha256": "b04d10c2a08985e8eaf6801353ad71eeff5692a05cfe8c5196eae61d337b763b",
+    "bytes": 760006
+  }
+}
