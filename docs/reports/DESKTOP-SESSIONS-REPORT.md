@@ -189,17 +189,11 @@ registered sessions (`probe`, `flash`, both `mac-sam`).
    `prefix: flash | override: None`. Then resumed `probe` too — final
    arbiter state: both sessions `override: None` (left exactly as found).
 
-Screenshots (also copied next to this report):
+Screenshots (committed next to this report):
 
-- `sessions-tab.png` — the tab with both rows Active + Pause buttons
-- `sessions-paused.png` — both rows Paused (amber) + Resume buttons
-- `sessions-resumed.png` — after resuming
-
-```
-/Users/sam/.hermes/profiles/web-dev/cache/scratch/sessions-tab.png
-/Users/sam/.hermes/profiles/web-dev/cache/scratch/sessions-paused.png
-/Users/sam/.hermes/profiles/web-dev/cache/scratch/sessions-resumed.png
-```
+- ![sessions-tab](sessions-tab.png) — the tab with both rows Active + Pause buttons
+- ![sessions-paused](sessions-paused.png) — both rows Paused (amber) + Resume buttons
+- ![sessions-resumed](sessions-resumed.png) — after resuming
 
 ## Left open
 

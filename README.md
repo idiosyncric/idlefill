@@ -134,6 +134,9 @@ adapters/   per-project executors (career-ops: queue builder + JD evaluator
 scripts/    thin CLI wrappers (build-careerops-queue.mjs)
 deploy/     PHASE 2, UNTESTED: compose.yaml, traefik/idlefill.yml, deploy.sh,
             com.sam.idlefill.client.plist
+docs/       reports/ — per-issue build reports (historical record; see
+            docs/reports/README.md). New issue reports land there, never at
+            the repo root.
 data/       gitignored; queue.jsonl, results.jsonl land here
 ```
 

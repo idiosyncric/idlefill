@@ -651,7 +651,7 @@ test('idlefill-mcp issue #14: IDLEFILL_MCP_READ_ONLY=1 blocks every write tool f
 // the repo. Origin (a) (the adapters/<dir> glob) is proven at unit level
 // against discoverToolModules with a scratch repoRoot — the server has no
 // repo-root override env, so a full-process test of (a) is impossible without
-// touching the real repo (deviation noted in ISSUE15-REPORT.md).
+// touching the real repo (deviation noted in docs/reports/ISSUE15-REPORT.md).
 // ---------------------------------------------------------------------------
 
 const FIXTURE_HELLO = join(__dirname, 'test-fixtures', 'hello-tool', 'idlefill-mcp-tools.mjs');
