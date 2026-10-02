@@ -525,18 +525,41 @@ ground truth.
   `/Applications` (or a target dir passed as the first argument), and
   relaunches.
 - **URL scheme `idlefill://`.** Hosts: `""` or `open` → **State** (the
-  default), `logs` → **Logs**, `projects` → **Projects**; any unknown host
+  default), `sessions` → **Sessions**, `logs` → **Logs**, `projects` →
+  **Projects**; any unknown host
   → State. A URL that *launches* the app opens on the requested tab; a URL
   delivered to a *running* app activates it, brings the window forward, and
   switches tabs (extra restored windows are closed — the link targets one
   window). Parsing is the pure `AppModel.route(for:)` (unit-tested by the
   headless driver). This is how the menu bar's double-click and its
   re-routed rows hand off to the desktop app.
-- **Four tabs in the window** (a tab strip; the deep links and the tab
+- **Five tabs in the window** (a tab strip; the deep links and the tab
   buttons both set the active tab)
   - **State** — the color-coded state word, this machine's status, queue
     depth, today's finished/failed, and the running lease. Polls
     `GET /api/state` every 5s with the Bearer token.
+  - **Sessions** — the interactive Hermes sessions the arbiter knows
+    (the same `/api/state` poll's `sessions[]` — no second fetch loop).
+    Unlike the menu bar's Exception-Only glance, the desktop is the
+    *interaction surface*: EVERY session is listed (you need the healthy
+    rows to pause them). Row semantics mirror the dashboard
+    (`server/public/index.html`): state word **Paused** (override) >
+    **Active** (online + a request within 30s) > **Idle**; a lapsed
+    heartbeat (≥90s) is a dimmed row + a **stale** tag, never a state
+    word; short token prefix as the label (full token in the tooltip),
+    `client_name`, "last request …" age, `→ server_id` when set. The
+    per-row gate button (**Pause** / **Resume**) is the single write
+    site: `POST /api/sessions/<token>/override` with
+    `{"override":"pause"}` / `{"override":null}` and the Bearer header —
+    optimistic flip + per-row in-flight disable, revert with a one-line
+    error on failure, a 404 (`unknown_session`) re-polls immediately so
+    the rows re-land on arbiter truth. Empty `sessions[]` renders a
+    quiet empty state, never a blank pane. The projection is the pure
+    `SessionsView.project` and the wire shape the pure
+    `SessionsView.overrideRequest` — both proven headlessly by
+    `desktop/sessions-test.sh` (real source minus `@main` + a driver,
+    canned payloads, `env -i`, a local arbiter stub for the write path —
+    the same harness pattern as `menubar/sessions-test.sh`).
   - **Logs** — the client daemon log (`client/<entry>/logs/client.log`,
     `src` in dev / `dist` after a build; falls back to `client/logs/` if
     the entry log is missing). Refreshed on a ~2.5s timer, keeps the last
