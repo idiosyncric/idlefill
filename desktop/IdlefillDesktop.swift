@@ -2,11 +2,19 @@
 //  IdlefillDesktop.swift — the idlefill desktop app (macOS 14+).
 //
 //  A windowed companion (WindowGroup, NOT a MenuBarExtra) built with bare
-//  swiftc (no Xcode project). Four tabs in one window:
+//  swiftc (no Xcode project). Five tabs in one window:
 //
 //    state     — color-coded state word, this machine's status, queue depth,
 //                today finished/failed, the running lease (polls /api/state
 //                every 5s with the Bearer token)
+//    sessions  — the interactive Hermes sessions the arbiter knows about
+//                (the same /api/state poll's sessions[]): every row listed
+//                with its state word (Paused > Active > Idle, the 30s/90s
+//                windows), a stale tag on a lapsed heartbeat, and the
+//                per-session gate (Pause / Resume →
+//                POST /api/sessions/<token>/override). The desktop is the
+//                INTERACTION surface for sessions (the menubar is
+//                read-only, the dashboard is remote)
 //    logs      — the client daemon log tail (client/<entry>/logs/client.log),
 //                refreshed on a ~2.5s timer, last ~2000 lines kept, auto-scroll
 //                to the tail while at the bottom, "follow tail" toggle to
@@ -165,9 +173,134 @@ enum Conn: String {
 
 /// The main window's tabs — and the deep-link target type.
 enum MainTab: String, CaseIterable {
-  case state, logs, projects, settings
+  case state, sessions, logs, projects, settings
 
   var title: String { rawValue.uppercased() }
+}
+
+// MARK: sessions (interactive Hermes sessions — the desktop is the gate)
+
+/** The windows the dashboard uses (server/public/index.html
+ *  SESSION_ONLINE_MS / SESSION_ACTIVE_MS) — kept honest to the dashboard:
+ *  online = a heartbeat within 90s; active = online AND a request seen
+ *  within 30s. Stale is NOT a state word: it is the dim + tag on a row
+ *  whose heartbeat lapsed past the same 90s window. */
+let kSessionOnlineMs: Double = 90_000
+let kSessionActiveMs: Double = 30_000
+
+/** One projected sessions-tab row. Produced ONLY by the pure
+ *  `SessionsView.project` (never by the view), so the headless harness
+ *  (desktop/sessions-test.sh) asserts the exact semantics the panel
+ *  renders. Unlike the menubar's Exception-Only rule, the desktop lists
+ *  EVERY session — it is the interaction surface; you need the healthy
+ *  rows to pause them. */
+struct SessionRow: Identifiable, Equatable {
+  /// Identity + label: the token IS the session's identity (the /s/<token>
+  /// path). The row shows a short prefix; the full token rides in the
+  /// tooltip only (never a printed/logged surface).
+  let token: String
+  let shortToken: String
+  let clientName: String?
+  /// The state word: "Paused" | "Active" | "Idle" (the dashboard's
+  /// priority: override pause > online + recent request > idle).
+  let stateWord: String
+  /// Heartbeat lapsed past 90s — a dim + "stale" tag, NOT a state word.
+  let stale: Bool
+  /// "last request …" text (the dashboard's ago() wording), or
+  /// "no requests yet".
+  let lastRequestText: String
+  /// The engine this session routes to (shown as "→ server_id" when set).
+  let serverId: String?
+  /// True when the operator gate holds this session (override == pause).
+  let paused: Bool
+  /// The gate button's title: a paused row offers "Resume", a running
+  /// row offers "Pause".
+  let actionTitle: String
+
+  var id: String { token }
+}
+
+enum SessionsView {
+  /** PURE projection: /api/state payload (+ a fixed clock) → view rows.
+   *  Mirrors the dashboard's sessStateWord/sessBlock semantics exactly.
+   *  Rows with an empty/missing token are junk the projection drops (they
+   *  can never be named or acted on). `nowMs` is epoch-ms, injectable so
+   *  the harness runs on a fixed clock. */
+  static func project(payload: [String: Any], nowMs: Double) -> [SessionRow] {
+    let rows = (payload["sessions"] as? [[String: Any]]) ?? []
+    return rows.compactMap { s in
+      guard let tok = (s["token"] as? String), !tok.isEmpty else { return nil }
+      let lastSeen = (s["last_seen"] as? Double) ?? 0
+      let stale = nowMs - lastSeen >= kSessionOnlineMs
+      let online = !stale
+      let ov = (s["override"] as? [String: Any])?["override"] as? String
+      let paused = ov == "pause"
+      let lastActivity = (s["last_activity"] as? Double).flatMap { $0 == 0 ? nil : $0 }
+      let stateWord: String
+      if paused {
+        stateWord = "Paused"
+      } else if online, let la = lastActivity, nowMs - la < kSessionActiveMs {
+        stateWord = "Active"
+      } else {
+        stateWord = "Idle"
+      }
+      let lastRequestText: String
+      if let la = lastActivity {
+        lastRequestText = "last request " + agoText(nowMs - la)
+      } else {
+        lastRequestText = "no requests yet"
+      }
+      let name = (s["client_name"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+      let serverId = (s["server_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+      return SessionRow(
+        token: tok,
+        shortToken: String(tok.prefix(8)),
+        clientName: name,
+        stateWord: stateWord,
+        stale: stale,
+        lastRequestText: lastRequestText,
+        serverId: serverId,
+        paused: paused,
+        actionTitle: paused ? "Resume" : "Pause"
+      )
+    }
+  }
+
+  /** The dashboard's ago() wording (server/public/index.html), ported:
+   *  "45s ago" / "3m 12s ago" / "2h 5m ago". */
+  static func agoText(_ ms: Double) -> String {
+    let s = max(0, (ms / 1000).rounded())
+    if s < 60 { return "\(Int(s))s ago" }
+    let m = floor(s / 60)
+    if m < 60 { return "\(Int(m))m \(Int(s.truncatingRemainder(dividingBy: 60)))s ago" }
+    let h = floor(m / 60)
+    return "\(Int(h))h \(Int(m.truncatingRemainder(dividingBy: 60)))m ago"
+  }
+
+  /** PURE request builder for the gate write — the single write site for
+   *  sessions. `POST <serverURL>/api/sessions/<urlencoded token>/override`
+   *  with body {"override":"pause"} (pause) or {"override":null} (resume),
+   *  Authorization: Bearer <arbiter token>. The token parameter NEVER
+   *  appears in the URL or the body — only in the header — and nothing
+   *  here logs any of it. Pure (no networking) so the harness asserts the
+   *  exact wire shape. */
+  static func overrideRequest(serverURL: String, sessionToken: String,
+                              paused: Bool, arbiterToken: String) -> URLRequest {
+    // Percent-encode the session token for the path segment (RFC 3986
+    // unreserved set — the same discipline as the dashboard's
+    // encodeURIComponent).
+    var allowed = CharacterSet.alphanumerics
+    allowed.insert(charactersIn: "-._~")
+    let enc = sessionToken.addingPercentEncoding(withAllowedCharacters: allowed) ?? sessionToken
+    var req = URLRequest(url: URL(string: serverURL + "/api/sessions/" + enc + "/override")!)
+    req.httpMethod = "POST"
+    req.timeoutInterval = 5
+    req.setValue("Bearer \(arbiterToken)", forHTTPHeaderField: "Authorization")
+    req.setValue("application/json", forHTTPHeaderField: "content-type")
+    req.httpBody = try! JSONSerialization.data(withJSONObject:
+      ["override": (paused ? "pause" : (NSNull())) as Any])
+    return req
+  }
 }
 
 // MARK: - model
@@ -188,6 +321,15 @@ final class AppModel: ObservableObject {
   @Published var today: (finished: Int, failed: Int) = (0, 0)
   @Published var lease: (job: String, expiresAt: Double) = ("", 0)
   @Published var lastSeenS: Int? = nil
+
+  // sessions tab (the same /api/state poll carries sessions[])
+  @Published var sessions: [SessionRow] = []
+  /** Tokens whose gate write is in flight — the button is disabled
+   *  PER-ROW (not globally) while its own request runs. */
+  @Published var pendingSessionTokens: Set<String> = []
+  /** One-line error under the tab's rows (a failed override; cleared on
+   *  the next successful write or poll that proves the state). */
+  @Published var sessionsNote: String? = nil
 
   // log viewer (stable ids — trimming the head must not re-identify rows)
   @Published var logLines: [LogLine] = []
@@ -1088,11 +1230,12 @@ final class AppModel: ObservableObject {
   // MARK: deep-link routing (pure — testable headlessly)
 
   /** Map a URL to the tab it should open on. Hosts: "" or "open" → State
-   *  (the default), "logs" → Logs, "projects" → Projects; any other host —
-   *  or a non-idlefill scheme — → State. */
+   *  (the default), "sessions" → Sessions, "logs" → Logs, "projects" →
+   *  Projects; any other host — or a non-idlefill scheme — → State. */
   static func route(for url: URL) -> MainTab {
     guard url.scheme == "idlefill" else { return .state }
     switch url.host {
+    case "sessions": return .sessions
     case "logs": return .logs
     case "projects": return .projects
     default: return .state
@@ -1161,6 +1304,12 @@ final class AppModel: ObservableObject {
       return
     }
 
+    // sessions — parsed on EVERY successful poll (before the clients
+    // guard: sessions are global interactive traffic; a payload whose
+    // clients[] is empty still carries the sessions truth). The pure
+    // projection is the single read site the Sessions panel renders.
+    sessions = SessionsView.project(payload: o, nowMs: Date().timeIntervalSince1970 * 1000)
+
     // me — this machine's client row (prefer the online one; fall back to
     // the first row).
     let clients = (o["clients"] as? [[String: Any]]) ?? []
@@ -1203,6 +1352,74 @@ final class AppModel: ObservableObject {
     case (false, false, true): conn = .idle
     default: conn = .busy
     }
+  }
+
+  /** Test seam (the menubar's injectStatePayload precedent): run the REAL
+   *  poll-path apply() over a canned payload, headlessly. */
+  func injectStatePayload(_ payload: [String: Any]) {
+    guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
+    apply(data)
+  }
+
+  // MARK: sessions gate write (Pause / Resume — the desktop's interaction)
+
+  /** Flip one session's operator gate. The wire shape is built by the PURE
+   *  SessionsView.overrideRequest (POST /api/sessions/<token>/override,
+   *  {"override":"pause"|"null"}, Bearer header — the arbiter token rides
+   *  ONLY in the header, never the URL, never printed). Write-path UX
+   *  discipline (the Settings/Projects pattern): optimistic flip +
+   *  per-row in-flight disable; revert with a one-line error on failure;
+   *  a 404 (unknown_session — the arbiter restarted) re-polls at once so
+   *  the rows re-land on arbiter truth; success is confirmed by the next
+   *  5s poll. */
+  func setSessionOverride(sessionToken: String, paused: Bool) {
+    guard !pendingSessionTokens.contains(sessionToken) else { return }
+    guard let arbiterToken = token() else {
+      sessionsNote = "override failed: no arbiter token in client/config.json"
+      return
+    }
+    let req = SessionsView.overrideRequest(serverURL: serverURL(), sessionToken: sessionToken,
+                                           paused: paused, arbiterToken: arbiterToken)
+    // Optimistic: flip the row NOW (state word + button title follow it).
+    let prev = sessions
+    if let i = sessions.firstIndex(where: { $0.token == sessionToken }) {
+      let r = sessions[i]
+      sessions[i] = SessionRow(token: r.token, shortToken: r.shortToken, clientName: r.clientName,
+                               // Resume optimistically reads "Idle" (the
+                               // row's own timestamps are not carried on
+                               // the view row); the next poll re-derives
+                               // Active/Idle from arbiter truth.
+                               stateWord: paused ? "Paused" : "Idle",
+                               stale: r.stale, lastRequestText: r.lastRequestText,
+                               serverId: r.serverId, paused: paused,
+                               actionTitle: paused ? "Resume" : "Pause")
+    }
+    pendingSessionTokens.insert(sessionToken)
+    URLSession.shared.dataTask(with: req) { [weak self] _, resp, err in
+      DispatchQueue.main.async {
+        guard let self else { return }
+        self.pendingSessionTokens.remove(sessionToken)
+        let status = (resp as? HTTPURLResponse)?.statusCode ?? -1
+        if err == nil && (status == 200 || status == 201) {
+          // Success: the optimistic row stands; the next 5s poll confirms
+          // it against arbiter truth. Clear any older error line.
+          self.sessionsNote = nil
+          return
+        }
+        // Failure: revert to the pre-click rows.
+        self.sessions = prev
+        if status == 404 {
+          // unknown_session (the arbiter restarted / the session is gone):
+          // re-poll immediately so the rows re-land on arbiter truth.
+          self.sessionsNote = "session unknown to the arbiter — refreshing"
+          self.poll()
+        } else if status == -1 {
+          self.sessionsNote = "override failed: could not reach the arbiter"
+        } else {
+          self.sessionsNote = "override failed: HTTP \(status)"
+        }
+      }
+    }.resume()
   }
 
   // MARK: log viewer
@@ -1857,6 +2074,140 @@ struct StatePanel: View {
   }
 }
 
+// MARK: sessions
+
+/** The sessions tab: EVERY interactive session the arbiter knows (the
+ *  interaction surface — the healthy rows must be visible to be paused),
+ *  rendered from the pure SessionsView.project rows. Row semantics mirror
+ *  the dashboard (server/public/index.html sessBlock): short token +
+ *  client_name, "last request …", → server_id, the stale tag + dim on a
+ *  lapsed heartbeat (NOT a state word), the state word, and the one-button
+ *  gate (Pause / Resume). Empty sessions[] → a quiet empty state, never a
+ *  blank pane. */
+struct SessionsPanel: View {
+  @ObservedObject var m: AppModel
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 0) {
+      HStack {
+        PanelHead(title: "sessions")
+        Spacer()
+        Text("\(m.sessions.count)")
+          .font(.system(size: 11, design: .monospaced))
+          .foregroundStyle(Pal.dim)
+          .padding(.trailing, 14)
+      }
+      if m.sessions.isEmpty {
+        Text("no sessions — Hermes sessions pointed at this router appear here")
+          .font(.system(.caption, design: .monospaced))
+          .italic()
+          .foregroundStyle(Pal.dim)
+          .padding(14)
+      } else {
+        ScrollView {
+          VStack(spacing: 0) {
+            ForEach(m.sessions) { row in
+              sessionRow(row, pending: m.pendingSessionTokens.contains(row.token))
+              Rectangle().fill(Pal.hairline.opacity(0.5)).frame(height: 1)
+            }
+          }
+        }
+        .frame(maxHeight: .infinity)
+      }
+      if let note = m.sessionsNote {
+        Text(note)
+          .font(.system(size: 11, design: .monospaced))
+          .foregroundStyle(Pal.err)
+          .padding(.horizontal, 14).padding(.vertical, 6)
+      }
+    }
+  }
+
+  @ViewBuilder
+  private func sessionRow(_ row: SessionRow, pending: Bool) -> some View {
+    HStack(spacing: 10) {
+      Circle()
+        .fill(row.stale ? Pal.dim : Pal.ok)
+        .frame(width: 7, height: 7)
+      VStack(alignment: .leading, spacing: 2) {
+        HStack(spacing: 8) {
+          // The short prefix labels the row; the FULL token rides in the
+          // tooltip (the operator matches it against the router URL).
+          Text(row.shortToken)
+            .font(.system(size: 12, weight: .semibold, design: .monospaced))
+            .foregroundStyle(Pal.text)
+            .help("session \(row.token)")
+          if let name = row.clientName {
+            Text(name)
+              .font(.system(size: 11, design: .monospaced))
+              .foregroundStyle(Pal.dim)
+          }
+          if row.stale {
+            Text("stale")
+              .font(.system(size: 10, design: .monospaced))
+              .foregroundStyle(Pal.dim)
+              .padding(.horizontal, 5).padding(.vertical, 1)
+              .overlay(RoundedRectangle(cornerRadius: 3).stroke(Pal.hairline))
+              .help("no heartbeat from this session in the last 90s — the router may have dropped it")
+          }
+        }
+        HStack(spacing: 8) {
+          Text(row.lastRequestText)
+            .font(.system(size: 11, design: .monospaced))
+            .foregroundStyle(Pal.dim)
+            .help("the newest request the router saw on this session")
+          if let sid = row.serverId {
+            Text("→ \(sid)")
+              .font(.system(size: 11, design: .monospaced))
+              .foregroundStyle(Pal.dim)
+              .help("the engine this session routes to")
+          }
+        }
+      }
+      Spacer()
+      Text(row.stateWord)
+        .font(.system(size: 12, weight: .semibold, design: .monospaced))
+        .foregroundStyle(Self.stateColor(row.stateWord))
+        .help(Self.stateNote(row.stateWord))
+      Button(action: { m.setSessionOverride(sessionToken: row.token, paused: !row.paused) }) {
+        Text(pending ? "…" : row.actionTitle)
+          .font(.system(size: 11, weight: .semibold, design: .monospaced))
+          .foregroundStyle(Pal.text)
+          .padding(.horizontal, 10).padding(.vertical, 4)
+          .overlay(RoundedRectangle(cornerRadius: 4).stroke(Pal.hairline))
+          .contentShape(Rectangle())
+      }
+      .buttonStyle(.plain)
+      .disabled(pending)
+      .help(row.paused ? "open the gate — resume this session's traffic"
+                        : "hold this session's traffic at the router")
+    }
+    .padding(.horizontal, 14).padding(.vertical, 8)
+    // Stale is a DIM, not a state word (the dashboard's rule).
+    .opacity(row.stale ? 0.55 : 1.0)
+    .background(
+      // Per-row in-flight marker: a hairline accent wash while THIS row's
+      // write runs (the button shows "…" and is disabled).
+      Group { if pending { Rectangle().fill(Pal.accent.opacity(0.06)) } }
+    )
+  }
+
+  static func stateColor(_ w: String) -> Color {
+    switch w {
+    case "Paused": return Pal.warn
+    case "Active": return Pal.ok
+    default: return Pal.dim
+    }
+  }
+  static func stateNote(_ w: String) -> String {
+    switch w {
+    case "Paused": return "paused — the router holds this session's traffic"
+    case "Active": return "a request was seen on this session just now"
+    default: return "no request seen on this session recently"
+    }
+  }
+}
+
 // MARK: log viewer
 
 private struct SentinelKey: PreferenceKey {
@@ -2341,6 +2692,9 @@ struct ContentView: View {
         switch m.activeTab {
         case .state:
           StatePanel(m: m)
+        case .sessions:
+          SessionsPanel(m: m)
+            .frame(maxHeight: .infinity)
         case .logs:
           LogViewer(m: m)
             .frame(maxHeight: .infinity)
