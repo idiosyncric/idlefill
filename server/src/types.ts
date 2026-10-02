@@ -241,6 +241,15 @@ export interface SessionRecord {
   last_seen: number;
   /** Epoch-ms of the newest request seen on this session (null = none yet). */
   last_activity: number | null;
+  /**
+   * The router's queue truth for this session, carried on every register
+   * heartbeat (gate-state). 'active' = the session holds an inference slot
+   * right now; 'queued' = it has ≥1 parked request waiting for admission;
+   * `waiting` = parked-request count. null = the router reported no gate
+   * (idle session) — a session that stopped waiting never stays tagged.
+   * Absent on rows persisted before gate-state.
+   */
+  gate?: { state: 'active' | 'queued'; waiting: number } | null;
 }
 
 /**

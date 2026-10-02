@@ -45,6 +45,12 @@ export interface FakeArbiter {
   registers: Record<string, unknown>[];
   /** Every POST /api/sessions/register body received, in order (issue #9). */
   sessionRegisters: Record<string, unknown>[];
+  /**
+   * Gate blocks stored per token from register bodies (gate-state): the
+   * last heartbeat's `gate` verbatim (absent body field ⇒ null — the idle
+   * report). Echoed in GET /api/state sessions[] like the real arbiter.
+   */
+  sessionGates: Map<string, { state: string; waiting: number } | null>;
   /** Session overrides keyed by token (what /api/state reports in sessions[]). */
   sessionOverrides: Map<string, { override: string; until: number | null }>;
   /** Steer the override directly (the POST /api/clients/:id/override route does this too). */
@@ -71,6 +77,7 @@ export function startFakeArbiter(): Promise<FakeArbiter> {
     registers: [] as Record<string, unknown>[],
     sessionRegisters: [] as Record<string, unknown>[],
     sessionTokens: new Set<string>(),
+    sessionGates: new Map<string, { state: string; waiting: number } | null>(),
     sessionOverrides: new Map<string, { override: string; until: number | null }>(),
     clients: new Set<WebSocket>(),
   };
@@ -107,6 +114,9 @@ export function startFakeArbiter(): Promise<FakeArbiter> {
         if (!token) return send(400, { error: 'token required' });
         const created = !state.sessionTokens.has(token);
         state.sessionTokens.add(token);
+        // gate-state: store the block verbatim; an absent field is the
+        // idle report → clear (the real arbiter's clear-on-absent rule).
+        state.sessionGates.set(token, (j.gate as { state: string; waiting: number } | undefined) ?? null);
         return send(created ? 201 : 200, { created, session: { token } });
       }
       const sov = url.pathname.match(/^\/api\/sessions\/([^/]+)\/override$/);
@@ -133,6 +143,9 @@ export function startFakeArbiter(): Promise<FakeArbiter> {
           sessions: [...state.sessionTokens].map((token) => ({
             token,
             override: state.sessionOverrides.get(token) ?? null,
+            // gate-state: the stored block rides the row verbatim, like
+            // the real arbiter's /api/state spread.
+            gate: state.sessionGates.get(token) ?? null,
           })),
         });
       }
@@ -200,6 +213,7 @@ export function startFakeArbiter(): Promise<FakeArbiter> {
         denyLeaseAfter: state.denyLeaseAfter,
         registers: state.registers,
         sessionRegisters: state.sessionRegisters,
+        sessionGates: state.sessionGates,
         sessionOverrides: state.sessionOverrides,
         get lastRegister() {
           return state.registers[state.registers.length - 1] ?? {};

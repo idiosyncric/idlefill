@@ -36,6 +36,20 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 
 export type SessionOverrideKind = 'pause' | 'force';
 
+/**
+ * The gate-state block the register heartbeat carries (gate-state issue):
+ * what the router's queue knows about one session, surfaced verbatim on the
+ * arbiter's session rows. `active` = the session holds a slot right now
+ * (inflight > 0); `queued` = it has ≥1 parked request waiting for admission.
+ * `waiting` = parked requests for that session. A session that is neither
+ * reports NO snapshot — the register body then omits the block and the
+ * arbiter clears any stored gate for that token.
+ */
+export interface SessionGateSnapshot {
+  state: 'active' | 'queued';
+  waiting: number;
+}
+
 /** One row of GET /apistate → sessions[] as the client sees it. */
 export interface SessionStateRow {
   token: string;
@@ -47,10 +61,12 @@ export type ForwardFn = (req: IncomingMessage, res: ServerResponse, path: string
 
 export interface SessionGateDeps {
   /**
-   * POST /api/sessions/register for a token. Resolves true on 2xx.
-   * Rejections/false never block admission (fail-open).
+   * POST /api/sessions/register for a token. `gate` is the gate-state
+   * snapshot at call time (null = idle: no slot, no holds — the body then
+   * omits the gate block so the arbiter CLEARS any stored gate). Resolves
+   * true on 2xx. Rejections/false never block admission (fail-open).
    */
-  register: (token: string) => Promise<boolean>;
+  register: (token: string, gate: SessionGateSnapshot | null) => Promise<boolean>;
   /** Ask the daemon to re-poll /api/state now (on-demand override learn). */
   refreshState?: () => void;
   /** max_active_agent_sessions — concurrent sessions holding a slot. */
@@ -125,6 +141,22 @@ export class SessionGate {
     return !this.linkUp || this.released;
   }
 
+  /**
+   * The gate-state snapshot for one token — what a heartbeat reports to the
+   * arbiter. Pure read of the router's queue truth: holding a slot
+   * (inflight > 0) ⇒ `active` (the parked-request count still rides as
+   * `waiting` — a holder can have requests queued behind its own traffic);
+   * parked-only ⇒ `queued`; neither (idle, no traffic) ⇒ null, which the
+   * caller folds into an omitted gate block so the arbiter clears the row.
+   */
+  snapshot(token: string): SessionGateSnapshot | null {
+    const s = this.sessions.get(token);
+    if (!s) return null;
+    if (s.inflight > 0) return { state: 'active', waiting: s.holds.length };
+    if (s.holds.length > 0) return { state: 'queued', waiting: s.holds.length };
+    return null;
+  }
+
   // ------------------------------------------------------------------
   // Request path (called by the proxy for /s/<token>/… hits)
   // ------------------------------------------------------------------
@@ -185,7 +217,7 @@ export class SessionGate {
   private async register(s: Session): Promise<void> {
     s.lastRegisterAttempt = this.now();
     try {
-      const ok = await this.deps.register(s.token);
+      const ok = await this.deps.register(s.token, this.snapshot(s.token));
       if (ok) {
         if (!this.linkUp) {
           this.linkUp = true;

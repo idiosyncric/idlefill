@@ -1124,6 +1124,45 @@ test('sessions: register is idempotent on token; last_activity keeps the max', (
   rmSync(h.dir, { recursive: true, force: true });
 });
 
+// gate-state: the register heartbeat's gate block rides the row verbatim.
+// Valid ⇒ store (last-write-wins); absent/null ⇒ CLEAR; invalid ⇒ DROP
+// (never a rejected registration).
+test('sessions: gate block — stored on register, cleared on the idle report, invalid dropped', () => {
+  const h = makeMultiHarness();
+  // Create with a gate block.
+  const r1 = h.arbiter.registerSession('s-gate', { gate: { state: 'queued', waiting: 2 }, now: T0 });
+  assert.equal(r1.ok, true);
+  assert.deepEqual(r1.session!.gate, { state: 'queued', waiting: 2 });
+  // Heartbeat refreshes it (last-write-wins).
+  const r2 = h.arbiter.registerSession('s-gate', { gate: { state: 'active', waiting: 0 }, now: T0 + 1000 });
+  assert.deepEqual(r2.session!.gate, { state: 'active', waiting: 0 });
+  // Invalid blocks are DROPPED, not rejected — the stored value stands.
+  for (const bad of [
+    { state: 'bogus', waiting: 1 },
+    { state: 'queued', waiting: -1 },
+    { state: 'queued', waiting: 1.5 },
+    { state: 'queued', waiting: 'x' },
+    { state: 'queued' },
+    'queued',
+    [1, 2],
+  ]) {
+    const r = h.arbiter.registerSession('s-gate', { gate: bad, now: T0 + 2000 });
+    assert.equal(r.ok, true, `invalid gate ${JSON.stringify(bad)} never rejects the registration`);
+    assert.deepEqual(r.session!.gate, { state: 'active', waiting: 0 }, 'invalid block leaves the stored gate untouched');
+  }
+  // The idle report (gate absent) CLEARS the stored gate.
+  const r3 = h.arbiter.registerSession('s-gate', { now: T0 + 3000 });
+  assert.equal(r3.session!.gate, null, 'absent gate clears to null');
+  // Re-set, then explicit null also clears.
+  h.arbiter.registerSession('s-gate', { gate: { state: 'queued', waiting: 1 }, now: T0 + 4000 });
+  const r4 = h.arbiter.registerSession('s-gate', { gate: null, now: T0 + 5000 });
+  assert.equal(r4.session!.gate, null);
+  // A row created WITHOUT a gate block carries gate = null (never tagged).
+  const r5 = h.arbiter.registerSession('s-plain', { now: T0 });
+  assert.equal(r5.session!.gate, null);
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
 test('sessions: operator override set/clear/expiry (same shape as client overrides)', () => {
   const h = makeMultiHarness();
   const NOW = Date.now();

@@ -213,6 +213,14 @@ struct SessionRow: Identifiable, Equatable {
   let serverId: String?
   /// True when the operator gate holds this session (override == pause).
   let paused: Bool
+  /// The router reports parked requests waiting for admission
+  /// (gate.state == "queued"). An ADDITIONAL fact like `stale` — the state
+  /// word does not change; a paused row with parked traffic shows both.
+  /// Absent/unknown gate (old arbiter) ⇒ false, row renders as before.
+  let queued: Bool
+  /// Parked-request count when >1 (0 otherwise) — the tag reads
+  /// "queued · N waiting" only when there is more than one waiting.
+  let waitingCount: Int
   /// The gate button's title: a paused row offers "Resume", a running
   /// row offers "Pause".
   let actionTitle: String
@@ -252,6 +260,12 @@ enum SessionsView {
       }
       let name = (s["client_name"] as? String).flatMap { $0.isEmpty ? nil : $0 }
       let serverId = (s["server_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+      // gate-state: the router's queue truth. Missing/null/malformed (an
+      // old arbiter, or a row persisted before gate-state) ⇒ no tag — the
+      // row renders exactly as before.
+      let gate = s["gate"] as? [String: Any]
+      let queued = (gate?["state"] as? String) == "queued"
+      let waiting = (gate?["waiting"] as? Double).map { Int($0) } ?? 0
       return SessionRow(
         token: tok,
         shortToken: String(tok.prefix(8)),
@@ -261,6 +275,8 @@ enum SessionsView {
         lastRequestText: lastRequestText,
         serverId: serverId,
         paused: paused,
+        queued: queued,
+        waitingCount: waiting > 1 ? waiting : 0,
         actionTitle: paused ? "Resume" : "Pause"
       )
     }
@@ -1392,6 +1408,10 @@ final class AppModel: ObservableObject {
                                stateWord: paused ? "Paused" : "Idle",
                                stale: r.stale, lastRequestText: r.lastRequestText,
                                serverId: r.serverId, paused: paused,
+                               // The gate tag is the ROUTER's truth, not
+                               // the operator's — the optimistic flip
+                               // carries it unchanged until the next poll.
+                               queued: r.queued, waitingCount: r.waitingCount,
                                actionTitle: paused ? "Resume" : "Pause")
     }
     pendingSessionTokens.insert(sessionToken)
@@ -2165,6 +2185,18 @@ struct SessionsPanel: View {
         }
       }
       Spacer()
+      // gate-state: the router reports parked requests waiting for
+      // admission. An ADDITIONAL fact beside the state word (like `stale`
+      // is beside the token) — the state word itself never changes, so a
+      // paused row with parked traffic shows both.
+      if row.queued {
+        Text(row.waitingCount > 1 ? "queued · \(row.waitingCount) waiting" : "queued")
+          .font(.system(size: 10, design: .monospaced))
+          .foregroundStyle(Pal.dim)
+          .padding(.horizontal, 5).padding(.vertical, 1)
+          .overlay(RoundedRectangle(cornerRadius: 3).stroke(Pal.hairline))
+          .help("held at the router behind another session")
+      }
       Text(row.stateWord)
         .font(.system(size: 12, weight: .semibold, design: .monospaced))
         .foregroundStyle(Self.stateColor(row.stateWord))

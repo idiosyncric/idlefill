@@ -561,6 +561,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       client_name?: string;
       server_id?: string;
       last_activity?: number;
+      gate?: unknown;
     };
     const token = typeof body.token === 'string' ? body.token.trim() : '';
     if (!token) return reply.code(400).send({ error: 'token required' });
@@ -569,6 +570,9 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       ...(body.client_name ? { client_name: String(body.client_name) } : {}),
       ...(body.server_id ? { server_id: String(body.server_id) } : {}),
       ...(typeof body.last_activity === 'number' && Number.isFinite(body.last_activity) ? { last_activity: body.last_activity } : {}),
+      // gate-state: forwarded VERBATIM (absent = the idle report → clear;
+      // validation + drop-don't-reject live in registerSession).
+      gate: body.gate,
     });
     if (!res.ok) return reply.code(400).send({ error: res.reason ?? 'invalid' });
     return reply.code(res.created ? 201 : 200).send({ created: res.created, session: res.session });

@@ -68,6 +68,22 @@ export function leaseServerId(lease: { server_id?: string }): string {
   return lease.server_id ?? WATCHED_SERVER_ID;
 }
 
+/**
+ * Validate a register heartbeat's gate block (gate-state). Three verdicts:
+ *   - a valid { state: 'active'|'queued', waiting: finite int ≥0 } → stored;
+ *   - null/absent → null: the idle report, the stored gate CLEARS;
+ *   - anything else → undefined: INVALID, the field is DROPPED (never a
+ *     rejected registration) and the stored value stands.
+ */
+function normalizeSessionGate(v: unknown): { state: 'active' | 'queued'; waiting: number } | null | undefined {
+  if (v === null || v === undefined) return null;
+  if (typeof v !== 'object' || Array.isArray(v)) return undefined;
+  const g = v as { state?: unknown; waiting?: unknown };
+  if (g.state !== 'active' && g.state !== 'queued') return undefined;
+  if (typeof g.waiting !== 'number' || !Number.isFinite(g.waiting) || !Number.isInteger(g.waiting) || g.waiting < 0) return undefined;
+  return { state: g.state, waiting: g.waiting };
+}
+
 export type LeaseRejectionReason =
   | 'not_idle'
   | 'busy'
@@ -643,14 +659,22 @@ export class Arbiter {
    * this on first sight of a /s/<token> path and refreshes it with each
    * heartbeat; `last_activity` is the newest request the router saw on the
    * session (kept as the max — never rewound).
+   *
+   * `gate` (gate-state): the router's queue truth for the session —
+   * { state: 'active' | 'queued', waiting: int ≥0 }. Stored verbatim on
+   * every heartbeat (last-write-wins). The KEY BEING ABSENT (or null) is
+   * the idle report: the stored gate CLEARS to null, so a session that
+   * stopped waiting never stays tagged. An invalid block is DROPPED (the
+   * registration is never rejected for it; the stored value stands).
    */
   registerSession(
     token: string,
-    opts: { client_id?: string; client_name?: string; server_id?: string; last_activity?: number; now?: number },
+    opts: { client_id?: string; client_name?: string; server_id?: string; last_activity?: number; gate?: unknown; now?: number },
   ): { ok: boolean; reason?: string; created: boolean; session?: SessionRecord } {
     const t = typeof token === 'string' ? token.trim() : '';
     if (!t || t.length > 128) return { ok: false, reason: 'token required (≤128 chars)', created: false };
     const nowMs = opts.now ?? Date.now();
+    const gateVerdict = normalizeSessionGate(opts.gate);
     const s = this.store.state;
     const existing = s.sessions.find((x) => x.token === t);
     if (existing) {
@@ -661,6 +685,9 @@ export class Arbiter {
       if (typeof opts.last_activity === 'number' && Number.isFinite(opts.last_activity)) {
         existing.last_activity = Math.max(existing.last_activity ?? 0, opts.last_activity);
       }
+      // gate-state, last-write-wins: valid ⇒ store; null/absent ⇒ CLEAR
+      // (idle report); invalid (undefined) ⇒ dropped, stored value stands.
+      if (gateVerdict !== undefined) existing.gate = gateVerdict;
       this.store.save();
       return { ok: true, created: false, session: existing };
     }
@@ -672,6 +699,9 @@ export class Arbiter {
       registered_at: nowMs,
       last_seen: nowMs,
       last_activity: typeof opts.last_activity === 'number' && Number.isFinite(opts.last_activity) ? opts.last_activity : null,
+      // On create: valid or explicit-null ride; invalid is dropped whole
+      // (the row starts gate-less, exactly like an absent block).
+      ...(gateVerdict !== undefined ? { gate: gateVerdict } : {}),
     };
     s.sessions.push(session);
     this.store.appendEvent({ kind: 'session_registered', detail: `${t}${session.client_name ? ` (${session.client_name})` : ''}${session.server_id ? ` → ${session.server_id}` : ''}` });
