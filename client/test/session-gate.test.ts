@@ -27,7 +27,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startLlmProxy, waitProxyReady, type LlmProxy } from '../src/proxy.js';
-import { SessionGate } from '../src/session-gate.js';
+import { SessionGate, type SessionGateSnapshot } from '../src/session-gate.js';
 import { ClientDaemon } from '../src/index.js';
 import type { ClientConfig } from '../src/config.js';
 import { startFakeArbiter, type FakeArbiter } from './fake-arbiter.js';
@@ -103,22 +103,24 @@ async function waitFor(pred: () => boolean, timeoutMs = 3000, what = 'condition'
 function makeGate(opts: {
   maxActive?: number;
   holdCapMs?: number;
-  register?: (token: string) => Promise<boolean>;
+  register?: (token: string, gate: SessionGateSnapshot | null) => Promise<boolean>;
   now?: () => number;
-} = {}): { gate: SessionGate; registered: string[] } {
+} = {}): { gate: SessionGate; registered: string[]; calls: { token: string; gate: SessionGateSnapshot | null }[] } {
   const registered: string[] = [];
+  const calls: { token: string; gate: SessionGateSnapshot | null }[] = [];
   const gate = new SessionGate({
     maxActive: opts.maxActive ?? 1,
     holdCapMs: opts.holdCapMs ?? 30_000,
     now: opts.now,
     register:
       opts.register ??
-      (async (token) => {
+      (async (token, gateSnapshot) => {
         registered.push(token);
+        calls.push({ token, gate: gateSnapshot });
         return true;
       }),
   });
-  return { gate, registered };
+  return { gate, registered, calls };
 }
 
 async function harness(opts: { gate: SessionGate }): Promise<{ proxy: LlmProxy; up: Awaited<ReturnType<typeof startControllableUpstream>> }> {
@@ -301,6 +303,124 @@ test('(g) registration fires on first sight, throttled to ≤1 per 10s per sessi
   await r4.res;
   await waitFor(() => registered.length === 3, 1000, 'throttled refresh after window');
   assert.equal(registered[2], 'tokG');
+});
+
+// ---------------------------------------------------------------------------
+// Gate-state visibility: snapshot() + the gate block on the register wire
+// ---------------------------------------------------------------------------
+
+test('snapshot: active / queued / both / idle — the router queue truth', async () => {
+  const { gate } = makeGate({ maxActive: 1 });
+  const { proxy, up } = await harness({ gate });
+  gate.onStatePoll([]);
+
+  // Unknown token ⇒ null (nothing to report).
+  assert.equal(gate.snapshot('tokNope'), null);
+
+  // A holds the only slot (in flight, released by hand).
+  const resA = postChat(proxy.base_url, '/s/tokA/v1/chat/completions');
+  await waitFor(() => up.hits.length === 1, 3000, 'A forwarded');
+  assert.deepEqual(gate.snapshot('tokA'), { state: 'active', waiting: 0 }, 'holding a slot ⇒ active');
+
+  // B parks behind A ⇒ queued with its waiting count.
+  const resB = postChat(proxy.base_url, '/s/tokB/v1/chat/completions');
+  await waitFor(() => gate.queueDepth === 1, 1000, 'B queued');
+  assert.deepEqual(gate.snapshot('tokB'), { state: 'queued', waiting: 1 }, 'parked ⇒ queued + count');
+
+  // BOTH: pause A while it still holds the slot — its next request parks
+  // behind the operator hold while inflight > 0 ⇒ active, count reported.
+  gate.onStatePoll([{ token: 'tokA', override: { override: 'pause', until: null } }]);
+  const resA2 = postChat(proxy.base_url, '/s/tokA/v1/chat/completions');
+  await new Promise((r) => setTimeout(r, 100));
+  assert.deepEqual(gate.snapshot('tokA'), { state: 'active', waiting: 1 }, 'inflight + parked ⇒ active with the count');
+
+  // Drain: A finishes, B is admitted, then A's parked request follows —
+  // releases are sequential (each parked request only reaches the upstream
+  // after the slot frees). After everything settles, both sessions are
+  // idle ⇒ null (a session that stopped waiting must not stay tagged).
+  gate.onStatePoll([]);
+  up.release(1);
+  assert.equal((await resA).status, 200);
+  await waitFor(() => up.hits.length === 2, 3000, 'B admitted');
+  up.release(1);
+  assert.equal((await resB).status, 200);
+  await waitFor(() => up.hits.length === 3, 3000, "A's parked request admitted");
+  up.release(1);
+  assert.equal((await resA2).status, 200);
+  await waitFor(() => gate.snapshot('tokA') === null && gate.snapshot('tokB') === null, 2000, 'idle ⇒ null');
+});
+
+test('register calls carry the gate snapshot (active at refresh, queued while parked, null when idle)', async () => {
+  const clock = { t: 2_000_000 };
+  const { gate, calls } = makeGate({ maxActive: 1, now: () => clock.t });
+  const { proxy, up } = await harness({ gate });
+  gate.onStatePoll([]);
+
+  // First sight registers BEFORE the request is forwarded ⇒ idle snapshot.
+  const resA = postChat(proxy.base_url, '/s/tokA/v1/chat/completions');
+  await waitFor(() => up.hits.length === 1, 3000, 'A forwarded');
+  assert.deepEqual(calls[0], { token: 'tokA', gate: null }, 'first-sight register: no gate block yet');
+
+  // B first-sights and parks; its register fires at first sight (before
+  // the park), so it is also gate-less — the REFRESH is what reports it.
+  const resB = postChat(proxy.base_url, '/s/tokB/v1/chat/completions');
+  await waitFor(() => gate.queueDepth === 1, 1000, 'B queued');
+  assert.equal(calls.length, 2);
+
+  // Past the throttle window, the daemon-tick heartbeat re-registers BOTH
+  // with their live snapshots: A active (holding), B queued (waiting 1).
+  clock.t += 10_001;
+  gate.heartbeat();
+  await waitFor(() => calls.length === 4, 1000, 'heartbeat registers');
+  const byTok = new Map(calls.slice(2).map((c) => [c.token, c.gate]));
+  assert.deepEqual(byTok.get('tokA'), { state: 'active', waiting: 0 });
+  assert.deepEqual(byTok.get('tokB'), { state: 'queued', waiting: 1 });
+
+  // Drain everything (sequential releases — B only reaches the upstream
+  // after A's slot frees); the next heartbeat then reports idle ⇒ null
+  // (the body OMITS the gate block — the arbiter clears the stored gate).
+  up.release(1);
+  assert.equal((await resA).status, 200);
+  await waitFor(() => up.hits.length === 2, 3000, 'B admitted');
+  up.release(1);
+  assert.equal((await resB).status, 200);
+  await waitFor(() => gate.snapshot('tokB') === null, 2000, 'B idle');
+  clock.t += 10_001;
+  gate.heartbeat();
+  await waitFor(() => calls.filter((c) => c.token === 'tokB').length === 3, 1000, 'B heartbeat refresh');
+  assert.equal(calls.filter((c) => c.token === 'tokB').at(-1)!.gate, null, 'idle ⇒ null snapshot');
+});
+
+test('register wire: the gate block rides the POST body and the arbiter stores + echoes it', async () => {
+  // The daemon's register closure shape ({token, client identity, gate?})
+  // POSTed to the fake arbiter — the wire contract between the two.
+  const arb: FakeArbiter = await startFakeArbiter();
+  cleanup.push(() => arb.close());
+  const post = async (body: Record<string, unknown>) => {
+    const res = await fetch(`${arb.url}/api/sessions/register`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    assert.ok(res.status === 200 || res.status === 201, `register status ${res.status}`);
+  };
+
+  // First sight (idle): NO gate block on the wire (back-compat: an old
+  // arbiter never sees the field).
+  await post({ token: 'tokW', client_name: 'mac-w', last_activity: Date.now() });
+  assert.deepEqual(arb.sessionRegisters[0]!.gate, undefined, 'idle heartbeat omits the gate key');
+
+  // Parked heartbeat: the block rides verbatim.
+  await post({ token: 'tokW', client_name: 'mac-w', last_activity: Date.now(), gate: { state: 'queued', waiting: 2 } });
+  assert.deepEqual(arb.sessionGates.get('tokW'), { state: 'queued', waiting: 2 }, 'arbiter stores the block');
+  const st = (await (await fetch(`${arb.url}/api/state`)).json()) as {
+    sessions: { token: string; gate: unknown }[];
+  };
+  assert.deepEqual(st.sessions.find((x) => x.token === 'tokW')?.gate, { state: 'queued', waiting: 2 }, '/api/state echoes it');
+
+  // Idle heartbeat again: no block ⇒ the stored gate CLEARS.
+  await post({ token: 'tokW', client_name: 'mac-w', last_activity: Date.now() });
+  assert.equal(arb.sessionGates.get('tokW'), null, 'absent gate clears the stored block');
 });
 
 // ---------------------------------------------------------------------------

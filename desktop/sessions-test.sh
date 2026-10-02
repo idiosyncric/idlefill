@@ -408,6 +408,52 @@ check("(g) unknown host still routes to .state",
 check("(g) tab order state, sessions, logs, projects, settings",
       MainTab.allCases.map(\.rawValue) == ["state", "sessions", "logs", "projects", "settings"])
 
+// ==========================================================================
+// (h) gate-state: the router's queue truth renders as an ADDITIONAL tag
+//     (like `stale`) — the state word never changes. queued + paused shows
+//     BOTH; queued + stale shows BOTH; an absent/unknown gate (old arbiter)
+//     renders exactly as before.
+// ==========================================================================
+let vGate = proj("""
+{ "sessions": [
+  { "token": "tokq1wait1", "last_seen": \(Int(NOW) - 10_000), "last_activity": \(Int(NOW) - 10_000), "override": null,
+    "gate": { "state": "queued", "waiting": 1 } },
+  { "token": "tokq2wait3", "last_seen": \(Int(NOW) - 10_000), "last_activity": \(Int(NOW) - 10_000), "override": null,
+    "gate": { "state": "queued", "waiting": 3 } },
+  { "token": "tokactive0g", "last_seen": \(Int(NOW) - 10_000), "last_activity": \(Int(NOW) - 10_000), "override": null,
+    "gate": { "state": "active", "waiting": 0 } },
+  { "token": "tokqpaused", "last_seen": \(Int(NOW) - 10_000), "last_activity": \(Int(NOW) - 1_000),
+    "override": { "token": "tokqpaused", "override": "pause", "until": null, "set_at": \(Int(NOW) - 2_000) },
+    "gate": { "state": "queued", "waiting": 2 } },
+  { "token": "tokqstale01", "last_seen": \(Int(NOW) - 120_000), "override": null,
+    "gate": { "state": "queued", "waiting": 1 } },
+  { "token": "toknogate01", "last_seen": \(Int(NOW) - 10_000), "last_activity": \(Int(NOW) - 10_000), "override": null },
+  { "token": "toknullgate", "last_seen": \(Int(NOW) - 10_000), "last_activity": \(Int(NOW) - 10_000), "override": null,
+    "gate": null },
+  { "token": "tokjunkgate", "last_seen": \(Int(NOW) - 10_000), "last_activity": \(Int(NOW) - 10_000), "override": null,
+    "gate": { "state": "sideways" } }
+] }
+""")
+check("(h) 8 gate fixtures projected", vGate.count == 8)
+check("(h) queued waiting=1: tag set, no count (renders 'queued')",
+      row(vGate, "tokq1wait1")?.queued == true && row(vGate, "tokq1wait1")?.waitingCount == 0)
+check("(h) queued waiting=3: tag + count ('queued · 3 waiting')",
+      row(vGate, "tokq2wait3")?.queued == true && row(vGate, "tokq2wait3")?.waitingCount == 3)
+check("(h) the state word does NOT change: queued + fresh request stays Active",
+      row(vGate, "tokq1wait1")?.stateWord == "Active")
+check("(h) gate active: NO queued tag (the tag is the queue fact)",
+      row(vGate, "tokactive0g")?.queued == false)
+check("(h) queued + paused shows BOTH: word Paused, queued tag set",
+      row(vGate, "tokqpaused")?.stateWord == "Paused" && row(vGate, "tokqpaused")?.queued == true
+      && row(vGate, "tokqpaused")?.waitingCount == 2)
+check("(h) queued + stale shows BOTH: stale tag + queued tag, word Idle",
+      row(vGate, "tokqstale01")?.stale == true && row(vGate, "tokqstale01")?.queued == true
+      && row(vGate, "tokqstale01")?.stateWord == "Idle")
+check("(h) absent gate (old arbiter): renders as before — no tag",
+      row(vGate, "toknogate01")?.queued == false && row(vGate, "toknogate01")?.waitingCount == 0)
+check("(h) null gate (idle report): no tag", row(vGate, "toknullgate")?.queued == false)
+check("(h) malformed gate block: treated as absent, no tag", row(vGate, "tokjunkgate")?.queued == false)
+
 if failures > 0 {
   print("SESSIONS-DT-FAILURES \(failures)")
   exit(1)

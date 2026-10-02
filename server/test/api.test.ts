@@ -1054,6 +1054,53 @@ test('sessions: register creates (201), heartbeat updates (200), /api/state list
   assert.equal(bad.status, 400, 'token required');
 });
 
+// gate-state over REST: the register body's gate block stores on the row,
+// /api/state + /api/sessions carry it verbatim, the idle report (absent
+// block) clears it, an invalid block is dropped without rejecting the
+// registration.
+test('sessions: gate block over REST — stored, carried by /api/state + /api/sessions, cleared on idle, invalid dropped', async () => {
+  const reg = await fetch(`${base}/api/sessions/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ token: 's-gate-1', gate: { state: 'queued', waiting: 2 } }),
+  });
+  assert.equal(reg.status, 201);
+  const created = (await reg.json()) as { session: { gate: unknown } };
+  assert.deepEqual(created.session.gate, { state: 'queued', waiting: 2 }, 'create response carries the gate');
+
+  const st = (await (await fetch(`${base}/api/state?limit=5`, { headers: auth })).json()) as {
+    sessions: { token: string; gate?: { state: string; waiting: number } | null }[];
+  };
+  assert.deepEqual(st.sessions.find((x) => x.token === 's-gate-1')?.gate, { state: 'queued', waiting: 2 }, '/api/state carries it');
+  const list = (await (await fetch(`${base}/api/sessions`, { headers: auth })).json()) as {
+    sessions: { token: string; gate?: { state: string; waiting: number } | null }[];
+  };
+  assert.deepEqual(list.sessions.find((x) => x.token === 's-gate-1')?.gate, { state: 'queued', waiting: 2 }, '/api/sessions carries it');
+
+  // Invalid block: 2xx (never rejected), stored value untouched.
+  const bad = await fetch(`${base}/api/sessions/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ token: 's-gate-1', gate: { state: 'nope', waiting: 1 } }),
+  });
+  assert.equal(bad.status, 200, 'invalid gate never rejects the heartbeat');
+  const stBad = (await (await fetch(`${base}/api/state?limit=5`, { headers: auth })).json()) as {
+    sessions: { token: string; gate?: { state: string; waiting: number } | null }[];
+  };
+  assert.deepEqual(stBad.sessions.find((x) => x.token === 's-gate-1')?.gate, { state: 'queued', waiting: 2 }, 'invalid block dropped');
+
+  // Idle report (no gate key): the stored gate CLEARS.
+  await fetch(`${base}/api/sessions/register`, { method: 'POST', headers: auth, body: JSON.stringify({ token: 's-gate-1' }) });
+  const stClr = (await (await fetch(`${base}/api/state?limit=5`, { headers: auth })).json()) as {
+    sessions: { token: string; gate?: unknown }[];
+  };
+  assert.equal(stClr.sessions.find((x) => x.token === 's-gate-1')?.gate, null, 'absent gate clears to null');
+
+  // Back-compat: a body without the gate key is a plain heartbeat (200).
+  const plain = await fetch(`${base}/api/sessions/register`, { method: 'POST', headers: auth, body: JSON.stringify({ token: 's-gate-1' }) });
+  assert.equal(plain.status, 200);
+});
+
 test('sessions: operator override via API — set, expose, clear; 404 unknown token', async () => {
   await fetch(`${base}/api/sessions/register`, { method: 'POST', headers: auth, body: JSON.stringify({ token: 's-http-2' }) });
 
