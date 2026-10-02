@@ -215,6 +215,23 @@ parked request streams through. Operator overrides (arbiter-side, learned
 from the daemon's `/api/state` poll): `pause` holds a session's traffic
 even with free slots; `force` bypasses the slot cap for that session.
 
+**Gate-state visibility.** The register heartbeat also carries what the
+router's queue knows about the session, so the arbiter's session rows (and
+the desktop's SESSIONS tab) can show "queued behind another session · N
+waiting" instead of just "registered". The body gains an optional `gate`
+block; a session that neither holds a slot nor parks anything sends NO
+block, and the arbiter then CLEARS any stored gate (a session that stopped
+waiting must not stay tagged). Invalid blocks are dropped, never rejected;
+an old arbiter simply ignores the extra field.
+
+```
+POST /api/sessions/register  { "token": "…", "gate": { "state": "active" | "queued", "waiting": 3 } }
+```
+
+`state`: `active` = the session currently holds an inference slot
+(in-flight > 0); `queued` = it has ≥1 parked request waiting for admission.
+`waiting`: the parked-request count for that session right now.
+
 ```
 curl -X POST $ARBITER/api/sessions/<token>/override -d '{"override":"pause"}'   # hold
 curl -X POST $ARBITER/api/sessions/<token>/override -d '{"override":null}'      # resume
