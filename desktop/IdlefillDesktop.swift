@@ -1298,6 +1298,17 @@ final class AppModel: ObservableObject {
     return "http://100.105.225.1:8787"
   }
 
+  /// The loopback router port from client/config.json (the sessions-tab
+  /// minting hint needs it; same file + same fallback discipline as
+  /// serverURL()). Default matches client/config.example.json.
+  func proxyPort() -> Int {
+    let path = (repoRoot as NSString).appendingPathComponent("client/config.json")
+    if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+       let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+       let p = o["proxy_port"] as? Double, p > 0 { return Int(p) }
+    return 11435
+  }
+
   // MARK: state poll (same parsing as the menubar app)
 
   func poll() {
@@ -2109,20 +2120,29 @@ struct SessionsPanel: View {
 
   var body: some View {
     VStack(alignment: .leading, spacing: 0) {
-      HStack {
-        PanelHead(title: "sessions")
-        Spacer()
-        Text("\(m.sessions.count)")
-          .font(.system(size: 11, design: .monospaced))
-          .foregroundStyle(Pal.dim)
-          .padding(.trailing, 14)
-      }
+      // R1/R6: no duplicate "SESSIONS" header (the tab already says it) —
+      // the count rides with its noun, left-aligned where the header was.
+      Text("\(m.sessions.count) session\(m.sessions.count == 1 ? "" : "s")")
+        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+        .tracking(1)
+        .foregroundStyle(Pal.dim)
+        .padding(.horizontal, 14).padding(.top, 12).padding(.bottom, 6)
       if m.sessions.isEmpty {
-        Text("no sessions — Hermes sessions pointed at this router appear here")
-          .font(.system(.caption, design: .monospaced))
-          .italic()
-          .foregroundStyle(Pal.dim)
-          .padding(14)
+        VStack(alignment: .leading, spacing: 8) {
+          Text("no sessions — Hermes sessions pointed at this router appear here")
+            .font(.system(.caption, design: .monospaced))
+            .italic()
+            .foregroundStyle(Pal.dim)
+          // R9: the void gets the one action that fills it. The port is
+          // this client's real proxy_port (config.json, default 11435).
+          Text("point one here:  /model http://127.0.0.1:\(m.proxyPort())/s/<token>")
+            .font(.system(size: 11, design: .monospaced))
+            .foregroundStyle(Pal.text.opacity(0.75))
+            .textSelection(.enabled)
+            .padding(.horizontal, 8).padding(.vertical, 4)
+            .background(RoundedRectangle(cornerRadius: 4).fill(Pal.panel))
+        }
+        .padding(14)
       } else {
         ScrollView {
           VStack(spacing: 0) {
@@ -2145,22 +2165,29 @@ struct SessionsPanel: View {
 
   @ViewBuilder
   private func sessionRow(_ row: SessionRow, pending: Bool) -> some View {
+    // R8: ONE vertical axis — the whole HStack is center-aligned; the old
+    // first-baseline dot vs centered right cluster made the row off-kilter.
+    // R3: the decorative dot is gone — the state WORD is the single status
+    // affordance (HIG: status is text, color only reinforces it).
     HStack(spacing: 10) {
-      Circle()
-        .fill(row.stale ? Pal.dim : Pal.ok)
-        .frame(width: 7, height: 7)
       VStack(alignment: .leading, spacing: 2) {
         HStack(spacing: 8) {
           // The short prefix labels the row; the FULL token rides in the
           // tooltip (the operator matches it against the router URL).
           Text(row.shortToken)
             .font(.system(size: 12, weight: .semibold, design: .monospaced))
-            .foregroundStyle(Pal.text)
+            .foregroundStyle(row.stale ? Pal.dim : Pal.text)
             .help("session \(row.token)")
+          // R4: the host is a CHIP, not dim text glued to the name — it
+          // must not read as part of the session's name. Same treatment
+          // as the stale/queued tags (one chip language for the row).
           if let name = row.clientName {
             Text(name)
-              .font(.system(size: 11, design: .monospaced))
+              .font(.system(size: 10, design: .monospaced))
               .foregroundStyle(Pal.dim)
+              .padding(.horizontal, 5).padding(.vertical, 1)
+              .overlay(RoundedRectangle(cornerRadius: 3).stroke(Pal.hairline))
+              .help("the machine this session's router runs on")
           }
           if row.stale {
             Text("stale")
@@ -2184,7 +2211,7 @@ struct SessionsPanel: View {
           }
         }
       }
-      Spacer()
+      Spacer(minLength: 16)
       // gate-state: the router reports parked requests waiting for
       // admission. An ADDITIONAL fact beside the state word (like `stale`
       // is beside the token) — the state word itself never changes, so a
@@ -2201,12 +2228,17 @@ struct SessionsPanel: View {
         .font(.system(size: 12, weight: .semibold, design: .monospaced))
         .foregroundStyle(Self.stateColor(row.stateWord))
         .help(Self.stateNote(row.stateWord))
+        .accessibilityLabel("status \(row.stateWord)")
+      // R5: a real control, not a ghost outline glued to the state word —
+      // filled panel background + visible border + a clear gap from the
+      // Spacer(minLength: 16) above, so "Active" never reads as its label.
       Button(action: { m.setSessionOverride(sessionToken: row.token, paused: !row.paused) }) {
         Text(pending ? "…" : row.actionTitle)
           .font(.system(size: 11, weight: .semibold, design: .monospaced))
           .foregroundStyle(Pal.text)
-          .padding(.horizontal, 10).padding(.vertical, 4)
-          .overlay(RoundedRectangle(cornerRadius: 4).stroke(Pal.hairline))
+          .padding(.horizontal, 12).padding(.vertical, 5)
+          .background(RoundedRectangle(cornerRadius: 5).fill(Pal.panel))
+          .overlay(RoundedRectangle(cornerRadius: 5).stroke(Pal.dim.opacity(0.7), lineWidth: 1))
           .contentShape(Rectangle())
       }
       .buttonStyle(.plain)
@@ -2214,9 +2246,12 @@ struct SessionsPanel: View {
       .help(row.paused ? "open the gate — resume this session's traffic"
                         : "hold this session's traffic at the router")
     }
-    .padding(.horizontal, 14).padding(.vertical, 8)
-    // Stale is a DIM, not a state word (the dashboard's rule).
-    .opacity(row.stale ? 0.55 : 1.0)
+    .padding(.horizontal, 14).padding(.vertical, 10)
+    // Stale is a DIM, not a state word (the dashboard's rule). R7: the dim
+    // is a COLOR swap on the row's name (below), not a row opacity — the
+    // old 0.55 opacity dragged text to 2.7:1 on the near-black canvas
+    // (fails WCAG AA). A dimmed name still reads faded beside a white one,
+    // and every glyph stays >= 6:1.
     .background(
       // Per-row in-flight marker: a hairline accent wash while THIS row's
       // write runs (the button shows "…" and is disabled).
@@ -2685,10 +2720,20 @@ struct ContentView: View {
       HStack(spacing: 8) {
         LogoView(spinning: m.lease.1 > 0)
           .frame(width: 16, height: 16)
+          // R2: the ring spins ONLY while this machine holds a running
+          // lease — say so, so it never reads as a generic "loading".
+          .help(m.lease.1 > 0 ? "running an idle task: \(m.lease.0)" : "idle — no task running on this machine")
         Text("idlefill · desktop")
           .font(.system(.headline, design: .monospaced).weight(.semibold))
           .foregroundStyle(Pal.text)
         Spacer()
+        // R2: the word is SCOPED. Bare green "idle" beside green "Active"
+        // rows read as a contradiction — this is the ARBITER's verdict for
+        // this machine, so say whose status it is (same word/color the
+        // STATE tab's "arbiter" row shows).
+        Text("arbiter")
+          .font(.system(.body, design: .monospaced))
+          .foregroundStyle(Pal.dim)
         Text(m.conn.word)
           .font(.system(.body, design: .monospaced).weight(.semibold))
           .foregroundStyle(m.conn.color)
@@ -2704,7 +2749,11 @@ struct ContentView: View {
             Text(tab.title)
               .font(.system(size: 11, weight: .semibold, design: .monospaced))
               .tracking(1)
-              .foregroundStyle(m.activeTab == tab ? Pal.text : Pal.dim)
+              // R7: the active/inactive gap was white-vs-dim (both readable,
+              // nearly the same weight at a glance). A mid-tone inactive
+              // keeps the terminal look and widens the ramp. 0.8 is the
+              // floor: it composites to exactly 4.5:1 on the canvas (AA).
+              .foregroundStyle(m.activeTab == tab ? Pal.text : Pal.dim.opacity(0.8))
               .padding(.horizontal, 14).padding(.vertical, 7)
               .overlay(alignment: .bottom) {
                 if m.activeTab == tab {
@@ -2714,6 +2763,8 @@ struct ContentView: View {
               .contentShape(Rectangle())
           }
           .buttonStyle(.plain)
+          .accessibilityLabel(tab.rawValue)
+          .accessibilityAddTraits(m.activeTab == tab ? .isSelected : [])
         }
         Spacer()
       }
