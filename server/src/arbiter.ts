@@ -51,6 +51,7 @@
 import { randomBytes } from 'node:crypto';
 import type { IdleDetector } from './idle.js';
 import { activeLeaseExemptIps } from './idle.js';
+import { mintInstanceId } from './mesh.js';
 import type { IdleSignal, JobResultRow, JobThrottle, SessionOverride, SessionRecord } from './types.js';
 import type { StateStore } from './state.js';
 import type { ClientOverride, Lease, ProjectAllocation, ServerConfig, ServerConnection, UtcDate } from './types.js';
@@ -1208,6 +1209,29 @@ export class Arbiter {
   // ------------------------------------------------------------------
   // Queries
   // ------------------------------------------------------------------
+
+  /**
+   * This instance's stable mesh identity (#50 D2): minted on first boot
+   * and persisted in the state file. Tailnet IPs move; this id is the
+   * identity. The ONLY mesh data that touches state.json — peer snapshots
+   * stay ephemeral by design.
+   */
+  instanceId(): string {
+    const s = this.store.state;
+    if (typeof s.instance_id === 'string' && s.instance_id.trim() !== '') return s.instance_id;
+    s.instance_id = mintInstanceId();
+    this.store.save();
+    return s.instance_id;
+  }
+
+  /** Sum of queue depths across every registered client (the mesh's coarse depth). */
+  totalQueueDepth(): number {
+    let n = 0;
+    for (const c of this.store.state.clients) {
+      for (const p of c.projects ?? []) n += Number.isFinite(p.queue_depth) ? p.queue_depth : 0;
+    }
+    return n;
+  }
 
   activeLeases(now?: number): Lease[] {
     const n = now ?? Date.now();

@@ -182,6 +182,7 @@
   .worker .wname { min-width: 84px; font-weight: 600; }
   .worker .wmeta { color: var(--dim); }
   .worker .wqueue { margin-left: auto; white-space: nowrap; }
+  .worker .wstate { margin-left: auto; white-space: nowrap; font-size: 12px; }
   .worker .gate { margin-left: 8px; }
   /* Published stats: one line per worker, rendered verbatim (the arbiter
      never computes them). */
@@ -283,6 +284,17 @@
     <h2>Inference servers <button id="add-server" class="settings-toggle" type="button" title="add a declared inference server connection">+ add server</button></h2>
     <div id="add-server-form" class="settings-form"></div>
     <div id="servers"><div class="empty">no servers declared</div></div>
+  </section>
+
+  <!-- Mesh peers (#50) — other idlefill instances this arbiter pulls
+       coarse snapshots from. Exception-only: hidden while no peers are
+       configured. Read-only by construction: the snapshot carries
+       presence, per-engine idle state, queue DEPTHS, and session/lease
+       counts — never job ids, titles, URLs, or payloads. Cross-instance
+       control is #39 (paired), not this strip. -->
+  <section id="mesh-section" style="display:none">
+    <h2>Machines</h2>
+    <div id="mesh"></div>
   </section>
 
   <section>
@@ -641,6 +653,44 @@ function workBlock(p, st) {
 }
 
 // ---------------------------------------------------------------------------
+// Mesh peer row (#50) — one read-only row per configured peer instance.
+// Coarse by construction: the snapshot carries presence, per-engine idle
+// state, queue DEPTHS, and session/lease counts. There is nothing here to
+// expand into job ids/payloads — the read plane never carries them.
+// ---------------------------------------------------------------------------
+function peerBlock(p, st) {
+  const headState = p.online
+    ? '<span class="state ok">Online</span>'
+    : '<span class="state warn">Offline</span>';
+  const snap = p.snapshot;
+  let rows =
+    '<div class="kv"><span class="k">instance</span><span class="v dim">' + esc(p.instance_id ?? "unknown") + "</span></div>" +
+    '<div class="kv"><span class="k">last pull</span><span class="v">' +
+    (p.fetch_age_s === null ? "never" : ago(p.fetch_age_s * 1000)) + "</span></div>";
+  // Exception-only: the last fetch error, shown only while the last pull failed.
+  if (p.error) {
+    rows += '<div class="kv"><span class="k">last error</span><span class="v err">' + esc(p.error) + "</span></div>";
+  }
+  if (snap) {
+    const engines = (snap.servers || []).map((s) => {
+      const w = liveWord({ degraded: s.degraded, idle: s.idle }, false);
+      return '<div class="worker">' +
+        '<span class="dot ' + (s.idle && !s.degraded ? "off" : "run") + '"></span>' +
+        '<span class="wname">' + esc(s.name) + "</span>" +
+        '<span class="wstate ' + w.cls + '" title="' + esc(w.note) + '">' + esc(w.label) + "</span>" +
+        "</div>";
+    }).join("");
+    rows += '<div class="models">' + (engines || '<div class="empty">no engines reported</div>') + "</div>";
+    rows += '<div class="kv"><span class="k">queued</span><span class="v">' + (snap.queue_depth || 0).toLocaleString() +
+      " · " + (snap.sessions || 0) + " sessions · " + (snap.active_leases || 0) + " running</span></div>";
+  }
+  return '<div class="srv">' +
+    '<div class="srv-head"><span class="name">' + esc(p.name) + "</span>" + headState + "</div>" +
+    rows +
+    "</div>";
+}
+
+// ---------------------------------------------------------------------------
 // Sessions pane — one row per router-self-registered session (#32/#33).
 // The router enforces admission; the dashboard only displays arbiter truth,
 // so the state word is derived from the row's own timestamps + override —
@@ -782,6 +832,18 @@ async function refresh() {
     sbox.innerHTML = '<div class="empty">no servers declared</div>';
   } else {
     sbox.innerHTML = st.servers.map((s) => srvBlock(s, st)).join("");
+  }
+
+  // --- Mesh peers (#50) — exception-only: hidden while no peers are
+  //     configured. Read-only snapshot rows; the local machine is the rest
+  //     of this page, never a row here.
+  const meshBox = $("mesh");
+  const peers = st.mesh?.peers || [];
+  if (peers.length === 0) {
+    $("mesh-section").style.display = "none";
+  } else {
+    $("mesh-section").style.display = "";
+    meshBox.innerHTML = peers.map((p) => peerBlock(p, st)).join("");
   }
 
   // --- Projects (running jobs, budgets, workers + published stats, controls)

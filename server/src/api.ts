@@ -13,9 +13,11 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs';
+import os from 'node:os';
 import fastify, { type FastifyInstance } from 'fastify';
 import { WebSocketServer } from 'ws';
 import { utcDay, type Arbiter, WATCHED_SERVER_ID } from './arbiter.js';
+import { buildMeshSnapshot, type MeshFederation } from './mesh.js';
 import type { ProjectAllocation, QueuePreviewRow, RebuildRunState, ServerConfig, ServerConnection } from './types.js';
 
 export interface ApiDeps {
@@ -23,12 +25,30 @@ export interface ApiDeps {
   cfg: ServerConfig;
   /** Path to the static dashboard. */
   publicDir: string;
+  /**
+   * Mesh federation read plane (#50). Optional so existing callers/tests
+   * stay valid; absent = no mesh (no /api/mesh route beyond the local
+   * snapshot, no `mesh` key on /api/state).
+   */
+  mesh?: MeshFederation;
 }
 
 /** Validate a request token against the configured set. */
 export function isValidToken(cfg: ServerConfig, token: string | null | undefined): boolean {
   if (!token || typeof token !== 'string') return false;
   return cfg.api_tokens.includes(token);
+}
+
+/**
+ * Mesh read-plane auth (#50 D2): the fleet peer_token is read-only and
+ * scoped to GET /api/mesh ONLY. It never unlocks any other /api/* route,
+ * and local admin tokens always work on /api/mesh (the operator's own
+ * surfaces read the same endpoint).
+ */
+export function isPeerToken(cfg: ServerConfig, token: string | null | undefined): boolean {
+  if (!token || typeof token !== 'string') return false;
+  const pt = cfg.peer_token;
+  return typeof pt === 'string' && pt !== '' && token === pt;
 }
 
 /**
@@ -193,7 +213,7 @@ function serverView(arbiter: Arbiter, cfg: ServerConfig, now: number) {
 
 /** Attach the API routes (authed) and the dashboard (public read). */
 export function buildApi(deps: ApiDeps): FastifyInstance {
-  const { arbiter, cfg, publicDir } = deps;
+  const { arbiter, cfg, publicDir, mesh } = deps;
 
   const app = fastify({ logger: false });
   app.decorate('idlefill', { arbiter, cfg, publicDir });
@@ -211,6 +231,11 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     // ANY /api/* path is a 401.
     const isAnonymousState = path === '/api/state' && req.method === 'GET' && token === null;
     if (isAnonymousState) return;
+    // Mesh read plane (#50 D2): the fleet peer_token is read-only and works
+    // ONLY on GET /api/mesh. It never unlocks any other route; a wrong
+    // token anywhere (including here) is still a 401.
+    const isMeshRead = path === '/api/mesh' && req.method === 'GET' && isPeerToken(cfg, token);
+    if (isMeshRead) return;
     if (!isValidToken(cfg, token)) {
       await reply.code(401).send({ error: 'unauthorized', hint: 'present a valid token (Authorization: Bearer or ?token=)' });
       return;
@@ -609,6 +634,37 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   });
 
   // ------------------------------------------------------------------
+  // Mesh federation read plane (#50)
+  // ------------------------------------------------------------------
+
+  /**
+   * This instance's coarse snapshot for peers. Auth: the fleet peer_token
+   * (read-only, scoped here by the onRequest hook) or a local admin token.
+   * COARSE by construction — presence, per-engine idle signal, queue
+   * DEPTHS, session/lease counts. Never job ids, titles, URLs, payloads.
+   */
+  app.get('/api/mesh', async () => {
+    const now = Date.now();
+    const s = arbiter['store'].state;
+    const servers = s.servers.map((row: ServerConnection) => ({
+      name: row.name,
+      signal: arbiter.serverSignal(row.id, now),
+    }));
+    return buildMeshSnapshot(
+      arbiter.instanceId(),
+      cfg.mesh_name || os.hostname(),
+      servers,
+      arbiter.totalQueueDepth(),
+      arbiter.listSessions().length,
+      arbiter.activeLeases(now).length,
+      now,
+      // The arbiter's own version (display-only; the client handshake
+      // precedent). Absent on a build that never baked one.
+      process.env.IDLEFILL_VERSION,
+    );
+  });
+
+  // ------------------------------------------------------------------
   // State (public read when anonymous; token-authed otherwise)
   // ------------------------------------------------------------------
 
@@ -662,6 +718,11 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       // Empty list when nothing is throttled — the dashboard renders this
       // as the exception-only "Throttled jobs" section.
       throttled_jobs: arbiter.throttledJobs(),
+      // Mesh federation (#50): this instance's identity + the merged peer
+      // view. ADD key (the /api/state shape contract: add, never rename).
+      // Ephemeral — peer snapshots never touch state.json. Absent when no
+      // federation is wired (a build without the mesh module stays as-is).
+      ...(mesh ? { mesh: { instance_id: arbiter.instanceId(), peers: mesh.view(now) } } : {}),
       projects: projectView(arbiter, cfg, s.clients, day, now, todayTotals(s.leases, day)),
       servers: serverView(arbiter, cfg, now),
       events: s.events.slice(Math.max(0, s.events.length - limit)).reverse(),

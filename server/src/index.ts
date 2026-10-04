@@ -10,6 +10,7 @@ import { buildApi, attachWebSocket } from './api.js';
 import { Arbiter, WATCHED_SERVER_ID } from './arbiter.js';
 import { loadConfig } from './config.js';
 import { IdleDetector, makeRealActivityFetcher, makeRealLogMtimeSource } from './idle.js';
+import { MeshFederation, makeRealMeshFetcher } from './mesh.js';
 import { StateStore } from './state.js';
 import type { ServerConnection } from './types.js';
 
@@ -36,6 +37,12 @@ async function main(): Promise<void> {
     });
 
   const arbiter = new Arbiter(store, cfg, new Map(), { detectorFactory: makeDetector });
+
+  // Mesh federation read plane (#50): pull coarse peer snapshots on the
+  // poll cadence. Ephemeral — never written to state.json. No peers
+  // configured = the module stays inert (the /api/mesh route still
+  // answers with this instance's own snapshot for peers that list us).
+  const mesh = new MeshFederation(cfg, makeRealMeshFetcher());
 
   // Persisted operator settings re-hydrate onto the live config objects:
   //  - project rows (pause state + per-project grant-knob overrides) replace
@@ -70,7 +77,7 @@ async function main(): Promise<void> {
   }
   store.save();
 
-  const app = buildApi({ arbiter, cfg, publicDir: join(entryDir, '..', 'public') });
+  const app = buildApi({ arbiter, cfg, publicDir: join(entryDir, '..', 'public'), mesh });
   const wss = attachWebSocket(app, arbiter, cfg);
   const broadcast = (app as unknown as Record<string, unknown>).broadcastWs as (obj: unknown) => void;
 

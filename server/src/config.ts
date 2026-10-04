@@ -55,6 +55,20 @@ export function applyDefaults(raw: Partial<ServerConfig> | null | undefined): Se
     server_peers: Array.isArray(r.server_peers)
       ? r.server_peers.filter((m): m is string => typeof m === 'string' && m.trim() !== '')
       : DEFAULTS.server_peers,
+    // Mesh federation read plane (#50). mesh_peers is the peer registry —
+    // deliberately NOT server_peers (llama-swap backends). Entries are
+    // {url, name?}; a blank url is dropped (a peer with no url cannot be
+    // pulled from).
+    mesh_peers: Array.isArray(r.mesh_peers)
+      ? (r.mesh_peers as Record<string, unknown>[])
+          .map((p) => ({
+            url: typeof p?.url === 'string' ? p.url.trim() : '',
+            ...(typeof p?.name === 'string' && p.name.trim() !== '' ? { name: p.name.trim() } : {}),
+          }))
+          .filter((p) => p.url !== '')
+      : [],
+    peer_token: typeof r.peer_token === 'string' ? r.peer_token : '',
+    mesh_name: typeof r.mesh_name === 'string' && r.mesh_name.trim() !== '' ? r.mesh_name.trim() : '',
     log_glob: str(r.log_glob, DEFAULTS.log_glob),
     idle_seconds: num(r.idle_seconds, DEFAULTS.idle_seconds),
     poll_ms: num(r.poll_ms, DEFAULTS.poll_ms),

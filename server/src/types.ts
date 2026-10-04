@@ -29,6 +29,21 @@ export interface ServerConfig {
   server_models?: string[];
   /** llama-swap `peer:` backends routed behind the single entry point (display metadata). */
   server_peers?: string[];
+  /**
+   * Mesh federation read plane (#50 D1). The peer registry: other
+   * idlefill arbiters to pull coarse snapshots from. NOT `server_peers`
+   * (that key means llama-swap backends). Each arbiter pulls on the
+   * poll cadence; snapshots are ephemeral (never written to state.json).
+   */
+  mesh_peers?: { url: string; name?: string }[];
+  /**
+   * Fleet read-only token (#50 D2). Presented by peer arbiters at
+   * GET /api/mesh. Empty = the mesh read plane is closed to peers
+   * (the endpoint still answers local admin tokens).
+   */
+  peer_token?: string;
+  /** This instance's mesh display name (default: the OS hostname). */
+  mesh_name?: string;
   /** Glob of NInfer req-*.jsonl logs. Empty string disables the log-mtime signal. */
   log_glob: string;
   idle_seconds: number;
@@ -441,6 +456,12 @@ export interface ProjectStateRow {
 export interface ArbiterState {
   /** Declared inference-server connections (seeded from config on first load). */
   servers: ServerConnection[];
+  /**
+   * Stable mesh instance identity (#50 D2): random hex, minted at first
+   * boot and persisted. Tailnet IPs move; this id is the identity. The
+   * ONLY mesh data in the state file — peer snapshots stay ephemeral.
+   */
+  instance_id?: string;
   /** Persisted operator state for each configured project. */
   projects: ProjectStateRow[];
   clients: ClientRecord[];
