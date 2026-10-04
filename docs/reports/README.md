@@ -27,3 +27,5 @@ New issue reports land **here**, never at the repo root.
 | #27 | [ISSUE27-REPORT.md](ISSUE27-REPORT.md) | Menu bar panel rework |
 | #9 D | [DESKTOP-SESSIONS-REPORT.md](DESKTOP-SESSIONS-REPORT.md) | Desktop Sessions tab (the interactive surface) |
 | gate-state | [GATE-STATE-REPORT.md](GATE-STATE-REPORT.md) | Gate-state visibility on the session rows (#40) |
+| #50 | [../architecture/mesh.md](../architecture/mesh.md) | Mesh topology decision lock (federation, identity, packaging) |
+| #39 | [ISSUE39-RESCOPE.md](ISSUE39-RESCOPE.md) | Peer discovery re-scoped against the locked mesh transport |
