@@ -28,5 +28,6 @@ New issue reports land **here**, never at the repo root.
 | #9 D | [DESKTOP-SESSIONS-REPORT.md](DESKTOP-SESSIONS-REPORT.md) | Desktop Sessions tab (the interactive surface) |
 | gate-state | [GATE-STATE-REPORT.md](GATE-STATE-REPORT.md) | Gate-state visibility on the session rows (#40) |
 | #50 | [../architecture/mesh.md](../architecture/mesh.md) | Mesh topology decision lock (federation, identity, packaging) |
+| #55 | [../architecture/fleet-service.md](../architecture/fleet-service.md) | Fleet service grilling: instance identity, roster, pairing (separate service) |
 | #50 | [ISSUE50-READPLANE-REPORT.md](ISSUE50-READPLANE-REPORT.md) | Mesh read plane: /api/mesh, peer pull, dashboard Machines strip |
 | #39 | [ISSUE39-RESCOPE.md](ISSUE39-RESCOPE.md) | Peer discovery re-scoped against the locked mesh transport |
