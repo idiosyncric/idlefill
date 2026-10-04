@@ -273,13 +273,16 @@ nothing is built for it now.
   file could not be registered here — outside this issue's allowed
   paths).
 
-## Open questions (owner input)
+## Decisions (owner, 2026-10-04)
 
-1. One in-flight cycle per project, or many? Recommended: one, for v1.
-   The cursor is one row; concurrency multiplies the cursor.
-2. Should a cycle inherit the project's daily budget as-is, or carry a
-   cycle-level cap? Recommended: inherit; the budget already bounds
-   idle work.
-3. Gate short-circuit order: on a failing gate, skip the item's
-   remaining gates (the spike's behavior) or run them all for a fuller
-   report? Recommended: skip; quarantine already names the failing gate.
+1. **In-flight cycles per project: configurable, default one.** New
+   config knob `cycle_max_in_flight` (default 1). One cursor per cycle
+   row already holds. The driver's admission rule caps how many cycle
+   rows may hold a running stage at once. Expanding past one is filed
+   as issue #56 (multi-cycle concurrency: admission rule, budget
+   interaction, N-cycle status shape).
+2. **Budget: a cycle inherits the project's daily budget as-is.
+   LOCKED.** No cycle-level cap in v1.
+3. **Gate short-circuit: skip. LOCKED.** On a failing gate the driver
+   quarantines the item and skips that item's remaining gates. The
+   quarantine reason string already names the failing gate.

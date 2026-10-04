@@ -67,3 +67,15 @@ pitfalls).
 The cycles-file reader/writer pair + a driver loop fired from the poll
 tick (the `maybeRunScheduledRebuilds` shape), the MCP cycle tool
 module, and the test-file registration. Nothing else moves.
+
+## Owner decisions (2026-10-04)
+
+The owner reviewed the grill and locked the three open questions. In-flight
+cycles per project: configurable via `cycle_max_in_flight`, default one.
+Budget: a cycle inherits the project's daily budget as-is; no cycle-level
+cap in v1. Gate short-circuit: skip; a failing gate quarantines the item
+and skips that item's remaining gates. Expanding past one in-flight cycle
+is filed as issue #56 (multi-cycle concurrency: admission rule, budget
+interaction, N-cycle status shape). The spike file is now registered in
+`client/package.json`'s `test` script; the client suite count rose from
+61 to 65.
