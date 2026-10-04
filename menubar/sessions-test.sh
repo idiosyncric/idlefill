@@ -14,6 +14,9 @@
 #   (d) override label rendering: pause -> "paused", force -> "forced";
 #       paused AND stale -> both words on the one-liner.
 #   (e) client_name shown when present; token prefix when absent.
+#   (g) gate-state (#40): queued rides the exception one-liner (with the
+#       waiting count when >1); paused+queued and queued+stale show both;
+#       absent/null/malformed gate (old arbiter) renders exactly as before.
 #   Plus: the single write site — AppModel.injectStatePayload (the real
 #   poll path's apply()) lands sessions/sessionsCountLine on the model,
 #   and an empty payload clears them.
@@ -197,6 +200,76 @@ check("(e) lastActivity 0 -> nil",
       vAct.sessions.first(where: { $0.token == "actzero00000" })?.lastActivity == nil)
 check("(e) lastActivity real value carried",
       vAct.sessions.first(where: { $0.token == "actreal00000" })?.lastActivity == NOW - 4_000)
+
+// ==========================================================================
+// (g) gate-state (#40): the router's parked-request block rides the row.
+//     queued is an ADDITIONAL exception fact (like stale) — the count
+//     buckets are unchanged (queued-but-healthy still counts active).
+//     Absent / null / malformed gate (old arbiter) renders as before.
+// ==========================================================================
+let vGate = proj("""
+{ "sessions": [
+  { "token": "gq1aaaaaaaa", "client_name": "mac-q", "last_seen": \(Int(NOW) - 5_000), "override": null,
+    "gate": { "state": "queued", "waiting": 1 } },
+  { "token": "gq3aaaaaaaa", "client_name": "mac-q3", "last_seen": \(Int(NOW) - 5_000), "override": null,
+    "gate": { "state": "queued", "waiting": 3 } },
+  { "token": "gactiveaaaa", "client_name": "mac-a", "last_seen": \(Int(NOW) - 5_000), "override": null,
+    "gate": { "state": "active", "waiting": 2 } }
+] }
+""")
+check("(g) queued waiting=1 -> 'queued' one-liner",
+      vGate.sessions.first(where: { $0.token == "gq1aaaaaaaa" })?.exceptionLine == "mac-q · queued")
+check("(g) queued waiting=3 -> 'queued · 3 waiting'",
+      vGate.sessions.first(where: { $0.token == "gq3aaaaaaaa" })?.exceptionLine == "mac-q3 · queued · 3 waiting")
+check("(g) active gate is not an exception (no row)",
+      vGate.sessions.first(where: { $0.token == "gactiveaaaa" })?.exceptionLine == nil
+      && vGate.sessions.first(where: { $0.token == "gactiveaaaa" })?.queued == false)
+check("(g) queued fields carried on the projection",
+      vGate.sessions.first(where: { $0.token == "gq3aaaaaaaa" })?.queued == true
+      && vGate.sessions.first(where: { $0.token == "gq3aaaaaaaa" })?.waitingCount == 3
+      && vGate.sessions.first(where: { $0.token == "gq1aaaaaaaa" })?.waitingCount == 0)
+// queued does NOT change the count buckets (still active, not its own bucket).
+check("(g) count line unaffected by queued", vGate.sessionsCountLine == "3 active")
+// paused + queued shows BOTH words (override first, like the desktop row).
+let vGateOv = proj("""
+{ "sessions": [
+  { "token": "gpqaaaaaaaaa", "client_name": "mac-pq", "last_seen": \(Int(NOW) - 5_000),
+    "override": { "token": "gpqaaaaaaaaa", "override": "pause", "until": null, "set_at": \(Int(NOW) - 1_000) },
+    "gate": { "state": "queued", "waiting": 2 } }
+] }
+""")
+check("(g) paused AND queued -> both words",
+      vGateOv.sessions.first?.exceptionLine == "mac-pq · paused · queued · 2 waiting")
+// queued + stale shows both too.
+let vGateStale = proj("""
+{ "sessions": [
+  { "token": "gstaaaaaaaaa", "client_name": "mac-gs", "last_seen": \(Int(NOW) - 7_200_000), "override": null,
+    "gate": { "state": "queued", "waiting": 1 } }
+] }
+""")
+check("(g) queued AND stale -> both words",
+      vGateStale.sessions.first?.exceptionLine == "mac-gs · queued · stale")
+// Back-compat: absent key, null, and malformed blocks all render as before.
+let vGateOld = proj("""
+{ "sessions": [
+  { "token": "gabsaaaaaaaa", "client_name": "mac-abs", "last_seen": \(Int(NOW) - 5_000), "override": null },
+  { "token": "gnullaaaaaaa", "client_name": "mac-null", "last_seen": \(Int(NOW) - 5_000), "override": null,
+    "gate": null },
+  { "token": "gbadaaaaaaaa", "client_name": "mac-bad", "last_seen": \(Int(NOW) - 5_000), "override": null,
+    "gate": { "state": "sideways", "waiting": 1 } },
+  { "token": "gbad2aaaaaaa", "client_name": "mac-bad2", "last_seen": \(Int(NOW) - 5_000), "override": null,
+    "gate": "not-an-object" }
+] }
+""")
+check("(g) absent gate -> no tag, healthy",
+      vGateOld.sessions.first(where: { $0.token == "gabsaaaaaaaa" })?.queued == false
+      && vGateOld.sessions.first(where: { $0.token == "gabsaaaaaaaa" })?.exceptionLine == nil)
+check("(g) null gate (idle report) -> no tag",
+      vGateOld.sessions.first(where: { $0.token == "gnullaaaaaaa" })?.queued == false)
+check("(g) malformed gate block -> treated as absent",
+      vGateOld.sessions.first(where: { $0.token == "gbadaaaaaaaa" })?.queued == false
+      && vGateOld.sessions.first(where: { $0.token == "gbad2aaaaaaa" })?.queued == false)
+check("(g) old-arbiter payload count line unchanged", vGateOld.sessionsCountLine == "4 active")
 
 // ==========================================================================
 // (f) the single write site: the REAL poll path (apply -> applyProjection)

@@ -291,7 +291,15 @@ struct ScopeSession {
   let lastActivity: Double?    // epoch-ms of the newest request seen (nil = none yet)
   let overrideLabel: String?   // active operator override ("pause" | "force"; nil = none)
   let stale: Bool              // now - last_seen > 90_000 (the daemonRunning precedent)
-  /** The exception one-liner (paused / forced / stale sessions only —
+  /** Gate-state (#40): the router reports parked requests waiting for
+   *  admission (gate.state == "queued"). An ADDITIONAL fact like `stale` —
+   *  the exception one-liner gains the word, nothing else changes.
+   *  Absent/unknown gate (old arbiter) ⇒ false, row renders as before. */
+  let queued: Bool
+  /** Parked-request count when >1 (0 otherwise) — the one-liner reads
+   *  "queued · N waiting" only when there is more than one waiting. */
+  let waitingCount: Int
+  /** The exception one-liner (paused / forced / queued / stale sessions only —
    *  DESIGN.md Exception-Only: a healthy session renders NO row). nil = healthy. */
   let exceptionLine: String?
 }
@@ -594,18 +602,28 @@ enum ScopeView {
       let label = (ov == "pause" || ov == "force") ? ov : nil
       let name = (s["client_name"] as? String).flatMap { $0.isEmpty ? nil : $0 }
       let lastActivity = (s["last_activity"] as? Double).flatMap { $0 == 0 ? nil : $0 }
+      // Gate-state (#40): the router's parked-request block. Absent /
+      // null / malformed (old arbiter) ⇒ not queued, row renders as before.
+      let gateBlk = (s["gate"] as? [String: Any])
+      let queued = (gateBlk?["state"] as? String) == "queued"
+      let waiting = (gateBlk?["waiting"] as? Double).map { Int($0) } ?? 0
       // Exception-only one-liner (DESIGN.md): a healthy session renders NO
       // row. The session is named by its router's client_name when the
       // router identified itself, else by a short token prefix.
       let who = name ?? String(tok.prefix(8)) + "…"
-      var line: String?
-      if label == "pause" { line = "\(who) · paused" }
-      else if label == "force" { line = "\(who) · forced" }
-      else if stale { line = "\(who) · stale" }
-      if line != nil && stale && label != nil { line! += " · stale" }
+      // Word order mirrors the desktop row: override, then queued, then
+      // stale — every applicable fact shows (paused+queued shows both).
+      var words: [String] = []
+      if label == "pause" { words.append("paused") }
+      else if label == "force" { words.append("forced") }
+      if queued { words.append(waiting > 1 ? "queued · \(waiting) waiting" : "queued") }
+      if stale { words.append("stale") }
+      let line = words.isEmpty ? nil : "\(who) · " + words.joined(separator: " · ")
       return ScopeSession(token: tok, clientName: name, lastSeen: lastSeen,
                           lastActivity: lastActivity, overrideLabel: label,
-                          stale: stale, exceptionLine: line)
+                          stale: stale, queued: queued,
+                          waitingCount: waiting > 1 ? waiting : 0,
+                          exceptionLine: line)
     }
     // The count line (the only always-on sessions row, and only when
     // sessions exist): plain words, zero buckets omitted —
@@ -3101,7 +3119,7 @@ struct ContentView: View {
         // live on the dashboard). The count line renders ONLY when
         // sessions exist (Exception-Only: no sessions = no rows at all);
         // the one-liners are the EXCEPTION states only (paused / forced /
-        // stale) — a healthy session renders no row. Colors mirror the
+        // queued / stale) — a healthy session renders no row. Colors mirror the
         // dashboard's tags: paused (override) red, forced / stale amber.
         if let count = m.sessionsCountLine {
           KVRow(k: "sessions", v: count)

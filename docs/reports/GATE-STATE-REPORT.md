@@ -123,3 +123,28 @@ the contract the api.test back-compat case pins.
 3. desktop: queued tag on the sessions rows
 4. tests: gate-state coverage across client/server/desktop harnesses
 5. docs: README gate-state wire shape + this report
+
+## Follow-up: the two surfaces this report left out (branch `gate-state-surfaces`)
+
+The dashboard HTML and the menubar panel now carry the same gate-state fact,
+on a branch off main `47bd162` (the slice merged first, so this rides it):
+
+- **Menubar (`menubar/IdlefillMenubar.swift`)** — `ScopeSession` gains
+  `queued` + `waitingCount`; the exception one-liner composes words in the
+  desktop's order (override, then queued, then stale), so
+  `mac-q · paused · queued · 2 waiting` shows every applicable fact. The
+  count buckets are unchanged (queued-but-healthy still counts active).
+- **Dashboard (`server/public/index.html`)** — `sessBlock` renders a
+  `queued` / `queued · N waiting` tag beside the state word, same
+  exception-tag idiom as `stale`; the state word logic is untouched.
+- **Harness (`menubar/sessions-test.sh`)** — new (g) block: queued one-liners
+  (with/without the >1 waiting count), queued+paused and queued+stale show
+  both, active gate is not an exception, and the back-compat matrix (absent /
+  null / malformed gate renders exactly as before).
+
+Gates on this branch: `bash menubar/sessions-test.sh` → SESSIONS-ALL-PASS;
+`bash desktop/sessions-test.sh` → harness PASS; `NODE_ENV= npm run test` →
+RC=0; `bash menubar/build.sh` → RC=0 (ad-hoc signed). The live check
+(cap=1, two sessions, second shows queued) stays the owner's step — the
+dashboard and menubar read the same `gate` block the desktop row already
+proved end-to-end above.

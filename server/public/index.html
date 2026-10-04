@@ -685,6 +685,17 @@ function sessBlock(sess, st) {
   const staleTag = stale
     ? ' <span class="tag" title="no heartbeat from this session in the last 90s — the router may have dropped it">stale</span>'
     : "";
+  // Gate-state (#40): the router reports parked requests waiting for
+  // admission. An ADDITIONAL fact beside the state word (like `stale`) —
+  // the state word never changes, so paused+queued shows both. Absent /
+  // null / malformed gate (old arbiter) renders exactly as before.
+  const gateBlk = sess.gate;
+  const queued = !!gateBlk && gateBlk.state === "queued";
+  const waiting = gateBlk && Number.isFinite(gateBlk.waiting) ? Math.floor(gateBlk.waiting) : 0;
+  const queuedTag = queued
+    ? ' <span class="tag" title="held at the router behind another session">' +
+      (waiting > 1 ? "queued · " + waiting + " waiting" : "queued") + "</span>"
+    : "";
   const gate =
     '<select class="gate small" data-token="' + esc(sess.token) + '" title="set gate for session ' + esc(sess.token) + '">' +
     '<option value="paused"' + (sess.override?.override === "pause" ? " selected" : "") + ">" + esc(sessGateLabelText("paused")) + "</option>" +
@@ -692,7 +703,7 @@ function sessBlock(sess, st) {
     "</select>";
   return '<div class="sess' + (stale ? " stale" : "") + '" data-sess="' + esc(shortTok) + '">' +
     '<span class="dot ' + (stale ? "off" : "on") + '" title="' + (stale ? "stale (no heartbeat within 90s)" : "live (heartbeat within 90s)") + '"></span>' +
-    nameHtml + metaHtml + staleTag +
+    nameHtml + metaHtml + staleTag + queuedTag +
     '<span class="sstate ' + w.cls + '" title="' + esc(w.note) + '">' + esc(w.label) + "</span>" +
     gate +
     "</div>";
