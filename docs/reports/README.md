@@ -31,3 +31,5 @@ New issue reports land **here**, never at the repo root.
 | #55 | [../architecture/fleet-service.md](../architecture/fleet-service.md) | Fleet service grilling: instance identity, roster, pairing (separate service) |
 | #50 | [ISSUE50-READPLANE-REPORT.md](ISSUE50-READPLANE-REPORT.md) | Mesh read plane: /api/mesh, peer pull, dashboard Machines strip |
 | #39 | [ISSUE39-RESCOPE.md](ISSUE39-RESCOPE.md) | Peer discovery re-scoped against the locked mesh transport |
+| #51 | [../architecture/metrics-history.md](../architecture/metrics-history.md) | Metrics history grilling: JSONL retention store, query surface, mesh boundary |
+| #51 | [ISSUE51-GRILL-REPORT.md](ISSUE51-GRILL-REPORT.md) | Metrics history grill: verified gaps + settled decisions |
