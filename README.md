@@ -219,13 +219,14 @@ from the daemon's `/api/state` poll): `pause` holds a session's traffic
 even with free slots; `force` bypasses the slot cap for that session.
 
 **Gate-state visibility.** The register heartbeat also carries what the
-router's queue knows about the session, so the arbiter's session rows (and
-the desktop's SESSIONS tab) can show "queued behind another session · N
-waiting" instead of just "registered". The body gains an optional `gate`
-block; a session that neither holds a slot nor parks anything sends NO
-block, and the arbiter then CLEARS any stored gate (a session that stopped
-waiting must not stay tagged). Invalid blocks are dropped, never rejected;
-an old arbiter simply ignores the extra field.
+router's queue knows about the session, so the arbiter's session rows — and
+every sessions surface: the desktop's SESSIONS tab, the dashboard's Sessions
+panel, and the menubar panel's exception one-liners — can show "queued
+behind another session · N waiting" instead of just "registered". The body
+gains an optional `gate` block; a session that neither holds a slot nor
+parks anything sends NO block, and the arbiter then CLEARS any stored gate
+(a session that stopped waiting must not stay tagged). Invalid blocks are
+dropped, never rejected; an old arbiter simply ignores the extra field.
 
 ```
 POST /api/sessions/register  { "token": "…", "gate": { "state": "active" | "queued", "waiting": 3 } }
