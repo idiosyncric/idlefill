@@ -1037,13 +1037,26 @@ connected to, seeded from config (`server_name`, `server_models`,
   `last_activity`, `degraded`, `reidle_gated`, …). A declared-but-unwatched
   row carries `signal: null` — it is inventory, not a live feed.
 - `POST /api/servers` — add (no `id`) or patch-update (by `id`) a declared
-  connection: `{name, url, activity_path?, log_glob?, models?, peers?}`. Create
+  connection: `{name, url, activity_path?, log_glob?, auth_token?, models?, peers?}`. Create
   requires a valid http(s) `url` and rejects a duplicate
   (url + activity path). This is **config + display only**: the arbiter
   keeps watching its single configured feed; a declared row is where a
   future multi-feed core will point the watcher. `peer:` backends (e.g.
   `peer:gpu2`) are plain-words metadata — the entry point fronts them; the
   arbiter never routes to them.
+- **Per-server API keys (#60 B):** `auth_token` is a **write-only** field
+  for key-gated engines (oMLX answers its feed and `/v1/*` only with
+  `Authorization: Bearer <token>`). When a row carries one, the arbiter's
+  feed fetcher sends it as that header; the watched row's seed comes from
+  config `server_auth_token`. The value is NEVER echoed by any read
+  surface — `/api/state` (including the anonymous view), `/api/servers`,
+  the POST response, and mesh snapshots carry an `auth_set` boolean
+  instead. Patch semantics: a non-empty string sets/replaces, the empty
+  string is the sentinel that REMOVES it, an absent key keeps the stored
+  value (a read-modify round-trip of the other fields can never drop the
+  secret). The state file is written 0600 — it is the only place the value
+  lives. The dashboard's server form has a password field for it: empty =
+  keep, type = replace, the remove tick box = the clear sentinel.
 - **Feed-off providers (#60 A1):** an **explicit empty `activity_path`**
   (config `activity_path: ""` or a create/patch body carrying `""`) declares
   the server has NO activity feed — oMLX and other key-gated engines expose
@@ -1056,8 +1069,8 @@ connected to, seeded from config (`server_name`, `server_models`,
 
 ```bash
 node scripts/idlefill-control.mjs servers
-node scripts/idlefill-control.mjs server add box-two http://192.168.9.9:11434 [--models a,b] [--peers peer:gpu2]
-node scripts/idlefill-control.mjs server set <id> [--name N] [--url U] [--models a,b] [--peers p1]
+node scripts/idlefill-control.mjs server add box-two http://192.168.9.9:11434 [--models a,b] [--peers peer:gpu2] [--auth TOKEN]
+node scripts/idlefill-control.mjs server set <id> [--name N] [--url U] [--models a,b] [--peers p1] [--auth TOKEN | --auth-clear]
 ```
 
 ## Dashboard layout (the work flow)

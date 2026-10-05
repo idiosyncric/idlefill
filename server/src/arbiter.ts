@@ -1136,6 +1136,7 @@ export class Arbiter {
       url: this.cfg.llama_swap_url,
       activity_path: this.cfg.activity_path,
       ...(this.cfg.log_glob ? { log_glob: this.cfg.log_glob } : {}),
+      ...(this.cfg.server_auth_token ? { auth_token: this.cfg.server_auth_token } : {}),
       models: [...(this.cfg.server_models ?? [])],
       peers: [...(this.cfg.server_peers ?? [])],
       configured_at: nowMs,
@@ -1158,6 +1159,7 @@ export class Arbiter {
     url?: string;
     activity_path?: string;
     log_glob?: string;
+    auth_token?: string;
     models?: string[];
     peers?: string[];
   }): { ok: boolean; reason?: string; created: boolean; server?: ServerConnection } {
@@ -1183,9 +1185,17 @@ export class Arbiter {
       if (typeof input.activity_path === 'string')
         touch(() => void (row.activity_path = input.activity_path!.trim()));
       if (typeof input.log_glob === 'string') touch(() => void (row.log_glob = input.log_glob!.trim()));
+      // Per-server credential (#60 B): WRITE-ONLY. A non-empty string sets
+      // it; the sentinel null/empty string REMOVES it (explicit clear —
+      // an absent key leaves the stored token untouched, so a read-modify
+      // patch round-trip of the other fields can never drop the secret).
+      if (typeof input.auth_token === 'string') {
+        const t = input.auth_token.trim();
+        touch(() => void (t === '' ? delete row.auth_token : (row.auth_token = t)));
+      }
       if (models) touch(() => void (row.models = models));
       if (peers) touch(() => void (row.peers = peers));
-      if (!changed) return { ok: false, reason: 'nothing to update (provide name, url, activity_path, log_glob, models, or peers)', created: false };
+      if (!changed) return { ok: false, reason: 'nothing to update (provide name, url, activity_path, log_glob, auth_token, models, or peers)', created: false };
       row.updated_at = nowMs;
       // A url/activity/log_glob change moves the signal source: rebuild the
       // detector so the watcher follows the row (cheap; detectors are
@@ -1215,6 +1225,7 @@ export class Arbiter {
       url,
       activity_path: activityPath,
       ...(typeof input.log_glob === 'string' && input.log_glob.trim() !== '' ? { log_glob: input.log_glob.trim() } : {}),
+      ...(typeof input.auth_token === 'string' && input.auth_token.trim() !== '' ? { auth_token: input.auth_token.trim() } : {}),
       models: models ?? [],
       peers: peers ?? [],
       configured_at: nowMs,

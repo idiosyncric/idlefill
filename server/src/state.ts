@@ -6,7 +6,7 @@
  * renames over the target (atomic on POSIX).
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, statSync, chmodSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { ArbiterState, ClientRecord } from './types.js';
 
@@ -111,7 +111,15 @@ export class StateStore {
     const dir = dirname(this.file);
     if (dir && dir !== '.' && !existsSync(dir)) mkdirSync(dir, { recursive: true });
     const tmp = `${this.file}.tmp-${process.pid}`;
-    writeFileSync(tmp, JSON.stringify(this.state, null, 2));
+    // The state file can carry per-server credentials (#60 B) — owner-only,
+    // set on the TMP before the rename so the secret is never world-readable
+    // even for the instant between write and rename.
+    writeFileSync(tmp, JSON.stringify(this.state, null, 2), { mode: 0o600 });
+    try {
+      chmodSync(tmp, 0o600); // an existing tmp with a wider mode keeps it — force
+    } catch {
+      /* best effort */
+    }
     renameSync(tmp, this.file);
   }
 

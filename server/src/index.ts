@@ -29,8 +29,8 @@ async function main(): Promise<void> {
   // unknown delta, never a negative count.
   const feedDelta = new FeedDeltaTracker();
   const baseFetchActivity = makeRealActivityFetcher();
-  const fetchActivity = async (url: string): Promise<ActivityEntry[]> => {
-    const entries = await baseFetchActivity(url);
+  const fetchActivity = async (url: string, auth?: string): Promise<ActivityEntry[]> => {
+    const entries = await baseFetchActivity(url, auth);
     feedDelta.observe(url, entries);
     return entries;
   };
@@ -46,6 +46,9 @@ async function main(): Promise<void> {
       llama_swap_url: row.url,
       activity_path: row.activity_path,
       log_glob: row.log_glob ?? (row.id === WATCHED_SERVER_ID ? cfg.log_glob : ''),
+      // Per-server credential (#60 B): the watched row's seed comes from
+      // config.server_auth_token at boot; other rows carry their own.
+      ...(row.auth_token ? { auth_token: row.auth_token } : {}),
       idle_seconds: cfg.idle_seconds,
     });
 

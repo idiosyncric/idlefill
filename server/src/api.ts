@@ -219,8 +219,15 @@ function serverView(arbiter: Arbiter, cfg: ServerConfig, now: number) {
           })(),
         }
       : null;
+    // The row is echoed verbatim — so the credential (#60 B) is STRIPPED
+    // here. auth_token is write-only: this view feeds GET /api/servers AND
+    // the anonymous /api/state, and the dashboard renders both. A boolean
+    // (auth_set) tells the form a token exists without revealing it. ADD
+    // key.
+    const { auth_token, ...rowPublic } = row;
     return {
-      ...row,
+      ...rowPublic,
+      auth_set: auth_token !== undefined && auth_token !== '',
       watched: sig !== null,
       signal,
       models: row.models.map((m) => ({ name: m, running: runningModels.has(m), queued: queuedByModel.get(m) ?? 0 })),
@@ -625,6 +632,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       url?: string;
       activity_path?: string;
       log_glob?: string;
+      auth_token?: string;
       models?: string[];
       peers?: string[];
     };
@@ -632,7 +640,11 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     if (!res.ok) {
       return reply.code(res.reason === 'unknown_server' ? 404 : 400).send({ error: res.reason ?? 'invalid' });
     }
-    return { ok: true, created: res.created, server: res.server };
+    // The created/updated row is echoed — strip the credential (#60 B) the
+    // same way serverView does. The caller just SET it; it never reads it
+    // back through this API.
+    const { auth_token, ...serverPublic } = res.server!;
+    return { ok: true, created: res.created, server: { ...serverPublic, auth_set: auth_token !== undefined && auth_token !== '' } };
   });
 
   // ------------------------------------------------------------------

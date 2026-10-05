@@ -27,6 +27,7 @@ export const DEFAULTS: Omit<ServerConfig, 'state_file'> & {
   server_name: 'llama-swap',
   server_models: [],
   server_peers: [],
+  server_auth_token: '',
   log_glob: '',
   idle_seconds: 300,
   poll_ms: 15000,
@@ -60,6 +61,11 @@ export function applyDefaults(raw: Partial<ServerConfig> | null | undefined): Se
     server_peers: Array.isArray(r.server_peers)
       ? r.server_peers.filter((m): m is string => typeof m === 'string' && m.trim() !== '')
       : DEFAULTS.server_peers,
+    // Per-server credential seed (#60 B): a string sticks verbatim (no
+    // trim — tokens can carry significant whitespace edges? No: tokens
+    // never do, but the config file is the operator's input; trim here so
+    // a trailing newline from an editor paste does not poison the header).
+    server_auth_token: typeof r.server_auth_token === 'string' ? r.server_auth_token.trim() : DEFAULTS.server_auth_token,
     // Mesh federation read plane (#50). mesh_peers is the peer registry —
     // deliberately NOT server_peers (llama-swap backends). Entries are
     // {url, name?}; a blank url is dropped (a peer with no url cannot be

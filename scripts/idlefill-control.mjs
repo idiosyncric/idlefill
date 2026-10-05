@@ -130,7 +130,7 @@ const usage = () =>
   fail(
     'usage: idlefill-control.mjs clients | pause <client> [--for 30m] | force <client> [--for 30m] | clear <client> ' +
       '| projects | project <name> set [--idle N] [--max N] [--ttl N] | project <name> clear ' +
-      '| servers | server add <name> <url> [--models a,b] [--peers p1] | server set <id> [--name N] [--url U] [--models a,b] [--peers p1]',
+      '| servers | server add <name> <url> [--models a,b] [--peers p1] [--auth TOKEN] | server set <id> [--name N] [--url U] [--models a,b] [--peers p1] [--auth TOKEN | --auth-clear]',
   );
 
 if (cmd === 'clients') {
@@ -204,7 +204,7 @@ if (cmd === 'projects' || cmd === 'project') {
 if (cmd === 'servers' || cmd === 'server') {
   const servers = (await api('GET', '/api/servers')).servers ?? [];
   const printServer = (s) => {
-    console.log(`${s.id}  ${s.watched ? '[watched]' : '[declared]'}  ${s.name}  ${s.url}  ${s.activity_path}`);
+    console.log(`${s.id}  ${s.watched ? '[watched]' : '[declared]'}  ${s.name}  ${s.url}  ${s.activity_path}${s.auth_set ? '  key:set' : ''}`);
     console.log(`  models: ${s.models.length ? s.models.map((m) => `${m.name}${m.running ? ' (running)' : ''}${m.queued ? ` (${m.queued} queued)` : ''}`).join(', ') : '—'}`);
     if (s.peers?.length) console.log(`  peers (routed behind this entry point): ${s.peers.join(', ')}`);
   };
@@ -219,12 +219,15 @@ if (cmd === 'servers' || cmd === 'server') {
     const i = argv.indexOf(flag);
     return i === -1 ? undefined : argv[i + 1];
   };
+  // Boolean flag presence (no value consumed) — for --auth-clear.
+  const hasFlag = (flag) => argv.includes(flag);
   if (sub === 'add') {
     const url = argv[3];
     if (!nameOrId || !url) usage();
     const res = await api('POST', '/api/servers', {
       name: nameOrId,
       url,
+      ...(strFlag('--auth') !== undefined ? { auth_token: strFlag('--auth') } : {}),
       models: listCsv(strFlag('--models')),
       peers: listCsv(strFlag('--peers')),
     });
@@ -237,10 +240,14 @@ if (cmd === 'servers' || cmd === 'server') {
       id: nameOrId,
       name: strFlag('--name'),
       url: strFlag('--url'),
+      // --auth TOKEN sets the per-server credential; --auth-clear sends the
+      // empty sentinel that removes it. Neither flag = the stored key stays
+      // (the API never echoes it back, so it cannot be round-tripped).
+      ...(hasFlag('--auth-clear') ? { auth_token: '' } : strFlag('--auth') !== undefined ? { auth_token: strFlag('--auth') } : {}),
       models: listCsv(strFlag('--models')),
       peers: listCsv(strFlag('--peers')),
     });
-    console.log(`ok: updated ${res.server.id} (${res.server.name})`);
+    console.log(`ok: updated ${res.server.id} (${res.server.name})${res.server.auth_set ? ' (API key stored)' : ''}`);
     process.exit(0);
   }
   usage();

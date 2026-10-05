@@ -506,6 +506,12 @@ function srvBlock(s, st) {
       signalRows += '<div class="kv"><span class="k">re-idle gate</span><span class="v warn">armed (wait for full idle)</span></div>';
     }
   }
+  // Per-server credential (#60 B): exception-only — the row never shows
+  // the key itself, only that one is stored (auth_set rides the stripped
+  // server view).
+  if (s.auth_set) {
+    signalRows += '<div class="kv"><span class="k">API key</span><span class="v dim">set (hidden)</span></div>';
+  }
 
   // Model resources: one row each — running state (blue dot, signal
   // semantics), the self-reported queued depth, and the per-job estimate
@@ -1531,12 +1537,27 @@ function serverFormHtml(s, mode) {
   const cid = "sf-" + (mode === "add" ? "add" : cssEscape(s.id)) + "-";
   const text = (id, label, value, ph) =>
     '<input id="' + id + '" type="text" value="' + esc(value) + '" placeholder="' + esc(ph) + '" spellcheck="false">';
+  // Per-server API key (#60 B): WRITE-ONLY. The arbiter never echoes the
+  // token back — auth_set only says one exists. Empty field = keep the
+  // stored key; the tick box sends the empty-string sentinel that clears
+  // it. type=password keeps shoulder-surfing and (de)serialize honest.
+  const authPh = mode === "edit" && s.auth_set
+    ? "\u2022\u2022\u2022\u2022\u2022 key set \u2014 empty keeps it, paste to replace"
+    : "optional \u2014 sent as Authorization: Bearer on feed fetches";
+  const authRow =
+    formRow(cid + "auth", "API key (stored on the arbiter only)", "",
+      '<input id="' + cid + 'auth" type="password" value="" placeholder="' + esc(authPh) + '" spellcheck="false" autocomplete="off">' +
+      (mode === "edit" && s.auth_set
+        ? '<label class="units" style="display:inline-flex;gap:4px;align-items:center;flex:0 0 auto">' +
+          '<input type="checkbox" id="' + cid + 'auth-clear" style="flex:0 0 auto" title="send the clear sentinel">remove</label>'
+        : ""));
   const rows =
     formRow(cid + "name", "name", "", text(cid + "name", "the label in the pane", s.name ?? "", "llama-swap")) +
     formRow(cid + "url", "url (http or https)", "", text(cid + "url", "the activity feed's address", s.url ?? "", "http://100.105.225.1:11434")) +
     (mode === "add"
       ? formRow(cid + "path", "activity path (blank = default)", "", text(cid + "path", "the feed's activity path", s.activity_path ?? "", "/api/metrics/activity"))
       : "") +
+    authRow +
     formRow(cid + "models", "models, comma separated", "", text(cid + "models", "the queueable resources", (s.models || []).map((m) => m.name).join(", "), "Qwen3.8-27B, Llama-3.1-8B")) +
     formRow(cid + "peers", "peers behind the entry point, comma separated", "", text(cid + "peers", "plain-words metadata", (s.peers || []).join(", "), "peer:gpu2"));
   return rows +
@@ -1708,6 +1729,12 @@ $("servers").addEventListener("click", async (e) => {
   const body = {};
   if (val("name") && val("name") !== s.name) body.name = val("name");
   if (val("url") && val("url") !== s.url) body.url = val("url");
+  // API key (#60 B): typing a key SETS it; the remove tick box sends the
+  // empty-string sentinel that CLEARS it; an untouched field sends nothing
+  // (the stored key stays — the server never echoes it, so we cannot
+  // round-trip it through this form).
+  if (val("auth")) body.auth_token = val("auth");
+  else if (form.querySelector("#sf-" + cssEscape(id) + "-auth-clear")?.checked) body.auth_token = "";
   const m = list(val("models"));
   const curM = (s.models || []).map((x) => x.name);
   if (m.length !== curM.length || m.some((x, i) => x !== curM[i])) body.models = m;
@@ -1767,6 +1794,7 @@ if (addBtn && addForm) {
       peers: val("peers").split(",").map((x) => x.trim()).filter(Boolean),
     };
     if (val("path")) body.activity_path = val("path");
+    if (val("auth")) body.auth_token = val("auth"); // #60 B: optional key
     if (!body.name || !body.url) {
       formMsg(addForm, "name and an http(s) url are required", "err");
       return;

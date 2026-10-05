@@ -36,6 +36,12 @@ export interface ServerConfig {
   /** llama-swap `peer:` backends routed behind the single entry point (display metadata). */
   server_peers?: string[];
   /**
+   * Credential for the watched server (#60 B): seeded onto the watched
+   * row at boot and sent as `Authorization: Bearer <token>` on its feed
+   * fetches. Config-only input — never echoed by any read surface.
+   */
+  server_auth_token?: string;
+  /**
    * Mesh federation read plane (#50 D1). The peer registry: other
    * idlefill arbiters to pull coarse snapshots from. NOT `server_peers`
    * (that key means llama-swap backends). Each arbiter pulls on the
@@ -232,6 +238,15 @@ export interface ServerConnection {
   models: string[];
   /** llama-swap `peer:` backends routed behind this entry point (display only). */
   peers: string[];
+  /**
+   * Per-server credential for key-gated engines (#60 B): when set, the
+   * arbiter sends it as `Authorization: Bearer <token>` on this server's
+   * activity-feed fetches. WRITE-ONLY over the API: the row is STRIPPED
+   * of this field on every read surface (/api/state — including the
+   * anonymous view — /api/servers, POST responses, mesh snapshots, the
+   * dashboard). Only the arbiter's own state file holds the value.
+   */
+  auth_token?: string;
   configured_at: number;
   updated_at: number;
 }

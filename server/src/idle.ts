@@ -41,7 +41,7 @@ import { dirname, basename } from 'node:path';
 import type { ActivityEntry, IdleSignal, LastActivity } from './types.js';
 
 /** Fetch one page of the activity feed. Injectable for tests. */
-export type ActivityFetcher = (url: string) => Promise<ActivityEntry[]>;
+export type ActivityFetcher = (url: string, auth?: string) => Promise<ActivityEntry[]>;
 
 /** Read the newest mtime (ms) matching a glob, or null. Injectable for tests. */
 export type LogMtimeSource = (glob: string) => number | null;
@@ -57,6 +57,11 @@ export interface IdleDetectorOpts {
   activity_path: string;
   log_glob: string;
   idle_seconds: number;
+  /**
+   * Per-server credential (#60 B): passed to the fetcher so the real one
+   * sends `Authorization: Bearer <token>`. Absent/empty = no header.
+   */
+  auth_token?: string;
   /** Abort timeout for the feed fetch. */
   fetch_timeout_ms?: number;
 }
@@ -163,7 +168,7 @@ export class IdleDetector {
   private async fetchFeed(url: string): Promise<ActivityEntry[] | null> {
     const timeout = this.o.fetch_timeout_ms ?? 10000;
     try {
-      const entries = await this.o.fetchActivity(url);
+      const entries = await this.o.fetchActivity(url, this.o.auth_token);
       return Array.isArray(entries) ? entries : null;
     } catch {
       return null;
@@ -206,8 +211,12 @@ export function activeLeaseExemptIps(
 
 /** Default (real) activity fetcher used in production. */
 export function makeRealActivityFetcher(): ActivityFetcher {
-  return async (url) => {
-    const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+  return async (url, auth) => {
+    const headers: Record<string, string> = {};
+    // Per-server credential (#60 B): key-gated engines (oMLX) 401 the feed
+    // without it. Only ever present when the operator set a row token.
+    if (auth) headers.authorization = `Bearer ${auth}`;
+    const res = await fetch(url, { headers, signal: AbortSignal.timeout(10000) });
     if (!res.ok) throw new Error(`activity feed HTTP ${res.status}`);
     const body = (await res.json()) as { data?: ActivityEntry[] };
     return Array.isArray(body.data) ? body.data : [];
