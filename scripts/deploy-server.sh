@@ -87,11 +87,11 @@ fi
 # --- preflight: refuse to swap out a running lease (unless --force) --------
 # Auth header ONLY when a token exists — an EMPTY "Bearer " header would 401
 # the anonymous /api/state exception (the probes need that exception when
-# IDLEFILL_API_TOKEN is unset). Array form: the header carries a space.
-CURL_AUTH=()
-if [ -n "$TOKEN" ]; then CURL_AUTH=(-H "Authorization: Bearer $TOKEN"); fi
+# IDLEFILL_API_TOKEN is unset). macOS ships bash 3.2: expanding an EMPTY
+# array under set -u dies ("unbound variable"), so the guard IS the
+# expansion (${TOKEN:+…} emits the header only when the token is set).
 if [ "$FORCE" -ne 1 ]; then
-  ACTIVE="$(curl -fsS -m 10 "${CURL_AUTH[@]}" "$SERVER_URL/api/state" 2>/dev/null \
+  ACTIVE="$(curl -fsS -m 10 ${TOKEN:+-H "Authorization: Bearer $TOKEN"} "$SERVER_URL/api/state" 2>/dev/null \
     | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const s=JSON.parse(d);console.log((s.active_leases||[]).length)}catch{console.log(0)}})' || echo 0)"
   if [ "${ACTIVE:-0}" -gt 0 ]; then
     echo "arbiter has $ACTIVE active lease(s) — refusing to swap (use --force to override)" >&2
@@ -147,7 +147,7 @@ echo "==> healthcheck (up to ~25s)"
 ok=0
 for _ in 1 2 3 4 5 6 7 8; do
   sleep 3
-  code="$(curl -s -m 8 -o "$HEALTH_JSON" -w '%{http_code}' "${CURL_AUTH[@]}" "$SERVER_URL/api/state" || echo 000)"
+  code="$(curl -s -m 8 -o "$HEALTH_JSON" -w '%{http_code}' ${TOKEN:+-H "Authorization: Bearer $TOKEN"} "$SERVER_URL/api/state" || echo 000)"
   if [ "$code" = "200" ] && node -e '
       const s = require(process.argv[1]);
       process.exit(s && s.idle && Array.isArray(s.clients) ? 0 : 1);
