@@ -131,9 +131,12 @@ client/     Mac daemon — register, lease loop, loopback proxy, executor
             supervision, usage reporting, crash-safe queue handling
 adapters/   per-project executors (career-ops: queue builder + JD evaluator
             + the idlefill MCP server, idlefill-mcp.mjs)
-scripts/    thin CLI wrappers (build-careerops-queue.mjs)
+scripts/    thin CLI wrappers (build-careerops-queue.mjs, the control
+            CLIs: idlefill-control.mjs arbiter-side, idlefill-menubar.mjs
+            daemon-side — platform-portable, systemd-aware on Linux)
 deploy/     PHASE 2, UNTESTED: compose.yaml, traefik/idlefill.yml, deploy.sh,
-            com.sam.idlefill.client.plist
+            com.sam.idlefill.client.plist; systemd/ + install-client-service.sh
+            = the Linux client service (issue #54 — exercised, see below)
 docs/       reports/ — per-issue build reports (historical record; see
             docs/reports/README.md). New issue reports land there, never at
             the repo root.
@@ -178,6 +181,50 @@ your own backfill traffic keys on the IP it OBSERVES on your connection —
 not the static `ip` in your client config. Tailscale reassigns addresses;
 the observed value tracks that, and the configured value is kept only for
 display/audit (`reported_ip` on the client row).
+
+## The Linux client (issue #54)
+
+The daemon, gate and proxy are plain Node — they run on Linux. Only the
+service plumbing was macOS-shaped (launchd). On Linux the supervisor is a
+**systemd user unit**, and the **dashboard is the Linux surface** (no
+native app; the Swift apps keep their read-only contract and now also
+name-match their own client row, so a second online client never hijacks
+a machine's STATE view).
+
+Install, from a checkout on the Linux box:
+
+```bash
+git clone https://git.samwarth.com/sam/idlefill.git ~/Software/idlefill
+cd ~/Software/idlefill && npm ci            # node >= 18 works (tsx floor);
+                                            # the CI standard is 22
+cp client/config.example.json client/config.json
+$EDITOR client/config.json                  # server_url (tailnet IP), token,
+                                            # a UNIQUE client_name per machine
+bash deploy/install-client-service.sh       # render -> verify -> enable -> start
+```
+
+The installer mirrors the plist semantics (`KeepAlive{SuccessfulExit=false}`
+→ `Restart=on-failure`, `ThrottleInterval` → `RestartSec=30`) and the
+fail-closed install discipline (render to temp, byte-verify — placeholders
+surviving or ExecStart not matching this checkout abort before anything
+loads). It refuses to install while a non-systemd daemon for the same
+checkout is running. The unit starts at boot once lingering is on
+(`sudo loginctl enable-linger <user>` — the installer prints the command
+when it cannot run sudo itself).
+
+Lifecycle on Linux belongs to systemd: `systemctl --user
+start|stop|restart|status idlefill-client`, logs via `journalctl --user -u
+idlefill-client`. `scripts/idlefill-menubar.mjs` is the portable
+daemon-side control (status/start/stop/logs/diagnose/pids) — on Linux it
+shows the unit's state and refuses a raw SIGINT while the unit is active
+(a signal death reads as a crash and `Restart=on-failure` relaunches).
+Issue #49's code-staleness flag works here unchanged: the boot `revision`
+comes from `git rev-parse HEAD` in the checkout, so the cycle is
+`git pull && systemctl --user restart idlefill-client`.
+
+CI: `.gitea/workflows/test-linux.yml` keeps the node suites honest on
+ubuntu (the runner label must exist before it dispatches — see
+docs/reports/).
 
 ## Session gate (interactive agent traffic — issue #9)
 

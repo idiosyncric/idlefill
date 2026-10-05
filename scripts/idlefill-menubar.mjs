@@ -25,6 +25,13 @@
  * entry (src/ or dist/ index.ts). A bare `pgrep -f src/index.ts` matches any
  * shell that merely quotes the path — do not use it.
  *
+ * Linux (issue #54): the daemon-side commands (status/start/stop/restart/
+ * logs/diagnose/pids) are platform-portable — `ps` adapts to procps and the
+ * arbiter view is the same. The `app` subcommand (the Swift binary) and the
+ * launchd agent are macOS-only; on Linux the daemon's supervisor is systemd
+ * (deploy/install-client-service.sh) and status/diagnose show the unit's
+ * state and route stop/restart to `systemctl --user` when it is active.
+ *
  * Config: repo root resolves from this script's location (scripts/ → parent),
  * overridable with IDLEFILL_CONFIG_FILE=/path/to/client/config.json (same env
  * the app honors). The arbiter token is read at runtime from the gitignored
@@ -71,8 +78,30 @@ const clientLog = join(clientEntryDir, 'logs', 'client.log');
 
 // ---- process discovery (same identity rule as the Swift app) --------------
 
+const UNIT = 'idlefill-client'; // the Linux systemd user unit (deploy/systemd/)
+
+function isLinux() { return process.platform === 'linux'; }
+
+/** The systemd user unit's state, or null (not Linux / no user bus / unit
+ *  not installed). Issue #54: on Linux the supervisor answers lifecycle,
+ *  and a SIGINT here would fight Restart=on-failure. */
+function systemdUnit() {
+  if (!isLinux()) return null;
+  const r = spawnSync('systemctl', ['--user', 'show', UNIT, '-p', 'ActiveState,SubState,ExecMainPID,EnableState'], { encoding: 'utf8' });
+  if (r.status !== 0) return null;
+  const o = {};
+  for (const line of (r.stdout ?? '').split('\n')) {
+    const i = line.indexOf('=');
+    if (i > 0) o[line.slice(0, i)] = line.slice(i + 1);
+  }
+  return Object.keys(o).length ? o : null;
+}
+
 function psRows() {
-  const out = spawnSync('/bin/ps', ['-ax', '-o', 'pid=,ppid=,command='], { encoding: 'utf8' });
+  // macOS: /bin/ps -ax (BSD flags). Linux procps: the -ax form is a compat
+  // alias but -eo is the canonical "every process" selector; same columns.
+  const args = isLinux() ? ['-eo', 'pid=,ppid=,command='] : ['-ax', '-o', 'pid=,ppid=,command='];
+  const out = spawnSync('/bin/ps', args, { encoding: 'utf8' });
   return (out.stdout ?? '').split('\n').filter((l) => l.trim().length > 0);
 }
 
@@ -109,9 +138,9 @@ function appPid() {
 
 function clientConfig() {
   const p = join(clientDir, 'config.json');
-  if (!existsSync(p)) return { present: false, server_url: null, token: null };
+  if (!existsSync(p)) return { present: false, server_url: null, token: null, client_name: null };
   const o = JSON.parse(readFileSync(p, 'utf8'));
-  return { present: true, server_url: o.server_url ?? null, token: o.token ?? null };
+  return { present: true, server_url: o.server_url ?? null, token: o.token ?? null, client_name: o.client_name ?? null };
 }
 
 async function arbiterState() {
@@ -133,7 +162,12 @@ async function arbiterState() {
     for (const c of clients) {
       c.online = typeof c.last_seen === 'number' && c.last_seen > 0 && Date.now() - c.last_seen < 90_000;
     }
-    const me = clients.find((c) => c.online) ?? clients[0] ?? null;
+    // "me" = the row matching THIS client's configured name (registration is
+    // idempotent by name, issue #10) — fall back to an online row only when
+    // no name-match exists. A first-online guess grabs the WRONG machine
+    // once the fleet has a second online client (issue #54 teaches that).
+    const byName = cfg.client_name ? clients.find((c) => c.name === cfg.client_name) : null;
+    const me = byName ?? clients.find((c) => c.online) ?? clients[0] ?? null;
     return { reachable: true, clients, me, idle: o.idle ?? null, active_leases: o.active_leases ?? [] };
   } catch {
     return { reachable: false };
@@ -149,7 +183,8 @@ function mark(ok) { return ok ? y('ok  ') : r('FAIL'); }
 
 async function printStatus(quiet) {
   const pids = daemonPids();
-  const app = appPid();
+  const app = isLinux() ? null : appPid();
+  const unit = systemdUnit();
   const cfg = clientConfig();
   const tsxOk = existsSync(tsxBin);
   const st = await arbiterState();
@@ -158,8 +193,11 @@ async function printStatus(quiet) {
     console.log(`repo     ${repo}`);
     console.log(`config   ${cfg.present ? join(clientDir, 'config.json') : r('missing — ' + join(clientDir, 'config.json'))}`);
     console.log(`tsx      ${tsxOk ? tsxBin : r(tsxBin + ' — run npm install')}`);
+    if (isLinux()) {
+      console.log(`unit     ${unit ? `${UNIT} ${unit.ActiveState}/${unit.SubState} pid=${unit.ExecMainPID ?? '?'} ${unit.EnableState ?? ''}` : a('no systemd user unit — deploy/install-client-service.sh')}`);
+    }
     console.log(`daemon   ${pids.length ? 'pid ' + pids.join(', ') + (pids.length > 1 ? ' (tsx CLI + daemon — expected pair)' : '') : 'not running'}`);
-    console.log(`app      ${app ? 'pid ' + app : 'not running'}  (${appBin})`);
+    if (!isLinux()) console.log(`app      ${app ? 'pid ' + app : 'not running'}  (${appBin})`);
     if (!st.reachable) {
       console.log(`arbiter  ${r('unreachable')} (${cfg.server_url ?? 'no server_url in config'})`);
     } else {
@@ -176,6 +214,7 @@ async function printStatus(quiet) {
         const bits = [
           `${me.online ? y('online') : r('offline')}`,
           ageS != null ? `last_seen ${ageS}s ago` : 'last_seen n/a',
+          `rev ${(me.revision ?? 'pre-#49').slice(0, 7)}`,
           `queue ${depth}`,
           `today ${done} ok / ${fail} failed`,
         ];
@@ -184,7 +223,7 @@ async function printStatus(quiet) {
       }
     }
   }
-  return { pids, app, cfg, tsxOk, st };
+  return { pids, app, cfg, tsxOk, st, unit };
 }
 
 function logTail(n) {
@@ -199,8 +238,12 @@ function logTail(n) {
 async function cmdStart() {
   const pids = daemonPids();
   if (pids.length) { console.log(`daemon already running (pid ${pids.join(', ')})`); return 0; }
-  if (!existsSync(tsxBin)) { console.log(r(`start failed: ${tsxBin} not found — run npm install in ${repo}`)); return 1; }
-  const child = spawn(tsxBin, [entry], {
+  // The repo-local tsx shim is the fast path; a box without hoisted
+  // node_modules falls back to `npx tsx` (what the launchd plist and the
+  // systemd unit both run — issue #54 keeps one command shape everywhere).
+  const useShim = existsSync(tsxBin);
+  if (!useShim) console.log(a(`note: ${tsxBin} missing — falling back to npx tsx`));
+  const child = spawn(useShim ? tsxBin : 'npx', useShim ? [entry] : ['tsx', entry], {
     cwd: clientDir,
     detached: true,
     stdio: 'ignore',
@@ -216,6 +259,14 @@ async function cmdStart() {
 async function cmdStop() {
   const pids = daemonPids();
   if (!pids.length) { console.log('no daemon process found'); return 1; }
+  // Issue #54: under systemd the SUPERVISOR owns lifecycle. A SIGINT here
+  // reads as a crash and Restart=on-failure relaunches in ~30s — refuse and
+  // route the operator to the unit instead.
+  const unit = systemdUnit();
+  if (unit && unit.ActiveState === 'active') {
+    console.log(r(`the daemon is supervised by systemd — use: systemctl --user stop ${UNIT}`));
+    return 1;
+  }
   for (const pid of pids) process.kill(pid, 'SIGINT');
   console.log(`SIGINT → ${pids.join(', ')}`);
   // wait for clean exit (up to 10s)
@@ -254,14 +305,17 @@ function cmdApp(args) {
 }
 
 async function cmdDiagnose() {
-  const { pids, app, cfg, tsxOk, st } = await printStatus(true);
+  const { pids, app, cfg, tsxOk, st, unit } = await printStatus(true);
   console.log('');
   console.log(`config   ${mark(cfg.present)} ${cfg.present ? `server_url=${cfg.server_url}` : join(clientDir, 'config.json')}`);
   console.log(`tsx      ${mark(tsxOk)} ${tsxBin}`);
   const nodeCheck = spawnSync('node', ['--version'], { encoding: 'utf8', env: { PATH: ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin'].join(':') + ':' + (process.env.PATH ?? '') } });
   console.log(`node     ${mark(nodeCheck.status === 0)} ${nodeCheck.stdout?.trim() ?? nodeCheck.error?.message}`);
+  if (isLinux()) {
+    console.log(`unit     ${mark(!!unit)} ${unit ? `${UNIT} ${unit.ActiveState}/${unit.SubState} ${unit.EnableState ?? ''}` : 'no systemd user unit (deploy/install-client-service.sh)'}`);
+  }
   console.log(`daemon   ${mark(pids.length >= 1)} ${pids.length ? 'pid ' + pids.join(', ') + (pids.length > 1 ? ' (tsx CLI + daemon — expected pair)' : '') : 'not running'}`);
-  console.log(`app      ${mark(!!app)} ${app ? 'pid ' + app : 'not running'}`);
+  if (!isLinux()) console.log(`app      ${mark(!!app)} ${app ? 'pid ' + app : 'not running'}`);
   console.log(`arbiter  ${mark(st.reachable)} ${st.reachable ? (st.me ? `me=${st.me.name} online=${st.me.online}` : 'no client rows') : `unreachable${st.status ? ` (HTTP ${st.status})` : ''}`}`);
 
   if (pids.length && st.reachable && st.me && !st.me.online) {
@@ -288,6 +342,7 @@ const linesArg = rest.includes('--lines') ? Number(rest[rest.indexOf('--lines') 
 let rc = 0;
 switch (cmd) {
   case 'status': await printStatus(false); break;
+  case 'pids': { const p = daemonPids(); console.log(p.join('\n')); rc = p.length ? 0 : 1; break; }
   case 'start': rc = await cmdStart(); break;
   case 'stop': rc = await cmdStop(); break;
   case 'restart': {

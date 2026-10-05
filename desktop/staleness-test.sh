@@ -114,6 +114,35 @@ check("live: my row reports this checkout's HEAD -> cleared (restart state)", !m
 m.injectStatePayload(clientPayload(revisionJSON: ""))
 check("live: my row with NO revision (old daemon) -> renders as before", !m.daemonBehind)
 
+// ==========================================================================
+// (3) the multi-client fleet contract (issue #54): a SECOND online client
+// must not hijack "me". A Linux box registered under its own name, listed
+// FIRST and online and at this checkout's HEAD, alongside my row reporting
+// an OLDER commit: the name-matched read keeps the flag ON. The old
+// "first online" heuristic would have read the OTHER machine's row and
+// reported false — a silent wrong-machine staleness read.
+// ==========================================================================
+func fleetPayload() -> [String: Any] {
+  let now = Int(Date().timeIntervalSince1970 * 1000)
+  let json = """
+  { "clients": [
+      { "client_id": "c-linux", "name": "urza-linux",
+        "last_seen": \(now), "projects": [], "revision": "\(HEAD_FULL)" },
+      { "client_id": "c-dt", "name": "stale-dt-test",
+        "last_seen": \(now), "projects": [], "revision": "\(OTHER_FULL)" }
+    ],
+    "idle": { "idle": true, "degraded": false } }
+  """
+  guard let d = json.data(using: .utf8),
+        let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] else {
+    fatalError("bad fixture json")
+  }
+  return o
+}
+
+m.injectStatePayload(fleetPayload())
+check("fleet: a second online client listed first cannot hijack my row (name-match)", m.daemonBehind)
+
 if failures > 0 {
   print("STALENESS-DT-FAILURES \(failures)")
   exit(1)

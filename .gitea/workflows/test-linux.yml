@@ -1,0 +1,58 @@
+name: test-linux
+
+# Linux job (issue #54): the client core is plain Node and must STAY that
+# way. This job proves the node suites + typecheck + build run on Linux, and
+# byte-verifies the systemd unit rendering the installer performs on a real
+# box (the fail-closed render/verify chain, without touching a service).
+#
+# Runner: `urza:docker` — the weakstone runner's Docker backend (its labels
+# are ubuntu-latest/22.04/20.04, so the job lands in an ubuntu container).
+# Registration is owner-only; until that runner is registered + online this
+# workflow stays dormant (see docs/reports/ISSUE54-REPORT.md).
+
+env:
+  NODE_ENV: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  linux:
+    name: "client core + systemd rendering (ubuntu)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: install
+        run: npm ci --no-audit --no-fund
+
+      - name: "tests (all node workspaces)"
+        run: npm test
+
+      - name: typecheck (server + client)
+        run: |
+          npx tsc --noEmit -p server/tsconfig.json
+          npx tsc --noEmit -p client/tsconfig.json
+
+      - name: build (all workspaces)
+        run: npm run build
+
+      - name: "systemd unit renders + byte-verifies (installer --dry-run)"
+        run: |
+          set -euo pipefail
+          # a throwaway client config so the installer's sanity checks pass;
+          # --dry-run writes nothing outside its render temp.
+          printf '{"server_url":"http://127.0.0.1:1","token":"ci-fixture","client_name":"ci-linux"}\n' > client/config.json
+          bash deploy/install-client-service.sh --dry-run | tee /tmp/render.out
+          grep -q 'ExecStart=' /tmp/render.out
+          ! grep -q '@REPO@\|@NPATH@' /tmp/render.out   # no placeholder survives
+          rm -f client/config.json

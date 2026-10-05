@@ -1317,6 +1317,18 @@ final class AppModel: ObservableObject {
     return 11435
   }
 
+  /// THIS machine's registered client name (client/config.json `client_name`
+  /// — issue #54). Registration is idempotent by name (#10), so the name is
+  /// the stable key for selecting my row on `/api/state`. nil = unreadable
+  /// config, which falls back to the old online-first guess.
+  func configuredClientName() -> String? {
+    let path = (repoRoot as NSString).appendingPathComponent("client/config.json")
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+          let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let n = o["client_name"] as? String, !n.isEmpty else { return nil }
+    return n
+  }
+
   // MARK: state poll (same parsing as the menubar app)
 
   func poll() {
@@ -1345,10 +1357,18 @@ final class AppModel: ObservableObject {
     // projection is the single read site the Sessions panel renders.
     sessions = SessionsView.project(payload: o, nowMs: Date().timeIntervalSince1970 * 1000)
 
-    // me — this machine's client row (prefer the online one; fall back to
-    // the first row).
+    // me — this machine's client row. ISSUE #54: a second client can now be
+    // online at the same time (a Linux box registered under its own name),
+    // so the old "first online, else first" guess can pick ANOTHER
+    // machine's row — which would point the #49 staleness comparison at
+    // the wrong daemon. Prefer the row whose name equals this checkout's
+    // configured client_name; only fall back to the old heuristic when the
+    // config is unreadable or this machine never registered under that name.
     let clients = (o["clients"] as? [[String: Any]]) ?? []
-    let me = clients.first(where: { ($0["online"] as? Bool) == true }) ?? clients.first
+    let myName = configuredClientName()
+    let me = (myName.flatMap { n in clients.first(where: { ($0["name"] as? String) == n }) })
+        ?? clients.first(where: { ($0["online"] as? Bool) == true })
+        ?? clients.first
     guard let c = me else {
       conn = .unreachable
       return
