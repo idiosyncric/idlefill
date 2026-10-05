@@ -361,7 +361,7 @@ test('register calls carry the gate snapshot (active at refresh, queued while pa
   // First sight registers BEFORE the request is forwarded ⇒ idle snapshot.
   const resA = postChat(proxy.base_url, '/s/tokA/v1/chat/completions');
   await waitFor(() => up.hits.length === 1, 3000, 'A forwarded');
-  assert.deepEqual(calls[0], { token: 'tokA', gate: null }, 'first-sight register: no gate block yet');
+  assert.deepEqual(calls[0], { token: 'tokA', gate: null, sessionId: undefined }, 'first-sight register: no gate block yet');
 
   // B first-sights and parks; its register fires at first sight (before
   // the park), so it is also gate-less — the REFRESH is what reports it.
@@ -603,23 +603,33 @@ test('#41 posture key absent when the session gate is disabled (no gate = no pos
 // ---------------------------------------------------------------------------
 
 test('#42 header capture: the id reaches the register heartbeat; a headerless later request never clears it', async () => {
-  const { gate, calls } = makeGate();
+  const clock = { t: 2_000_000 };
+  const { gate, calls } = makeGate({ now: () => clock.t });
   const { proxy, up } = await harness({ gate });
-  up.release(2);
 
   const resP = fetch(`${proxy.base_url}/s/tokId/v1/chat/completions`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-hermes-session-id': '20261005_172826_f38167' },
     body: JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }] }),
   });
+  await waitFor(() => up.hits.length === 1, 3000, 'upstream hit');
+  up.release(1);
   const res = await resP;
   assert.equal(res.status, 200);
+  // touch() runs BEFORE the first-sight register, so the very first
+  // heartbeat on the token already carries the captured id.
   await waitFor(() => calls.some((c) => c.token === 'tokId' && c.sessionId === '20261005_172826_f38167'), 3000, 'the captured id on a register call');
 
   // A headerless follow-up on the SAME token: forwarded exactly as before,
-  // and the NEXT heartbeat still carries the stored id (last-known-wins).
-  const res2 = await postChat(proxy.base_url, '/s/tokId/v1/chat/completions');
+  // and the NEXT heartbeat (past the 10s throttle, via the daemon tick)
+  // still carries the stored id — last-known-wins.
+  const res2P = postChat(proxy.base_url, '/s/tokId/v1/chat/completions');
+  await waitFor(() => up.hits.length === 2, 3000, 'second upstream hit');
+  up.release(1);
+  const res2 = await res2P;
   assert.equal(res2.status, 200);
+  clock.t += 10_001;
+  gate.heartbeat();
   await waitFor(() => calls.filter((c) => c.token === 'tokId').length >= 2, 3000, 'a second register heartbeat on the token');
   const last = calls.filter((c) => c.token === 'tokId').at(-1)!;
   assert.equal(last.sessionId, '20261005_172826_f38167', 'the headerless request never cleared the stored id');
@@ -628,13 +638,15 @@ test('#42 header capture: the id reaches the register heartbeat; a headerless la
 test('#42 header sanitizer: an oversized header is dropped, the request forwards exactly as before', async () => {
   const { gate, calls } = makeGate();
   const { proxy, up } = await harness({ gate });
-  up.release(1);
 
-  const res = await fetch(`${proxy.base_url}/s/tokHuge/v1/chat/completions`, {
+  const resP = fetch(`${proxy.base_url}/s/tokHuge/v1/chat/completions`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-hermes-session-id': 'x'.repeat(300) },
     body: JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }] }),
   });
+  await waitFor(() => up.hits.length === 1, 3000, 'upstream hit');
+  up.release(1);
+  const res = await resP;
   assert.equal(res.status, 200, 'an oversized id never blocks admission');
   await waitFor(() => calls.some((c) => c.token === 'tokHuge'), 3000, 'the register call');
   const c = calls.find((x) => x.token === 'tokHuge')!;
@@ -644,10 +656,53 @@ test('#42 header sanitizer: an oversized header is dropped, the request forwards
 test('#42 no header at all: the register heartbeat omits the id (old behavior intact)', async () => {
   const { gate, calls } = makeGate();
   const { proxy, up } = await harness({ gate });
+  const resP = postChat(proxy.base_url, '/s/tokPlain/v1/chat/completions');
+  await waitFor(() => up.hits.length === 1, 3000, 'upstream hit');
   up.release(1);
-  const res = await postChat(proxy.base_url, '/s/tokPlain/v1/chat/completions');
+  const res = await resP;
   assert.equal(res.status, 200);
   await waitFor(() => calls.some((c) => c.token === 'tokPlain'), 3000, 'the register call');
   const c = calls.find((x) => x.token === 'tokPlain')!;
   assert.equal(c.sessionId, undefined, 'headerless sessions carry no id');
+});
+
+// ---------------------------------------------------------------------------
+// #43 — the register heartbeat publishes the port the proxy ACTUALLY bound
+// (config proxy_port may be 0 = ephemeral, so only the daemon knows). The
+// Sessions surface needs it to hand over the exact /model line.
+// ---------------------------------------------------------------------------
+
+test('#43 register heartbeat carries proxy_port once the proxy binds', async () => {
+  const arb = await startFakeArbiter();
+  const dir = mkdtempSync(join(tmpdir(), 'idlefill-proxyport-'));
+  mkdirSync(join(dir, 'state'), { recursive: true });
+  const cfg: ClientConfig = {
+    server_url: arb.url,
+    token: 't',
+    client_name: 'port-client',
+    ip: '',
+    proxy_port: 0, // ephemeral — the row must carry the REAL bound port
+    llm_target: 'http://127.0.0.1:1',
+    repo_root: dir,
+    state_dir: join(dir, 'state'),
+    state_file: join(dir, 'state.json'),
+    projects: [],
+  };
+  try {
+    const d = new ClientDaemon(cfg, { pollMs: 50, log: { info: () => {} } });
+    await d.start();
+    const bound = Number(new URL(d.proxyUrl!).port);
+    assert.ok(bound > 0, 'the proxy bound a real port');
+    // The first register precedes ensureProxy; a heartbeat within a couple
+    // of 50ms ticks must carry the key.
+    await waitFor(
+      () => arb.registers.some((b) => b.proxy_port === bound),
+      3000,
+      `a register body with proxy_port=${bound}`,
+    );
+    await d.stop();
+  } finally {
+    await arb.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

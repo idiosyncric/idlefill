@@ -160,6 +160,13 @@
     cursor: pointer; margin-top: 4px;
   }
   .unthrottle:hover { border-color: var(--accent); }
+  /* Session launcher (#43): one block per proxy-hosting machine — a header
+     line (name + mint control), minted command lines stacked UNDERNEATH so
+     a long /model line never crowds the row or pushes siblings around. */
+  .launch-row { padding: 3px 0; font-size: 12px; }
+  .launch-row .wname { font-weight: 600; margin-right: 8px; }
+  .launch-line { display: flex; gap: 6px; align-items: baseline; margin-top: 4px; }
+  .launch-line code { flex: 0 1 auto; min-width: 0; overflow-wrap: anywhere; }
   /* Sessions (router-self-registered interactive traffic — exception-only
      section, hidden while nothing is registered): one row per session —
      liveness dot, short token (+ the client that registered it), the engine
@@ -383,6 +390,18 @@
   <section id="sessions-section" data-view="sessions" style="display:none">
     <h2>Sessions</h2>
     <div id="sessions"></div>
+  </section>
+
+  <!-- Session launcher (#43): mint a session token and hand over the exact
+       `/model …/s/<token>` line, so starting a gated session stops being a
+       hand-edited base_url. Exception-only: the section stays hidden until
+       at least one client reports a proxy port (only a #43 gate-bearing
+       daemon can host a session). Mints are page-local — the arbiter never
+       sees them; the row appears when the session's first request hits the
+       router. -->
+  <section id="launcher-section" data-view="sessions" style="display:none">
+    <h2>New session</h2>
+    <div id="launcher"></div>
   </section>
 
   <!-- Throttled jobs — the anti-thrash backstop (exception-only: the
@@ -886,6 +905,103 @@ function sessStateWord(sess, st) {
   return { label: "Idle", cls: "dim", note: "no request seen on this session recently" };
 }
 
+// Session launcher (#43): mint a token, hand over the exact `/model` line.
+// The mint lives PAGE-side (crypto in the browser) — the arbiter never
+// sees a token until the session's first request hits the router and the
+// router self-registers it. Lines persist in localStorage keyed by client
+// so the 5s refresh (and a page reload) never wipes a line the operator is
+// mid-paste. Exception-only: the section shows only when some online
+// client reports proxy_port (only a #43 gate-bearing daemon can host one).
+// The last /api/state the page rendered (refresh() sets it), so the
+// launcher's click handlers can re-render without a fetch round-trip.
+let LAST_ST = null;
+
+const MINT_KEY = "idlefill.mintedSessions";
+
+function mintedLines() {
+  try {
+    const raw = localStorage.getItem(MINT_KEY);
+    const obj = raw ? JSON.parse(raw) : {};
+    return obj && typeof obj === "object" ? obj : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveMinted(obj) {
+  try { localStorage.setItem(MINT_KEY, JSON.stringify(obj)); } catch { /* private mode: lines just don't persist */ }
+}
+
+function mintToken() {
+  // <8 hex>-<4 hex>: path-safe (the router accepts any non-slash token,
+  // the arbiter caps at 128), short enough to retype, unique enough here.
+  const b = new Uint8Array(6);
+  crypto.getRandomValues(b);
+  const h = Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  return h.slice(0, 8) + "-" + h.slice(8);
+}
+
+function renderLauncher(st) {
+  if (QUEUE_PAGE) return;
+  // The raw /api/state clients carry last_seen, not an online flag — the
+  // 90s liveness precedent (SESSION_ONLINE_MS, same as the session rows).
+  const hosted = (st.clients || [])
+    .filter((c) => c.proxy_port && st.now - (c.last_seen ?? 0) < SESSION_ONLINE_MS)
+    .sort((a, b) => a.name.localeCompare(b.name));
+  const sec = $("launcher-section");
+  if (hosted.length === 0) {
+    sec.style.display = "none";
+    syncViewEmpty();
+    return;
+  }
+  sec.style.display = "";
+  syncViewEmpty(); // a hostable launcher means the Sessions view is not empty
+  const minted = mintedLines();
+  $("launcher").innerHTML = hosted.map((c) => {
+    const lines = Array.isArray(minted[c.name]) ? minted[c.name] : [];
+    return '<div class="launch-row">' +
+      '<span class="wname">' + esc(c.name) + "</span>" +
+      '<button class="unthrottle mint" data-client="' + esc(c.name) + '" data-port="' + esc(String(c.proxy_port)) + '" type="button" title="mint a fresh session token for this machine&#39;s router">new session</button>' +
+      lines.map((l) =>
+        '<div class="launch-line"><code>/model http://127.0.0.1:' + esc(String(l.port)) + "/s/" + esc(l.token) + "</code>" +
+        '<button class="unthrottle copy" data-line="/model http://127.0.0.1:' + esc(String(l.port)) + "/s/" + esc(l.token) + '" type="button">copy</button>' +
+        '<button class="unthrottle drop" data-client="' + esc(c.name) + '" data-token="' + esc(l.token) + '" type="button" title="forget this line (an already-started session keeps running)">×</button></div>'
+      ).join("") +
+      "</div>";
+  }).join("");
+}
+
+function wireLauncher() {
+  if (QUEUE_PAGE) return;
+  $("launcher").addEventListener("click", (e) => {
+    const btn = e.target.closest("button");
+    if (!btn) return;
+    if (btn.classList.contains("mint")) {
+      const minted = mintedLines();
+      const list = Array.isArray(minted[btn.dataset.client]) ? minted[btn.dataset.client] : [];
+      list.unshift({ port: Number(btn.dataset.port), token: mintToken() });
+      minted[btn.dataset.client] = list.slice(0, 5); // the page keeps the newest five per machine
+      saveMinted(minted);
+      if (LAST_ST) renderLauncher(LAST_ST);
+      return;
+    }
+    if (btn.classList.contains("copy")) {
+      navigator.clipboard?.writeText(btn.dataset.line).then(
+        () => { btn.textContent = "copied"; setTimeout(() => { btn.textContent = "copy"; }, 1200); },
+        () => { btn.textContent = "copy failed"; },
+      );
+      return;
+    }
+    if (btn.classList.contains("drop")) {
+      const minted = mintedLines();
+      minted[btn.dataset.client] = (Array.isArray(minted[btn.dataset.client]) ? minted[btn.dataset.client] : [])
+        .filter((l) => l.token !== btn.dataset.token);
+      saveMinted(minted);
+      if (LAST_ST) renderLauncher(LAST_ST);
+    }
+  });
+}
+
 function sessBlock(sess, st) {
   const stale = st.now - (sess.last_seen ?? 0) >= SESSION_ONLINE_MS;
   const w = sessStateWord(sess, st);
@@ -981,6 +1097,7 @@ async function refresh() {
     return;
   }
 
+  LAST_ST = st;
   const live = liveStatus(st);
   setStatus(live.cls, live.label, live.note);
   updateViewBadges(st);
@@ -1069,6 +1186,13 @@ async function refresh() {
     sessBox.innerHTML = sessRows.map((s) => sessBlock(s, st)).join("");
   }
 
+  // --- Session launcher (#43) — exception-only: hidden until a client
+  //     reports a proxy port (only a gate-bearing #43 daemon hosts gated
+  //     sessions). Minted lines persist across the 5s refresh (page-local
+  //     map, keyed by client); the row itself appears once the session's
+  //     first request hits the router.
+  renderLauncher(st);
+
   // --- Throttled jobs (the anti-thrash backstop — exception-only: the
   //     section stays hidden while nothing is throttled, and each block
   //     carries the recovery control).
@@ -1151,6 +1275,11 @@ const QUEUE_PAGE = (() => {
 // The route is fixed for the life of the page — set the view class once;
 // CSS (body.queuepage) hides the overview panes and shows the queue section.
 document.body.classList.toggle("queuepage", !!QUEUE_PAGE);
+
+// Session launcher (#43): wired HERE, not at its definition, because the
+// handler guard reads QUEUE_PAGE — a const declared just above (touching
+// it earlier is a TDZ crash that would abort the whole script).
+wireLauncher();
 
 function renderQueuePage(st) {
   if (!QUEUE_PAGE) return;

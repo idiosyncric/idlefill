@@ -1622,3 +1622,76 @@ test('session_id (#42): two concurrent sessions on one client keep distinct ids 
   assert.equal(mine.length, 2, 'two rows, not one');
   assert.deepEqual(new Set(mine.map((s) => s.session_id)), new Set(['chat-a-111', 'chat-b-222']), 'each row keeps its own conversation id');
 });
+
+// ---------------------------------------------------------------------------
+// #43 session launcher — the register heartbeat's proxy_port ADD-key: the
+// port the router's proxy actually bound. Sanitized integer 1..65535,
+// stored on valid reports (same heartbeat rule as version/revision),
+// echoed exception-only on the client row and the per-project worker row.
+// ---------------------------------------------------------------------------
+
+test('proxy_port (#43): a valid report stores + echoes on the client row and the worker row', async () => {
+  const reg = await fetch(`${base}/api/clients/register`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({
+      name: 'launcher-client',
+      proxy_port: 11435,
+      projects: [{ name: 'career-ops', model: 'Qwen3.8-27B', estimated_seconds: 900, queue_depth: 0 }],
+    }),
+  });
+  assert.equal(reg.status, 200);
+  const st = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: { name: string; proxy_port?: number }[];
+    projects: { name: string; workers: { client: string; proxy_port?: number }[] }[];
+  };
+  assert.equal(st.clients.find((c) => c.name === 'launcher-client')!.proxy_port, 11435, 'the client row carries the bound port');
+  const w = st.projects.find((p) => p.name === 'career-ops')!.workers.find((x) => x.client === 'launcher-client')!;
+  assert.equal(w.proxy_port, 11435, 'the worker row carries it too (the launcher lists rows from this)');
+});
+
+test('proxy_port (#43): malformed values are dropped, never rejected; absent = no key (old client)', async () => {
+  for (const bad of [0, -5, 70000, 12.5, '11435', null]) {
+    const r = await fetch(`${base}/api/clients/register`, {
+      method: 'POST', headers: auth,
+      body: JSON.stringify({ name: 'launcher-bad', proxy_port: bad }),
+    });
+    assert.equal(r.status, 200, 'a malformed proxy_port never rejects the registration');
+  }
+  const st = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: { name: string; proxy_port?: number }[];
+  };
+  assert.ok(!('proxy_port' in st.clients.find((c) => c.name === 'launcher-bad')!), 'every malformed value is dropped');
+
+  const legacy = await fetch(`${base}/api/clients/register`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({ name: 'launcher-legacy' }),
+  });
+  assert.equal(legacy.status, 200);
+  const st2 = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: { name: string; proxy_port?: number }[];
+  };
+  assert.ok(!('proxy_port' in st2.clients.find((c) => c.name === 'launcher-legacy')!), 'an old client row carries no port (the launcher stays hidden for it)');
+});
+
+test('proxy_port (#43): a later heartbeat without the key keeps the stored port', async () => {
+  await fetch(`${base}/api/clients/register`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({ name: 'launcher-keep', proxy_port: 44000 }),
+  });
+  await fetch(`${base}/api/clients/register`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({ name: 'launcher-keep' }),
+  });
+  const st = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: { name: string; proxy_port?: number }[];
+  };
+  assert.equal(st.clients.find((c) => c.name === 'launcher-keep')!.proxy_port, 44000, 'the port rides the row until the next valid report (the daemon registers before the proxy binds on boot)');
+});
+
+test('dashboard carries the session launcher (#43)', async () => {
+  const html = await (await fetch(base + '/')).text();
+  assert.ok(html.includes('id="launcher-section"'), 'the launcher section exists');
+  assert.ok(html.includes('data-view="sessions"') && html.includes('id="launcher"'), 'it lives in the Sessions view');
+  assert.ok(html.includes('mintedSessions') && html.includes('mintToken'), 'the mint lives page-side (crypto in the browser), persisted across refresh');
+  assert.ok(html.includes('/model http://127.0.0.1:') || html.includes('/model http://127.0.0.1:" +'), 'the handed-over line is the exact /model command');
+});

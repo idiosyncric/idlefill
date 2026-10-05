@@ -300,6 +300,17 @@ verbatim, and the dashboard puts a `gate fail-open` badge on that
 machine's worker rows. `armed` renders nothing (no tag is the healthy
 state); a daemon with `session_gate: false` sends no key at all.
 
+**Session launcher (#43).** The heartbeat also carries `proxy_port` — the
+port the proxy ACTUALLY bound (config `proxy_port: 0` = ephemeral, so only
+the daemon knows). The dashboard's Sessions view shows a **New session**
+section, exception-only: it appears once at least one online client
+reports a port. One `new session` button per machine mints a
+`<8hex>-<4hex>` token in the browser and hands over the exact line
+`/model http://127.0.0.1:<port>/s/<token>` with a copy button; the line
+persists across refreshes until you dismiss it. The arbiter never sees a
+token until the session's first request hits the router — the mint is
+purely page-side.
+
 `state`: `active` = the session currently holds an inference slot
 (in-flight > 0); `queued` = it has ≥1 parked request waiting for admission.
 `waiting`: the parked-request count for that session right now.

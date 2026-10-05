@@ -352,6 +352,15 @@ export interface ClientRecord {
    * healthy state).
    */
   gate_posture?: 'armed' | 'fail_open';
+  /**
+   * The port the client's session-gate proxy ACTUALLY bound (#43 session
+   * launcher), published on the register heartbeat — the config value may
+   * be 0 (ephemeral), so only the daemon knows. The Sessions surface uses
+   * it to hand over the exact `/model http://127.0.0.1:<port>/s/<token>`
+   * line for this machine. ADD-key: stored on a valid report (integer in
+   * 1..65535, else dropped), absent on old clients and gate-less daemons.
+   */
+  proxy_port?: number;
 }
 
 /**

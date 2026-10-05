@@ -1169,14 +1169,21 @@ export class ClientDaemon {
       // never a rejection.
       ...(clientRevision ? { revision: clientRevision } : {}),
       // Gate posture (#41): the router's OWN admission posture, published so
-      // the surfaces can say whether the slot cap + operator overrides are
+      // the arbiter can say whether the slot cap + operator overrides are
       // actually in force. `armed` = the arbiter is reachable and gating;
       // `fail_open` = it is unreachable, so every session is admitted and
       // the cap is off. Derived from the gate's single `failOpen` flag — no
       // second source of truth. Exception-only: a daemon running WITHOUT a
       // session gate reports nothing (there is no gate to be armed), and an
-      // old arbiter that ignores the key keeps working.
+      // old arbiter ignores the key and keeps working.
       ...(this.gate ? { gate_posture: this.gate.failOpen ? 'fail_open' : 'armed' } : {}),
+      // Session launcher (#43): the port the session-gate proxy ACTUALLY
+      // bound (cfg proxy_port may be 0 = ephemeral). The arbiter echoes it,
+      // so the Sessions surface can hand the operator the exact
+      // `/model http://127.0.0.1:<port>/s/<token>` line for this machine.
+      // ADD-key: an old arbiter ignores it; a daemon whose proxy never came
+      // up reports nothing.
+      ...(this.proxy ? { proxy_port: this.proxy.port } : {}),
       // The arbiter stores this per-project view for the dashboard
       // (Projects → workers allocated). Re-registration is a heartbeat:
       // last_seen refreshes and queue depths update on every tick. `stats`

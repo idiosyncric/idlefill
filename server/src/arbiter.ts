@@ -229,7 +229,7 @@ export class Arbiter {
     observedIp: string,
     projects?: ProjectAllocation[],
     now?: number,
-    info?: { version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open' },
+    info?: { version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open'; proxy_port?: number },
   ): { client_id: string; created: boolean } {
     const s = this.store.state;
     const seen = now ?? Date.now();
@@ -260,6 +260,15 @@ export class Arbiter {
     // lives inside the router and the arbiter cannot observe it.
     const gatePosture =
       info?.gate_posture === 'armed' || info?.gate_posture === 'fail_open' ? info.gate_posture : undefined;
+    // Session launcher (#43): the port the proxy actually bound. Sanitized
+    // the same edge way — an integer in the real-port range, else dropped
+    // (never a rejection). Stored on a valid report; an absent report
+    // leaves the row as-is (the daemon registers before the proxy binds,
+    // and old clients never send the key at all).
+    const proxyPort =
+      typeof info?.proxy_port === 'number' && Number.isInteger(info.proxy_port) && info.proxy_port >= 1 && info.proxy_port <= 65535
+        ? info.proxy_port
+        : undefined;
     const existing = s.clients.find((c) => c.name === name);
     if (existing) {
       if (validIp(observedIp)) existing.ip = observedIp; // observed wins
@@ -289,6 +298,10 @@ export class Arbiter {
       // its link returns, so a recovered gate overwrites the stale
       // `fail_open` within one poll (the surfaces render only fail_open).
       if (gatePosture) existing.gate_posture = gatePosture;
+      // Proxy port (#43): same heartbeat rule — a valid report updates the
+      // row (the proxy rebind on restart is reflected within one tick);
+      // absent leaves it as-is.
+      if (proxyPort) existing.proxy_port = proxyPort;
       this.store.save();
       return { client_id: existing.client_id, created: false };
     }
@@ -308,6 +321,7 @@ export class Arbiter {
       ...(protocol !== undefined ? { protocol } : {}),
       ...(revision ? { revision } : {}),
       ...(gatePosture ? { gate_posture: gatePosture } : {}),
+      ...(proxyPort ? { proxy_port: proxyPort } : {}),
     });
     this.store.appendEvent({ kind: 'client_registered', detail: `${name} (${client_id})` });
     // A fresh registration that already carries rebuild state (client

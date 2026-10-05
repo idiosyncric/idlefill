@@ -88,7 +88,7 @@ function bearer(req: { headers: Record<string, unknown>; query: unknown }): stri
 function projectView(
   arbiter: Arbiter,
   cfg: ServerConfig,
-  clients: { name: string; last_seen: number; projects: { name: string; model: string; estimated_seconds: number; queue_depth: number; queue_preview?: QueuePreviewRow[]; stats?: Record<string, number | string>; last_rebuild?: RebuildRunState; cycles?: CycleStatusRow[]; cycle_cap?: number }[]; version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open' }[],
+  clients: { name: string; last_seen: number; projects: { name: string; model: string; estimated_seconds: number; queue_depth: number; queue_preview?: QueuePreviewRow[]; stats?: Record<string, number | string>; last_rebuild?: RebuildRunState; cycles?: CycleStatusRow[]; cycle_cap?: number }[]; version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open'; proxy_port?: number }[],
   day: string,
   now: number,
   today: Record<string, { finished: number; failed: number }>,
@@ -129,6 +129,9 @@ function projectView(
           // echoed exception-only (absent on pre-#41 clients AND on a daemon
           // running with no session gate — both render the row unchanged).
           ...(c.gate_posture ? { gate_posture: c.gate_posture } : {}),
+          // Session launcher (#43): the port the router's proxy bound, so
+          // the Sessions view can mint sessions against THIS machine.
+          ...(c.proxy_port ? { proxy_port: c.proxy_port } : {}),
         };
       })
       .sort((a, b) => Number(b.online) - Number(a.online) || a.client.localeCompare(b.client));
@@ -285,7 +288,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   // ------------------------------------------------------------------
 
   app.post('/api/clients/register', async (req, reply) => {
-    const body = (req.body ?? {}) as { name?: string; ip?: string; projects?: ProjectAllocation[]; version?: unknown; protocol?: unknown; revision?: unknown; gate_posture?: unknown };
+    const body = (req.body ?? {}) as { name?: string; ip?: string; projects?: ProjectAllocation[]; version?: unknown; protocol?: unknown; revision?: unknown; gate_posture?: unknown; proxy_port?: unknown };
     const name = typeof body.name === 'string' ? body.name.trim() : '';
     if (!name) return reply.code(400).send({ error: 'name required' });
     const remote = (req.ip ?? '').split(':').pop() ?? 'unknown';
@@ -406,14 +409,20 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     // registerClient. Absent = an old client or a gate-less daemon: the
     // surfaces render the row exactly as before.
     const gate_posture = body.gate_posture === 'armed' || body.gate_posture === 'fail_open' ? body.gate_posture : undefined;
+    // Session launcher (#43): the port the proxy actually bound — a plain
+    // pass-through here, sanitized (integer 1..65535, else dropped) in
+    // registerClient. The daemon registers once before its proxy binds, so
+    // the key simply arrives on a later heartbeat; old clients never send
+    // it at all.
+    const proxy_port = typeof body.proxy_port === 'number' ? body.proxy_port : undefined;
     const res = arbiter.registerClient(
       name,
       typeof body.ip === 'string' && body.ip.trim() ? body.ip.trim() : undefined,
       remote,
       projects,
       undefined,
-      version !== undefined || protocol !== undefined || revision !== undefined || gate_posture !== undefined
-        ? { version, protocol, revision, gate_posture }
+      version !== undefined || protocol !== undefined || revision !== undefined || gate_posture !== undefined || proxy_port !== undefined
+        ? { version, protocol, revision, gate_posture, proxy_port }
         : undefined,
     );
     return reply.code(200).send({ client_id: res.client_id, created: res.created });
