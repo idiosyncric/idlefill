@@ -55,14 +55,27 @@ REMOTE_HOME="${IDLEFILL_REMOTE_DIR:-$URZA_HOME/idlefill}"
 # how the pre-script container was launched; state.json is uid-1000-owned).
 URZA_UID_GID="$(ssh "$URZA" 'printf %s:%s "$(id -u)" "$(id -g)"')"
 
-# --- config: token + URL from the Mac's client config (gitignored) ---------
+# --- config: arbiter endpoint + token --------------------------------------
+# #60 moved the Mac's client config to the LOCAL arbiter (mesh D3/D5: the
+# surfaces talk to the local origin). The deploy health-checks the instance
+# being REPLACED, so the target endpoint + token now come from env when
+# set (IDLEFILL_SERVER_URL / IDLEFILL_API_TOKEN — the same shape CI will
+# need per the standing note); the client config stays the fallback for
+# the single-remote (pre-mesh) layout. Empty token = anonymous probes:
+# GET /api/state is readable anonymously by design (the dashboard poll),
+# and active_leases / idle / clients all ride it — enough for both probes.
 CLIENT_CFG="$REPO_ROOT/client/config.json"
-[ -f "$CLIENT_CFG" ] || { echo "missing $CLIENT_CFG (need server_url + token)" >&2; exit 1; }
-read -r SERVER_URL TOKEN < <(node -e '
+SERVER_URL="${IDLEFILL_SERVER_URL:-}"
+TOKEN="${IDLEFILL_API_TOKEN:-}"
+if [ -z "$SERVER_URL" ]; then
+  [ -f "$CLIENT_CFG" ] || { echo "missing $CLIENT_CFG (need server_url + token) or set IDLEFILL_SERVER_URL" >&2; exit 1; }
+  read -r SERVER_URL CFG_TOKEN < <(node -e '
   const c = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
   if (!c.server_url || !c.token) { console.error("client config missing server_url/token"); process.exit(1); }
   console.log(c.server_url, c.token);
-' "$CLIENT_CFG")
+  ' "$CLIENT_CFG")
+  TOKEN="${TOKEN:-$CFG_TOKEN}"
+fi
 
 echo "==> deploy $TAG (branch: $BRANCH) → $URZA:$REMOTE_HOME  via $SERVER_URL"
 
@@ -72,8 +85,13 @@ if [ "$DIRTY" -gt 0 ]; then
 fi
 
 # --- preflight: refuse to swap out a running lease (unless --force) --------
+# Auth header ONLY when a token exists — an EMPTY "Bearer " header would 401
+# the anonymous /api/state exception (the probes need that exception when
+# IDLEFILL_API_TOKEN is unset). Array form: the header carries a space.
+CURL_AUTH=()
+if [ -n "$TOKEN" ]; then CURL_AUTH=(-H "Authorization: Bearer $TOKEN"); fi
 if [ "$FORCE" -ne 1 ]; then
-  ACTIVE="$(curl -fsS -m 10 -H "Authorization: Bearer $TOKEN" "$SERVER_URL/api/state" 2>/dev/null \
+  ACTIVE="$(curl -fsS -m 10 "${CURL_AUTH[@]}" "$SERVER_URL/api/state" 2>/dev/null \
     | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const s=JSON.parse(d);console.log((s.active_leases||[]).length)}catch{console.log(0)}})' || echo 0)"
   if [ "${ACTIVE:-0}" -gt 0 ]; then
     echo "arbiter has $ACTIVE active lease(s) — refusing to swap (use --force to override)" >&2
@@ -129,7 +147,7 @@ echo "==> healthcheck (up to ~25s)"
 ok=0
 for _ in 1 2 3 4 5 6 7 8; do
   sleep 3
-  code="$(curl -s -m 8 -o "$HEALTH_JSON" -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$SERVER_URL/api/state" || echo 000)"
+  code="$(curl -s -m 8 -o "$HEALTH_JSON" -w '%{http_code}' "${CURL_AUTH[@]}" "$SERVER_URL/api/state" || echo 000)"
   if [ "$code" = "200" ] && node -e '
       const s = require(process.argv[1]);
       process.exit(s && s.idle && Array.isArray(s.clients) ? 0 : 1);
