@@ -50,7 +50,9 @@ export function applyDefaults(raw: Partial<ServerConfig> | null | undefined): Se
     listen: num(r.listen, DEFAULTS.listen),
     api_tokens: Array.isArray(r.api_tokens) ? r.api_tokens.filter((t) => typeof t === 'string') : [],
     llama_swap_url: str(r.llama_swap_url, DEFAULTS.llama_swap_url),
-    activity_path: str(r.activity_path, DEFAULTS.activity_path),
+    // An EXPLICIT empty string is the feed-off declaration (#60 A1) and
+    // must survive; an absent/garbage key falls back to the default path.
+    activity_path: typeof r.activity_path === 'string' ? r.activity_path : DEFAULTS.activity_path,
     server_name: str(r.server_name, DEFAULTS.server_name),
     server_models: Array.isArray(r.server_models)
       ? r.server_models.filter((m): m is string => typeof m === 'string' && m.trim() !== '')

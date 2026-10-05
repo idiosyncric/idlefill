@@ -22,6 +22,12 @@ export interface ServerConfig {
   listen: number;
   api_tokens: string[];
   llama_swap_url: string;
+  /**
+   * Activity-feed path on the watched server. EMPTY = the watched server
+   * declares NO feed (#60 A1, e.g. oMLX): the feed signal is disabled
+   * rather than degraded, and log_glob alone carries the idle verdict.
+   * An ABSENT key keeps the default `/api/metrics/activity` (back-compat).
+   */
   activity_path: string;
   /** Display name for the watched inference server (defaults to the URL's host:port). */
   server_name?: string;
@@ -209,6 +215,12 @@ export interface ServerConnection {
   name: string;
   /** Inference-server (llama-swap) base URL. */
   url: string;
+  /**
+   * Activity-feed path. EMPTY = this server declares NO feed (#60 A1):
+   * its detector disables the feed signal instead of degrading; log_glob
+   * alone then carries the verdict. Rows created before #60 A1 always
+   * carry a path and behave exactly as before.
+   */
   activity_path: string;
   /**
    * Per-server log-mtime glob (the second idle signal; see IdleDetector).
@@ -454,6 +466,14 @@ export interface IdleSignal {
   last_log_write: number | null;
   signal_degraded: boolean;
   degraded_reason: string | null;
+  /**
+   * True when the server row declares an activity feed (non-empty
+   * `activity_path`). False = feed-off provider (#60 A1): the log-mtime
+   * signal alone carries the verdict and the row is never degraded by a
+   * feed failure. ADD key — the /api/state shape contract (add, never
+   * rename).
+   */
+  feed_enabled: boolean;
 }
 
 export type EventKind =

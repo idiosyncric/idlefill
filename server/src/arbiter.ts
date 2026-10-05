@@ -650,6 +650,7 @@ export class Arbiter {
           last_log_write: null,
           signal_degraded: true,
           degraded_reason: 'no detectors',
+          feed_enabled: true,
         },
     };
   }
@@ -1176,7 +1177,10 @@ export class Arbiter {
       };
       if (typeof input.name === 'string' && input.name.trim() !== '') touch(() => void (row.name = input.name!.trim()));
       if (typeof input.url === 'string' && input.url.trim() !== '') touch(() => void (row.url = input.url!.trim()));
-      if (typeof input.activity_path === 'string' && input.activity_path.trim() !== '')
+      // An EXPLICIT empty activity_path = feed-off declaration (#60 A1):
+      // the key being PRESENT with an empty string disables the feed
+      // signal; an absent key leaves the row untouched (patch semantics).
+      if (typeof input.activity_path === 'string')
         touch(() => void (row.activity_path = input.activity_path!.trim()));
       if (typeof input.log_glob === 'string') touch(() => void (row.log_glob = input.log_glob!.trim()));
       if (models) touch(() => void (row.models = models));
@@ -1196,8 +1200,13 @@ export class Arbiter {
     const url = typeof input.url === 'string' ? input.url.trim() : '';
     if (!name || !url) return { ok: false, reason: 'name and url required', created: false };
     if (!/^https?:\/\//.test(url)) return { ok: false, reason: 'url must be an http(s) address', created: false };
+    // Create: an absent activity_path falls back to the llama-swap default
+    // (back-compat); an EXPLICIT empty string declares a feed-off provider
+    // (#60 A1) and sticks.
     const activityPath =
-      typeof input.activity_path === 'string' && input.activity_path.trim() !== '' ? input.activity_path.trim() : '/api/metrics/activity';
+      typeof input.activity_path === 'string'
+        ? input.activity_path.trim()
+        : '/api/metrics/activity';
     const dupe = s.servers.find((x) => x.url === url && x.activity_path === activityPath);
     if (dupe) return { ok: false, reason: `duplicate connection: ${dupe.name} already declared at this url + activity path`, created: false };
     const server: ServerConnection = {

@@ -1037,13 +1037,22 @@ connected to, seeded from config (`server_name`, `server_models`,
   `last_activity`, `degraded`, `reidle_gated`, …). A declared-but-unwatched
   row carries `signal: null` — it is inventory, not a live feed.
 - `POST /api/servers` — add (no `id`) or patch-update (by `id`) a declared
-  connection: `{name, url, activity_path?, models?, peers?}`. Create
+  connection: `{name, url, activity_path?, log_glob?, models?, peers?}`. Create
   requires a valid http(s) `url` and rejects a duplicate
   (url + activity path). This is **config + display only**: the arbiter
   keeps watching its single configured feed; a declared row is where a
   future multi-feed core will point the watcher. `peer:` backends (e.g.
   `peer:gpu2`) are plain-words metadata — the entry point fronts them; the
   arbiter never routes to them.
+- **Feed-off providers (#60 A1):** an **explicit empty `activity_path`**
+  (config `activity_path: ""` or a create/patch body carrying `""`) declares
+  the server has NO activity feed — oMLX and other key-gated engines expose
+  none. The detector then DISABLES the feed signal instead of degrading it,
+  and `log_glob` alone carries the idle verdict (`idle_for_s` from the log
+  mtime; `null` — never idle — when the glob matches nothing, so the
+  fail-closed posture is unchanged). The signal carries `feed_enabled:
+  false` for the dashboard. An absent key keeps the default
+  `/api/metrics/activity`, so every existing row behaves exactly as before.
 
 ```bash
 node scripts/idlefill-control.mjs servers

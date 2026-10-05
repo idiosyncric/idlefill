@@ -12,10 +12,21 @@
  *   idle_for = now - max(last_activity_ts, last_log_write)
  *   idle     = idle_for >= idle_seconds AND NOT degraded
  *
- * DEGRADED: a failed/timed-out fetch keeps the last-known signals and sets
- * `signal_degraded: true`. While degraded the arbiter must NOT grant leases
- * (we can't prove idle) and must NOT revoke on stale activity either — see
- * Arbiter.tick.
+ * FEED-OFF (#60 A1): an EMPTY `activity_path` declares the server has NO
+ * activity feed (oMLX and other key-gated engines expose none). The feed
+ * signal is then DISABLED — the fetch never runs, the row is NOT degraded,
+ * and log mtime alone carries the verdict. This is a DECLARATION, not a
+ * failure: a provider with no feed is fully watchable via log_glob. A row
+ * that carries a path keeps today's behavior exactly (back-compat).
+ *
+ * DEGRADED: a failed/timed-out fetch (only possible when a path is
+ * declared) keeps the last-known signals and sets `signal_degraded: true`.
+ * While degraded the arbiter must NOT grant leases (we can't prove idle)
+ * and must NOT revoke on stale activity either — see Arbiter.tick.
+ *
+ * FAIL-CLOSED when NO signal resolves: feed off AND the log glob matches
+ * nothing (or is unset) leaves `idle_for_s: null` — never idle, same
+ * posture as a degraded feed.
  *
  * SELF-TRAFFIC EXEMPTION (the critical invariant): an activity entry whose
  * `src` matches a registered client's IP is skipped from `last_activity`
@@ -39,6 +50,10 @@ export interface IdleDetectorOpts {
   fetchActivity: ActivityFetcher;
   logMtime: LogMtimeSource;
   llama_swap_url: string;
+  /**
+   * Activity-feed path. EMPTY = the server declares NO feed (#60 A1):
+   * the feed signal is disabled, not degraded.
+   */
   activity_path: string;
   log_glob: string;
   idle_seconds: number;
@@ -71,6 +86,12 @@ export class IdleDetector {
     this.lastLogWrite = this.o.log_glob ? this.o.logMtime(this.o.log_glob) : null;
 
     // --- activity feed signal ---
+    // A row that declares NO feed (empty activity_path, #60 A1) skips the
+    // fetch entirely: no feed = no feed signal, NOT a degraded one. The
+    // degrade path is reserved for a declared feed that fails.
+    if (!this.feedEnabled()) {
+      return this.signal(now);
+    }
     const url = `${this.o.llama_swap_url.replace(/\/$/, '')}${this.o.activity_path}`;
     const entries = await this.fetchFeed(url);
 
@@ -123,7 +144,13 @@ export class IdleDetector {
       last_log_write: this.lastLogWrite,
       signal_degraded: this.degraded,
       degraded_reason: this.degradedReason,
+      feed_enabled: this.feedEnabled(),
     };
+  }
+
+  /** True when the row declares an activity feed (non-empty path, #60 A1). */
+  feedEnabled(): boolean {
+    return this.o.activity_path.trim() !== '';
   }
 
   get isDegraded(): boolean {

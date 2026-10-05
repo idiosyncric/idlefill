@@ -208,6 +208,9 @@ function serverView(arbiter: Arbiter, cfg: ServerConfig, now: number) {
           last_log_write_age_s: sig.last_log_write ? Math.max(0, Math.round((now - sig.last_log_write) / 1000)) : null,
           degraded: sig.signal_degraded,
           degraded_reason: sig.degraded_reason,
+          // Feed-off providers (#60 A1): false = this row declares no feed
+          // and log mtime alone carries the verdict. ADD key.
+          feed_enabled: sig.feed_enabled,
           reidle_gated: arbiter.reidleGated(row.id),
           // Session folding (#32): the newest session activity on this server.
           session_last_activity_age_s: (() => {
@@ -817,6 +820,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       last_log_write: null,
       signal_degraded: true,
       degraded_reason: 'no detector for the watched server',
+      feed_enabled: true,
     };
     const lastAct = sig.last_activity ?? s.last_activity;
     const lastActAgo = lastAct ? Math.max(0, Math.round((now - lastAct.ts) / 1000)) : null;
