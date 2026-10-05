@@ -19,7 +19,7 @@ import { WebSocketServer } from 'ws';
 import { utcDay, type Arbiter, WATCHED_SERVER_ID } from './arbiter.js';
 import { seriesKeyOf, type MetricsBucket, type MetricsSeries, type MetricsStore } from './metrics.js';
 import { buildMeshSnapshot, type MeshFederation } from './mesh.js';
-import type { ProjectAllocation, QueuePreviewRow, RebuildRunState, ServerConfig, ServerConnection } from './types.js';
+import type { CycleStatusRow, ProjectAllocation, QueuePreviewRow, RebuildRunState, ServerConfig, ServerConnection } from './types.js';
 
 export interface ApiDeps {
   arbiter: Arbiter;
@@ -88,7 +88,7 @@ function bearer(req: { headers: Record<string, unknown>; query: unknown }): stri
 function projectView(
   arbiter: Arbiter,
   cfg: ServerConfig,
-  clients: { name: string; last_seen: number; projects: { name: string; model: string; estimated_seconds: number; queue_depth: number; queue_preview?: QueuePreviewRow[]; stats?: Record<string, number | string>; last_rebuild?: RebuildRunState }[]; version?: string; protocol?: number; revision?: string }[],
+  clients: { name: string; last_seen: number; projects: { name: string; model: string; estimated_seconds: number; queue_depth: number; queue_preview?: QueuePreviewRow[]; stats?: Record<string, number | string>; last_rebuild?: RebuildRunState; cycles?: CycleStatusRow[]; cycle_cap?: number }[]; version?: string; protocol?: number; revision?: string }[],
   day: string,
   now: number,
   today: Record<string, { finished: number; failed: number }>,
@@ -112,6 +112,11 @@ function projectView(
           // Scheduled rebuild run state (issue #3): stored + echoed verbatim
           // from the client's heartbeat. Absent = never run / not configured.
           ...(alloc?.last_rebuild ? { last_rebuild: alloc.last_rebuild } : {}),
+          // Dev-cycle rows (#53 D9.3): echoed verbatim from the allocation,
+          // exception-only like last_rebuild — absent when the worker reports
+          // no cycles. The strip renders per-cycle rows; no rollup here.
+          ...(alloc?.cycles ? { cycles: alloc.cycles } : {}),
+          ...(alloc?.cycle_cap !== undefined ? { cycle_cap: alloc.cycle_cap } : {}),
           // Version handshake (exception-only: absent on pre-version
           // clients, so the row carries the keys only when the client
           // reported them — the dashboard renders them exception-only too).
@@ -319,6 +324,35 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
         queue_after: r.queue_after,
       };
     };
+    // Dev-cycle status rows (#53 D9.3): client-published display data, same
+    // discipline as preview/rebuild — stored verbatim, never computed.
+    // Bound it hard like the preview: ≤20 rows (the client caps at 20 too),
+    // cycle_id trim ≤128, status one of planned|running|paused|done, every
+    // numeric field a finite integer ≥ 0, stage one of item|gate. A row
+    // failing shape checks is DROPPED, never stored; a non-array or an
+    // all-dropped array means the key is absent.
+    const cleanCycles = (raw: unknown): CycleStatusRow[] | undefined => {
+      if (!Array.isArray(raw)) return undefined;
+      const uint = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v >= 0;
+      const out: CycleStatusRow[] = [];
+      for (const r of raw as Record<string, unknown>[]) {
+        if (out.length >= 20) break;
+        if (!r || typeof r !== 'object' || Array.isArray(r)) continue;
+        const cycle_id = typeof r.cycle_id === 'string' && r.cycle_id.trim() !== '' ? r.cycle_id.trim().slice(0, 128) : '';
+        if (!cycle_id) continue;
+        const status = r.status;
+        if (status !== 'planned' && status !== 'running' && status !== 'paused' && status !== 'done') continue;
+        if (!uint(r.items_total) || !uint(r.item_index) || !uint(r.settled) || !uint(r.passed) || !uint(r.quarantined)) continue;
+        const stage = r.stage;
+        if (stage !== 'item' && stage !== 'gate') continue;
+        out.push({ cycle_id, status, items_total: r.items_total, item_index: r.item_index, settled: r.settled, passed: r.passed, quarantined: r.quarantined, stage });
+      }
+      return out.length > 0 ? out : undefined;
+    };
+    // cycle_cap: the client's effective cycle_max_in_flight (0 = knob
+    // absent). A plain display number — finite integer ≥ 0, else dropped.
+    const cleanCycleCap = (raw: unknown): number | undefined =>
+      typeof raw === 'number' && Number.isInteger(raw) && raw >= 0 ? raw : undefined;
     const projects = Array.isArray(body.projects)
       ? body.projects
           .filter((p) => p && typeof p.name === 'string' && p.name.trim() !== '')
@@ -331,6 +365,12 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
             stats: cleanStats((p as { stats?: unknown }).stats),
             ...(cleanRebuild((p as { last_rebuild?: unknown }).last_rebuild)
               ? { last_rebuild: cleanRebuild((p as { last_rebuild?: unknown }).last_rebuild) }
+              : {}),
+            ...(cleanCycles((p as { cycles?: unknown }).cycles)
+              ? { cycles: cleanCycles((p as { cycles?: unknown }).cycles) }
+              : {}),
+            ...(cleanCycleCap((p as { cycle_cap?: unknown }).cycle_cap) !== undefined
+              ? { cycle_cap: cleanCycleCap((p as { cycle_cap?: unknown }).cycle_cap) }
               : {}),
           }))
       : undefined;

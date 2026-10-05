@@ -432,16 +432,18 @@ Verified against the shipped MCP module
   own job, and the row's `verdicts` map is private to the row. The
   spike's third phase asserts both.
 
-The dashboard cycle strip is verified NOT built: `server/public/index.html`
-carries zero occurrences of "cycle" (grep, this session). The shape
-rule for that later build: cycle counts ride the client-published
-`stats` block on the register heartbeat. The block exists
-(`client/src/index.ts:1108-1114` — `projectStats` + `queue` +
-`quarantined`). ADD a `cycles` key, computed client-side from the
-project's cycles file — per-status row counts plus the effective
-`cycle_max_in_flight` cap are the expected content. The arbiter stores
-and displays it verbatim, never computes (the `last_rebuild`
-discipline, D7). `state.json` gains nothing: no new arbiter state.
+The dashboard cycle strip is BUILT (`server/public/index.html` renders a
+per-worker Cycles section; `docs/reports/ISSUE53-CYCLE-STRIP-REPORT.md`
+records the build + live verification). The shape rule it shipped with:
+cycle rows ride the client-published register heartbeat as a `cycles`
+key — one entry per cycle row (this section's locked rule; the
+per-status-count variant below is the PROPOSED key set the owner's
+build-wave pick resolved toward per-cycle rows), plus a sibling
+`cycle_cap` carrying the effective `cycle_max_in_flight` (0 = knob
+absent). Both computed client-side from the project's cycles file. The
+arbiter stores and displays them verbatim, never computes (the
+`last_rebuild` discipline, D7). `state.json` gains nothing: no new
+arbiter state.
 
 Rejected alternative: an arbiter-side cycle rollup. Rejected by D2 —
 the arbiter may live on another machine and holds no cycle rows. The

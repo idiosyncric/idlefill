@@ -195,6 +195,19 @@
      never computes them). */
   .wstats { padding: 0 0 2px; margin-left: 15px; color: var(--dim); font-size: 11px; }
   .wstats b { color: var(--text); font-weight: 600; }
+  /* Dev cycles (#53 D9.3) — exception-only section: one row per
+     (worker, project, cycle), never a merged progress line. Values render
+     verbatim from the published payload — neither the arbiter nor this
+     page computes cycle progress. One group per (worker, project); the
+     project group head carries the effective cap the worker publishes. */
+  .cyc-group { padding: 6px 0; border-bottom: 1px solid rgba(48,54,61,0.5); }
+  .cyc-group:last-child { border-bottom: none; }
+  .cyc-head { display: flex; align-items: baseline; gap: 8px; }
+  .cyc-head .ccap { color: var(--dim); font-size: 11px; }
+  .cycle { display: flex; align-items: baseline; gap: 10px; margin-left: 15px; font-size: 12px; padding: 2px 0; }
+  .cycle .cname { overflow-wrap: anywhere; }
+  .cycle .cstat { font-size: 11px; }
+  .cycle .cmeta { color: var(--dim); margin-left: auto; white-space: nowrap; font-size: 11px; }
   /* Settings editors (project grant knobs, server connection) — the same
      collapsed-by-default toggle pattern as the worker list and the logs
      tray. The forms are token-gated writes, so the affordance is the whole
@@ -307,6 +320,16 @@
   <section>
     <h2>Projects</h2>
     <div id="projects"><div class="empty">no projects configured</div></div>
+  </section>
+
+  <!-- Dev cycles (#53 D9.3) — cycle progress PUBLISHED by each worker from
+       its own cycles file (the arbiter stores + echoes it, it never
+       computes — the last_rebuild discipline). Exception-only: hidden while
+       no worker row carries a non-empty cycles block. One row per
+       (worker, project, cycle) — no merged progress line. -->
+  <section id="cycles-section" style="display:none">
+    <h2>Cycles</h2>
+    <div id="cycles"></div>
   </section>
 
   <!-- Sessions — interactive traffic the router self-registered (#32/#33).
@@ -670,6 +693,66 @@ function workBlock(p, st) {
 }
 
 // ---------------------------------------------------------------------------
+// Dev-cycle strip (#53 D9.3) — one row per (worker, project, cycle). The
+// rows arrive on the worker's published allocation: the arbiter stored and
+// echoed them verbatim and this page renders them verbatim. The ONLY
+// arithmetic anywhere here is the +1 that turns a 0-based cursor into the
+// human "item 3 of 7" — no rollups, no merged progress line.
+// ---------------------------------------------------------------------------
+function cycleStateWord(status) {
+  if (status === "done") return "ok";
+  if (status === "running") return "accent";
+  if (status === "paused") return "warn";
+  return "dim"; // planned
+}
+
+function cycleRow(c) {
+  // Verdict tallies are exception-only: a zero is simply not shown.
+  const tallies = [];
+  if (c.passed) tallies.push(c.passed + " passed");
+  if (c.quarantined) tallies.push('<span class="err">' + c.quarantined + " quarantined</span>");
+  return '<div class="cycle">' +
+    '<span class="cname" title="cycle id (published by the worker)">' + esc(c.cycle_id) + "</span>" +
+    '<span class="cstat ' + cycleStateWord(c.status) + '">' + esc(c.status) + "</span>" +
+    '<span class="cmeta" title="current item (the worker\'s stored cursor, shown 1-based) · current stage · verdict tallies">' +
+    "item " + ((c.item_index || 0) + 1) + "/" + (c.items_total || 0) +
+    " · " + esc(c.stage) +
+    (tallies.length ? " · " + tallies.join(" · ") : "") +
+    "</span></div>";
+}
+
+function renderCycleStrip(st) {
+  // Groups: one per (worker, project) that publishes rows, so the effective
+  // cycle cap reads once at the group head (the worker's own number).
+  const groups = [];
+  for (const p of st.projects || []) {
+    for (const w of p.workers || []) {
+      const rows = w.cycles || [];
+      if (rows.length === 0) continue;
+      groups.push({ project: p.name, worker: w.client, online: w.online, cap: w.cycle_cap, rows });
+    }
+  }
+  if (groups.length === 0) {
+    $("cycles-section").style.display = "none";
+    return;
+  }
+  $("cycles-section").style.display = "";
+  $("cycles").innerHTML = groups.map((g) =>
+    '<div class="cyc-group">' +
+    '<div class="cyc-head"><span class="dot ' + (g.online ? "on" : "off") + '" title="' + (g.online ? "worker online" : "worker offline") + '"></span>' +
+    '<span class="name">' + esc(g.project) + "</span>" +
+    '<span class="dim">' + esc(g.worker) + "</span>" +
+    // The cap the worker publishes (0 = its cycle_max_in_flight knob is
+    // absent, so its cycles file is never driven). Exception-only: a worker
+    // that predates this key shows nothing.
+    (g.cap !== undefined ? '<span class="ccap" title="cycle_max_in_flight the worker\'s driver runs with — admission cap, stages still run one at a time per machine">cap ' + esc(g.cap) + "</span>" : "") +
+    "</div>" +
+    g.rows.map(cycleRow).join("") +
+    "</div>"
+  ).join("");
+}
+
+// ---------------------------------------------------------------------------
 // Mesh peer row (#50) — one read-only row per configured peer instance.
 // Coarse by construction: the snapshot carries presence, per-engine idle
 // state, queue DEPTHS, and session/lease counts. There is nothing here to
@@ -889,6 +972,11 @@ async function refresh() {
       }
     }
   }
+
+  // --- Dev cycles (#53 D9.3) — exception-only: hidden while no worker row
+  //     carries a non-empty cycles block. Per-cycle rows rendered verbatim
+  //     from the published payload (no arbiter-side, no page-side rollup).
+  renderCycleStrip(st);
 
   // --- Sessions (router-self-registered interactive traffic — exception-
   //     only: the section stays hidden while nothing is registered).

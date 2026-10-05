@@ -515,6 +515,89 @@ export function writeCycles(queueFile: string, rows: CycleRow[]): void {
 }
 
 /**
+ * One cycle row as the register heartbeat publishes it for the dashboard's
+ * cycle strip (#53 D9.3: one entry per cycle, no merged progress line).
+ * Computed CLIENT-side from the project's cycles file; the arbiter stores
+ * and displays it verbatim, it never computes (the last_rebuild discipline,
+ * D7). `item_index` is the row's cursor.item as stored (0-based) — the
+ * dashboard renders it +1 / items_total.
+ */
+export interface CycleStatusRow {
+  cycle_id: string;
+  status: 'planned' | 'running' | 'paused' | 'done';
+  items_total: number;
+  item_index: number;
+  settled: number;
+  passed: number;
+  quarantined: number;
+  stage: 'item' | 'gate';
+}
+
+/** Cap for the published strip: the strip is display data, not a dump. */
+export const CYCLE_PUBLISH_MAX_ROWS = 20;
+
+/**
+ * The per-project cycles block for the register heartbeat (#53 D9.3 + D7
+ * add-keys rule): `cycles` holds one entry per row in the cycles file, in
+ * file order, and `cycle_cap` the EFFECTIVE cycle_max_in_flight (0 = the
+ * knob is absent). Exception-only: null = publish NOTHING (no cycles file,
+ * an empty list, or every row unusable) — exactly the queuePreview /
+ * last_rebuild shape. Best-effort: this NEVER throws, whatever the file
+ * holds (the cycles file reads unvalidated — readCycles fail-closes for the
+ * DRIVER by returning null on a corrupt file, but a valid-JSON array of
+ * junk rows still reaches here, so the row shape is guarded per row).
+ */
+export function publishCycles(
+  queueFile: string,
+  projectName: string,
+  fromDir: string = clientDir,
+): { cycles: CycleStatusRow[]; cycle_cap: number } | null {
+  try {
+    const rows = readCycles(queueFile);
+    if (!rows || rows.length === 0) return null;
+    const out: CycleStatusRow[] = [];
+    for (const row of rows as unknown as Partial<CycleRow>[]) {
+      if (out.length >= CYCLE_PUBLISH_MAX_ROWS) break;
+      if (!row || typeof row !== 'object') continue;
+      const cycle_id = typeof row.cycle_id === 'string' && row.cycle_id.trim() !== '' ? row.cycle_id.trim() : '';
+      if (!cycle_id) continue;
+      const status =
+        row.status === 'planned' || row.status === 'running' || row.status === 'paused' || row.status === 'done'
+          ? row.status
+          : null;
+      if (!status) continue;
+      const itemsTotal = Array.isArray(row.items) ? row.items.length : 0;
+      const cursorItem =
+        typeof row.cursor?.item === 'number' && Number.isInteger(row.cursor.item) && row.cursor.item >= 0
+          ? row.cursor.item
+          : 0;
+      const verdicts = row.verdicts && typeof row.verdicts === 'object' && !Array.isArray(row.verdicts) ? row.verdicts : {};
+      let passed = 0;
+      let quarantined = 0;
+      for (const v of Object.values(verdicts)) {
+        if (v === 'passed') passed += 1;
+        else if (v === 'quarantined') quarantined += 1;
+      }
+      out.push({
+        cycle_id,
+        status,
+        items_total: itemsTotal,
+        item_index: cursorItem,
+        settled: Object.keys(verdicts).length,
+        passed,
+        quarantined,
+        stage: row.cursor?.stage === 'gate' ? 'gate' : 'item',
+      });
+    }
+    if (out.length === 0) return null;
+    const cap = resolveCycleMaxInFlight(projectName, fromDir);
+    return { cycles: out, cycle_cap: cap ?? 0 };
+  } catch {
+    return null; // best-effort, like queuePreview: a bad file never breaks the heartbeat
+  }
+}
+
+/**
  * The per-project `cycle_max_in_flight` knob (owner decision 1: configurable,
  * default 1). Resolved at call time from the raw client config — the typed
  * loader shape does not carry it, and the driver must never bake it.
@@ -1096,6 +1179,12 @@ export class ClientDaemon {
         // `stats` — it never computes or parses anything). Absent when the
         // project has no scheduled_rebuild or it has never run.
         const lastRebuild = readRebuildState(p.queue_file);
+        // Dev cycles (#53 D9.3): the per-cycle status rows for the
+        // dashboard's cycle strip — computed HERE from the project's
+        // cycles file, published like everything else: the arbiter stores
+        // and displays verbatim, it never computes (D7). Exception-only:
+        // absent when the project has no cycles file or the list is empty.
+        const cycleBlock = publishCycles(p.queue_file, p.name);
         return {
           name: p.name,
           model: p.model,
@@ -1113,6 +1202,9 @@ export class ClientDaemon {
             quarantined: quarantineCount(this.cfg.state_dir),
           },
           ...(lastRebuild ? { last_rebuild: lastRebuild } : {}),
+          // One entry per cycle row (D9.3 — no merged progress line) plus the
+          // effective cycle_max_in_flight cap (0 = the knob is absent).
+          ...(cycleBlock ? { cycles: cycleBlock.cycles, cycle_cap: cycleBlock.cycle_cap } : {}),
         };
       }),
     });

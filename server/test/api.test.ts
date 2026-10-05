@@ -1115,6 +1115,129 @@ test('scheduled rebuild: last_rebuild rides register → /api/state; a new run e
 
 
 // ---------------------------------------------------------------------------
+// Dashboard cycle strip (#53 D9.3): the client-published cycles block rides
+// register → /api/state VERBATIM on both views; malformed rows/keys are
+// dropped, never stored, never a rejection. The arbiter stores + displays —
+// it never computes anything about cycles.
+// ---------------------------------------------------------------------------
+
+const CYC_A = { cycle_id: 'cyc-a', status: 'running', items_total: 3, item_index: 1, settled: 2, passed: 1, quarantined: 1, stage: 'gate' };
+const CYC_B = { cycle_id: 'cyc-b', status: 'planned', items_total: 3, item_index: 0, settled: 0, passed: 0, quarantined: 0, stage: 'item' };
+
+test('cycles: a published block echoes verbatim through /api/state (client row + projectView worker row)', async () => {
+  const reg = await fetch(`${base}/api/clients/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({
+      name: 'worker-cyc',
+      projects: [{ name: 'career-ops', model: 'Qwen3.8-27B', estimated_seconds: 900, queue_depth: 4, cycles: [CYC_A, CYC_B], cycle_cap: 2 }],
+    }),
+  });
+  assert.equal(reg.status, 200);
+
+  const st = (await (await fetch(`${base}/api/state?limit=50`, { headers: auth })).json()) as {
+    clients: { name: string; projects: Record<string, unknown>[] }[];
+    projects: { name: string; workers: Record<string, unknown>[] }[];
+  };
+
+  const row = st.clients.find((c) => c.name === 'worker-cyc')!;
+  assert.deepEqual(row.projects[0]!.cycles, [CYC_A, CYC_B], 'the client row echoes cycles verbatim, file order kept');
+  assert.equal(row.projects[0]!.cycle_cap, 2, 'cycle_cap echoes verbatim');
+
+  const proj = st.projects.find((p) => p.name === 'career-ops')!;
+  const w = proj.workers.find((x) => x.client === 'worker-cyc')!;
+  assert.deepEqual(w.cycles, [CYC_A, CYC_B], 'projectView carries cycles exactly like last_rebuild');
+  assert.equal(w.cycle_cap, 2, 'projectView carries cycle_cap');
+
+  // A heartbeat with NO cycles block replaces the row: the keys drop with it
+  // (the register payload is the whole per-project view, same as last_rebuild).
+  await fetch(`${base}/api/clients/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ name: 'worker-cyc', projects: [{ name: 'career-ops', model: 'Qwen3.8-27B', estimated_seconds: 900, queue_depth: 4 }] }),
+  });
+  const st2 = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: { name: string; projects: Record<string, unknown>[] }[];
+  };
+  const row2 = st2.clients.find((c) => c.name === 'worker-cyc')!;
+  assert.ok(!('cycles' in row2.projects[0]!) && !('cycle_cap' in row2.projects[0]!), 'a heartbeat without the block drops the keys (no stale rows)');
+});
+
+test('cycles: malformed blocks are dropped — never stored, never a rejection', async () => {
+  const cases: { name: string; projects: Record<string, unknown>[]; wantKeys: boolean; wantCycleIds?: string[]; wantCap?: number }[] = [
+    // Non-array cycles: key dropped.
+    { name: 'cyc-nonarray', projects: [{ name: 'career-ops', model: 'm', estimated_seconds: 1, queue_depth: 1, cycles: { cycle_id: 'nope' } }], wantKeys: false },
+    // Every row malformed (bad status / NaN count / missing stage / empty id): key dropped.
+    {
+      name: 'cyc-allbad',
+      projects: [{
+        name: 'career-ops', model: 'm', estimated_seconds: 1, queue_depth: 1,
+        cycles: [
+          { ...CYC_A, cycle_id: '' },
+          { ...CYC_A, cycle_id: 'bad-status', status: 'exploded' },
+          { ...CYC_A, cycle_id: 'nan-count', settled: Number.NaN },
+          { ...CYC_A, cycle_id: 'float-count', passed: 1.5 },
+          { ...CYC_A, cycle_id: 'neg-index', item_index: -1 },
+          { ...CYC_A, cycle_id: 'bad-stage', stage: 'verdict' },
+          null, 42, 'row', [],
+        ],
+      }],
+      wantKeys: false,
+    },
+    // Mixed: bad rows dropped, the good row survives; a malformed cycle_cap
+    // (NaN) drops only its key.
+    {
+      name: 'cyc-mixed',
+      projects: [{
+        name: 'career-ops', model: 'm', estimated_seconds: 1, queue_depth: 1,
+        cycles: [null, CYC_B],
+        cycle_cap: Number.NaN,
+      }],
+      wantKeys: true,
+      wantCycleIds: ['cyc-b'],
+      wantCap: undefined,
+    },
+    // >20 rows: capped at the first 20; oversized cycle_id trimmed to 128.
+    {
+      name: 'cyc-many',
+      projects: [{
+        name: 'career-ops', model: 'm', estimated_seconds: 1, queue_depth: 1,
+        cycles: [...Array.from({ length: 25 }, (_, i) => ({ ...CYC_B, cycle_id: `cyc-${i}` })), { ...CYC_B, cycle_id: 'x'.repeat(200) }],
+        cycle_cap: 0,
+      }],
+      wantKeys: true,
+      wantCycleIds: Array.from({ length: 20 }, (_, i) => `cyc-${i}`),
+      wantCap: 0,
+    },
+  ];
+
+  for (const c of cases) {
+    const res = await fetch(`${base}/api/clients/register`, { method: 'POST', headers: auth, body: JSON.stringify({ name: c.name, projects: c.projects }) });
+    assert.equal(res.status, 200, `${c.name}: a malformed cycles block never rejects the register`);
+  }
+
+  const st = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: { name: string; projects: Record<string, unknown>[] }[];
+  };
+  for (const c of cases) {
+    const row = st.clients.find((x) => x.name === c.name)!;
+    const p = row.projects[0]!;
+    if (!c.wantKeys) {
+      assert.ok(!('cycles' in p), `${c.name}: malformed cycles dropped, never stored`);
+      assert.ok(!('cycle_cap' in p), `${c.name}: no cycle_cap leaked`);
+      continue;
+    }
+    assert.deepEqual((p.cycles as { cycle_id: string }[]).map((r) => r.cycle_id), c.wantCycleIds, `${c.name}: bad rows dropped, good rows survive in order`);
+    if ('cycle_cap' in c && c.wantCap === undefined) assert.ok(!('cycle_cap' in p), `${c.name}: a malformed cycle_cap is dropped`);
+    else if ('wantCap' in c) assert.equal(p.cycle_cap, c.wantCap, `${c.name}: cycle_cap stored`);
+    for (const r of (p.cycles as Record<string, unknown>[]) ?? []) {
+      assert.ok(typeof r.cycle_id === 'string' && (r.cycle_id as string).length <= 128, `${c.name}: cycle_id trimmed to ≤128`);
+    }
+  }
+});
+
+
+// ---------------------------------------------------------------------------
 // Sessions (#32/#33): HTTP surface — register/heartbeat, /api/state rows,
 // operator override.
 // ---------------------------------------------------------------------------

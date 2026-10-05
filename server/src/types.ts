@@ -110,6 +110,27 @@ export interface QueuePreviewRow {
 }
 
 /**
+ * One dev-cycle row as the client publishes it for the dashboard's cycle
+ * strip (#53 D9.3: one entry per cycle, no merged progress line). Computed
+ * CLIENT-side from the project's cycles file; the arbiter stores and
+ * displays it verbatim, it never computes (the last_rebuild discipline,
+ * D7). Sanitized at registration: cycle_id string trim ≤128, status in
+ * planned|running|paused|done, numeric fields finite integers ≥ 0, stage
+ * in item|gate; rows failing shape checks are dropped, never stored.
+ */
+export interface CycleStatusRow {
+  cycle_id: string;
+  status: 'planned' | 'running' | 'paused' | 'done';
+  items_total: number;
+  /** The row's cursor.item as stored (0-based); the dashboard renders +1. */
+  item_index: number;
+  settled: number;
+  passed: number;
+  quarantined: number;
+  stage: 'item' | 'gate';
+}
+
+/**
  * A project allocation as reported by a client at (re)registration. The
  * client knows its own config (model, estimate, queue depth) and reports it;
  * the arbiter only stores and displays it.
@@ -142,6 +163,21 @@ export interface ProjectAllocation {
    * numbers only; malformed → dropped.
    */
   last_rebuild?: RebuildRunState;
+  /**
+   * Dev-cycle status rows (#53 D9.3), published by the client with the
+   * heartbeat when its project has a cycles file with at least one usable
+   * row. One entry per cycle, file order — no merged progress line. The
+   * arbiter stores + echoes them on /api/state verbatim; it never computes.
+   * Sanitized at registration (cleanCycles): ≤20 rows, malformed rows
+   * dropped. Absent on older clients and on projects with no cycles.
+   */
+  cycles?: CycleStatusRow[];
+  /**
+   * The EFFECTIVE cycle_max_in_flight the client's driver runs with
+   * (0 = the knob is absent). Client-published display data like the rows
+   * above; finite integer ≥ 0 or the key is dropped.
+   */
+  cycle_cap?: number;
 }
 
 /**
