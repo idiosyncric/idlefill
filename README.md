@@ -1099,10 +1099,24 @@ node scripts/idlefill-control.mjs server set <id> [--name N] [--url U] [--models
 The dashboard reads top-to-bottom as the operator's work flow: the header
 state word answers *is the box doing what it should* (`Idle` green /
 `Busy` amber / `Running Idle Tasks` blue / `Degraded` red, or `unreachable`
-when the poll fails), then **two panes** — **Inference Servers** and
-**Projects** — and the fixed bottom **logs** tray (Events/Leases tabs,
-shared records-to-show).
+when the poll fails), then a **view-tab bar** (#61 step 2: **Overview ·
+Projects · Sessions · Usage** — one page, four views, so the desktop
+webview reads as one tabbed surface), then the sections of the active view,
+and the fixed bottom **logs** tray (Events/Leases tabs, shared
+records-to-show — a dock, not a tab: it stays reachable from every view).
 
+- **The view split** — every section carries a view: **Overview** =
+  Inference Servers, Machines (mesh), Cycles, Throttled jobs; **Projects** =
+  the Projects pane + queue search; **Sessions** = interactive traffic;
+  **Usage** = the metrics charts. The switch is a CSS class flip
+  (`section.vthide`), never inline display — the exception-only sections
+  keep owning their own hidden-while-empty state inside a tab, and the view
+  shows an italic empty line only when its whole area would be blank. The
+  selection persists (`localStorage idlefill.viewTab`); the Sessions tab
+  badges a count only while sessions sit queued, the Projects tab only
+  while jobs are throttled (exception-only). The queue detail route
+  (`/[project]/[worker]/queue`) hides the tab bar and keeps its
+  single-section layout.
 - **Inference Servers** — one block per declared inference server (today:
   the one watched feed). The watched block carries the live signal: the
   countdown (`idle for`, the page's one display number), the last activity

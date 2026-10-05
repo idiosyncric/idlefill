@@ -252,6 +252,23 @@ test('dashboard HTML serves (two-pane dashboard: Inference Servers + Projects)',
   assert.ok((res.headers.get('content-type') ?? '').includes('text/html'));
 });
 
+test('dashboard carries the view-tab structure (#61 step 2: one surface, four views)', async () => {
+  const res = await fetch(`${base}/`);
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  // The tab bar + the four views, and every section assigned to one.
+  assert.match(html, /id="view-tabs"/, 'the view-tab bar is on the page');
+  for (const v of ['overview', 'projects', 'sessions', 'usage']) {
+    assert.match(html, new RegExp(`data-view="${v}"`), `sections assigned to the ${v} view`);
+    assert.match(html, new RegExp(`vtab-${v}`), `the ${v} tab button exists`);
+  }
+  // The view switch is a class flip, not inline style (inline display is
+  // owned by the exception-only sections themselves).
+  assert.match(html, /section\.vthide \{ display: none !important; \}/, 'the hide mechanism is the vthide class');
+  // The queue route keeps its own single-section layout (tab bar hidden).
+  assert.match(html, /body\.queuepage #view-tabs \{ display: none; \}/, 'the queue route hides the tab bar');
+});
+
 test('queue detail page serves the same dashboard at /[project]/[worker]/queue', async () => {
   // The queue page is the SAME single-file dashboard (the inline script
   // switches views on location.pathname). Public read, like `/` (phase 1).

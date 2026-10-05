@@ -275,6 +275,31 @@
   #queue-section { display: none; }
   body.queuepage #queue-section { display: block; }
   body.queuepage > main > section:not(#queue-section):not(#queue-search-section) { display: none; }
+  /* View tabs (#61 step 2): the single page splits into Overview / Projects /
+     Sessions / Usage so the desktop window reads as one tabbed surface. The
+     tab group reuses the logs-tray tab styling (canvas fill, 4px radius,
+     slate-filled active tab — DESIGN.md "Logs Tray"). The hide rides a class
+     with !important because the exception-only sections toggle their OWN
+     inline display in JS; the class must beat it, not fight it. Sections
+     WITHOUT a data-view (the queue detail section) are never touched by the
+     tab switch — the queuepage body-class rule owns those. No animation:
+     tab switching is a display flip (DESIGN.md "Don't animate anything but
+     the tray chevron"). */
+  #view-tabs { display: flex; align-items: center; gap: 10px; padding: 8px 20px 0; }
+  #view-tabs .tabs { display: flex; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
+  #view-tabs .tabs button {
+    background: var(--bg); border: none; color: var(--dim);
+    font: inherit; font-size: 11px; font-weight: 600; letter-spacing: 1px;
+    text-transform: uppercase; padding: 3px 12px; cursor: pointer;
+  }
+  #view-tabs .tabs button.active { color: var(--text); background: var(--panel); }
+  /* Exception-only badge on a tab: a count appears only when that view has
+     something refusing/holding work (throttled jobs, queued sessions). No
+     badge is the healthy state (the Exception-Only Rule). */
+  #view-tabs .tabs button .vbadge { color: var(--warn); font-weight: 600; margin-left: 6px; }
+  main section.vthide { display: none !important; }
+  #view-empty { grid-column: 1 / -1; padding: 10px 2px; }
+  body.queuepage #view-tabs { display: none; }
   footer { padding: 10px 20px; color: var(--dim); font-size: 11px; border-top: 1px solid var(--border); margin-top: 10px; }
   a { color: var(--accent); text-decoration: none; }
   code { background: rgba(110,118,129,0.2); padding: 0 4px; border-radius: 3px; font-size: 12px; }
@@ -294,13 +319,31 @@
   </span>
 </header>
 
+<!-- View tabs (#61 step 2): one surface, four views. The desktop app embeds
+     this page, so it needs the tabbed structure its retired Swift tabs gave
+     it; the browser gets the same split. Overview = the machine and the
+     fleet (servers, other instances, cycles, refused work), Projects = the
+     work + its queue search, Sessions = interactive traffic, Usage = the
+     history charts. The logs stay the bottom dock (a dock, not a tab: it
+     must stay visible while any view is open). Deep links keep working —
+     the queue route hides the tab bar and owns the main area. -->
+<div id="view-tabs" role="tablist" aria-label="dashboard views">
+  <div class="tabs">
+    <button id="vtab-overview" type="button" class="active" role="tab" aria-selected="true" data-view="overview">Overview</button>
+    <button id="vtab-projects" type="button" role="tab" aria-selected="false" data-view="projects">Projects</button>
+    <button id="vtab-sessions" type="button" role="tab" aria-selected="false" data-view="sessions">Sessions<span class="vbadge" id="badge-sessions" hidden></span></button>
+    <button id="vtab-usage" type="button" role="tab" aria-selected="false" data-view="usage">Usage</button>
+  </div>
+  <span class="sub">the same page the browser shows — one surface per machine</span>
+</div>
+
 <main>
   <!-- Two panes: the inference server(s) the arbiter watches, and the
        projects that queue work against them. Everything else — running
        jobs, budgets, workers, published stats, controls — nests under
        its project. -->
 
-  <section>
+  <section data-view="overview">
     <h2>Inference servers <button id="add-server" class="settings-toggle" type="button" title="add a declared inference server connection">+ add server</button></h2>
     <div id="add-server-form" class="settings-form"></div>
     <div id="servers"><div class="empty">no servers declared</div></div>
@@ -312,12 +355,12 @@
        presence, per-engine idle state, queue DEPTHS, and session/lease
        counts — never job ids, titles, URLs, or payloads. Cross-instance
        control is #39 (paired), not this strip. -->
-  <section id="mesh-section" style="display:none">
+  <section id="mesh-section" data-view="overview" style="display:none">
     <h2>Machines</h2>
     <div id="mesh"></div>
   </section>
 
-  <section>
+  <section data-view="projects">
     <h2>Projects</h2>
     <div id="projects"><div class="empty">no projects configured</div></div>
   </section>
@@ -327,7 +370,7 @@
        computes — the last_rebuild discipline). Exception-only: hidden while
        no worker row carries a non-empty cycles block. One row per
        (worker, project, cycle) — no merged progress line. -->
-  <section id="cycles-section" style="display:none">
+  <section id="cycles-section" data-view="overview" style="display:none">
     <h2>Cycles</h2>
     <div id="cycles"></div>
   </section>
@@ -337,7 +380,7 @@
        The pause gate asks the router to hold that session's traffic (the
        router enforces admission; the arbiter stores + exposes — the
        dashboard only displays arbiter truth). -->
-  <section id="sessions-section" style="display:none">
+  <section id="sessions-section" data-view="sessions" style="display:none">
     <h2>Sessions</h2>
     <div id="sessions"></div>
   </section>
@@ -345,7 +388,7 @@
   <!-- Throttled jobs — the anti-thrash backstop (exception-only: the
        section is hidden while the list is empty; the unthrottle button
        is the operator's recovery, token-gated like the gates). -->
-  <section id="throttled-section" style="display:none">
+  <section id="throttled-section" data-view="overview" style="display:none">
     <h2>Throttled jobs</h2>
     <div id="throttled"></div>
   </section>
@@ -355,7 +398,7 @@
        Its OWN refresh timer (5 min): charts over days do not need the 5s
        /api/state cadence, and the read is the anonymous /api/metrics
        exception — no gate token needed. -->
-  <section id="usage-section" style="display:none">
+  <section id="usage-section" data-view="usage" style="display:none">
     <h2>Usage <span class="sub" style="text-transform:none;letter-spacing:0">· last 7 days</span></h2>
     <div id="usage"></div>
   </section>
@@ -367,7 +410,7 @@
        never this one, so a mid-type query survives a tick — only the
        results block is rebuilt. Exception-only, like the throttled
        section: hidden while the query is empty. -->
-  <section id="queue-search-section" style="display:none">
+  <section id="queue-search-section" data-view="projects" style="display:none">
     <h2>Queue search
       <input id="queue-search" type="text" placeholder="filter queued jobs — job_id / company / title" spellcheck="false" autocomplete="off" title="substring match across every worker's published queue preview (first 100 queued per worker) — read-only, no API call">
     </h2>
@@ -384,6 +427,12 @@
     <h2>Queue</h2>
     <div id="queue-detail"></div>
   </section>
+
+  <!-- Per-view empty state (#61 step 2): the exception-only sections hide
+       themselves while they have no data, so a tab could open onto a blank
+       main area. The null case stays legible (DESIGN.md "Empty States").
+       Static DOM — never rebuilt by refresh. -->
+  <div id="view-empty" class="empty" hidden></div>
 
 </main>
 
@@ -918,6 +967,7 @@ async function refresh() {
 
   const live = liveStatus(st);
   setStatus(live.cls, live.label, live.note);
+  updateViewBadges(st);
 
   // Queue search runs on BOTH routes: feed the filter the published worker
   // previews now (the queuepage branch below returns before the overview's
@@ -1059,6 +1109,10 @@ async function refresh() {
         "</tr>";
     }).join("");
   }
+  // Re-check the per-view empty line AFTER the section toggles above: an
+  // exception-only section may have just hidden or shown itself, and the
+  // active view's area can go blank underneath an open tab.
+  syncViewEmpty();
 }
 
 // CSS.escape for attribute selectors (project names with odd characters).
@@ -1206,10 +1260,113 @@ function renderQueueSearch() {
   // select-all. Both are cheap: the filter is a scan of published rows.
   inp.addEventListener("input", renderQueueSearch);
   inp.addEventListener("change", renderQueueSearch);
+  // #61 step 2: the search lives in the Projects view — a query typed from
+  // any other view jumps to the view where its results show.
+  inp.addEventListener("focus", () => { if (!QUEUE_PAGE && currentView() !== "projects") applyView("projects"); });
 })();
 
 // (refresh is invoked at the END of the script, after all render + gate
 // helpers are defined — see the bottom.)
+// ---------------------------------------------------------------------------
+// View tabs (#61 step 2) — one page, four views. A section carries a
+// data-view attribute; exactly one view group is shown at a time. The
+// switch is a class flip (main section.vthide), never inline style: the
+// exception-only sections own their inline display (hidden while empty),
+// and the class rule carries !important so the two mechanisms never fight.
+// The choice persists (idlefill.viewTab) like the tray tab, and a link into
+// the queue route (body.queuepage) hides the bar entirely — that route owns
+// the main area.
+// ---------------------------------------------------------------------------
+const VIEW_TABS = ["overview", "projects", "sessions", "usage"];
+const VIEW_TAB_IDS = { overview: "vtab-overview", projects: "vtab-projects", sessions: "vtab-sessions", usage: "vtab-usage" };
+
+function currentView() {
+  try {
+    const v = localStorage.getItem("idlefill.viewTab");
+    if (v && VIEW_TABS.includes(v)) return v;
+  } catch { }
+  return "overview";
+}
+
+function applyView(view) {
+  for (const sec of document.querySelectorAll("main section[data-view]")) {
+    sec.classList.toggle("vthide", sec.dataset.view !== view);
+  }
+  for (const v of VIEW_TABS) {
+    const on = v === view;
+    const btn = $(VIEW_TAB_IDS[v]);
+    if (!btn) continue;
+    btn.classList.toggle("active", on);
+    btn.setAttribute("aria-selected", on ? "true" : "false");
+  }
+  syncViewEmpty();
+  try { localStorage.setItem("idlefill.viewTab", view); } catch { }
+}
+
+// The null case stays legible: when the active view's sections are all
+// hidden (exception-only: nothing registered yet), show one italic line
+// instead of a blank canvas. Checked after every refresh, because the
+// sections toggle their own display and the view can change underneath.
+const VIEW_EMPTY_MSG = {
+  overview: "nothing on this machine yet — no servers declared",
+  projects: "no projects configured on this arbiter",
+  sessions: "no interactive sessions registered — point a session at the local proxy to see it here",
+  usage: "no usage recorded yet — the metrics store fills as the box runs",
+};
+
+function syncViewEmpty() {
+  const box = $("view-empty");
+  if (!box || QUEUE_PAGE) return;
+  const view = currentView();
+  let any = false;
+  for (const sec of document.querySelectorAll("main section[data-view]")) {
+    if (sec.dataset.view !== view) continue;
+    if (sec.style.display === "none") continue; // exception-only: hidden while empty
+    any = true;
+    break;
+  }
+  box.hidden = any;
+  box.textContent = any ? "" : (VIEW_EMPTY_MSG[view] || "");
+}
+
+(function wireViewTabs() {
+  if (QUEUE_PAGE) return; // the queue detail route hides the bar (body.queuepage)
+  applyView(currentView());
+  $("view-tabs").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-view]");
+    if (!btn) return;
+    applyView(btn.dataset.view);
+  });
+})();
+
+// Exception-only tab badges (the Exception-Only Rule): a count shows ONLY
+// where work is refused or held — a queued session, a throttled job. A
+// tab with no badge is the healthy state. Refreshed from the same payload
+// the panes render from (no extra polling).
+function updateViewBadges(st) {
+  const heldSessions = (st.sessions || []).filter((s) => s.gate && s.gate.state === "queued").length;
+  const badge = $("badge-sessions");
+  if (badge) {
+    badge.textContent = heldSessions > 0 ? String(heldSessions) : "";
+    badge.hidden = heldSessions === 0;
+  }
+  const projTab = $("vtab-projects");
+  if (projTab && !projTab.querySelector(".vbadge")) {
+    const b = document.createElement("span");
+    b.className = "vbadge";
+    b.id = "badge-projects";
+    b.hidden = true;
+    projTab.appendChild(b);
+  }
+  const pb = $("badge-projects");
+  if (pb) {
+    const throttled = (st.throttled_jobs || []).length;
+    pb.textContent = throttled > 0 ? String(throttled) : "";
+    pb.hidden = throttled === 0;
+    pb.title = throttled > 0 ? throttled + " throttled job(s) — see Overview → Throttled jobs" : "";
+  }
+}
+
 // Logs tray: expand/collapse toggle (bottom dock; collapsed by default,
 // persisted), Events/Leases tabs, and the shared records-to-show combo.
 const tray = $("logs-tray");
