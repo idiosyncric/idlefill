@@ -1407,6 +1407,82 @@ async function finishJob(jobId: string, usage: Record<string, unknown>): Promise
   return leaseId;
 }
 
+
+// ---------------------------------------------------------------------------
+// Gate posture (#41): the client router publishes its OWN armed-vs-fail_open
+// state on the register heartbeat. The arbiter sanitizes (exact enum, else
+// dropped), stores + echoes it on the client row AND the per-project worker
+// row (surfaces read either), and a later `armed` report overwrites a stale
+// `fail_open` within one heartbeat. Absent = old client / gate-less daemon:
+// the row carries no key and the surfaces render exactly as before.
+// ---------------------------------------------------------------------------
+
+test('gate posture: an armed report stores + echoes on the client row and the worker row', async () => {
+  const reg = await fetch(`${base}/api/clients/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({
+      name: 'posture-armed',
+      gate_posture: 'armed',
+      projects: [{ name: 'career-ops', model: 'Qwen3.8-27B', estimated_seconds: 900, queue_depth: 0 }],
+    }),
+  });
+  assert.equal(reg.status, 200);
+  const st = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: { name: string; gate_posture?: string }[];
+    projects: { name: string; workers: { client: string; gate_posture?: string }[] }[];
+  };
+  assert.equal(st.clients.find((c) => c.name === 'posture-armed')!.gate_posture, 'armed', 'the client row carries the posture');
+  const w = st.projects.find((p) => p.name === 'career-ops')!.workers.find((x) => x.client === 'posture-armed')!;
+  assert.equal(w.gate_posture, 'armed', 'the worker row carries it too (the dashboard badge reads this)');
+});
+
+test('gate posture: a fail_open report stores; the next armed heartbeat overwrites it', async () => {
+  await fetch(`${base}/api/clients/register`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({ name: 'posture-flip', gate_posture: 'fail_open' }),
+  });
+  let st = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: { name: string; gate_posture?: string }[];
+  };
+  assert.equal(st.clients.find((c) => c.name === 'posture-flip')!.gate_posture, 'fail_open', 'the badge state is stored while the link is down');
+
+  // The recovery path: the link returns, the daemon re-registers armed, and
+  // the stale fail_open is gone within one heartbeat (the badge clears).
+  await fetch(`${base}/api/clients/register`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({ name: 'posture-flip', gate_posture: 'armed' }),
+  });
+  st = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: { name: string; gate_posture?: string }[];
+  };
+  assert.equal(st.clients.find((c) => c.name === 'posture-flip')!.gate_posture, 'armed', 'a recovered gate overwrites the stale fail_open');
+});
+
+test('gate posture: a register WITHOUT the key keeps registering with no key (old client / gate-less daemon)', async () => {
+  const reg = await fetch(`${base}/api/clients/register`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({ name: 'posture-legacy' }),
+  });
+  assert.equal(reg.status, 200, 'pre-#41 clients keep registering');
+  const st = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: { name: string; gate_posture?: string }[];
+  };
+  assert.ok(!('gate_posture' in st.clients.find((c) => c.name === 'posture-legacy')!), 'no posture key on an old client row (surfaces render as before)');
+});
+
+test('gate posture: a malformed posture value is dropped, never rejected', async () => {
+  const reg = await fetch(`${base}/api/clients/register`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({ name: 'posture-bad', gate_posture: 'yes-please' }),
+  });
+  assert.equal(reg.status, 200, 'a malformed posture never rejects a registration');
+  const st = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: { name: string; gate_posture?: string }[];
+  };
+  assert.ok(!('gate_posture' in st.clients.find((c) => c.name === 'posture-bad')!), 'a value outside the enum is dropped');
+});
+
 test('results endpoint: score rides the usage body → row stored; newest-first, limit, job_id filter, 404, auth gate', async () => {
   // Quiet feed so the grants are clean.
   entries.length = 0;
@@ -1471,4 +1547,78 @@ test('results endpoint: score rides the usage body → row stored; newest-first,
   // Auth gate: the anonymous /api/state exception does NOT extend here.
   const anon = await fetch(`${base}/api/projects/career-ops/results`);
   assert.equal(anon.status, 401, 'results are token-gated (no anonymous read)');
+});
+
+// ---------------------------------------------------------------------------
+// #42 Slice 0 — session_id ADD-key on the register heartbeat (the router
+// captured it from X-Hermes-Session-Id). Storage posture mirrors the token
+// rule: bounded printable, drop-don't-reject, last-known-wins (an absent
+// report never clears a stored id — headerless follow-ups are routine).
+// ---------------------------------------------------------------------------
+
+test('session_id (#42): a valid report stores on the row and rides /api/state + /api/sessions', async () => {
+  const reg = await fetch(`${base}/api/sessions/register`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({ token: 's42-valid', client_name: 'mac-mini', session_id: '20261005_172826_f38167' }),
+  });
+  assert.equal(reg.status, 201);
+  const body = await reg.json() as { session: { session_id?: string } };
+  assert.equal(body.session.session_id, '20261005_172826_f38167', 'the create response carries it');
+
+  const list = await (await fetch(`${base}/api/sessions`, { headers: auth })).json() as { sessions: { token: string; session_id?: string }[] };
+  assert.equal(list.sessions.find((s) => s.token === 's42-valid')!.session_id, '20261005_172826_f38167');
+});
+
+test('session_id (#42): a later heartbeat WITHOUT the key keeps the stored id (last-known-wins)', async () => {
+  await fetch(`${base}/api/sessions/register`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({ token: 's42-keep', session_id: 'sess-keep-me' }),
+  });
+  const hb = await fetch(`${base}/api/sessions/register`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({ token: 's42-keep', last_activity: Date.now() }),
+  });
+  assert.equal(hb.status, 200);
+  const body = await hb.json() as { session: { session_id?: string } };
+  assert.equal(body.session.session_id, 'sess-keep-me', 'a headerless heartbeat never clears the id');
+});
+
+test('session_id (#42): an invalid report is DROPPED — registration succeeds, stored value stands', async () => {
+  await fetch(`${base}/api/sessions/register`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({ token: 's42-bad', session_id: 'good-id' }),
+  });
+  for (const bad of ['x'.repeat(129), 'has\u0007control', '   ', 42, { nested: true }]) {
+    const r = await fetch(`${base}/api/sessions/register`, {
+      method: 'POST', headers: auth,
+      body: JSON.stringify({ token: 's42-bad', session_id: bad }),
+    });
+    assert.equal(r.status, 200, 'a malformed session_id never rejects the heartbeat');
+  }
+  const list = await (await fetch(`${base}/api/sessions`, { headers: auth })).json() as { sessions: { token: string; session_id?: string }[] };
+  assert.equal(list.sessions.find((s) => s.token === 's42-bad')!.session_id, 'good-id', 'the stored id survives malformed reports');
+
+  // A brand-new row with only a malformed id starts WITHOUT the key.
+  const fresh = await fetch(`${base}/api/sessions/register`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({ token: 's42-freshbad', session_id: 'x'.repeat(129) }),
+  });
+  assert.equal(fresh.status, 201);
+  const fb = await fresh.json() as { session: Record<string, unknown> };
+  assert.ok(!('session_id' in fb.session), 'the fresh row starts id-less');
+});
+
+test('session_id (#42): two concurrent sessions on one client keep distinct ids (the one-row complaint)', async () => {
+  // The observable win from the brief: two Hermes chats on one profile are
+  // two rows distinguished by id even before the plugin lands.
+  for (const [tok, id] of [['s42-chatA', 'chat-a-111'], ['s42-chatB', 'chat-b-222']] as const) {
+    await fetch(`${base}/api/sessions/register`, {
+      method: 'POST', headers: auth,
+      body: JSON.stringify({ token: tok, client_name: 'mac-mini', session_id: id }),
+    });
+  }
+  const list = await (await fetch(`${base}/api/sessions`, { headers: auth })).json() as { sessions: { token: string; session_id?: string; client_name?: string }[] };
+  const mine = list.sessions.filter((s) => s.client_name === 'mac-mini' && s.token.startsWith('s42-chat'));
+  assert.equal(mine.length, 2, 'two rows, not one');
+  assert.deepEqual(new Set(mine.map((s) => s.session_id)), new Set(['chat-a-111', 'chat-b-222']), 'each row keeps its own conversation id');
 });

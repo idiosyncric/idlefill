@@ -682,6 +682,15 @@ function workBlock(p, st) {
     const pausedBadge = w.override?.override === "pause"
       ? ' <span class="tag" style="color:var(--err);border-color:var(--err)" title="this worker is paused — no new grants (from any project)">paused</span>'
       : "";
+    // Gate posture (#41): the router reports its OWN admission posture on
+    // every register heartbeat. Exception-only: `armed` (the healthy state)
+    // renders NOTHING, an absent key (old client, or a daemon with no
+    // session gate) renders nothing, and only `fail_open` puts up a badge —
+    // it means the slot cap is OFF and every session is admitted, so the
+    // operator must never be told the gate is holding when it is not.
+    const postureBadge = w.gate_posture === "fail_open"
+      ? ' <span class="tag" style="color:var(--warn);border-color:var(--warn)" title="this machine\'s arbiter link is down — its session gate is FAIL-OPEN: every session is admitted and the session slot cap is off until the link returns">gate fail-open</span>'
+      : "";
     const stats = w.stats || {};
     const statKeys = Object.keys(stats);
     const statsHtml = statKeys.length
@@ -693,7 +702,7 @@ function workBlock(p, st) {
       '<span class="dot ' + (w.online ? "on" : "off") + '" title="' + (w.online ? "online (saw a heartbeat within 90s)" : "offline (no recent heartbeat)") + '"></span>' +
       // The worker's own version (the version handshake — exception-only:
       // absent on pre-version workers, rendered dimmed after the name).
-      '<span class="wname">' + esc(w.client) + (w.version ? ' <span class="wmeta" title="version reported by this worker at registration">' + esc(w.version) + '</span>' : "") + (w.online ? "" : ' <span class="wmeta">(offline)</span>') + pausedBadge + "</span>" +
+      '<span class="wname">' + esc(w.client) + (w.version ? ' <span class="wmeta" title="version reported by this worker at registration">' + esc(w.version) + '</span>' : "") + (w.online ? "" : ' <span class="wmeta">(offline)</span>') + pausedBadge + postureBadge + "</span>" +
       '<span class="wmeta">' + esc(w.model || "—") + (w.estimated_seconds ? " · " + durFmt(w.estimated_seconds) + "/job" : "") + "</span>" +
       '<span class="wqueue">' + (w.queue_depth || 0).toLocaleString() + " queued" +
       (w.queue_depth > 0
@@ -889,6 +898,13 @@ function sessBlock(sess, st) {
     esc(shortTok) + (sess.client_name ? ' <span class="smeta">' + esc(sess.client_name) + "</span>" : "") +
     "</span>";
   const metaHtml =
+    // #42 Slice 0 (exception-only): when the router captured a real Hermes
+    // conversation id from the X-Hermes-Session-Id header, the row shows it
+    // — the same id the TUI banner shows. A row that never carried one
+    // renders exactly as before (curl, non-Hermes clients).
+    (sess.session_id
+      ? '<span class="smeta" title="hermes conversation id (X-Hermes-Session-Id)">hermes ' + esc(String(sess.session_id)) + "</span> "
+      : "") +
     '<span class="smeta" title="the newest request the router saw on this session">' +
     (sess.last_activity !== null && sess.last_activity !== undefined
       ? "last request " + ago(st.now - sess.last_activity)
@@ -1017,12 +1033,12 @@ async function refresh() {
     pbox.innerHTML = '<div class="empty">no projects configured</div>';
   } else {
     // Worker rows expose the client_id for the per-worker gate; the worker's
-    // override rides on the client row that reports it.
+    // override + gate posture (#41) ride on the client row that reports it.
     const withIds = st.projects.map((p) => ({
       ...p,
       workers: (p.workers || []).map((w) => {
         const c = (st.clients || []).find((c) => c.name === w.client);
-        return { ...w, clientId: c?.client_id ?? "", override: c?.override ?? null };
+        return { ...w, clientId: c?.client_id ?? "", override: c?.override ?? null, gate_posture: c?.gate_posture ?? null };
       }),
     }));
     pbox.innerHTML = withIds.map((p) => workBlock(p, st)).join("");

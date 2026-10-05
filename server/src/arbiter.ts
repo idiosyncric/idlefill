@@ -103,6 +103,21 @@ function normalizeSessionGate(v: unknown): { state: 'active' | 'queued'; waiting
   return { state: g.state, waiting: g.waiting };
 }
 
+/**
+ * Sanitize a reported Hermes conversation id (#42 Slice 0). Token-style
+ * posture: bounded printable string, or undefined — an invalid value is
+ * DROPPED (the registration is never rejected for it, and a stored id
+ * never clears).
+ */
+function cleanReportedId(v: unknown): string | undefined {
+  if (typeof v !== 'string') return undefined;
+  const s = v.trim();
+  if (!s || s.length > 128) return undefined;
+  // eslint-disable-next-line no-control-regex
+  if (/[^\x20-\x7e]/.test(s)) return undefined;
+  return s;
+}
+
 export type LeaseRejectionReason =
   | 'not_idle'
   | 'busy'
@@ -214,7 +229,7 @@ export class Arbiter {
     observedIp: string,
     projects?: ProjectAllocation[],
     now?: number,
-    info?: { version?: string; protocol?: number; revision?: string },
+    info?: { version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open' },
   ): { client_id: string; created: boolean } {
     const s = this.store.state;
     const seen = now ?? Date.now();
@@ -239,6 +254,12 @@ export class Arbiter {
       typeof info?.revision === 'string' && info.revision.trim() !== '' && info.revision.trim().length <= 64
         ? info.revision.trim()
         : undefined;
+    // Gate posture (#41): an exact-value enum, everything else dropped
+    // (same drop-don't-reject posture as every other reported display
+    // field). Stored VERBATIM as the client last reported it — the posture
+    // lives inside the router and the arbiter cannot observe it.
+    const gatePosture =
+      info?.gate_posture === 'armed' || info?.gate_posture === 'fail_open' ? info.gate_posture : undefined;
     const existing = s.clients.find((c) => c.name === name);
     if (existing) {
       if (validIp(observedIp)) existing.ip = observedIp; // observed wins
@@ -262,6 +283,12 @@ export class Arbiter {
       // `daemon behind` tag clears on that heartbeat); a client that never
       // sends the field leaves the row exactly as it was.
       if (revision) existing.revision = revision;
+      // Gate posture (#41): the same heartbeat rule as version/revision —
+      // a present, valid report updates the row; absent leaves it as-is.
+      // A gate-bearing daemon re-registers `armed` on the first tick after
+      // its link returns, so a recovered gate overwrites the stale
+      // `fail_open` within one poll (the surfaces render only fail_open).
+      if (gatePosture) existing.gate_posture = gatePosture;
       this.store.save();
       return { client_id: existing.client_id, created: false };
     }
@@ -280,6 +307,7 @@ export class Arbiter {
       ...(version ? { version } : {}),
       ...(protocol !== undefined ? { protocol } : {}),
       ...(revision ? { revision } : {}),
+      ...(gatePosture ? { gate_posture: gatePosture } : {}),
     });
     this.store.appendEvent({ kind: 'client_registered', detail: `${name} (${client_id})` });
     // A fresh registration that already carries rebuild state (client
@@ -705,12 +733,16 @@ export class Arbiter {
    */
   registerSession(
     token: string,
-    opts: { client_id?: string; client_name?: string; server_id?: string; last_activity?: number; gate?: unknown; now?: number },
+    opts: { client_id?: string; client_name?: string; server_id?: string; last_activity?: number; gate?: unknown; session_id?: unknown; now?: number },
   ): { ok: boolean; reason?: string; created: boolean; session?: SessionRecord } {
     const t = typeof token === 'string' ? token.trim() : '';
     if (!t || t.length > 128) return { ok: false, reason: 'token required (≤128 chars)', created: false };
     const nowMs = opts.now ?? Date.now();
     const gateVerdict = normalizeSessionGate(opts.gate);
+    // #42 Slice 0: the Hermes conversation id, sanitized the token way —
+    // bounded printable, and an invalid value is DROPPED (never a rejection,
+    // never a clear of a stored id).
+    const sessionId = cleanReportedId(opts.session_id);
     const s = this.store.state;
     const existing = s.sessions.find((x) => x.token === t);
     if (existing) {
@@ -724,6 +756,10 @@ export class Arbiter {
       // gate-state, last-write-wins: valid ⇒ store; null/absent ⇒ CLEAR
       // (idle report); invalid (undefined) ⇒ dropped, stored value stands.
       if (gateVerdict !== undefined) existing.gate = gateVerdict;
+      // session_id (#42), last-known-wins: a valid report updates; an
+      // absent one never clears a stored id (headerless requests on the
+      // same token are routine).
+      if (sessionId) existing.session_id = sessionId;
       this.store.save();
       return { ok: true, created: false, session: existing };
     }
@@ -738,6 +774,7 @@ export class Arbiter {
       // On create: valid or explicit-null ride; invalid is dropped whole
       // (the row starts gate-less, exactly like an absent block).
       ...(gateVerdict !== undefined ? { gate: gateVerdict } : {}),
+      ...(sessionId ? { session_id: sessionId } : {}),
     };
     s.sessions.push(session);
     this.store.appendEvent({ kind: 'session_registered', detail: `${t}${session.client_name ? ` (${session.client_name})` : ''}${session.server_id ? ` → ${session.server_id}` : ''}` });

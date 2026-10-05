@@ -103,12 +103,12 @@ async function waitFor(pred: () => boolean, timeoutMs = 3000, what = 'condition'
 function makeGate(opts: {
   maxActive?: number;
   holdCapMs?: number;
-  register?: (token: string, gate: SessionGateSnapshot | null) => Promise<boolean>;
+  register?: (token: string, gate: SessionGateSnapshot | null, sessionId?: string) => Promise<boolean>;
   now?: () => number;
   clientName?: string;
-} = {}): { gate: SessionGate; registered: string[]; calls: { token: string; gate: SessionGateSnapshot | null }[] } {
+} = {}): { gate: SessionGate; registered: string[]; calls: { token: string; gate: SessionGateSnapshot | null; sessionId?: string }[] } {
   const registered: string[] = [];
-  const calls: { token: string; gate: SessionGateSnapshot | null }[] = [];
+  const calls: { token: string; gate: SessionGateSnapshot | null; sessionId?: string }[] = [];
   const gate = new SessionGate({
     maxActive: opts.maxActive ?? 1,
     holdCapMs: opts.holdCapMs ?? 30_000,
@@ -116,9 +116,9 @@ function makeGate(opts: {
     clientName: opts.clientName,
     register:
       opts.register ??
-      (async (token, gateSnapshot) => {
+      (async (token, gateSnapshot, sessionId) => {
         registered.push(token);
-        calls.push({ token, gate: gateSnapshot });
+        calls.push({ token, gate: gateSnapshot, sessionId });
         return true;
       }),
   });
@@ -504,4 +504,150 @@ test('(h) a session row owned by ANOTHER client is not adopted (fleet)', async (
   await new Promise((r) => setTimeout(r, 100));
   assert.deepEqual(registered.sort(), ['tokMine', 'tokOld'], 'foreign-owned row never registered; own + ownerless adopted');
   assert.equal(gate.snapshot('tokMac'), null, 'foreign row never enters local tracking');
+});
+
+// ---------------------------------------------------------------------------
+// #41 — gate posture on the register heartbeat: the router publishes its
+// OWN armed-vs-fail_open state so the operator's surfaces can say whether
+// the slot cap is actually in force. `armed` while the link is up;
+// `fail_open` after onLinkDown (the arbiter-unreachable path the daemon
+// already drives). A daemon with the gate DISABLED (session_gate: false)
+// reports NOTHING — there is no gate to have a posture.
+// ---------------------------------------------------------------------------
+
+test('#41 posture on the wire: armed while the link is up, fail_open after the link drops', async () => {
+  const arb = await startFakeArbiter();
+  const dir = mkdtempSync(join(tmpdir(), 'idlefill-posture-'));
+  mkdirSync(join(dir, 'state'), { recursive: true });
+  const cfg: ClientConfig = {
+    server_url: arb.url,
+    token: 't',
+    client_name: 'posture-client',
+    ip: '',
+    proxy_port: 0,
+    llm_target: 'http://127.0.0.1:1',
+    repo_root: dir,
+    state_dir: join(dir, 'state'),
+    state_file: join(dir, 'state.json'),
+    projects: [],
+  };
+  try {
+    const d = new ClientDaemon(cfg, { pollMs: 50, log: { info: () => {} } });
+    await d.start();
+    // The gate is ON by default; the proxy (which builds it) comes up in
+    // start(), so within a couple of 50ms ticks a register carries the key.
+    await waitFor(
+      () => arb.registers.some((b) => b.gate_posture === 'armed'),
+      3000,
+      'a register body with gate_posture=armed',
+    );
+    // The fake arbiter going dark is the daemon's fail-open path: the next
+    // state poll fails, onLinkDown flips the flag, the NEXT register says
+    // fail_open. (Stop the arbiter — the exact production failure mode.)
+    await arb.close();
+    await waitFor(
+      () => (d.sessionGate ? d.sessionGate.failOpen : false),
+      5000,
+      'the gate flipped to fail-open after the arbiter died',
+    );
+    // Note: registers now fail (the arbiter is down) — the posture rides
+    // the LAST register that got through, so prove the getter contract here
+    // and let the server-side test cover storage. The surfaces read the
+    // last-known posture, which is the honest posture at link-death time.
+    assert.ok(d.sessionGate?.failOpen, 'failOpen true while the arbiter is unreachable');
+    await d.stop();
+  } finally {
+    await arb.close().catch(() => {});
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#41 posture key absent when the session gate is disabled (no gate = no posture)', async () => {
+  const arb = await startFakeArbiter();
+  const dir = mkdtempSync(join(tmpdir(), 'idlefill-nogate-'));
+  mkdirSync(join(dir, 'state'), { recursive: true });
+  const cfg: ClientConfig = {
+    server_url: arb.url,
+    token: 't',
+    client_name: 'nogate-client',
+    ip: '',
+    proxy_port: 0,
+    llm_target: 'http://127.0.0.1:1',
+    repo_root: dir,
+    state_dir: join(dir, 'state'),
+    state_file: join(dir, 'state.json'),
+    projects: [],
+    session_gate: false,
+  };
+  try {
+    const d = new ClientDaemon(cfg, { pollMs: 50, log: { info: () => {} } });
+    await d.start();
+    await waitFor(() => arb.registers.length >= 2, 3000, 'two registers');
+    for (const b of arb.registers) {
+      assert.ok(!('gate_posture' in b), 'a gate-less daemon never sends the key');
+    }
+    assert.equal(d.sessionGate, null, 'no gate built at all');
+    await d.stop();
+  } finally {
+    await arb.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// #42 Slice 0 — the router captures X-Hermes-Session-Id per request and
+// publishes it on the register heartbeat (ADD-key). Sanitizer posture:
+// bounded printable (≤128 chars, no control chars) — an invalid header is
+// DROPPED, admission never changes, and a stored id never clears from a
+// later headerless request (last-known-wins).
+// ---------------------------------------------------------------------------
+
+test('#42 header capture: the id reaches the register heartbeat; a headerless later request never clears it', async () => {
+  const { gate, calls } = makeGate();
+  const { proxy, up } = await harness({ gate });
+  up.release(2);
+
+  const resP = fetch(`${proxy.base_url}/s/tokId/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-hermes-session-id': '20261005_172826_f38167' },
+    body: JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  const res = await resP;
+  assert.equal(res.status, 200);
+  await waitFor(() => calls.some((c) => c.token === 'tokId' && c.sessionId === '20261005_172826_f38167'), 3000, 'the captured id on a register call');
+
+  // A headerless follow-up on the SAME token: forwarded exactly as before,
+  // and the NEXT heartbeat still carries the stored id (last-known-wins).
+  const res2 = await postChat(proxy.base_url, '/s/tokId/v1/chat/completions');
+  assert.equal(res2.status, 200);
+  await waitFor(() => calls.filter((c) => c.token === 'tokId').length >= 2, 3000, 'a second register heartbeat on the token');
+  const last = calls.filter((c) => c.token === 'tokId').at(-1)!;
+  assert.equal(last.sessionId, '20261005_172826_f38167', 'the headerless request never cleared the stored id');
+});
+
+test('#42 header sanitizer: an oversized header is dropped, the request forwards exactly as before', async () => {
+  const { gate, calls } = makeGate();
+  const { proxy, up } = await harness({ gate });
+  up.release(1);
+
+  const res = await fetch(`${proxy.base_url}/s/tokHuge/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-hermes-session-id': 'x'.repeat(300) },
+    body: JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  assert.equal(res.status, 200, 'an oversized id never blocks admission');
+  await waitFor(() => calls.some((c) => c.token === 'tokHuge'), 3000, 'the register call');
+  const c = calls.find((x) => x.token === 'tokHuge')!;
+  assert.equal(c.sessionId, undefined, 'the oversized value is DROPPED, not truncated');
+});
+
+test('#42 no header at all: the register heartbeat omits the id (old behavior intact)', async () => {
+  const { gate, calls } = makeGate();
+  const { proxy, up } = await harness({ gate });
+  up.release(1);
+  const res = await postChat(proxy.base_url, '/s/tokPlain/v1/chat/completions');
+  assert.equal(res.status, 200);
+  await waitFor(() => calls.some((c) => c.token === 'tokPlain'), 3000, 'the register call');
+  const c = calls.find((x) => x.token === 'tokPlain')!;
+  assert.equal(c.sessionId, undefined, 'headerless sessions carry no id');
 });

@@ -276,8 +276,29 @@ parks anything sends NO block, and the arbiter then CLEARS any stored gate
 dropped, never rejected; an old arbiter simply ignores the extra field.
 
 ```
-POST /api/sessions/register  { "token": "…", "gate": { "state": "active" | "queued", "waiting": 3 } }
+POST /api/sessions/register  { "token": "…", "gate": { "state": "active" | "queued", "waiting": 3 }, "session_id": "…" }
 ```
+
+**Hermes conversation id (#42 Slice 0).** When a request on a session path
+carries the `X-Hermes-Session-Id` header, the router captures it and the
+register heartbeat gains the `session_id` add-key — the REAL Hermes
+conversation id (the one the TUI banner shows), so two concurrent chats on
+one profile are two distinguishable rows even before the gate plugin
+lands. The first request that carries it sets the row's id; a later
+headerless request never clears it. Malformed values (over 128 chars,
+control chars) are dropped, never rejected — the same posture as the
+token rule. A session that never carried the header (curl, other clients)
+has no key and renders exactly as before. The future middleware-plugin
+path (#42) publishes the SAME field from the other side.
+
+**Gate posture (#41).** The client daemon's register heartbeat also
+carries `gate_posture`: `armed` while the arbiter link is up (slot cap +
+operator overrides in force) or `fail_open` after the link drops (every
+session admitted, cap OFF). The router owns this truth — the arbiter
+cannot observe it — so the arbiter stores + echoes the last valid report
+verbatim, and the dashboard puts a `gate fail-open` badge on that
+machine's worker rows. `armed` renders nothing (no tag is the healthy
+state); a daemon with `session_gate: false` sends no key at all.
 
 `state`: `active` = the session currently holds an inference slot
 (in-flight > 0); `queued` = it has ≥1 parked request waiting for admission.

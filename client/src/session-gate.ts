@@ -68,8 +68,11 @@ export interface SessionGateDeps {
    * snapshot at call time (null = idle: no slot, no holds — the body then
    * omits the gate block so the arbiter CLEARS any stored gate). Resolves
    * true on 2xx. Rejections/false never block admission (fail-open).
+   * `sessionId` (#42 Slice 0) is the REAL Hermes conversation id captured
+   * from the X-Hermes-Session-Id header — undefined until a request on the
+   * token carried it, then stable; the body omits the key when undefined.
    */
-  register: (token: string, gate: SessionGateSnapshot | null) => Promise<boolean>;
+  register: (token: string, gate: SessionGateSnapshot | null, sessionId?: string) => Promise<boolean>;
   /** #54: this client's registered name (client/config.json client_name).
    *  Arbiter session rows naming a DIFFERENT client are not adopted —
    *  see onStatePoll. Unset (tests, odd configs) keeps the old
@@ -106,6 +109,30 @@ interface Session {
   holds: Held[];
   registered: boolean;
   lastRegisterAttempt: number;
+  /**
+   * The REAL Hermes conversation id this token carries, captured from the
+   * `X-Hermes-Session-Id` request header (#42 Slice 0). A header-free
+   * request (curl, other clients) leaves it absent. Published on the
+   * register heartbeat as the `session_id` ADD-key — one contract, two
+   * sources: the header path and the future middleware path converge on
+   * the same stored field.
+   */
+  session_id?: string;
+}
+
+/** #42 Slice 0: the header Hermes may carry with every provider request. */
+export const SESSION_ID_HEADER = 'x-hermes-session-id';
+
+/** Bound + sanitize a reported session id (same drop-don't-reject posture
+ *  as the token rule): printable, ≤128 chars, else treated as absent. */
+function cleanSessionId(v: unknown): string | undefined {
+  if (typeof v !== 'string') return undefined;
+  const s = v.trim();
+  if (!s || s.length > 128) return undefined;
+  // Header values with control characters are hostile input; drop them.
+  // eslint-disable-next-line no-control-regex
+  if (/[^\x20-\x7e]/.test(s)) return undefined;
+  return s;
 }
 
 /** `/s/<token>/rest…` — the session path contract (token ≤128 chars, arbiter rule). */
@@ -170,7 +197,10 @@ export class SessionGate {
   // ------------------------------------------------------------------
 
   route(req: IncomingMessage, res: ServerResponse, token: string, path: string, forward: ForwardFn): void {
-    const s = this.touch(token);
+    // #42 Slice 0: Hermes may carry its REAL conversation id on every
+    // provider request. Capture it per request — the row's identity display
+    // updates from live traffic, headerless clients leave it untouched.
+    const s = this.touch(token, cleanSessionId(req.headers[SESSION_ID_HEADER]));
 
     // Fail-open posture: arbiter down or gate shutting down ⇒ admit.
     if (!this.linkUp || this.released) {
@@ -203,13 +233,17 @@ export class SessionGate {
   }
 
   /** First-sight bookkeeping: create the row + throttled registration. */
-  private touch(token: string): Session {
+  private touch(token: string, sessionId?: string): Session {
     let s = this.sessions.get(token);
     const fresh = !s;
     if (!s) {
       s = { token, override: null, inflight: 0, holds: [], registered: false, lastRegisterAttempt: 0 };
       this.sessions.set(token, s);
     }
+    // A captured id rides forward from the first request that carried it;
+    // a later headerless request never clears it (last-known-wins, the same
+    // posture as the client-published display fields).
+    if (sessionId) s.session_id = sessionId;
     const target = s;
     if (this.now() - target.lastRegisterAttempt >= this.heartbeatMs) {
       void this.register(target);
@@ -225,7 +259,7 @@ export class SessionGate {
   private async register(s: Session): Promise<void> {
     s.lastRegisterAttempt = this.now();
     try {
-      const ok = await this.deps.register(s.token, this.snapshot(s.token));
+      const ok = await this.deps.register(s.token, this.snapshot(s.token), s.session_id);
       if (ok) {
         if (!this.linkUp) {
           this.linkUp = true;

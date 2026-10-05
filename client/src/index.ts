@@ -1168,6 +1168,15 @@ export class ClientDaemon {
       // the field exactly like the version handshake: absent is normal,
       // never a rejection.
       ...(clientRevision ? { revision: clientRevision } : {}),
+      // Gate posture (#41): the router's OWN admission posture, published so
+      // the surfaces can say whether the slot cap + operator overrides are
+      // actually in force. `armed` = the arbiter is reachable and gating;
+      // `fail_open` = it is unreachable, so every session is admitted and
+      // the cap is off. Derived from the gate's single `failOpen` flag — no
+      // second source of truth. Exception-only: a daemon running WITHOUT a
+      // session gate reports nothing (there is no gate to be armed), and an
+      // old arbiter that ignores the key keeps working.
+      ...(this.gate ? { gate_posture: this.gate.failOpen ? 'fail_open' : 'armed' } : {}),
       // The arbiter stores this per-project view for the dashboard
       // (Projects → workers allocated). Re-registration is a heartbeat:
       // last_seen refreshes and queue depths update on every tick. `stats`
@@ -1509,7 +1518,7 @@ export class ClientDaemon {
         holdCapMs: this.cfg.session_hold_cap_ms ?? 120_000,
         clientName: this.cfg.client_name,
         log: (m) => this.log.info(m),
-        register: async (token, gate) => {
+        register: async (token, gate, sessionId) => {
           const { status } = await api(this.cfg, 'POST', '/api/sessions/register', {
             token,
             ...(this.clientId ? { client_id: this.clientId } : {}),
@@ -1520,6 +1529,11 @@ export class ClientDaemon {
             // arbiter then CLEARS any stored gate for the token. An old
             // arbiter ignores the extra field (back-compat).
             ...(gate ? { gate } : {}),
+            // #42 Slice 0: the REAL Hermes conversation id, captured from
+            // the X-Hermes-Session-Id request header. ADD-key: absent until
+            // some request on this token carried the header; an old arbiter
+            // ignores it (back-compat).
+            ...(sessionId ? { session_id: sessionId } : {}),
           });
           return status === 200 || status === 201;
         },

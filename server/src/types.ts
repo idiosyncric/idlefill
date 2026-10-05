@@ -338,6 +338,20 @@ export interface ClientRecord {
    * malformed → dropped); absent on pre-#49 clients — never a rejection.
    */
   revision?: string;
+  /**
+   * The client router's session-gate posture (#41), published on every
+   * register heartbeat: `armed` = the arbiter is reachable and the slot cap
+   * + operator overrides are in force; `fail_open` = the arbiter was
+   * unreachable from the router's side, so every session was admitted and
+   * the cap is OFF. A silently fail-open gate is the failure this issue
+   * exists to close. The arbiter stores + echoes the LAST report verbatim
+   * (client-truth discipline: the posture lives inside the router, the
+   * arbiter cannot observe it); surfaces render it exception-only — an
+   * absent key (old client, or a daemon running without a session gate)
+   * renders exactly as before, and `armed` renders nothing (no tag is the
+   * healthy state).
+   */
+  gate_posture?: 'armed' | 'fail_open';
 }
 
 /**
@@ -394,6 +408,16 @@ export interface SessionRecord {
    * Absent on rows persisted before gate-state.
    */
   gate?: { state: 'active' | 'queued'; waiting: number } | null;
+  /**
+   * The REAL Hermes conversation id (#42 Slice 0), captured by the router
+   * from the `X-Hermes-Session-Id` request header and published on the
+   * register heartbeat as an ADD-key. The plugin path (middleware
+   * `llm_execution`) and the header path converge on THIS field — one
+   * contract, two sources. Absent = the session never carried the header
+   * (curl, non-Hermes clients, pre-slice rows): surfaces render unchanged.
+   * Sanitizer posture: bounded printable string, drop-don't-reject.
+   */
+  session_id?: string;
 }
 
 /**

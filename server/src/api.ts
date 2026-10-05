@@ -88,7 +88,7 @@ function bearer(req: { headers: Record<string, unknown>; query: unknown }): stri
 function projectView(
   arbiter: Arbiter,
   cfg: ServerConfig,
-  clients: { name: string; last_seen: number; projects: { name: string; model: string; estimated_seconds: number; queue_depth: number; queue_preview?: QueuePreviewRow[]; stats?: Record<string, number | string>; last_rebuild?: RebuildRunState; cycles?: CycleStatusRow[]; cycle_cap?: number }[]; version?: string; protocol?: number; revision?: string }[],
+  clients: { name: string; last_seen: number; projects: { name: string; model: string; estimated_seconds: number; queue_depth: number; queue_preview?: QueuePreviewRow[]; stats?: Record<string, number | string>; last_rebuild?: RebuildRunState; cycles?: CycleStatusRow[]; cycle_cap?: number }[]; version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open' }[],
   day: string,
   now: number,
   today: Record<string, { finished: number; failed: number }>,
@@ -125,6 +125,10 @@ function projectView(
           // Code-staleness (issue #49): the daemon's boot commit, same
           // exception-only rule (absent on pre-#49 clients).
           ...(c.revision ? { revision: c.revision } : {}),
+          // Gate posture (#41): the router's own armed-vs-fail-open state,
+          // echoed exception-only (absent on pre-#41 clients AND on a daemon
+          // running with no session gate — both render the row unchanged).
+          ...(c.gate_posture ? { gate_posture: c.gate_posture } : {}),
         };
       })
       .sort((a, b) => Number(b.online) - Number(a.online) || a.client.localeCompare(b.client));
@@ -281,7 +285,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   // ------------------------------------------------------------------
 
   app.post('/api/clients/register', async (req, reply) => {
-    const body = (req.body ?? {}) as { name?: string; ip?: string; projects?: ProjectAllocation[]; version?: unknown; protocol?: unknown; revision?: unknown };
+    const body = (req.body ?? {}) as { name?: string; ip?: string; projects?: ProjectAllocation[]; version?: unknown; protocol?: unknown; revision?: unknown; gate_posture?: unknown };
     const name = typeof body.name === 'string' ? body.name.trim() : '';
     if (!name) return reply.code(400).send({ error: 'name required' });
     const remote = (req.ip ?? '').split(':').pop() ?? 'unknown';
@@ -397,14 +401,19 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     // loaded its code from. Same edge posture — a plain string pass-through,
     // sanitized in registerClient; absent on pre-#49 clients.
     const revision = typeof body.revision === 'string' ? body.revision : undefined;
+    // Gate posture (#41): the router's OWN fail-open/armed state, a plain
+    // pass-through here — sanitized (exact-value, else dropped) in
+    // registerClient. Absent = an old client or a gate-less daemon: the
+    // surfaces render the row exactly as before.
+    const gate_posture = body.gate_posture === 'armed' || body.gate_posture === 'fail_open' ? body.gate_posture : undefined;
     const res = arbiter.registerClient(
       name,
       typeof body.ip === 'string' && body.ip.trim() ? body.ip.trim() : undefined,
       remote,
       projects,
       undefined,
-      version !== undefined || protocol !== undefined || revision !== undefined
-        ? { version, protocol, revision }
+      version !== undefined || protocol !== undefined || revision !== undefined || gate_posture !== undefined
+        ? { version, protocol, revision, gate_posture }
         : undefined,
     );
     return reply.code(200).send({ client_id: res.client_id, created: res.created });
@@ -668,6 +677,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       server_id?: string;
       last_activity?: number;
       gate?: unknown;
+      session_id?: unknown;
     };
     const token = typeof body.token === 'string' ? body.token.trim() : '';
     if (!token) return reply.code(400).send({ error: 'token required' });
@@ -679,6 +689,9 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       // gate-state: forwarded VERBATIM (absent = the idle report → clear;
       // validation + drop-don't-reject live in registerSession).
       gate: body.gate,
+      // #42 Slice 0: the Hermes conversation id, forwarded verbatim the
+      // same way (bounded/sanitized in registerSession, never a rejection).
+      session_id: body.session_id,
     });
     if (!res.ok) return reply.code(400).send({ error: res.reason ?? 'invalid' });
     return reply.code(res.created ? 201 : 200).send({ created: res.created, session: res.session });
