@@ -81,6 +81,16 @@ export interface ServerConfig {
   projects: ProjectConfig[];
   /** State file path (env IDLEFILL_STATE overrides). */
   state_file: string;
+  /**
+   * Metrics retention store (#51 D5): how long the raw JSONL day-files
+   * survive. Past this window only the hour buckets remain. Default 48.
+   */
+  metrics_raw_window_hours?: number;
+  /**
+   * Metrics retention store (#51 D5): how long the hour-bucket day-files
+   * survive. Default 400 (the 30-day acceptance bar, with room).
+   */
+  metrics_retention_days?: number;
 }
 
 /**

@@ -38,6 +38,9 @@ export const DEFAULTS: Omit<ServerConfig, 'state_file'> & {
   job_cooldown_seconds: 300,
   projects: [],
   state_file: './state.json',
+  // Metrics retention store (#51 D5).
+  metrics_raw_window_hours: 48,
+  metrics_retention_days: 400,
 };
 
 /** Coerce a raw (partial) config object into a full ServerConfig, applying defaults per field. */
@@ -86,6 +89,10 @@ export function applyDefaults(raw: Partial<ServerConfig> | null | undefined): Se
         }))
       : [],
     state_file: str(r.state_file, process.env.IDLEFILL_STATE || DEFAULTS.state_file),
+    // Metrics retention store (#51 D5): raw window in hours, hour-bucket
+    // retention in days. Non-positive/garbage falls back to the default.
+    metrics_raw_window_hours: num(r.metrics_raw_window_hours, DEFAULTS.metrics_raw_window_hours ?? 48),
+    metrics_retention_days: num(r.metrics_retention_days, DEFAULTS.metrics_retention_days ?? 400),
   };
 }
 

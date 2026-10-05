@@ -17,6 +17,7 @@ import os from 'node:os';
 import fastify, { type FastifyInstance } from 'fastify';
 import { WebSocketServer } from 'ws';
 import { utcDay, type Arbiter, WATCHED_SERVER_ID } from './arbiter.js';
+import { seriesKeyOf, type MetricsBucket, type MetricsSeries, type MetricsStore } from './metrics.js';
 import { buildMeshSnapshot, type MeshFederation } from './mesh.js';
 import type { ProjectAllocation, QueuePreviewRow, RebuildRunState, ServerConfig, ServerConnection } from './types.js';
 
@@ -31,6 +32,11 @@ export interface ApiDeps {
    * snapshot, no `mesh` key on /api/state).
    */
   mesh?: MeshFederation;
+  /**
+   * Metrics retention store (#51). Optional so existing callers/tests stay
+   * valid; absent = GET /api/metrics answers 501 (the store is not wired).
+   */
+  metrics?: MetricsStore;
 }
 
 /** Validate a request token against the configured set. */
@@ -213,7 +219,7 @@ function serverView(arbiter: Arbiter, cfg: ServerConfig, now: number) {
 
 /** Attach the API routes (authed) and the dashboard (public read). */
 export function buildApi(deps: ApiDeps): FastifyInstance {
-  const { arbiter, cfg, publicDir, mesh } = deps;
+  const { arbiter, cfg, publicDir, mesh, metrics } = deps;
 
   const app = fastify({ logger: false });
   app.decorate('idlefill', { arbiter, cfg, publicDir });
@@ -231,6 +237,13 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     // ANY /api/* path is a 401.
     const isAnonymousState = path === '/api/state' && req.method === 'GET' && token === null;
     if (isAnonymousState) return;
+    // Metrics read plane (#51 D6): the /api/state anonymous exception
+    // extends to GET /api/metrics — the dashboard is anonymous today and the
+    // tailnet is the trust boundary. A wrong token is still a 401 (it falls
+    // through to the strict check below), and the fleet peer_token does NOT
+    // unlock this route: isMeshRead below is scoped to /api/mesh only.
+    const isAnonymousMetrics = path === '/api/metrics' && req.method === 'GET' && token === null;
+    if (isAnonymousMetrics) return;
     // Mesh read plane (#50 D2): the fleet peer_token is read-only and works
     // ONLY on GET /api/mesh. It never unlocks any other route; a wrong
     // token anywhere (including here) is still a 401.
@@ -662,6 +675,75 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       // precedent). Absent on a build that never baked one.
       process.env.IDLEFILL_VERSION,
     );
+  });
+
+  // ------------------------------------------------------------------
+  // Metrics retention store (#51 D6)
+  // ------------------------------------------------------------------
+
+  /**
+   * Range read over the retention store. Params: `series` (engine|lease|
+   * session, required), `key` (optional filter: server_id / session token /
+   * project), `from`/`to` (epoch-ms, default the last 7 days), `bucket`
+   * (hour default | raw; raw answers only inside the raw window — the store
+   * clamps). Bad params answer 400 with an error string, same discipline as
+   * the settings routes. The response caps at 2,000 points: the OLDEST are
+   * trimmed and `truncated: true` rides. Auth: anonymous read like
+   * /api/state (the onRequest hook); a wrong token is still 401; the fleet
+   * peer_token does NOT unlock this route.
+   */
+  app.get('/api/metrics', async (req, reply) => {
+    if (!metrics) return reply.code(501).send({ error: 'metrics store not wired' });
+
+    const q = (typeof req.query === 'object' && req.query !== null ? req.query : {}) as Record<string, unknown>;
+    const series = q.series;
+    if (series !== 'engine' && series !== 'lease' && series !== 'session') {
+      return reply.code(400).send({ error: 'series must be engine, lease, or session' });
+    }
+    const bucket = q.bucket === undefined ? 'hour' : q.bucket;
+    if (bucket !== 'hour' && bucket !== 'raw') {
+      return reply.code(400).send({ error: 'bucket must be hour or raw' });
+    }
+    const now = Date.now();
+    const WEEK_MS = 7 * 86_400_000;
+    const from = typeof q.from === 'string' || typeof q.from === 'number' ? Number(q.from) : now - WEEK_MS;
+    const to = typeof q.to === 'string' || typeof q.to === 'number' ? Number(q.to) : now;
+    if (!Number.isFinite(from) || !Number.isFinite(to)) {
+      return reply.code(400).send({ error: 'from and to must be epoch-ms numbers' });
+    }
+    if (from > to) return reply.code(400).send({ error: 'from must be <= to' });
+    if (typeof q.key !== 'undefined' && typeof q.key !== 'string') {
+      return reply.code(400).send({ error: 'key must be a string' });
+    }
+
+    const lines = metrics.readRange({
+      series: series as MetricsSeries,
+      ...(typeof q.key === 'string' && q.key !== '' ? { key: q.key } : {}),
+      from,
+      to,
+      bucket: bucket as MetricsBucket,
+      now,
+    });
+
+    // 2,000-point cap: trim the OLDEST, keep the newest (D6).
+    const MAX_POINTS = 2000;
+    const truncated = lines.length > MAX_POINTS;
+    const kept = truncated ? lines.slice(lines.length - MAX_POINTS) : lines;
+
+    const byKey = new Map<string, Record<string, unknown>[]>();
+    for (const l of kept) {
+      const k = seriesKeyOf(l);
+      let arr = byKey.get(k);
+      if (!arr) {
+        arr = [];
+        byKey.set(k, arr);
+      }
+      arr.push(l as unknown as Record<string, unknown>);
+    }
+    return {
+      series: [...byKey.entries()].map(([key, points]) => ({ key, points })),
+      truncated,
+    };
   });
 
   // ------------------------------------------------------------------

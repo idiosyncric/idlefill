@@ -110,6 +110,13 @@
   .bar > div { height: 100%; background: var(--accent); }
   .bar > div.hot { background: var(--warn); }
   .empty { color: var(--dim); font-style: italic; padding: 6px 0; }
+  /* Usage (#51) — inline SVG sparklines over /api/metrics hour buckets.
+     No chart library: the polyline is built here, the colors ride the
+     page's own tokens. */
+  .usage-row { display: flex; align-items: center; gap: 10px; padding: 3px 0; }
+  .usage-row .k { color: var(--dim); flex: none; min-width: 130px; }
+  .usage-row .v { margin-left: auto; flex: none; }
+  .usage-row svg { flex: 1 1 auto; min-width: 0; height: 26px; display: block; }
   /* Liveness dot — worker rows + per-server model rows. */
   .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex: none; }
   .dot.on { background: var(--ok); } .dot.off { background: var(--dim); }
@@ -318,6 +325,16 @@
   <section id="throttled-section" style="display:none">
     <h2>Throttled jobs</h2>
     <div id="throttled"></div>
+  </section>
+
+  <!-- Usage (#51) — charts over the metrics retention store (hour buckets,
+       last 7 days). Exception-only: hidden while the store has no points.
+       Its OWN refresh timer (5 min): charts over days do not need the 5s
+       /api/state cadence, and the read is the anonymous /api/metrics
+       exception — no gate token needed. -->
+  <section id="usage-section" style="display:none">
+    <h2>Usage <span class="sub" style="text-transform:none;letter-spacing:0">· last 7 days</span></h2>
+    <div id="usage"></div>
   </section>
 
   <!-- Queue search — client-side filter of the per-worker PUBLISHED
@@ -1688,8 +1705,87 @@ if (addBtn && addForm) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Usage (#51) — charts over the metrics retention store. Its OWN timer:
+// charts over days do not need the 5s /api/state cadence (the store's
+// pitfall list says so explicitly). Reads GET /api/metrics anonymously
+// (the /api/state exception extends to it) — no gate token involved.
+// Exception-only: the section stays hidden while the store has no points.
+// Inline SVG sparklines only — no chart library (the dashboard stays a
+// single hand-written file).
+
+const USAGE_MS = 7 * 86400000; // the default view: last 7 days (D8)
+
+function sparkline(values, cls) {
+  // A polyline in a 100x26 viewBox stretched to the row (preserveAspectRatio
+  // none). Empty/flat series render as a straight baseline, never a gap.
+  if (!values.length) return "";
+  const max = Math.max(...values, 1);
+  const n = values.length;
+  const pts = values.map((v, i) => {
+    const x = n === 1 ? 50 : (i / (n - 1)) * 100;
+    const y = 24 - (Math.max(0, v) / max) * 22;
+    return x.toFixed(1) + "," + y.toFixed(1);
+  }).join(" ");
+  return '<svg viewBox="0 0 100 26" preserveAspectRatio="none" aria-hidden="true">' +
+    '<polyline points="' + pts + '" fill="none" stroke="var(' + cls + ')" stroke-width="1.5" vector-effect="non-scaling-stroke"/>' +
+    "</svg>";
+}
+
+function usageRow(label, values, cls, valueText, title) {
+  return '<div class="usage-row" title="' + esc(title) + '">' +
+    '<span class="k">' + esc(label) + "</span>" +
+    sparkline(values, cls) +
+    '<span class="v ' + cls.slice(2) + '">' + esc(valueText) + "</span>" +
+    "</div>";
+}
+
+async function refreshUsage() {
+  let data;
+  try {
+    const now = Date.now();
+    const from = now - USAGE_MS;
+    const url = (series) => "/api/metrics?series=" + series + "&bucket=hour&from=" + from + "&to=" + now;
+    const [eng, lease] = await Promise.all([fetch(url("engine"), { cache: "no-store" }), fetch(url("lease"), { cache: "no-store" })]);
+    if (!eng.ok || !lease.ok) throw new Error("HTTP " + eng.status + "/" + lease.status);
+    data = { engine: await eng.json(), lease: await lease.json() };
+  } catch {
+    // Store unreachable / not wired: exception-only, hide the section.
+    $("usage-section").style.display = "none";
+    return;
+  }
+
+  const engKeys = data.engine.series || [];
+  const leaseKeys = data.lease.series || [];
+  const total = engKeys.reduce((n, s) => n + s.points.length, 0) + leaseKeys.reduce((n, s) => n + s.points.length, 0);
+  if (total === 0) {
+    $("usage-section").style.display = "none";
+    return;
+  }
+  $("usage-section").style.display = "";
+
+  const rows = [];
+  for (const s of engKeys) {
+    const pts = s.points;
+    // requests per hour (the doc's chart 1)
+    const reqs = pts.map((p) => p.req_total ?? 0);
+    rows.push(usageRow(s.key + " req/hour", reqs, "--accent", String(reqs.reduce((a, b) => a + b, 0)), "requests per hour bucket, last 7 days"));
+    // idle share per hour (the doc's "idle hours" as a per-hour ratio)
+    const idleShare = pts.map((p) => (p.samples ? Math.round(((p.idle_samples ?? 0) / p.samples) * 100) : 0));
+    rows.push(usageRow(s.key + " idle %", idleShare, "--ok", idleShare.length ? Math.round(idleShare.reduce((a, b) => a + b, 0) / idleShare.length) + "% avg" : "—", "idle samples per hour bucket, last 7 days"));
+  }
+  for (const s of leaseKeys) {
+    const pts = s.points;
+    const toks = pts.map((p) => p.tokens_out ?? 0);
+    rows.push(usageRow(s.key + " tokens/hour", toks, "--warn", toks.reduce((a, b) => a + b, 0).toLocaleString(), "lease output tokens per hour bucket, last 7 days"));
+  }
+  $("usage").innerHTML = rows.join("");
+}
+
 refresh();
 setInterval(refresh, 5000);
+refreshUsage();
+setInterval(refreshUsage, 300000); // 5 min — its own timer, not the state poll
 </script>
 </body>
 </html>
