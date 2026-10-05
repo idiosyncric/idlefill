@@ -36,3 +36,4 @@ New issue reports land **here**, never at the repo root.
 | #51 | [ISSUE51-GRILL-REPORT.md](ISSUE51-GRILL-REPORT.md) | Metrics history grill: verified gaps + settled decisions |
 | #49 | [ISSUE49-REPORT.md](ISSUE49-REPORT.md) | Daemon code-staleness: boot-revision handshake + `daemon behind` flag |
 | #48 | [ISSUE48-REPORT.md](ISSUE48-REPORT.md) | Sessions-tab visual cleanup: R1–R9 acceptance pass + after-screenshot (`sessions-tab-after.png`) |
+| #54 | [ISSUE54-REPORT.md](ISSUE54-REPORT.md) | Linux client service: systemd user unit + installer on urza, portable control, fleet-safe me-row, session-gate adoption fix, Linux CI green |

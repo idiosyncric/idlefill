@@ -65,7 +65,11 @@ issue's "verify nothing breaks" clause exposed.
   compose service name (career-ops never noticed: its approve job skips
   checkout). Fixed on the host: `container.network: forgejo-net` added
   to the runner config (bind-mounted), runner restarted and
-  re-declared. CI green result recorded below.
+  re-declared. RESULT: on `610e67e` the job is GREEN on
+  `gitea/runner-images:ubuntu-latest` — suites 126/77/17/2 pass 0 fail,
+  tsc + build clean, and the installer `--dry-run` renders +
+  byte-verifies inside a systemd-less container (the bus/analyze steps
+  skip with a note; the byte-checks run).
 
 ## Gates
 
