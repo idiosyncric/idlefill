@@ -27,7 +27,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startLlmProxy, waitProxyReady, type LlmProxy } from '../src/proxy.js';
-import { SessionGate, type SessionGateSnapshot } from '../src/session-gate.js';
+import { SessionGate, type SessionGateSnapshot, SessionHistory } from '../src/session-gate.js';
 import { ClientDaemon } from '../src/index.js';
 import type { ClientConfig } from '../src/config.js';
 import { startFakeArbiter, type FakeArbiter } from './fake-arbiter.js';
@@ -68,8 +68,14 @@ function startControllableUpstream(): Promise<{
         release(n = 1) {
           for (let i = 0; i < n && waiting.length > 0; i++) {
             const res = waiting.shift()!;
+            const hit = hits[Math.max(0, hits.length - n + i)];
+            // #45: a real OpenAI-compatible response echoes the served
+            // model + a usage block — the gate's response-side peek reads
+            // them (a fixed stand-in when the body didn't parse).
+            let model = 'resp-model';
+            try { model = (JSON.parse(hit?.body || '{}') as { model?: string }).model ?? model; } catch { /* keep default */ }
             res.writeHead(200, { 'content-type': 'application/json' });
-            res.end(JSON.stringify({ id: 'chatcmpl-1', choices: [{ message: { content: 'hi' } }] }));
+            res.end(JSON.stringify({ id: 'chatcmpl-1', model, choices: [{ message: { content: 'hi' } }], usage: { total_tokens: 42 } }));
           }
         },
         close: () =>
@@ -103,12 +109,12 @@ async function waitFor(pred: () => boolean, timeoutMs = 3000, what = 'condition'
 function makeGate(opts: {
   maxActive?: number;
   holdCapMs?: number;
-  register?: (token: string, gate: SessionGateSnapshot | null, sessionId?: string) => Promise<boolean>;
+  register?: (token: string, gate: SessionGateSnapshot | null, sessionId?: string, history?: SessionHistory) => Promise<boolean>;
   now?: () => number;
   clientName?: string;
-} = {}): { gate: SessionGate; registered: string[]; calls: { token: string; gate: SessionGateSnapshot | null; sessionId?: string }[] } {
+} = {}): { gate: SessionGate; registered: string[]; calls: { token: string; gate: SessionGateSnapshot | null; sessionId?: string; history?: SessionHistory }[] } {
   const registered: string[] = [];
-  const calls: { token: string; gate: SessionGateSnapshot | null; sessionId?: string }[] = [];
+  const calls: { token: string; gate: SessionGateSnapshot | null; sessionId?: string; history?: SessionHistory }[] = [];
   const gate = new SessionGate({
     maxActive: opts.maxActive ?? 1,
     holdCapMs: opts.holdCapMs ?? 30_000,
@@ -116,9 +122,9 @@ function makeGate(opts: {
     clientName: opts.clientName,
     register:
       opts.register ??
-      (async (token, gateSnapshot, sessionId) => {
+      (async (token, gateSnapshot, sessionId, history) => {
         registered.push(token);
-        calls.push({ token, gate: gateSnapshot, sessionId });
+        calls.push({ token, gate: gateSnapshot, sessionId, history });
         return true;
       }),
   });
@@ -361,7 +367,7 @@ test('register calls carry the gate snapshot (active at refresh, queued while pa
   // First sight registers BEFORE the request is forwarded ⇒ idle snapshot.
   const resA = postChat(proxy.base_url, '/s/tokA/v1/chat/completions');
   await waitFor(() => up.hits.length === 1, 3000, 'A forwarded');
-  assert.deepEqual(calls[0], { token: 'tokA', gate: null, sessionId: undefined }, 'first-sight register: no gate block yet');
+  assert.deepEqual(calls[0], { token: 'tokA', gate: null, sessionId: undefined, history: undefined }, 'first-sight register: no gate block, no traffic history yet');
 
   // B first-sights and parks; its register fires at first sight (before
   // the park), so it is also gate-less — the REFRESH is what reports it.
@@ -735,4 +741,44 @@ test('#44 queue position on the wire: three parked sessions carry 1-based FIFO p
   await waitFor(() => up.hits.length === 3, 3000, 'C admitted');
   up.release(1);
   assert.equal((await resC).status, 200);
+});
+
+test('#45 session history on the wire: request ring + response-sniffed model/tokens reach the heartbeat', async () => {
+  const clock = { t: 90_000_000 };
+  const { gate, calls } = makeGate({ maxActive: 1, now: () => clock.t });
+  const { proxy, up } = await harness({ gate });
+  gate.onStatePoll([]); // arbiter reachable
+
+  // A chat-completions request on a session path: the ring counts it, the
+  // response echo carries the model, the usage block carries total_tokens.
+  const resP = postChat(proxy.base_url, '/s/hist1/v1/chat/completions');
+  await waitFor(() => up.hits.length === 1, 3000, 'hit forwarded');
+  up.release(1);
+  assert.equal((await resP).status, 200);
+
+  clock.t += 10_001; // past the heartbeat throttle
+  gate.heartbeat();
+  await waitFor(() => calls.some((c) => c.token === 'hist1' && c.history), 3000, 'history heartbeat');
+  const last = calls.filter((c) => c.token === 'hist1').at(-1)!;
+  assert.ok(last.history, 'the heartbeat carries the history ADD-key');
+  assert.equal(last.history!.rpm.length, 10, 'exactly 10 per-minute buckets');
+  assert.equal(last.history!.rpm.at(-1), 1, 'the newest minute counted this request');
+  assert.equal(last.history!.model, 'm', 'the model came from the upstream response echo');
+  assert.equal(last.history!.tokens, 42, 'the token total came from the streamed usage block');
+
+  // A parked request still counts (the router saw it even if it waits).
+  const resA = postChat(proxy.base_url, '/s/hist2/v1/chat/completions');
+  await waitFor(() => up.hits.length === 2, 3000, 'hist2 takes the slot');
+  const resB = postChat(proxy.base_url, '/s/hist3/v1/chat/completions'); // parked (cap=1)
+  await waitFor(() => gate.queueDepth === 1, 2000, 'hist3 parked');
+  clock.t += 10_001;
+  gate.heartbeat();
+  await waitFor(() => calls.some((c) => c.token === 'hist3' && c.history), 3000, 'parked hist3 history');
+  assert.ok((calls.filter((c) => c.token === 'hist3').at(-1)!.history!.rpm.at(-1) ?? 0) >= 1, 'parked request counted in the ring');
+
+  up.release(1);
+  assert.equal((await resA).status, 200);
+  await waitFor(() => up.hits.length === 3, 3000, 'hist3 admitted');
+  up.release(1);
+  assert.equal((await resB).status, 200);
 });

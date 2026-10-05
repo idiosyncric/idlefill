@@ -79,7 +79,15 @@ export interface SessionGateDeps {
    * from the X-Hermes-Session-Id header — undefined until a request on the
    * token carried it, then stable; the body omits the key when undefined.
    */
-  register: (token: string, gate: SessionGateSnapshot | null, sessionId?: string) => Promise<boolean>;
+  register: (
+    token: string,
+    gate: SessionGateSnapshot | null,
+    sessionId?: string,
+    /** #45: compact per-session request history (10×60s counts + last
+     *  model + last token total) — the `history` ADD-Key on the register
+     *  body. Absent for a session with no recorded traffic. */
+    history?: SessionHistory,
+  ) => Promise<boolean>;
   /** #54: this client's registered name (client/config.json client_name).
    *  Arbiter session rows naming a DIFFERENT client are not adopted —
    *  see onStatePoll. Unset (tests, odd configs) keeps the old
@@ -125,6 +133,66 @@ interface Session {
    * the same stored field.
    */
   session_id?: string;
+  /**
+   * #45 request ring: epoch-ms of every forwarded/parked request, newest
+   * last, capped (RING_MAX). In-memory only — a restart starts empty.
+   * Published on the register heartbeat inside the `history` ADD-key as
+   * per-minute counts (see sessionHistory).
+   */
+  ring: number[];
+  /** Last model name sniffed from a forwarded chat-completion body (#45). */
+  model?: string;
+  /** Last token total observed in an upstream usage chunk (#45). */
+  tokens?: number;
+
+}
+
+/** #45: cap on the in-memory request ring (a restart starts empty). */
+const RING_MAX = 240;
+
+/** #45: the `history` ADD-key shape published on the register heartbeat. */
+export interface SessionHistory {
+  /** requests/min counts, 60s buckets, oldest→newest, always 10 entries. */
+  rpm: number[];
+  /** last model name sniffed from a forwarded chat-completions body. */
+  model?: string;
+  /** last total_tokens observed in this session's streamed usage. */
+  tokens?: number;
+}
+
+/** #45: compact request history for the register heartbeat — counts per
+ *  60s bucket, oldest→newest, always exactly 10 buckets (10 minutes). */
+function sessionHistory(s: Session, now: number): SessionHistory {
+  const rpm = new Array<number>(10).fill(0);
+  for (const t of s.ring) {
+    const age = now - t;
+    if (age < 0 || age >= 600_000) continue;
+    const idx = 9 - Math.floor(age / 60_000);
+    rpm[idx] = (rpm[idx] ?? 0) + 1;
+  }
+  return { rpm, ...(s.model ? { model: s.model } : {}), ...(s.tokens ? { tokens: s.tokens } : {}) };
+}
+
+/**
+ * #45: sniff the model name out of a chat-completions body WITHOUT
+ * buffering the stream: parse only the first request chunk. A chunk that
+ * doesn't end on a complete JSON object just yields the model field if the
+ * regex finds one inside it; anything malformed yields nothing
+ * (drop-don't-reject, like every other observed field).
+ */
+function sniffModelChunk(chunk: Buffer | string): string | undefined {
+  const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+  const m = /"model"\s*:\s*"([^"\\\x00-\x1f\x7f]{1,80})"/.exec(text);
+  return m ? m[1] : undefined;
+}
+
+/** #45: token totals ride the streamed usage chunk ("usage":{...total_tokens:N}). */
+function sniffUsageChunk(chunk: Buffer | string): number | undefined {
+  const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+  const m = /"total_tokens"\s*:\s*(\d{1,12})/.exec(text);
+  if (!m) return undefined;
+  const n = Number(m[1]);
+  return Number.isFinite(n) && n >= 0 ? n : undefined;
 }
 
 /** #42 Slice 0: the header Hermes may carry with every provider request. */
@@ -213,6 +281,15 @@ export class SessionGate {
     // provider request. Capture it per request — the row's identity display
     // updates from live traffic, headerless clients leave it untouched.
     const s = this.touch(token, cleanSessionId(req.headers[SESSION_ID_HEADER]));
+    // #45 session detail: count the request the moment the router sees it
+    // (forwarded OR parked — a parked request is still a request). The
+    // body is NEVER touched here: a parked request must keep its body
+    // unconsumed for the forward on admission (a req 'data' listener
+    // drains it and wedges the park — found by the (c)/(e) gate tests).
+    // Model + usage sniff from the upstream RESPONSE instead (below): the
+    // engine echoes the model it served in the response body, and
+    // observing the piped upstream never steals bytes.
+    this.recordRequest(s);
 
     // Fail-open posture: arbiter down or gate shutting down ⇒ admit.
     if (!this.linkUp || this.released) {
@@ -244,12 +321,18 @@ export class SessionGate {
     this.maybeRefresh();
   }
 
+  /** #45: one ring entry per request (capped; in-memory, restart starts empty). */
+  private recordRequest(s: Session): void {
+    s.ring.push(this.now());
+    if (s.ring.length > RING_MAX) s.ring.splice(0, s.ring.length - RING_MAX);
+  }
+
   /** First-sight bookkeeping: create the row + throttled registration. */
   private touch(token: string, sessionId?: string): Session {
     let s = this.sessions.get(token);
     const fresh = !s;
     if (!s) {
-      s = { token, override: null, inflight: 0, holds: [], registered: false, lastRegisterAttempt: 0 };
+      s = { token, override: null, inflight: 0, holds: [], registered: false, lastRegisterAttempt: 0, ring: [] };
       this.sessions.set(token, s);
     }
     // A captured id rides forward from the first request that carried it;
@@ -271,7 +354,14 @@ export class SessionGate {
   private async register(s: Session): Promise<void> {
     s.lastRegisterAttempt = this.now();
     try {
-      const ok = await this.deps.register(s.token, this.snapshot(s.token), s.session_id);
+      const ok = await this.deps.register(
+        s.token,
+        this.snapshot(s.token),
+        s.session_id,
+        // #45: send the compact history only when the session has traffic
+        // (an idle row stays exactly as it was — ADD-key posture).
+        ...(s.ring.length || s.model || s.tokens ? [sessionHistory(s, this.now()) as SessionHistory] : []),
+      );
       if (ok) {
         if (!this.linkUp) {
           this.linkUp = true;
@@ -314,6 +404,35 @@ export class SessionGate {
     };
     // 'close' covers clean finish, upstream error, and client abort.
     res.once('close', settle);
+    // #45: the response peek — when the proxy pipes the upstream response
+    // into res, the piped source is the upstream stream; an extra data
+    // listener there OBSERVES chunks (pipe keeps its own listener; extra
+    // listeners see copies, they never steal bytes) and stores the model
+    // the engine served + the last total_tokens streamed. Detaches once
+    // both facts are known so long-lived streams never keep parsing.
+    if (!s.model || !s.tokens) {
+      res.once('pipe', (src) => {
+        const onChunk = (chunk: Buffer | string) => {
+          if (!s.model) {
+            const model = sniffModelChunk(chunk);
+            if (model) s.model = model;
+          }
+          if (!s.tokens) {
+            const n = sniffUsageChunk(chunk);
+            if (n !== undefined) s.tokens = n;
+          }
+          if (s.model && s.tokens) detach();
+        };
+        const detach = () => {
+          src.removeListener('data', onChunk);
+          src.removeListener('end', detach);
+          src.removeListener('close', detach);
+        };
+        src.on('data', onChunk);
+        src.once('end', detach);
+        src.once('close', detach);
+      });
+    }
     forward(req, res, path);
   }
 
@@ -507,7 +626,7 @@ export class SessionGate {
   private ensure(token: string): Session {
     let s = this.sessions.get(token);
     if (!s) {
-      s = { token, override: null, inflight: 0, holds: [], registered: false, lastRegisterAttempt: 0 };
+      s = { token, override: null, inflight: 0, holds: [], registered: false, lastRegisterAttempt: 0, ring: [] };
       this.sessions.set(token, s);
     }
     return s;

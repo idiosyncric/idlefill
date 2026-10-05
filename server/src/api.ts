@@ -687,6 +687,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       last_activity?: number;
       gate?: unknown;
       session_id?: unknown;
+      history?: unknown;
     };
     const token = typeof body.token === 'string' ? body.token.trim() : '';
     if (!token) return reply.code(400).send({ error: 'token required' });
@@ -701,6 +702,10 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       // #42 Slice 0: the Hermes conversation id, forwarded verbatim the
       // same way (bounded/sanitized in registerSession, never a rejection).
       session_id: body.session_id,
+      // #45: the compact request history (per-minute counts + last model
+      // + last streamed tokens). Forwarded verbatim; the sanitizer lives
+      // in registerSession (drop-don't-reject, like the gate block).
+      ...(body.history !== undefined ? { history: body.history } : {}),
     });
     if (!res.ok) return reply.code(400).send({ error: res.reason ?? 'invalid' });
     return reply.code(res.created ? 201 : 200).send({ created: res.created, session: res.session });

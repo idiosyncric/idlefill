@@ -176,6 +176,11 @@
   .sess { display: flex; flex-wrap: wrap; gap: 8px; padding: 2px 0; font-size: 12px; align-items: baseline; }
   .sess .sname { min-width: 96px; font-weight: 600; }
   .sess .smeta { color: var(--dim); white-space: nowrap; }
+  /* #45: a per-row request-rate sparkline (the Usage section's inline-SVG
+     helper, shrunk). Exception-only: it renders ONLY when the router
+     reported a history block — rows from old routers stay exactly as-is. */
+  .sess .sspark { width: 84px; height: 16px; flex: none; }
+  .sess .sspark svg { width: 100%; height: 100%; display: block; }
   /* #44: the state word + the gate select are ONE right-pinned cluster —
      long meta (the hermes id) may wrap the tags onto a second line, but
      the control never strands alone or jumps rows. */
@@ -1016,6 +1021,22 @@ function sessBlock(sess, st) {
     '<span class="sname" title="session ' + esc(sess.token) + (sess.client_name ? " — registered by " + esc(sess.client_name) : "") + '">' +
     esc(shortTok) + (sess.client_name ? ' <span class="smeta">' + esc(sess.client_name) + "</span>" : "") +
     "</span>";
+  // #45 session detail (exception-only): the router-reported compact
+  // history — model tag, inline requests/min sparkline, last token total.
+  // A row with no history block renders exactly as before.
+  const hist = sess.history;
+  const histHtml = hist
+    ? (hist.model
+        ? ' <span class="smeta" title="last model this session negotiated (sniffed by the router from its requests)">model ' + esc(hist.model) + "</span>"
+        : "") +
+      (hist.tokens
+        ? ' <span class="smeta" title="token total of the last usage chunk the router streamed for this session">' +
+          (hist.tokens >= 1000 ? Math.round(hist.tokens / 100) / 10 + "k" : hist.tokens) + " tok</span>"
+        : "") +
+      (hist.rpm && hist.rpm.some((v) => v > 0)
+        ? ' <span class="sspark" title="requests/min, last 10 minutes">' + sparkline(hist.rpm, "--dim") + "</span>"
+        : "")
+    : "";
   const metaHtml =
     // #42 Slice 0 (exception-only): when the router captured a real Hermes
     // conversation id from the X-Hermes-Session-Id header, the row shows it
@@ -1067,7 +1088,7 @@ function sessBlock(sess, st) {
     "</select>";
   return '<div class="sess' + (stale ? " stale" : "") + '" data-sess="' + esc(shortTok) + '">' +
     '<span class="dot ' + (stale ? "off" : "on") + '" title="' + (stale ? "stale (no heartbeat within 90s)" : "live (heartbeat within 90s)") + '"></span>' +
-    nameHtml + metaHtml + staleTag + forcedTag + queuedTag +
+    nameHtml + metaHtml + histHtml + staleTag + forcedTag + queuedTag +
     '<span class="sright"><span class="sstate ' + w.cls + '" title="' + esc(w.note) + '">' + esc(w.label) + "</span>" +
     gate + "</span>" +
     "</div>";

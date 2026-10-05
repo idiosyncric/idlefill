@@ -276,7 +276,7 @@ parks anything sends NO block, and the arbiter then CLEARS any stored gate
 dropped, never rejected; an old arbiter simply ignores the extra field.
 
 ```
-POST /api/sessions/register  { "token": "…", "gate": { "state": "active" | "queued", "waiting": 3, "position": 1 }, "session_id": "…" }
+POST /api/sessions/register  { "token": "…", "gate": { "state": "active" | "queued", "waiting": 3, "position": 1 }, "session_id": "…", "history": { "rpm": [0,0,1,2,0,0,0,0,3,5], "model": "…", "tokens": 1234 } }
 ```
 
 **Queue position (#44).** A `queued` block also carries `position` — that
@@ -287,6 +287,20 @@ position drops only the key — the gate block still stores; an old router
 keeps the exact old shape. Dashboard queued rows render `queued · #N` from
 it (the `N waiting` form survives only when the router is too old to
 report positions).
+
+**Session detail (#45).** The heartbeat also carries a `history` ADD-key
+when the session has traffic: `{ "rpm": [10 per-minute counts,
+oldest→newest], "model": "…", "tokens": 1234 }`. The ROUTER computes it —
+a capped in-memory ring counts every request it sees (forwarded OR
+parked), and the model + token totals come from the upstream RESPONSE
+(the engine echoes the served model; its usage block carries
+total_tokens). The request body is never peeked: a parked request's body
+must stay unconsumed for the forward on admission. The arbiter stamps
+`reported_at`, sanitizes per-key (drop-don't-reject; an all-empty block
+is absent; an absent report never clears a stored block), and the
+dashboard rows render the facts exception-only: `model <name>` tag,
+`18.4k tok`, and a tiny inline sparkline of requests/min. Legacy rows
+render unchanged.
 
 **Force, exposed (#44).** The dashboard's per-session gate select is now a
 three-option gate: Session Running / Session Paused / **Session Forced**.

@@ -1525,7 +1525,7 @@ export class ClientDaemon {
         holdCapMs: this.cfg.session_hold_cap_ms ?? 120_000,
         clientName: this.cfg.client_name,
         log: (m) => this.log.info(m),
-        register: async (token, gate, sessionId) => {
+        register: async (token, gate, sessionId, history) => {
           const { status } = await api(this.cfg, 'POST', '/api/sessions/register', {
             token,
             ...(this.clientId ? { client_id: this.clientId } : {}),
@@ -1541,6 +1541,11 @@ export class ClientDaemon {
             // some request on this token carried the header; an old arbiter
             // ignores it (back-compat).
             ...(sessionId ? { session_id: sessionId } : {}),
+            // #45 session detail: the compact request history the router
+            // keeps per session (10×60s request counts + last model +
+            // last streamed token total). ADD-key: absent for a session
+            // with no recorded traffic; an old arbiter ignores it.
+            ...(history ? { history } : {}),
           });
           return status === 200 || status === 201;
         },

@@ -427,6 +427,20 @@ export interface SessionRecord {
    * Sanitizer posture: bounded printable string, drop-don't-reject.
    */
   session_id?: string;
+  /**
+   * #45 session detail: the compact request history the router keeps per
+   * session, carried on the register heartbeat as the `history` ADD-key.
+   * `rpm`: requests/min counts, 60s buckets, oldest→newest, exactly 10
+   * entries (10 minutes) — computed by the ROUTER at report time (the
+   * router sees every request; the arbiter only echoes). `model`: last
+   * model name sniffed from a forwarded chat-completions body. `tokens`:
+   * last total_tokens observed in the session's streamed usage.
+   * `reported_at`: when the arbiter received this snapshot (rpm ages only
+   * while heartbeats keep flowing; a stale row dims via last_seen).
+   * Absent = pre-slice row or a session with no recorded traffic — the
+   * surfaces render unchanged. Sanitizer posture: drop-don't-reject.
+   */
+  history?: { rpm: number[]; model?: string; tokens?: number; reported_at: number };
 }
 
 /**

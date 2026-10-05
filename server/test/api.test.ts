@@ -1751,3 +1751,57 @@ test('dashboard carries the force control + the queue-position tag (#44)', async
   assert.ok(html.includes('forced</span>') && html.includes('slot cap'), 'the exception-only forced tag exists');
   assert.ok(html.includes('queued \u00b7 #"') || html.includes('position " + position'), 'the queued tag renders the router-reported position');
 });
+
+// ---------------------------------------------------------------------------
+// #45 session detail: the `history` ADD-key (10×60s request counts +
+// last model + last streamed tokens). Sanitizer posture: drop-don't-reject
+// per key; a block with nothing valid is absent; absent leaves the stored
+// block (the router refreshes it every heartbeat it has traffic).
+// ---------------------------------------------------------------------------
+
+test('session history (#45): valid block stores + echoes; malformed keys drop; empty block is absent', async () => {
+  const rpm = [0, 0, 0, 1, 2, 0, 0, 0, 3, 5];
+  const a = await fetch(`${base}/api/sessions/register`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({ token: 's45-a', history: { rpm, model: 'qwen3.8-27b', tokens: 1234 } }),
+  });
+  assert.equal(a.status, 201);
+  let list = await (await fetch(`${base}/api/sessions`, { headers: auth })).json() as { sessions: { token: string; history?: { rpm: number[]; model?: string; tokens?: number; reported_at: number } }[] };
+  const ha = list.sessions.find((s) => s.token === 's45-a')!.history!;
+  assert.deepEqual(ha.rpm, rpm, 'the per-minute series rides verbatim');
+  assert.equal(ha.model, 'qwen3.8-27b');
+  assert.equal(ha.tokens, 1234);
+  assert.ok(ha.reported_at > 0, 'the arbiter stamps when the snapshot arrived');
+
+  // Malformed keys drop per-key; the valid ones survive.
+  await fetch(`${base}/api/sessions/register`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({ token: 's45-b', history: { rpm: [1, -5, 'x', 2], model: '', tokens: 1e15 } }),
+  });
+  list = await (await fetch(`${base}/api/sessions`, { headers: auth })).json() as typeof list;
+  const hb = list.sessions.find((s) => s.token === 's45-b')!.history!;
+  assert.deepEqual(hb.rpm, [1, 2], 'negative/non-integer counts dropped');
+  assert.equal(hb.model, undefined, 'empty model dropped');
+  assert.equal(hb.tokens, undefined, 'out-of-range tokens dropped');
+
+  // A block with NOTHING valid is treated as absent — the row has no key.
+  const c = await fetch(`${base}/api/sessions/register`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({ token: 's45-c', history: { rpm: [] } }),
+  });
+  assert.equal(c.status, 201);
+  list = await (await fetch(`${base}/api/sessions`, { headers: auth })).json() as typeof list;
+  assert.equal(list.sessions.find((s) => s.token === 's45-c')!.history, undefined, 'empty history = absent');
+
+  // Absent leaves the stored block standing (ADD-key posture).
+  await fetch(`${base}/api/sessions/register`, { method: 'POST', headers: auth, body: JSON.stringify({ token: 's45-a' }) });
+  list = await (await fetch(`${base}/api/sessions`, { headers: auth })).json() as typeof list;
+  assert.deepEqual(list.sessions.find((s) => s.token === 's45-a')!.history!.rpm, rpm, 'no report never clears the block');
+});
+
+test('dashboard renders the session history facts (#45) exception-only', async () => {
+  const html = await (await fetch(base + '/')).text();
+  assert.ok(html.includes('hist.rpm'), 'the row reads the router-reported per-minute series');
+  assert.ok(html.includes('last model this session negotiated'), 'the model tag carries a tooltip');
+  assert.ok(html.includes('sspark'), 'the inline sparkline class exists for session rows');
+});

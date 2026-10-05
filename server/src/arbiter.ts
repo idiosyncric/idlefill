@@ -125,6 +125,38 @@ function cleanReportedId(v: unknown): string | undefined {
   return s;
 }
 
+/**
+ * #45: sanitize a reported request-history block (#45). Per-key
+ * drop-don't-reject: rpm must be an array of integers 0..1e6 (truncated
+ * to the newest 10); model rides the id sanitizer; tokens an integer
+ * 0..1e12. A block with NOTHING valid is treated as absent (undefined).
+ */
+function cleanReportedHistory(
+  v: unknown,
+  now: number,
+): { rpm: number[]; model?: string; tokens?: number; reported_at: number } | undefined {
+  if (typeof v !== 'object' || v === null) return undefined;
+  const h = v as { rpm?: unknown; model?: unknown; tokens?: unknown };
+  const out: { rpm: number[]; model?: string; tokens?: number; reported_at: number } = {
+    rpm: [],
+    reported_at: now,
+  };
+  if (Array.isArray(h.rpm)) {
+    const clean = h.rpm
+      .filter((n) => typeof n === 'number' && Number.isInteger(n) && n >= 0 && n <= 1_000_000)
+      .slice(-10);
+    out.rpm = clean;
+  }
+  const model = cleanReportedId(h.model);
+  if (model) out.model = model;
+  if (typeof h.tokens === 'number' && Number.isInteger(h.tokens) && h.tokens >= 0 && h.tokens <= 1e12) {
+    out.tokens = h.tokens;
+  }
+  // Nothing survived sanitization: treat the whole block as absent.
+  if (!out.rpm.length && !out.model && out.tokens === undefined) return undefined;
+  return out;
+}
+
 export type LeaseRejectionReason =
   | 'not_idle'
   | 'busy'
@@ -754,7 +786,7 @@ export class Arbiter {
    */
   registerSession(
     token: string,
-    opts: { client_id?: string; client_name?: string; server_id?: string; last_activity?: number; gate?: unknown; session_id?: unknown; now?: number },
+    opts: { client_id?: string; client_name?: string; server_id?: string; last_activity?: number; gate?: unknown; session_id?: unknown; history?: unknown; now?: number },
   ): { ok: boolean; reason?: string; created: boolean; session?: SessionRecord } {
     const t = typeof token === 'string' ? token.trim() : '';
     if (!t || t.length > 128) return { ok: false, reason: 'token required (≤128 chars)', created: false };
@@ -764,6 +796,10 @@ export class Arbiter {
     // bounded printable, and an invalid value is DROPPED (never a rejection,
     // never a clear of a stored id).
     const sessionId = cleanReportedId(opts.session_id);
+    // #45: the compact request history. Valid block replaces; absent
+    // leaves the stored block (ADD-key posture — heartbeats with traffic
+    // refresh it; an old client simply never sends it).
+    const history = cleanReportedHistory(opts.history, nowMs);
     const s = this.store.state;
     const existing = s.sessions.find((x) => x.token === t);
     if (existing) {
@@ -781,6 +817,7 @@ export class Arbiter {
       // absent one never clears a stored id (headerless requests on the
       // same token are routine).
       if (sessionId) existing.session_id = sessionId;
+      if (history) existing.history = history;
       this.store.save();
       return { ok: true, created: false, session: existing };
     }
@@ -796,6 +833,7 @@ export class Arbiter {
       // (the row starts gate-less, exactly like an absent block).
       ...(gateVerdict !== undefined ? { gate: gateVerdict } : {}),
       ...(sessionId ? { session_id: sessionId } : {}),
+      ...(history ? { history } : {}),
     };
     s.sessions.push(session);
     this.store.appendEvent({ kind: 'session_registered', detail: `${t}${session.client_name ? ` (${session.client_name})` : ''}${session.server_id ? ` → ${session.server_id}` : ''}` });
