@@ -71,11 +71,24 @@ the operator's gate — no lease is ever interrupted automatically.
 
 ## Live verification (2026-10-05)
 
-The issue's live instance was real: the deployed daemon predates the
-gate-state merge and silently never sent the `gate` block. Post-deploy
-check per the issue's acceptance criteria — see the note appended below
-in the closing issue comment (arbiter redeployed, daemon kickstarted,
-`revision` observed on `/api/state`, stale→clear cycle exercised).
+The issue's live instance was real: the deployed daemon predated the
+gate-state merge and silently never sent the `gate` block.
+
+- Arbiter redeployed via the standard path (visible Orca tab, wrapper,
+  `IDLEFILL-DEPLOY-DONE-rc0`): image `idlefill-server:086f196` on urza,
+  healthcheck pass, both remotes pushed.
+- Daemon kickstart (`launchctl kickstart -k gui/$(id -u)/
+  com.sam.idlefill.client`, 0 active leases confirmed first) brought up
+  the #49 client: the live client row now reads
+  `revision: 086f196e1ea9ee…` — the full boot SHA, matching the repo
+  HEAD at boot. Absent before the restart; present after.
+- Stale→clear cycle exercised for real: after a further docs commit
+  advanced the tree to `f1bc4c8` WITHOUT touching the daemon, the
+  arbiter row still reported `086f196` → mismatch (the surfaces' pure
+  prefix rule flags it: `behind=true`). One `kickstart -k` later the
+  row reported `f1bc4c8` → `behind=false`, cleared within one
+  heartbeat, exactly as specified. The daemon now runs at the tree's
+  HEAD; the flag is clear.
 
 ## Back-compat
 
