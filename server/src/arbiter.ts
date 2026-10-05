@@ -94,13 +94,20 @@ export function leaseServerId(lease: { server_id?: string }): string {
  *   - anything else → undefined: INVALID, the field is DROPPED (never a
  *     rejected registration) and the stored value stands.
  */
-function normalizeSessionGate(v: unknown): { state: 'active' | 'queued'; waiting: number } | null | undefined {
+function normalizeSessionGate(v: unknown): { state: 'active' | 'queued'; waiting: number; position?: number } | null | undefined {
   if (v === null || v === undefined) return null;
   if (typeof v !== 'object' || Array.isArray(v)) return undefined;
-  const g = v as { state?: unknown; waiting?: unknown };
+  const g = v as { state?: unknown; waiting?: unknown; position?: unknown };
   if (g.state !== 'active' && g.state !== 'queued') return undefined;
   if (typeof g.waiting !== 'number' || !Number.isFinite(g.waiting) || !Number.isInteger(g.waiting) || g.waiting < 0) return undefined;
-  return { state: g.state, waiting: g.waiting };
+  // #44 add-key: 1-based queue position, only meaningful while queued.
+  // Malformed = dropped (the block still rides, minus the key) — never a
+  // rejected registration; absent = an old router (the row keeps no key).
+  const position =
+    typeof g.position === 'number' && Number.isInteger(g.position) && g.position >= 1
+      ? g.position
+      : undefined;
+  return { state: g.state, waiting: g.waiting, ...(position !== undefined ? { position } : {}) };
 }
 
 /**

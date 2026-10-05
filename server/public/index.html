@@ -176,8 +176,12 @@
   .sess { display: flex; flex-wrap: wrap; gap: 8px; padding: 2px 0; font-size: 12px; align-items: baseline; }
   .sess .sname { min-width: 96px; font-weight: 600; }
   .sess .smeta { color: var(--dim); white-space: nowrap; }
-  .sess .sstate { margin-left: auto; font-size: 12px; font-weight: 600; white-space: nowrap; }
-  .sess .gate { margin-left: 8px; }
+  /* #44: the state word + the gate select are ONE right-pinned cluster —
+     long meta (the hermes id) may wrap the tags onto a second line, but
+     the control never strands alone or jumps rows. */
+  .sess .sright { margin-left: auto; display: inline-flex; gap: 8px; align-items: baseline; white-space: nowrap; flex-shrink: 0; }
+  .sess .sstate { font-size: 12px; font-weight: 600; white-space: nowrap; }
+  .sess .gate { margin-left: 0; }
   .sess.stale { opacity: 0.55; }
   /* The worker list collapses (the tray chevron's 150ms pattern, applied to
      a per-project toggle). Expanded by default; state per project in
@@ -341,7 +345,6 @@
     <button id="vtab-sessions" type="button" role="tab" aria-selected="false" data-view="sessions">Sessions<span class="vbadge" id="badge-sessions" hidden></span></button>
     <button id="vtab-usage" type="button" role="tab" aria-selected="false" data-view="usage">Usage</button>
   </div>
-  <span class="sub">the same page the browser shows — one surface per machine</span>
 </div>
 
 <main>
@@ -1030,6 +1033,12 @@ function sessBlock(sess, st) {
   const staleTag = stale
     ? ' <span class="tag" title="no heartbeat from this session in the last 90s — the router may have dropped it">stale</span>'
     : "";
+  // #44 (exception-only): a FORCED session bypasses the slot cap — an
+  // operator action worth seeing at a glance, tagged the same way a paused
+  // row's state word is. An unforced row renders exactly as before.
+  const forcedTag = sess.override?.override === "force"
+    ? ' <span class="tag" style="color:var(--accent);border-color:var(--accent)" title="operator forced this session — the router admits it past the session slot cap until the override is cleared">forced</span>'
+    : "";
   // Gate-state (#40): the router reports parked requests waiting for
   // admission. An ADDITIONAL fact beside the state word (like `stale`) —
   // the state word never changes, so paused+queued shows both. Absent /
@@ -1037,27 +1046,39 @@ function sessBlock(sess, st) {
   const gateBlk = sess.gate;
   const queued = !!gateBlk && gateBlk.state === "queued";
   const waiting = gateBlk && Number.isFinite(gateBlk.waiting) ? Math.floor(gateBlk.waiting) : 0;
+  // #44: the router also reports this session's place in the FIFO line
+  // (queue order is router-local truth — the tag shows it verbatim).
+  const position = gateBlk && Number.isFinite(gateBlk.position) ? Math.floor(gateBlk.position) : 0;
   const queuedTag = queued
-    ? ' <span class="tag" title="held at the router behind another session">' +
-      (waiting > 1 ? "queued · " + waiting + " waiting" : "queued") + "</span>"
+    ? ' <span class="tag" title="' + (position > 0 ? "position " + position + " in the router\u0027s FIFO queue — held behind another session" : "held at the router behind another session") + '">' +
+      (position > 0
+        ? "queued \u00b7 #" + position
+        : waiting > 1 ? "queued \u00b7 " + waiting + " waiting" : "queued") + "</span>"
     : "";
   const gate =
     '<select class="gate small" data-token="' + esc(sess.token) + '" title="set gate for session ' + esc(sess.token) + '">' +
     '<option value="paused"' + (sess.override?.override === "pause" ? " selected" : "") + ">" + esc(sessGateLabelText("paused")) + "</option>" +
-    '<option value="running"' + (sess.override?.override !== "pause" ? " selected" : "") + ">" + esc(sessGateLabelText("running")) + "</option>" +
+    '<option value="running"' + (sess.override?.override !== "pause" && sess.override?.override !== "force" ? " selected" : "") + ">" + esc(sessGateLabelText("running")) + "</option>" +
+    // #44: force was always honored at the arbiter + router (route()
+    // forwards at once, past the slot cap); the dashboard was the only
+    // surface that never offered it. Same optimistic+revert write pattern
+    // as pause.
+    '<option value="forced"' + (sess.override?.override === "force" ? " selected" : "") + ">" + esc(sessGateLabelText("forced")) + "</option>" +
     "</select>";
   return '<div class="sess' + (stale ? " stale" : "") + '" data-sess="' + esc(shortTok) + '">' +
     '<span class="dot ' + (stale ? "off" : "on") + '" title="' + (stale ? "stale (no heartbeat within 90s)" : "live (heartbeat within 90s)") + '"></span>' +
-    nameHtml + metaHtml + staleTag + queuedTag +
-    '<span class="sstate ' + w.cls + '" title="' + esc(w.note) + '">' + esc(w.label) + "</span>" +
-    gate +
+    nameHtml + metaHtml + staleTag + forcedTag + queuedTag +
+    '<span class="sright"><span class="sstate ' + w.cls + '" title="' + esc(w.note) + '">' + esc(w.label) + "</span>" +
+    gate + "</span>" +
     "</div>";
 }
 
 // Gate option text for a session (the same two-option gate language as the
 // engine / project / worker gates; the live state lives in the state word).
+// #44 adds the third option: 'forced' — the slot-cap bypass, arbiter +
+// router honored it all along, the dashboard now offers it.
 function sessGateLabelText(mode) {
-  return mode === "paused" ? "Session Paused" : "Session Running";
+  return mode === "paused" ? "Session Paused" : mode === "forced" ? "Session Forced" : "Session Running";
 }
 
 // ---------------------------------------------------------------------------
@@ -1675,7 +1696,11 @@ async function setProjectPaused(name, paused) {
 // Pause/resume one interactive session (POST /api/sessions/:token/override —
 // the same token-gated write shape as the client override; 'pause' asks the
 // router to hold the session's traffic, null clears the override).
-async function setSessionPaused(sessToken, paused) {
+async function setSessionOverrideMode(sessToken, mode) {
+  // mode: 'running' | 'paused' | 'forced' → override null | pause | force
+  // (the API contract, #32 vocabulary). #44: force was always honored
+  // arbiter-side + at the router (route() bypasses the slot cap); the
+  // dashboard was the only surface that never offered it.
   const token = gateToken();
   if (!token) {
     flashGateMsg("gate needs the arbiter API token — paste it into 'gate token' in the header", "err", true);
@@ -1686,7 +1711,7 @@ async function setSessionPaused(sessToken, paused) {
     }
     return false;
   }
-  const body = paused ? { override: "pause" } : { override: null };
+  const body = mode === "paused" ? { override: "pause" } : mode === "forced" ? { override: "force" } : { override: null };
   try {
     const res = await fetch("/api/sessions/" + encodeURIComponent(sessToken) + "/override?token=" + encodeURIComponent(token), {
       method: "POST",
@@ -1699,7 +1724,12 @@ async function setSessionPaused(sessToken, paused) {
       flashGateMsg(detail, "err");
       return false;
     }
-    flashGateMsg(paused ? "session paused — the router holds its traffic" : "session running — gate open", "ok");
+    flashGateMsg(
+      mode === "paused" ? "session paused — the router holds its traffic"
+        : mode === "forced" ? "session forced — the slot cap is bypassed for it until cleared"
+        : "session running — gate open",
+      "ok",
+    );
     refresh();
     return true;
   } catch (err) {
@@ -1752,7 +1782,7 @@ $("projects").addEventListener("change", async (e) => {
 $("sessions").addEventListener("change", async (e) => {
   const sessSel = e.target.closest("select.gate.small[data-token]");
   if (!sessSel) return;
-  const ok = await setSessionPaused(sessSel.dataset.token, sessSel.value === "paused");
+  const ok = await setSessionOverrideMode(sessSel.dataset.token, sessSel.value);
   if (!ok) refresh(); // failed change → re-render from server truth (row snaps back)
 });
 

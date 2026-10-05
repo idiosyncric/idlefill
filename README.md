@@ -276,8 +276,26 @@ parks anything sends NO block, and the arbiter then CLEARS any stored gate
 dropped, never rejected; an old arbiter simply ignores the extra field.
 
 ```
-POST /api/sessions/register  { "token": "…", "gate": { "state": "active" | "queued", "waiting": 3 }, "session_id": "…" }
+POST /api/sessions/register  { "token": "…", "gate": { "state": "active" | "queued", "waiting": 3, "position": 1 }, "session_id": "…" }
 ```
+
+**Queue position (#44).** A `queued` block also carries `position` — that
+session's 1-based place in the router's FIFO line (queue order is
+router-local truth; the arbiter only echoes the report). The session
+HOLDING a slot sends no position (it is not in the queue). A malformed
+position drops only the key — the gate block still stores; an old router
+keeps the exact old shape. Dashboard queued rows render `queued · #N` from
+it (the `N waiting` form survives only when the router is too old to
+report positions).
+
+**Force, exposed (#44).** The dashboard's per-session gate select is now a
+three-option gate: Session Running / Session Paused / **Session Forced**.
+`force` was always honored (the arbiter stores it, the router admits a
+forced session past the slot cap and releases its parked holds); the
+dashboard was the surface that never offered it. A forced row gets the
+exception-only `forced` tag. Queue *manipulation* (promote/remove) is a
+deferred slice — it needs an arbiter→router command channel that does not
+exist yet.
 
 **Hermes conversation id (#42 Slice 0).** When a request on a session path
 carries the `X-Hermes-Session-Id` header, the router captures it and the

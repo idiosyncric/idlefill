@@ -327,14 +327,14 @@ test('snapshot: active / queued / both / idle — the router queue truth', async
   // B parks behind A ⇒ queued with its waiting count.
   const resB = postChat(proxy.base_url, '/s/tokB/v1/chat/completions');
   await waitFor(() => gate.queueDepth === 1, 1000, 'B queued');
-  assert.deepEqual(gate.snapshot('tokB'), { state: 'queued', waiting: 1 }, 'parked ⇒ queued + count');
+  assert.deepEqual(gate.snapshot('tokB'), { state: 'queued', waiting: 1, position: 1 }, 'parked ⇒ queued + count + 1st in line (#44)');
 
   // BOTH: pause A while it still holds the slot — its next request parks
   // behind the operator hold while inflight > 0 ⇒ active, count reported.
   gate.onStatePoll([{ token: 'tokA', override: { override: 'pause', until: null } }]);
   const resA2 = postChat(proxy.base_url, '/s/tokA/v1/chat/completions');
   await new Promise((r) => setTimeout(r, 100));
-  assert.deepEqual(gate.snapshot('tokA'), { state: 'active', waiting: 1 }, 'inflight + parked ⇒ active with the count');
+  assert.deepEqual(gate.snapshot('tokA'), { state: 'active', waiting: 1 }, 'inflight + parked ⇒ active with the count (no position — active holds a slot, not in the queue)');
 
   // Drain: A finishes, B is admitted, then A's parked request follows —
   // releases are sequential (each parked request only reaches the upstream
@@ -376,7 +376,7 @@ test('register calls carry the gate snapshot (active at refresh, queued while pa
   await waitFor(() => calls.length === 4, 1000, 'heartbeat registers');
   const byTok = new Map(calls.slice(2).map((c) => [c.token, c.gate]));
   assert.deepEqual(byTok.get('tokA'), { state: 'active', waiting: 0 });
-  assert.deepEqual(byTok.get('tokB'), { state: 'queued', waiting: 1 });
+  assert.deepEqual(byTok.get('tokB'), { state: 'queued', waiting: 1, position: 1 });
 
   // Drain everything (sequential releases — B only reaches the upstream
   // after A's slot frees); the next heartbeat then reports idle ⇒ null
@@ -705,4 +705,34 @@ test('#43 register heartbeat carries proxy_port once the proxy binds', async () 
     await arb.close();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('#44 queue position on the wire: three parked sessions carry 1-based FIFO places', async () => {
+  const clock = { t: 5_000_000 };
+  const { gate, calls } = makeGate({ maxActive: 1, now: () => clock.t });
+  const { proxy, up } = await harness({ gate });
+
+  const resA = postChat(proxy.base_url, '/s/posA/v1/chat/completions'); // takes the slot
+  await waitFor(() => up.hits.length === 1, 3000, 'A forwarded');
+  const resB = postChat(proxy.base_url, '/s/posB/v1/chat/completions'); // parks first
+  const resC = postChat(proxy.base_url, '/s/posC/v1/chat/completions'); // parks second
+  await waitFor(() => gate.queueDepth === 2, 2000, 'B and C queued');
+
+  clock.t += 10_001;
+  gate.heartbeat();
+  await waitFor(() => calls.filter((c) => c.gate?.state === 'queued').length >= 2, 3000, 'queued heartbeats');
+  const pos = (tok: string) => calls.filter((c) => c.token === tok).at(-1)!.gate?.position;
+  assert.equal(pos('posB'), 1, 'B parked first ⇒ 1st in line');
+  assert.equal(pos('posC'), 2, 'C parked second ⇒ 2nd in line');
+  assert.equal(calls.filter((c) => c.token === 'posA').at(-1)!.gate?.position, undefined, 'the session HOLDING the slot reports no position');
+
+  // Drain (sequential releases); nothing wedged, the parked path unchanged.
+  up.release(1);
+  assert.equal((await resA).status, 200);
+  await waitFor(() => up.hits.length === 2, 3000, 'B admitted');
+  up.release(1);
+  assert.equal((await resB).status, 200);
+  await waitFor(() => up.hits.length === 3, 3000, 'C admitted');
+  up.release(1);
+  assert.equal((await resC).status, 200);
 });

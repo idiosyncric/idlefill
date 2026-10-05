@@ -48,6 +48,13 @@ export type SessionOverrideKind = 'pause' | 'force';
 export interface SessionGateSnapshot {
   state: 'active' | 'queued';
   waiting: number;
+  /**
+   * #44: the session's 1-based position in the router's FIFO queue, when
+   * state is 'queued' (the queue order lives ONLY at the router — the
+   * arbiter sees parked counts, not order). Absent when not queued, or
+   * with an old arbiter that never echoes it back.
+   */
+  position?: number;
 }
 
 /** One row of GET /apistate → sessions[] as the client sees it. */
@@ -188,7 +195,12 @@ export class SessionGate {
     const s = this.sessions.get(token);
     if (!s) return null;
     if (s.inflight > 0) return { state: 'active', waiting: s.holds.length };
-    if (s.holds.length > 0) return { state: 'queued', waiting: s.holds.length };
+    if (s.holds.length > 0) {
+      // #44: a queued session also carries its place in line (the queue is
+      // router-local truth; surfaces render the number verbatim).
+      const pos = this.queue.indexOf(token) + 1;
+      return { state: 'queued', waiting: s.holds.length, ...(pos > 0 ? { position: pos } : {}) };
+    }
     return null;
   }
 

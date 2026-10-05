@@ -416,7 +416,7 @@ export interface SessionRecord {
    * (idle session) — a session that stopped waiting never stays tagged.
    * Absent on rows persisted before gate-state.
    */
-  gate?: { state: 'active' | 'queued'; waiting: number } | null;
+  gate?: { state: 'active' | 'queued'; waiting: number; position?: number } | null;
   /**
    * The REAL Hermes conversation id (#42 Slice 0), captured by the router
    * from the `X-Hermes-Session-Id` request header and published on the

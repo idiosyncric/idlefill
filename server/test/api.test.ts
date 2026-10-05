@@ -1695,3 +1695,59 @@ test('dashboard carries the session launcher (#43)', async () => {
   assert.ok(html.includes('mintedSessions') && html.includes('mintToken'), 'the mint lives page-side (crypto in the browser), persisted across refresh');
   assert.ok(html.includes('/model http://127.0.0.1:') || html.includes('/model http://127.0.0.1:" +'), 'the handed-over line is the exact /model command');
 });
+
+// ---------------------------------------------------------------------------
+// #44 queue transparency + exposed force:
+//  - the gate block's position ADD-key (1-based FIFO place, router-local
+//    truth): stored/echoed on a valid report; malformed dropped (the block
+//    still rides minus the key); absent = old router, row unchanged.
+//  - force rides the session override end-to-end (already covered by
+//    arbiter.test setSessionOverride + the router's route() bypass) — the
+//    dashboard now offers it as a third gate option.
+// ---------------------------------------------------------------------------
+
+test('queue position (#44): a valid position stores + echoes; malformed drops only the key', async () => {
+  await fetch(`${base}/api/sessions/register`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({ token: 's44-pos', gate: { state: 'queued', waiting: 2, position: 3 } }),
+  });
+  let list = await (await fetch(`${base}/api/sessions`, { headers: auth })).json() as { sessions: { token: string; gate?: { state: string; waiting: number; position?: number } }[] };
+  assert.deepEqual(list.sessions.find((s) => s.token === 's44-pos')!.gate, { state: 'queued', waiting: 2, position: 3 }, 'the queued row carries its place in line');
+
+  // A malformed position drops ONLY the key — the queued state still rides
+  // (drop-don't-reject, per-key, inside the gate block).
+  await fetch(`${base}/api/sessions/register`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({ token: 's44-pos', gate: { state: 'queued', waiting: 1, position: 0 } }),
+  });
+  list = await (await fetch(`${base}/api/sessions`, { headers: auth })).json() as typeof list;
+  assert.deepEqual(list.sessions.find((s) => s.token === 's44-pos')!.gate, { state: 'queued', waiting: 1 }, 'position=0 is dropped; the block minus the key stores');
+
+  // An old router (no key): the block stores without position, unchanged.
+  await fetch(`${base}/api/sessions/register`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({ token: 's44-old', gate: { state: 'queued', waiting: 1 } }),
+  });
+  list = await (await fetch(`${base}/api/sessions`, { headers: auth })).json() as typeof list;
+  assert.deepEqual(list.sessions.find((s) => s.token === 's44-old')!.gate, { state: 'queued', waiting: 1 }, 'old routers keep the exact old shape');
+});
+
+test('force on a session row (#44): the override stores, state echoes it, clear removes it', async () => {
+  await fetch(`${base}/api/sessions/register`, { method: 'POST', headers: auth, body: JSON.stringify({ token: 's44-force' }) });
+  const set = await fetch(`${base}/api/sessions/s44-force/override`, {
+    method: 'POST', headers: auth, body: JSON.stringify({ override: 'force' }),
+  });
+  assert.equal(set.status, 200, 'the API accepts force for a session (it always did — #44 exposes the control)');
+  let st = (await (await fetch(`${base}/api/state?limit=1`, { headers: auth })).json()) as { sessions: { token: string; override: { override: string } | null }[] };
+  assert.equal(st.sessions.find((s) => s.token === 's44-force')!.override!.override, 'force');
+  await fetch(`${base}/api/sessions/s44-force/override`, { method: 'POST', headers: auth, body: JSON.stringify({ override: null }) });
+  st = (await (await fetch(`${base}/api/state?limit=1`, { headers: auth })).json()) as typeof st;
+  assert.equal(st.sessions.find((s) => s.token === 's44-force')!.override, null, 'clear returns the row to the cap');
+});
+
+test('dashboard carries the force control + the queue-position tag (#44)', async () => {
+  const html = await (await fetch(base + '/')).text();
+  assert.ok(html.includes('value="forced"') && html.includes('Session Forced'), 'the session gate select offers force');
+  assert.ok(html.includes('forced</span>') && html.includes('slot cap'), 'the exception-only forced tag exists');
+  assert.ok(html.includes('queued \u00b7 #"') || html.includes('position " + position'), 'the queued tag renders the router-reported position');
+});
