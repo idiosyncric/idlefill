@@ -70,8 +70,12 @@ if [ -n "$LIVE_PIDS" ]; then
 fi
 
 # ---- render + byte-verify (never edit the template) -----------------------
-TMP="$(mktemp "$TARGET.render.XXXXXX")"
-trap 'rm -f "$TMP"' EXIT
+# systemd-analyze verify parses the FILENAME as the unit name — a mktemp
+# file without the .service suffix dies with "Failed to prepare filename:
+# Invalid argument". Render into a temp DIR under the real unit name.
+RDIR="$(mktemp -d "${TMPDIR:-/tmp}/idlefill-unit.XXXXXX")"
+TMP="$RDIR/$UNIT.service"
+trap 'rm -rf "$RDIR"' EXIT
 sed -e "s|@REPO@|$REPO|g" -e "s|@NPATH@|$NPATH|g" "$TEMPLATE" > "$TMP"
 
 # byte-verify: no placeholder survives, and the substituted paths point at
