@@ -172,6 +172,12 @@ async function main(): Promise<void> {
         metrics.recordLeaseEnd(r.lease, { now: Date.now() });
       }
       const now = Date.now();
+      // Mesh pull (#50): refresh peer snapshots on the SAME poll cadence.
+      // (The #50 report said "refresh rides the existing tickOnce" — it
+      // never actually did: mesh.refresh had no production caller, so the
+      // read plane could never federate live. Wired here for #60 A4.)
+      // refresh() never throws — each peer's failure rides its own row.
+      if (mesh.enabled) await mesh.refresh(now);
       sampleEngines(now);
       rollupDue(now);
     } catch (err) {
