@@ -16,6 +16,6 @@
   },
   "scripts": {
     "build-queue": "node queue.mjs",
-    "test": "node --test queue.test.mjs mcp.test.mjs"
+    "test": "node --test queue.test.mjs mcp.test.mjs cycle-tools.test.mjs"
   }
 }

@@ -432,6 +432,332 @@ export function rebuildDue(state: RebuildRunState | null, everyMinutes: number, 
 }
 
 // ---------------------------------------------------------------------------
+// Dev cycles (issue #58): the cycles file + the cycle driver
+// (docs/architecture/dev-cycles.md D1-D7 — the spike proved the machine)
+// ---------------------------------------------------------------------------
+
+/** One gate inside a cycle item: its own queue job + the rule the driver
+ *  applies to the job's result line. The rule is stored VERBATIM (the Phase 2
+ *  self-improvement seam, D8); an unrecognized rule never passes (D6). */
+export interface CycleGateSpec {
+  name: string;
+  job_id: string;
+  rule: string;
+  /** Payload keys for the gate's queue line (merged with cycle_id + stage). */
+  payload?: Record<string, unknown>;
+}
+
+/** One work item inside a cycle: its queue job + the gates that follow it. */
+export interface CycleItemSpec {
+  job_id: string;
+  gates: CycleGateSpec[];
+  /** Payload keys for the item's queue line (merged with cycle_id + stage). */
+  payload?: Record<string, unknown>;
+}
+
+/** The persisted cursor: current item index + current stage within the item. */
+export interface CycleCursor {
+  item: number;
+  stage: 'item' | 'gate';
+  gate: number;
+}
+
+/** One cycle row in the cycles file (D4 — the minimum for a restart to
+ *  resume mid-series; the driver rebuilds everything else from ground truth). */
+export interface CycleRow {
+  cycle_id: string;
+  project: string;
+  status: 'planned' | 'running' | 'paused' | 'done';
+  items: CycleItemSpec[];
+  cursor: CycleCursor;
+  verdicts: Record<string, 'passed' | 'quarantined'>;
+}
+
+/** `<queue_file>.cycles.json` — one file per project, next to the queue,
+ *  exactly the rebuildStateFile shape (D4). */
+export function cyclesFile(queueFile: string): string {
+  return `${queueFile}.cycles.json`;
+}
+
+/** Read the cycle rows. Missing / corrupt / non-array = null: cycles fail
+ *  closed (the state.json + readRebuildState posture) and the daemon keeps
+ *  draining the queue normally. */
+export function readCycles(queueFile: string): CycleRow[] | null {
+  const f = cyclesFile(queueFile);
+  if (!existsSync(f)) return null;
+  try {
+    const raw = JSON.parse(readFileSync(f, 'utf-8')) as unknown;
+    if (!Array.isArray(raw)) return null;
+    return raw as CycleRow[];
+  } catch {
+    return null;
+  }
+}
+
+/** Persist the cycle rows atomically (tmp + rename in the same directory —
+ *  the writeQueue / writeRebuildState discipline). */
+export function writeCycles(queueFile: string, rows: CycleRow[]): void {
+  const f = cyclesFile(queueFile);
+  mkdirSync(dirname(f), { recursive: true });
+  const tmp = `${f}.tmp-${process.pid}`;
+  writeFileSync(tmp, JSON.stringify(rows, null, 2) + '\n');
+  renameSync(tmp, f);
+}
+
+/**
+ * The per-project `cycle_max_in_flight` knob (owner decision 1: configurable,
+ * default 1). Resolved at call time from the raw client config — the typed
+ * loader shape does not carry it, and the driver must never bake it.
+ *
+ * The key's PRESENCE is also the project's opt-in to the cycle driver — the
+ * exact `scheduled_rebuild.enabled` gate shape (the maybeRunScheduledRebuilds
+ * pattern): a project without the knob never has its cycles file touched by
+ * the daemon. Absent = null (off). Present but not a finite number ≥ 1 = 1
+ * (the owner's default cap).
+ */
+export function resolveCycleMaxInFlight(projectName: string, fromDir: string = clientDir): number | null {
+  for (const cand of [
+    join(fromDir, 'config.json'),
+    join(fromDir, 'config.client.json'),
+    join(dirname(fromDir), 'config.json'),
+    join(dirname(fromDir), 'config.client.json'),
+  ]) {
+    try {
+      const raw = JSON.parse(readFileSync(cand, 'utf-8')) as { projects?: unknown };
+      const list = Array.isArray(raw.projects) ? (raw.projects as Record<string, unknown>[]) : [];
+      const entry = list.find((p) => p && typeof p === 'object' && p.name === projectName);
+      if (!entry || !('cycle_max_in_flight' in entry)) continue;
+      const v = entry.cycle_max_in_flight;
+      return typeof v === 'number' && Number.isFinite(v) && v >= 1 ? Math.floor(v) : 1;
+    } catch {
+      /* candidate missing or unreadable — try the next */
+    }
+  }
+  return null;
+}
+
+/** Resolve a dot-path against a result line ('echo.note' → result.echo.note). */
+function resolveResultPath(obj: Record<string, unknown>, path: string): unknown {
+  let cur: unknown = obj;
+  for (const part of path.split('.')) {
+    if (cur === null || typeof cur !== 'object') return undefined;
+    cur = (cur as Record<string, unknown>)[part];
+  }
+  return cur;
+}
+
+/**
+ * The gate rule (D3): the executor's ok says the check RAN; the rule decides
+ * whether it PASSED. Supported forms (anything else fails closed, D6):
+ *   "<path> contains <text>"  — String(value at the dot-path) includes text
+ *   "<path> == <value>"       — strict string equality
+ *   "ok"                      — the result line's ok === true
+ */
+function gatePassed(gate: CycleGateSpec, result: Record<string, unknown>): boolean {
+  const rule = gate.rule.trim();
+  const contains = /^(.+?)\s+contains\s+(.+)$/.exec(rule);
+  if (contains) {
+    const v = resolveResultPath(result, contains[1]!.trim());
+    return v !== undefined && v !== null && String(v).includes(contains[2]!);
+  }
+  const eq = /^(.+?)\s*==\s*(.+)$/.exec(rule);
+  if (eq) {
+    const v = resolveResultPath(result, eq[1]!.trim());
+    return String(v ?? '') === eq[2]!.trim();
+  }
+  if (rule === 'ok') return result.ok === true;
+  return false; // an unrecognized rule never passes (fail-closed, D6)
+}
+
+/**
+ * The cycle driver (D1/D7): a cursor over the existing queue / results /
+ * quarantine family. One step per project per poll tick (the
+ * maybeRunScheduledRebuilds pattern). Hard rules:
+ *   - it NEVER spawns an executor — every stage is a queue job the lease
+ *     loop runs under the normal grant path (D3);
+ *   - it re-reads the cycles, queue, results, and quarantine files every
+ *     step: the cursor never trusts memory (D4);
+ *   - a failing gate verdict quarantines the ITEM (reason gate_<name>_failed)
+ *     and skips that item's remaining gates (owner decision 3); the cursor
+ *     advances and the cycle never stops (D3/D6 rule 2);
+ *   - an unknown verdict parks the cursor — never advance on unknown; the
+ *     retry path quarantines the stage job at MAX_ATTEMPTS and the driver
+ *     records the fact and moves on (D6 rule 1);
+ *   - `maxInFlight` caps how many cycle rows may hold a running (queued or
+ *     leased) stage at once — a client-side driver rule (owner decision 1).
+ */
+export class CycleDriver {
+  private readonly queueFile: string;
+  private readonly resultsFile: string;
+  private readonly stateDir: string;
+  private readonly maxInFlight: number;
+
+  constructor(queueFile: string, resultsFile: string, stateDir: string, maxInFlight = 1) {
+    this.queueFile = queueFile;
+    this.resultsFile = resultsFile;
+    this.stateDir = stateDir;
+    this.maxInFlight = Number.isFinite(maxInFlight) && maxInFlight >= 1 ? Math.floor(maxInFlight) : 1;
+  }
+
+  /** One driver step over every row in the project's cycles file. */
+  tick(): void {
+    const rows = readCycles(this.queueFile);
+    if (!rows || rows.length === 0) return; // no cycles file (or corrupt): fail closed
+    const queued = new Set(readQueue(this.queueFile).map((j) => j.job_id));
+
+    const stageJobOf = (row: CycleRow): string | null => {
+      const item = row.items[row.cursor.item];
+      if (!item) return null;
+      if (row.cursor.stage === 'item') return item.job_id;
+      return item.gates[row.cursor.gate]?.job_id ?? null;
+    };
+    const inFlight = (): number =>
+      rows.reduce((n, r) => {
+        if (r.status !== 'running') return n;
+        const s = stageJobOf(r);
+        return s !== null && queued.has(s) ? n + 1 : n;
+      }, 0);
+
+    for (const row of rows) {
+      if (row.status === 'done' || row.status === 'paused') continue;
+      const stage = stageJobOf(row);
+      const holds = stage !== null && queued.has(stage);
+      if (!holds && inFlight() >= this.maxInFlight) continue; // admission cap
+      this.stepRow(row, queued);
+    }
+    writeCycles(this.queueFile, rows);
+  }
+
+  /** Advance one row by reading ground truth for its current stage. */
+  private stepRow(row: CycleRow, queued: Set<string>): void {
+    if (row.status === 'planned') row.status = 'running'; // admitted: it starts
+    const item = row.items[row.cursor.item];
+    if (!item) {
+      row.status = 'done';
+      return;
+    }
+
+    if (row.cursor.stage === 'item') {
+      if (queued.has(item.job_id)) return; // queued/running: the daemon owns it
+      if (this.quarantined(item.job_id)) {
+        // the retry path exhausted the item (MAX_ATTEMPTS) — no verdict needed
+        row.verdicts[item.job_id] = 'quarantined';
+        this.advance(row);
+        return;
+      }
+      const res = this.lastResult(item.job_id);
+      if (!res) {
+        // never started (fresh cursor, or a restart mid-series): enqueue it
+        this.enqueue(row, item.job_id, item.payload, 'item', queued);
+        return;
+      }
+      if (res.ok !== true) return; // failed: the daemon re-queued it, wait
+      if (item.gates.length === 0) {
+        row.verdicts[item.job_id] = 'passed';
+        this.advance(row);
+        return;
+      }
+      row.cursor.stage = 'gate';
+      row.cursor.gate = 0;
+      const first = item.gates[0]!;
+      this.enqueue(row, first.job_id, first.payload, `gate:${first.name}`, queued);
+      return;
+    }
+
+    // stage === 'gate'
+    const gate = item.gates[row.cursor.gate];
+    if (!gate) {
+      row.verdicts[item.job_id] = 'passed';
+      this.advance(row);
+      return;
+    }
+    if (queued.has(gate.job_id)) return; // queued/running: park (D6 rule 1)
+    if (this.quarantined(gate.job_id)) {
+      // the gate job itself exhausted its attempts: fail CLOSED for the item
+      quarantineJob(this.stateDir, this.queueFile, this.itemJob(row, item), `gate_${gate.name}_exhausted`);
+      row.verdicts[item.job_id] = 'quarantined';
+      this.advance(row);
+      return;
+    }
+    const res = this.lastResult(gate.job_id);
+    if (!res) {
+      this.enqueue(row, gate.job_id, gate.payload, `gate:${gate.name}`, queued);
+      return;
+    }
+    if (res.ok !== true) return; // the gate job itself failed: retry path owns it
+    if (!gatePassed(gate, res)) {
+      // D3: the gate quarantines the ITEM, not the cycle. The item already
+      // left the queue on its own success, so this append is the audit line.
+      quarantineJob(this.stateDir, this.queueFile, this.itemJob(row, item), `gate_${gate.name}_failed`);
+      row.verdicts[item.job_id] = 'quarantined';
+      // Owner decision 3: skip the item's remaining gates. The cursor
+      // advances; the cycle never stops (D6 rule 2).
+      this.advance(row);
+      return;
+    }
+    row.cursor.gate += 1;
+    const next = item.gates[row.cursor.gate];
+    if (next) {
+      this.enqueue(row, next.job_id, next.payload, `gate:${next.name}`, queued);
+    } else {
+      row.verdicts[item.job_id] = 'passed';
+      this.advance(row);
+    }
+  }
+
+  /** The item's queue job as the quarantine audit line needs it. */
+  private itemJob(row: CycleRow, item: CycleItemSpec): QueueJob {
+    return { job_id: item.job_id, payload: { ...(item.payload ?? {}), cycle_id: row.cycle_id, stage: 'item' } };
+  }
+
+  /** Queue one stage's job. The payload GAINS cycle_id + stage (D7): the
+   *  payload vocabulary is open ([k: string]: unknown), so this is no schema
+   *  change and no wire change. */
+  private enqueue(row: CycleRow, jobId: string, payload: Record<string, unknown> | undefined, stage: string, queued: Set<string>): void {
+    writeQueue(this.queueFile, [...readQueue(this.queueFile), { job_id: jobId, payload: { ...(payload ?? {}), cycle_id: row.cycle_id, stage } }]);
+    queued.add(jobId);
+  }
+
+  private advance(row: CycleRow): void {
+    row.cursor.item += 1;
+    row.cursor.stage = 'item';
+    row.cursor.gate = 0;
+    if (row.cursor.item >= row.items.length) row.status = 'done';
+  }
+
+  /** The LAST result line for a job_id, or null when it never settled. */
+  private lastResult(jobId: string): Record<string, unknown> | null {
+    if (!existsSync(this.resultsFile)) return null;
+    let hit: Record<string, unknown> | null = null;
+    for (const l of readFileSync(this.resultsFile, 'utf-8').split('\n')) {
+      if (!l.trim()) continue;
+      try {
+        const r = JSON.parse(l) as Record<string, unknown>;
+        if (r && r.job_id === jobId) hit = r;
+      } catch {
+        /* skip corrupt line */
+      }
+    }
+    return hit;
+  }
+
+  /** True when the job sits in quarantine.jsonl (retry-path exhaustion). */
+  private quarantined(jobId: string): boolean {
+    const f = join(this.stateDir, 'quarantine.jsonl');
+    if (!existsSync(f)) return false;
+    for (const l of readFileSync(f, 'utf-8').split('\n')) {
+      if (!l.trim()) continue;
+      try {
+        if ((JSON.parse(l) as Record<string, unknown>).job_id === jobId) return true;
+      } catch {
+        /* skip corrupt line */
+      }
+    }
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // HTTP helpers against the arbiter
 // ---------------------------------------------------------------------------
 
@@ -855,6 +1181,11 @@ export class ClientDaemon {
     // grant). Fire-and-forget: the tick never waits on the command.
     void this.maybeRunScheduledRebuilds();
 
+    // Dev cycles (issue #58): one driver step per project per tick, the same
+    // fire-and-forget cadence — the tick never waits on the driver, and a
+    // project with no cycles file does nothing (cycles fail closed, D4).
+    void this.maybeRunCycleDrivers();
+
     const { status, body } = await api<{
       idle: { idle: boolean; degraded: boolean; reidle_gated: boolean };
       active_leases: { lease_id: string }[];
@@ -1023,6 +1354,40 @@ export class ClientDaemon {
     } finally {
       this.rebuildInFlight.delete(proj.name);
       this.rebuildExecs.delete(proj.name);
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Dev cycles (issue #58)
+  // ------------------------------------------------------------------
+
+  private readonly cycleTickInFlight = new Set<string>();
+
+  /**
+   * Cadence = every poll tick (the maybeRunScheduledRebuilds pattern): one
+   * CycleDriver step per project, fire-and-forget — the step is bounded file
+   * I/O and never blocks the tick. The driver instance is built fresh each
+   * tick from the files: the cursor never trusts memory (D4). A cycle
+   * failure must never take the daemon down (D6 rule 2).
+   */
+  private async maybeRunCycleDrivers(): Promise<void> {
+    for (const proj of this.cfg.projects) {
+      if (this.cycleTickInFlight.has(proj.name)) continue; // overlap guard
+      // Opt-in gate (the scheduled_rebuild.enabled shape): the project must
+      // carry cycle_max_in_flight in its config entry. Absent = the daemon
+      // never touches that project's cycles file.
+      const cap = resolveCycleMaxInFlight(proj.name);
+      if (cap === null) continue;
+      if (!existsSync(cyclesFile(proj.queue_file))) continue;
+      this.cycleTickInFlight.add(proj.name);
+      try {
+        const driver = new CycleDriver(proj.queue_file, proj.results_file, this.cfg.state_dir, cap);
+        driver.tick();
+      } catch (err) {
+        this.log.info(`cycle driver (${proj.name}) error: ${err instanceof Error ? err.message : err}`);
+      } finally {
+        this.cycleTickInFlight.delete(proj.name);
+      }
     }
   }
 
