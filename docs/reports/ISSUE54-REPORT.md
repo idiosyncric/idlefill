@@ -58,12 +58,14 @@ issue's "verify nothing breaks" clause exposed.
 - ubuntu job: full node suites + tsc + build + the installer `--dry-run`
   rendering byte-check. Targets the weakstone Docker runner
   (`ubuntu-latest` label family). `forgejo-runner validate` passes.
-  STATUS: the weakstone container runner (act_runner, labels historically
-  ubuntu-latest/22.04/20.04) polls and claims `sam/career-ops` jobs —
-  whether it claims idlefill's `ubuntu-latest` jobs is exactly what the
-  first push proves (a run stuck in `waiting` = the label does not reach
-  this repo; the runner-list API answers 403 with the agent token, and
-  runner registration scope changes are owner-only in the UI).
+  STATUS: the first pushes DISPATCHED on `weakstone-runner` (labels
+  ubuntu-latest/22.04/20.04 — it claims idlefill jobs fine) and FAILED
+  at checkout: `Could not resolve host: app` — act_runner puts job
+  containers on a per-task bridge network that cannot resolve the
+  compose service name (career-ops never noticed: its approve job skips
+  checkout). Fixed on the host: `container.network: forgejo-net` added
+  to the runner config (bind-mounted), runner restarted and
+  re-declared. CI green result recorded below.
 
 ## Gates
 
@@ -79,4 +81,33 @@ issue's "verify nothing breaks" clause exposed.
 
 ## Live acceptance (urza, Ubuntu 24.04, systemd 255, node 18.19.1)
 
-(Filled in below after the live run.)
+- Fresh clone at `ad002fa`, `npm ci` (61 packages; tsx 4.23 on node 18.19
+  works — engine floor `>=18`), config written on-box from the server's
+  own config.json (token never crossed the wire twice; `client_name:
+  urza`, `server_url` the tailnet IP so `observed_ip` registers
+  meaningfully — loopback would collide with the arbiter host's
+  self-traffic exemption).
+- `install-client-service.sh` refused once with the fail-closed guard
+  working exactly as designed (`systemd-analyze verify` rejected the
+  rendered unit): verify parses the FILENAME as the unit name and the
+  mktemp temp had no `.service` suffix. Fixed (render into a temp DIR
+  under the real unit name), installed: unit **active + enabled**,
+  linger already on, `journalctl` carries the daemon log.
+- `scripts/idlefill-menubar.mjs status` on Linux: unit line
+  `idlefill-client active/running pid=…`, arbiter `me` row by name,
+  boot `revision` line — the macOS control surface, portable.
+- Fleet view (`/api/state`): `mac-sam` (obs 100.94.165.102) and `urza`
+  (obs 100.105.225.1) both online, both rev-matched to the checkout
+  after `git pull && systemctl --user restart` — the #49 staleness
+  cycle works on Linux unchanged.
+- **Real bug the second client exposed** (fixed in `b4106ae`, test (h)
+  11/11): the session gate adopted EVERY arbiter session row
+  (`onStatePoll` → `ensure`), so urza registered + heartbeated
+  mac-sam's sessions — last-writer-wins flipped attribution between
+  daemons every 10s and the idle snapshot of one cleared the other's
+  gate tags. Fix: rows naming another `client_name` are skipped
+  entirely; ownerless rows keep the old adopt behavior. Live proof:
+  after both daemons run the fix, real traffic through the mac router
+  re-claims `probe` for `mac-sam` and attribution stays stable across
+  6 polls (a stolen row self-heals on its next request; the 1h session
+  sweep bounds the stale case).
