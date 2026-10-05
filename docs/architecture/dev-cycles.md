@@ -286,3 +286,179 @@ nothing is built for it now.
 3. **Gate short-circuit: skip. LOCKED.** On a failing gate the driver
    quarantines the item and skips that item's remaining gates. The
    quarantine reason string already names the failing gate.
+
+## D9 — Multi-cycle concurrency (issue #56 addendum)
+
+Owner decision 1 set `cycle_max_in_flight` (default 1) and filed this
+addendum for expansion past one. This section settles the three named
+questions: the admission rule at a cap above one (D9.1), the daily
+budget interaction (D9.2), and the status shape for N cycles (D9.3).
+Every citation below was verified in this session against the shipped
+issue #58 code. The spike extension in
+`client/test/dev-cycle-worked-example.test.ts` runs two cycles over
+one project against the real daemon, the real noop adapter, and the
+fake arbiter.
+
+### D9.1 — Admission rule: the shipped driver already IS the locked rule
+
+Locked: **a cycle row holds a stage when the queue file carries that
+row's current stage job. The cap counts holding rows. A row may start a
+stage only while the number of holding rows sits under
+`cycle_max_in_flight`.**
+
+Verified against the shipped code:
+
+- `CycleDriver.tick()` (`client/src/index.ts:613-639`) re-reads the
+  cycles file and the queue file on every step. The `inFlight` helper
+  (`client/src/index.ts:624-629`) counts rows with status `running`
+  whose current stage job sits in the queue. The admission gate
+  (`client/src/index.ts:635`) skips a non-holding row when that count
+  already reaches the cap. A holding row never re-enqueues — its stage
+  line already sits in the queue.
+- The cap is read from the per-project `cycle_max_in_flight` entry of
+  the raw client config by `resolveCycleMaxInFlight`
+  (`client/src/index.ts:528-547`). The key's presence is also the
+  project's opt-in: absent means null, and `maybeRunCycleDrivers`
+  (`client/src/index.ts:1391-1410`) never touches that project's
+  cycles file. A present but invalid value falls to 1. The daemon
+  fires one driver step per project per poll tick
+  (`client/src/index.ts:1205`), building the driver fresh from the
+  files each tick (D4).
+- The count covers granted-and-running stages as well as merely
+  queued ones. A leased job keeps its queue line until it settles.
+  The success path removes the line (`client/src/index.ts:1583`). The
+  failure path keeps it and bumps `attempts`
+  (`client/src/index.ts:296-306, 1595-1604`). Only the quarantine path
+  removes it (`client/src/index.ts:314-327`). One queue-file lookup
+  therefore names every holder, queued or running. The arbiter stays
+  out of the count — the cap is a client-side driver rule (owner
+  decision 1).
+
+So the shipped implementation needs NO change for a cap above one. The
+spike's `MultiCycleDriver` mirrors `tick()` exactly and proves the
+behavior end-to-end: with cap 1 the second cycle's first stage never
+enters the queue while the first cycle holds one. With cap 2 both
+first stages reach the queue and both cycles lease through the
+arbiter.
+
+Rejected alternatives:
+
+- Count only granted-and-running stages. That needs a second source
+  of truth for "running". The queue file already carries it, and a
+  driver that cross-checks lease state breaks D4's ground-truth rule.
+  The deciding trade-off: one file, one truth.
+- Enforce the cap in the arbiter. Rejected by D2 and owner decision
+  1: cycle truth is client-side, and the arbiter holds no cycle rows.
+  The deciding trade-off: a cycle must survive the machine that owns
+  it going to sleep.
+
+What the operator must know: the cap admits stage lines, not executor
+slots. One daemon runs one executor at a time — the busy-return at
+`client/src/index.ts:1236` stops the lease loop while a lease is
+active — and the arbiter caps grants per engine with
+`max_concurrent_leases` (`server/src/arbiter.ts:469-471`). A cap of 2
+pipelines two cycles' stage lines into the queue. The stages still run
+one at a time on one machine. True parallel stage execution needs a
+multi-lease client, out of scope here (open question 1).
+
+### D9.2 — Budget: the daily budget bounds the project, shared across cycles
+
+Locked: **the per-project daily budget covers every cycle of the
+project together. N cycles share one pool. Nothing about the budget
+changes when the cap rises past one. This restates owner decision 2
+for N > 1.**
+
+Verified against the shipped arbiter:
+
+- The grant check sums the project, never a cycle.
+  `const used = this.projectTokensOut(params.project, utcDay(now));`
+  and the denial `budget_exhausted` on
+  `used >= project.daily_token_cap` (`server/src/arbiter.ts:473-474`).
+- The budget record is keyed by project and UTC day:
+  `state.budgets[project][day].tokens_out`
+  (`projectTokensOut`, `server/src/arbiter.ts:1265-1267` and
+  `addBudget`, `server/src/arbiter.ts:1290-1295`). No cycle key exists
+  anywhere in the arbiter. `requestLease` (`server/src/arbiter.ts:372`)
+  receives the project and the job_id only. `cycle_id` rides the queue
+  payload (D7) and never reaches a grant decision.
+
+Rejected alternative: a per-cycle split of the cap. That needs
+cycle-keyed budget records in the arbiter — new arbiter state about
+another machine's work, against D2 and mesh rule 3. It contradicts
+owner decision 2 (no cycle-level cap in v1). The deciding trade-off:
+the single operator reasons about one daily pool per project, and the
+arbiter stays cycle-blind.
+
+What the operator must know at a cap above one:
+
+- Cycles compete for one pool. One cycle's heavy item can exhaust the
+  UTC day for every cycle of the project. Every later grant then
+  denies `budget_exhausted` (`server/src/arbiter.ts:474`) until the
+  day rolls over. Competition, never a split, is the guarantee: the
+  pool always goes to whoever asks first.
+- The competition never starves the interactive gate. The budget only
+  refuses background grants at lease-request time. Interactive traffic
+  needs no lease, and session activity preempts an active lease even
+  mid-stage (`server/src/arbiter.ts:578-589`).
+- Failure isolation stays per job. A throttled or cooling job blocks
+  only its own re-grants (`server/src/arbiter.ts:420-427`). A dead
+  gate in one cycle cannot throttle another cycle's jobs. The spike's
+  third phase shows the same isolation for quarantine: one failing
+  gate quarantines one item, and the other cycle's verdicts stay
+  clean.
+
+### D9.3 — Status shape: one entry per cycle, no merged progress line
+
+Locked: **every status surface carries per-cycle entries. No surface
+merges N cycles into one progress line.** The shipped MCP pair already
+follows the rule. The add-keys rule below keeps the unbuilt dashboard
+on it.
+
+Verified against the shipped MCP module
+(`adapters/career-ops/idlefill-mcp-cycle-tools.mjs`):
+
+- `idlefill_list_cycles` returns `{ ok, project, cycles_file, count,
+  cycles[] }`, and each entry carries `cycle_id`, `status`, `cursor`,
+  `items` (a count), and `verdicts` (lines 220-232). No field
+  aggregates cursors or verdicts across rows.
+- `idlefill_cycle_status` returns ONE cycle: `cycle { cycle_id,
+  status, cursor, verdicts, items[] }` plus `current_stage` (lines
+  234-270). Each stage fact carries the live queue position and the
+  quarantine fact. The queue positions already record `cycle_id` from
+  the queue payload (line 96), so every cycle queue line is
+  attributable to its cycle.
+- Verdicts and quarantine facts are per cycle row and per item (D4,
+  D3). The quarantine file is project-wide, but each line names its
+  own job, and the row's `verdicts` map is private to the row. The
+  spike's third phase asserts both.
+
+The dashboard cycle strip is verified NOT built: `server/public/index.html`
+carries zero occurrences of "cycle" (grep, this session). The shape
+rule for that later build: cycle counts ride the client-published
+`stats` block on the register heartbeat. The block exists
+(`client/src/index.ts:1108-1114` — `projectStats` + `queue` +
+`quarantined`). ADD a `cycles` key, computed client-side from the
+project's cycles file — per-status row counts plus the effective
+`cycle_max_in_flight` cap are the expected content. The arbiter stores
+and displays it verbatim, never computes (the `last_rebuild`
+discipline, D7). `state.json` gains nothing: no new arbiter state.
+
+Rejected alternative: an arbiter-side cycle rollup. Rejected by D2 —
+the arbiter may live on another machine and holds no cycle rows. The
+deciding trade-off: display honesty over query convenience, the same
+reason the queue preview is published, not read.
+
+PROPOSED (owner input wanted): the exact `stats.cycles` key set. The
+rule — per-cycle entries, add-keys only, client-computed — is locked.
+The naming, and whether the strip shows counts or per-cycle rows, is
+a build-wave choice (open question 2).
+
+### Open questions (owner input)
+
+1. A cap above one pipelines admission only: one daemon runs one
+   executor, so stages still run one at a time per machine (D9.1).
+   File multi-lease client work — true parallel stage execution — as
+   its own issue, or leave cap > 1 as pipelining only?
+2. For the dashboard strip: accept the proposed `stats.cycles` count
+   keys, or prefer per-cycle rows in the published stats block? The
+   MCP surface already answers per-cycle detail either way.

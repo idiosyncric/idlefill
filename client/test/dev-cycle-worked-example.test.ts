@@ -47,6 +47,12 @@
  *     cursor; no later item is enqueued until the gate settles
  *   - corrupt cycles file reads as null (fail-closed for cycles, queue
  *     unaffected)
+ *   - multi-cycle concurrency (issue #56, D9.1/D9.3): two cycles on one
+ *     project against one daemon — with cap 1 cycle B's first stage never
+ *     enters the queue while cycle A holds a stage; with cap 2 both first
+ *     stages sit in the queue and both cycles lease through the arbiter;
+ *     a gate failure quarantines ONE cycle's item while the other cycle's
+ *     verdicts stay clean
  */
 
 import { test, after, before } from 'node:test';
@@ -125,6 +131,71 @@ function writeCycles(queueFile: string, rows: CycleRow[]): void {
 }
 
 // ---------------------------------------------------------------------------
+// Ground-truth readers + payload builders shared by both spike drivers.
+// ---------------------------------------------------------------------------
+
+/** The LAST result line for a job_id, or null when it never settled. */
+function lastResultLine(resultsFile: string, jobId: string): Record<string, unknown> | null {
+  if (!existsSync(resultsFile)) return null;
+  let hit: Record<string, unknown> | null = null;
+  for (const l of readFileSync(resultsFile, 'utf-8').split('\n')) {
+    if (!l.trim()) continue;
+    try {
+      const r = JSON.parse(l) as Record<string, unknown>;
+      if (r && r.job_id === jobId) hit = r;
+    } catch {
+      /* skip corrupt line */
+    }
+  }
+  return hit;
+}
+
+/** True when the job sits in quarantine.jsonl (retry-path exhaustion). */
+function quarantinedJob(stateDir: string, jobId: string): boolean {
+  const f = join(stateDir, 'quarantine.jsonl');
+  if (!existsSync(f)) return false;
+  for (const l of readFileSync(f, 'utf-8').split('\n')) {
+    if (!l.trim()) continue;
+    try {
+      if ((JSON.parse(l) as Record<string, unknown>).job_id === jobId) return true;
+    } catch {
+      /* skip corrupt line */
+    }
+  }
+  return false;
+}
+
+/** The gate rule (D3): the executor's ok says the check RAN; the rule
+ *  decides whether it PASSED. The noop stand-in reports the verdict in
+ *  its echoed `note`. */
+function verdictNotePassed(gate: GateSpec, result: Record<string, unknown>): boolean {
+  const echo = result.echo as Record<string, unknown> | undefined;
+  const note = String(echo?.note ?? '');
+  if (gate.rule === 'note contains verdict=pass') return note.includes('verdict=pass');
+  return false; // an unrecognized rule never passes (fail-closed, D6)
+}
+
+/** Item stage payload. cycle_id/stage are queue-line metadata; the project's
+ *  payload_fields decide what reaches the executor — these must NOT (asserted). */
+function itemPayloadFor(cycleId: string, item: ItemSpec): QueueJob['payload'] {
+  return {
+    target: 'repo-X',
+    note: `issue:${item.job_id}`,
+    cycle_id: cycleId,
+    stage: 'item',
+  };
+}
+
+function gatePayloadFor(cycleId: string, gate: GateSpec, verdict: 'pass' | 'fail'): QueueJob['payload'] {
+  return {
+    target: 'repo-X',
+    note: `gate:${gate.name}:verdict=${verdict}`,
+    cycle_id: cycleId,
+    stage: `gate:${gate.name}`,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // The proposed cycle driver (dev-cycles.md D1) — written HERE for the spike.
 // ---------------------------------------------------------------------------
 
@@ -153,28 +224,14 @@ class CycleDriver {
 
   /** The LAST result line for a job_id, or null when it never settled. */
   private lastResult(jobId: string): Record<string, unknown> | null {
-    if (!existsSync(this.resultsFile)) return null;
-    let hit: Record<string, unknown> | null = null;
-    for (const l of readFileSync(this.resultsFile, 'utf-8').split('\n')) {
-      if (!l.trim()) continue;
-      try {
-        const r = JSON.parse(l) as Record<string, unknown>;
-        if (r && r.job_id === jobId) hit = r;
-      } catch {
-        /* skip corrupt line */
-      }
-    }
-    return hit;
+    return lastResultLine(this.resultsFile, jobId);
   }
 
   /** The gate rule (D3): the executor's ok says the check RAN; the rule
    *  decides whether it PASSED. The noop stand-in reports the verdict in
    *  its echoed `note`. */
   private gatePassed(gate: GateSpec, result: Record<string, unknown>): boolean {
-    const echo = result.echo as Record<string, unknown> | undefined;
-    const note = String(echo?.note ?? '');
-    if (gate.rule === 'note contains verdict=pass') return note.includes('verdict=pass');
-    return false; // an unrecognized rule never passes (fail-closed, D6)
+    return verdictNotePassed(gate, result);
   }
 
   private enqueue(job: QueueJob): void {
@@ -313,6 +370,151 @@ class CycleDriver {
     this.row.cursor.gate = 0;
     if (this.row.cursor.item >= this.row.items.length) this.row.status = 'done';
     this.save();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The issue #56 spike driver: N cycle rows in ONE project, capped by
+// maxInFlight (D9.1). It mirrors the shipped CycleDriver.tick() shape —
+// admission counts the rows that HOLD a stage job in the queue — but lives
+// HERE because this spike proves the design, and the shipped unit tests
+// (test/cycle-driver.test.ts) already cover the cap itself.
+// ---------------------------------------------------------------------------
+
+class MultiCycleDriver {
+  readonly queueFile: string;
+  readonly resultsFile: string;
+  readonly stateDir: string;
+  readonly maxInFlight: number;
+  /** Which verdict each item's stand-in gate executor reports. */
+  readonly verdictPlan: Record<string, 'pass' | 'fail'>;
+
+  constructor(queueFile: string, resultsFile: string, stateDir: string, maxInFlight: number, verdictPlan: Record<string, 'pass' | 'fail'> = {}) {
+    this.queueFile = queueFile;
+    this.resultsFile = resultsFile;
+    this.stateDir = stateDir;
+    this.maxInFlight = Number.isFinite(maxInFlight) && maxInFlight >= 1 ? Math.floor(maxInFlight) : 1;
+    this.verdictPlan = verdictPlan;
+  }
+
+  /** The stage job the cursor points at, or null past the item list. */
+  private stageJobOf(row: CycleRow): string | null {
+    const item = row.items[row.cursor.item];
+    if (!item) return null;
+    if (row.cursor.stage === 'item') return item.job_id;
+    return item.gates[row.cursor.gate]?.job_id ?? null;
+  }
+
+  /**
+   * D9.1: a row HOLDS a stage when its current stage job sits in the queue
+   * file. The cap counts holding rows — queued-or-leased, because the daemon
+   * keeps a leased job in the queue until it settles.
+   */
+  private inFlight(rows: CycleRow[], queued: Set<string>): number {
+    return rows.reduce((n, r) => {
+      if (r.status !== 'running') return n;
+      const s = this.stageJobOf(r);
+      return s !== null && queued.has(s) ? n + 1 : n;
+    }, 0);
+  }
+
+  /** One driver step over every row in the project's cycles file. */
+  tick(): void {
+    const rows = readCycles(this.queueFile);
+    if (!rows || rows.length === 0) return; // no cycles file: fail closed
+    const queued = new Set(readQueue(this.queueFile).map((j) => j.job_id));
+
+    for (const row of rows) {
+      if (row.status === 'done' || row.status === 'paused') continue;
+      const stage = this.stageJobOf(row);
+      const holds = stage !== null && queued.has(stage);
+      if (!holds && this.inFlight(rows, queued) >= this.maxInFlight) continue; // D9.1 admission cap
+      this.stepRow(row, queued);
+    }
+    writeCycles(this.queueFile, rows);
+  }
+
+  private stepRow(row: CycleRow, queued: Set<string>): void {
+    if (row.status === 'planned') row.status = 'running'; // admitted: it starts
+    const item = row.items[row.cursor.item];
+    if (!item) {
+      row.status = 'done';
+      return;
+    }
+
+    if (row.cursor.stage === 'item') {
+      if (queued.has(item.job_id)) return; // queued/running: the daemon owns it
+      if (quarantinedJob(this.stateDir, item.job_id)) {
+        row.verdicts[item.job_id] = 'quarantined';
+        this.advance(row);
+        return;
+      }
+      const res = lastResultLine(this.resultsFile, item.job_id);
+      if (!res) {
+        this.enqueue({ job_id: item.job_id, payload: itemPayloadFor(row.cycle_id, item) });
+        queued.add(item.job_id);
+        return;
+      }
+      if (res.ok !== true) return; // failed: the daemon re-queued it, wait
+      if (item.gates.length === 0) {
+        row.verdicts[item.job_id] = 'passed';
+        this.advance(row);
+        return;
+      }
+      row.cursor.stage = 'gate';
+      row.cursor.gate = 0;
+      const first = item.gates[0]!;
+      this.enqueue({ job_id: first.job_id, payload: gatePayloadFor(row.cycle_id, first, this.verdictPlan[item.job_id] ?? 'pass') });
+      queued.add(first.job_id);
+      return;
+    }
+
+    const gate = item.gates[row.cursor.gate];
+    if (!gate) {
+      row.verdicts[item.job_id] = 'passed';
+      this.advance(row);
+      return;
+    }
+    if (queued.has(gate.job_id)) return; // queued/running: park (D6 rule 1)
+    if (quarantinedJob(this.stateDir, gate.job_id)) {
+      quarantineJob(this.stateDir, this.queueFile, { job_id: item.job_id, payload: itemPayloadFor(row.cycle_id, item) }, `gate_${gate.name}_exhausted`);
+      row.verdicts[item.job_id] = 'quarantined';
+      this.advance(row);
+      return;
+    }
+    const res = lastResultLine(this.resultsFile, gate.job_id);
+    if (!res) {
+      this.enqueue({ job_id: gate.job_id, payload: gatePayloadFor(row.cycle_id, gate, this.verdictPlan[item.job_id] ?? 'pass') });
+      queued.add(gate.job_id);
+      return;
+    }
+    if (res.ok !== true) return;
+    if (!verdictNotePassed(gate, res)) {
+      quarantineJob(this.stateDir, this.queueFile, { job_id: item.job_id, payload: itemPayloadFor(row.cycle_id, item) }, `gate_${gate.name}_failed`);
+      row.verdicts[item.job_id] = 'quarantined';
+      this.advance(row); // owner decision 3: skip the item's remaining gates
+      return;
+    }
+    row.cursor.gate += 1;
+    const next = item.gates[row.cursor.gate];
+    if (next) {
+      this.enqueue({ job_id: next.job_id, payload: gatePayloadFor(row.cycle_id, next, this.verdictPlan[item.job_id] ?? 'pass') });
+      queued.add(next.job_id);
+    } else {
+      row.verdicts[item.job_id] = 'passed';
+      this.advance(row);
+    }
+  }
+
+  private enqueue(job: QueueJob): void {
+    writeQueue(this.queueFile, [...readQueue(this.queueFile), job]);
+  }
+
+  private advance(row: CycleRow): void {
+    row.cursor.item += 1;
+    row.cursor.stage = 'item';
+    row.cursor.gate = 0;
+    if (row.cursor.item >= row.items.length) row.status = 'done';
   }
 }
 
@@ -568,4 +770,174 @@ test('corrupt cycles file reads as null: cycles fail closed, the queue is unaffe
   // The queue family is independent: a plain queue line still reads.
   writeQueue(queueFile, [{ job_id: 'plain-job', payload: { target: 'repo-X', note: 'n' } }]);
   assert.equal(queueDepth(queueFile), 1, 'queue truth is untouched by a corrupt cycles file');
+});
+
+// ---------------------------------------------------------------------------
+// Issue #56 spike: two cycles, one project, ONE set of ground-truth files.
+// Two cycle rows share the same queue/results/state files and each carries
+// its own cursor. The MultiCycleDriver applies the D9.1 admission rule in
+// the shipped CycleDriver.tick() shape: a row may start a stage only while
+// the number of rows HOLDING a stage job in the queue is under the cap.
+// ---------------------------------------------------------------------------
+
+function mkMultiRows(): CycleRow[] {
+  const mk = (id: string, gates: string[]): ItemSpec => ({
+    job_id: id,
+    gates: gates.map((g) => ({ name: g, job_id: `gate-${g}-${id}`, rule: 'note contains verdict=pass' })),
+  });
+  const a: CycleRow = {
+    cycle_id: 'cycle-A',
+    project: 'dev-cycle',
+    status: 'planned',
+    items: [mk('a1', ['build', 'review']), mk('a2', [])],
+    cursor: { item: 0, stage: 'item', gate: 0 },
+    verdicts: {},
+  };
+  const b: CycleRow = {
+    cycle_id: 'cycle-B',
+    project: 'dev-cycle',
+    status: 'planned',
+    items: [mk('b1', ['build', 'review']), mk('b2', [])],
+    cursor: { item: 0, stage: 'item', gate: 0 },
+    verdicts: {},
+  };
+  return [a, b];
+}
+
+function multiDone(): boolean {
+  const rows = readCycles(queueFile);
+  return !!rows && rows.length === 2 && rows.every((r) => r.status === 'done');
+}
+
+function rowById(cycleId: string): CycleRow {
+  return readCycles(queueFile)!.find((r) => r.cycle_id === cycleId)!;
+}
+
+test('multi-cycle concurrency (D9.1/D9.3): cap 1 admits one holder at a time; cap 2 runs both cycles; a gate failure quarantines one cycle\'s item and leaves the other untouched', async () => {
+  // --- phase 1: cap 1 ------------------------------------------------------
+  resetFiles();
+  arb.leaseRequests.length = 0;
+  arb.usageReports.length = 0;
+  arb.denyLeaseAfter.clear();
+  arb.idle = true;
+
+  writeCycles(queueFile, mkMultiRows());
+  writeQueue(queueFile, []);
+  const d1 = new MultiCycleDriver(queueFile, resultsFile, stateDir, 1);
+
+  // Park cycle A's first stage in the queue: grants for a1 are denied (the
+  // line stays queued, the hold persists). The deterministic proof of the
+  // admission rule: a second row cannot enter while one row holds.
+  arb.denyLeaseAfter.set('a1', 0);
+
+  const daemon1 = makeDaemon();
+  await daemon1.start();
+  try {
+    for (let i = 0; i < 12; i++) {
+      d1.tick();
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    const q1 = readQueue(queueFile).map((j) => j.job_id);
+    assert.deepEqual(q1, ['a1'], 'cap 1: the queue holds ONLY cycle A\'s parked stage');
+    assert.ok(!q1.includes('b1'), 'cap 1: cycle B\'s first stage never enters the queue while cycle A holds a stage');
+    assert.equal(rowById('cycle-B').status, 'planned', 'cap 1: the second row stays planned (admission cap)');
+
+    // Release the park: both cycles must run to completion under cap 1.
+    arb.denyLeaseAfter.delete('a1');
+    let overCap = false;
+    const deadline1 = Date.now() + 25_000;
+    while (Date.now() < deadline1) {
+      d1.tick();
+      // Every queue line here is some row's cursor stage: more than one
+      // line means two rows held a stage at once — over the cap.
+      if (readQueue(queueFile).length > 1) overCap = true;
+      if (multiDone()) break;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.ok(multiDone(), 'cap 1: both cycles complete (the cap interleaves, never wedges — D6 rule 2)');
+    assert.ok(!overCap, 'cap 1: never two cycle stages queued at once (one holder at a time)');
+    const leased1 = arb.leaseRequests.map((r) => r.job_id);
+    for (const id of ['a1', 'gate-build-a1', 'gate-review-a1', 'a2', 'b1', 'gate-build-b1', 'gate-review-b1', 'b2']) {
+      assert.ok(leased1.includes(id), `cap 1: ${id} leased through the arbiter`);
+    }
+  } finally {
+    await daemon1.stop();
+  }
+
+  // --- phase 2: cap 2, both cycles live at once ----------------------------
+  resetFiles();
+  arb.leaseRequests.length = 0;
+  arb.usageReports.length = 0;
+  arb.denyLeaseAfter.clear();
+  arb.idle = true;
+
+  writeCycles(queueFile, mkMultiRows());
+  writeQueue(queueFile, []);
+  const d2 = new MultiCycleDriver(queueFile, resultsFile, stateDir, 2);
+  const daemon2 = makeDaemon();
+  await daemon2.start();
+  try {
+    d2.tick();
+    const admitted = readQueue(queueFile).map((j) => j.job_id).sort();
+    assert.deepEqual(admitted, ['a1', 'b1'], 'cap 2: BOTH cycles\' first stages are admitted to the queue on the first tick');
+    assert.equal(rowById('cycle-A').status, 'running');
+    assert.equal(rowById('cycle-B').status, 'running', 'cap 2: two independent cursors run concurrently');
+
+    const deadline2 = Date.now() + 25_000;
+    while (Date.now() < deadline2) {
+      d2.tick();
+      if (multiDone()) break;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.ok(multiDone(), 'cap 2: both cycles finish');
+    const leased2 = arb.leaseRequests.map((r) => r.job_id);
+    for (const id of ['a1', 'gate-build-a1', 'gate-review-a1', 'a2', 'b1', 'gate-build-b1', 'gate-review-b1', 'b2']) {
+      assert.ok(leased2.includes(id), `cap 2: ${id} leased through the arbiter`);
+    }
+    assert.deepEqual(rowById('cycle-A').verdicts, { a1: 'passed', a2: 'passed' });
+    assert.deepEqual(rowById('cycle-B').verdicts, { b1: 'passed', b2: 'passed' });
+  } finally {
+    await daemon2.stop();
+  }
+
+  // --- phase 3: independence — a failing gate quarantines ONE cycle's item --
+  resetFiles();
+  arb.leaseRequests.length = 0;
+  arb.usageReports.length = 0;
+  arb.denyLeaseAfter.clear();
+  arb.idle = true;
+
+  writeCycles(queueFile, mkMultiRows());
+  writeQueue(queueFile, []);
+  // Only cycle A's a1 gate reports verdict=fail; cycle B's items all pass.
+  const d3 = new MultiCycleDriver(queueFile, resultsFile, stateDir, 2, { a1: 'fail' });
+  const daemon3 = makeDaemon();
+  await daemon3.start();
+  try {
+    const deadline3 = Date.now() + 25_000;
+    while (Date.now() < deadline3) {
+      d3.tick();
+      if (multiDone()) break;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.ok(multiDone(), 'a failing gate does not wedge either cycle (D6 rule 2)');
+
+    // The quarantine file is project-wide: exactly ONE line, and it names
+    // cycle A's item — cycle B contributed nothing.
+    const q = readQuarantine();
+    assert.equal(q.length, 1, 'exactly one quarantine line across BOTH cycles');
+    assert.equal(q[0]!.job_id, 'a1');
+    assert.equal(q[0]!.error, 'gate_build_failed');
+
+    // Verdicts are per-row: cycle B is untouched by cycle A's failure.
+    assert.deepEqual(rowById('cycle-A').verdicts, { a1: 'quarantined', a2: 'passed' });
+    assert.deepEqual(rowById('cycle-B').verdicts, { b1: 'passed', b2: 'passed' });
+
+    // Short-circuit stays per-item: A's review gate never ran, B's did.
+    const leased3 = arb.leaseRequests.map((r) => r.job_id);
+    assert.ok(!leased3.includes('gate-review-a1'), 'the failing gate skips ONLY that item\'s remaining gates');
+    assert.ok(leased3.includes('gate-review-b1'), 'the other cycle runs its full gate series');
+  } finally {
+    await daemon3.stop();
+  }
 });
