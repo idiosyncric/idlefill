@@ -219,6 +219,17 @@ export interface ClientRecord {
    * versioned handshake). Absent on pre-version clients.
    */
   protocol?: number;
+  /**
+   * The git commit the client's RUNNING process loaded its code from
+   * (`git rev-parse HEAD` at daemon startup — issue #49). Unlike
+   * `version` (a release number that only bumps on a tag), this reveals
+   * a daemon that predates the working tree it runs from. The surfaces
+   * compare it against their own checkout HEAD and flag the mismatch;
+   * the arbiter only stores and echoes it (it has no view of any
+   * client's repo tree). Sanitized like version (string ≤64 chars,
+   * malformed → dropped); absent on pre-#49 clients — never a rejection.
+   */
+  revision?: string;
 }
 
 /**

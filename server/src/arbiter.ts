@@ -196,7 +196,7 @@ export class Arbiter {
     observedIp: string,
     projects?: ProjectAllocation[],
     now?: number,
-    info?: { version?: string; protocol?: number },
+    info?: { version?: string; protocol?: number; revision?: string },
   ): { client_id: string; created: boolean } {
     const s = this.store.state;
     const seen = now ?? Date.now();
@@ -210,6 +210,16 @@ export class Arbiter {
     const protocol =
       typeof info?.protocol === 'number' && Number.isInteger(info.protocol) && info.protocol >= 0 && info.protocol <= 1000
         ? info.protocol
+        : undefined;
+    // Code-staleness (issue #49): the commit the client's running process
+    // loaded its code from. Same sanitize rule as version (string ≤64
+    // chars — a full SHA is 40, malformed → dropped, never a rejection).
+    // The arbiter stores + echoes it; the comparison against the
+    // operator's checkout lives in the surfaces (the arbiter has no view
+    // of any client's repo tree).
+    const revision =
+      typeof info?.revision === 'string' && info.revision.trim() !== '' && info.revision.trim().length <= 64
+        ? info.revision.trim()
         : undefined;
     const existing = s.clients.find((c) => c.name === name);
     if (existing) {
@@ -229,6 +239,11 @@ export class Arbiter {
       // the row; an older client that never sends them leaves the row as-is).
       if (version) existing.version = version;
       if (protocol !== undefined) existing.protocol = protocol;
+      // Code-staleness: same heartbeat rule — a daemon restart reports its
+      // new boot commit and updates the row within one tick (the surfaces'
+      // `daemon behind` tag clears on that heartbeat); a client that never
+      // sends the field leaves the row exactly as it was.
+      if (revision) existing.revision = revision;
       this.store.save();
       return { client_id: existing.client_id, created: false };
     }
@@ -246,6 +261,7 @@ export class Arbiter {
       projects: projects ?? [],
       ...(version ? { version } : {}),
       ...(protocol !== undefined ? { protocol } : {}),
+      ...(revision ? { revision } : {}),
     });
     this.store.appendEvent({ kind: 'client_registered', detail: `${name} (${client_id})` });
     // A fresh registration that already carries rebuild state (client

@@ -376,6 +376,14 @@ final class AppModel: ObservableObject {
    *  mark when healthy; clears after a successful re-point (the state is
    *  re-read from real launchd on every poll). */
   @Published var menubarStale = false
+  /** Code-staleness (issue #49): true when the daemon's reported boot
+   *  commit and this checkout's HEAD differ — the running daemon process
+   *  predates the tree it runs from (launchd KeepAlive relaunches only
+   *  on crash; the release `version` handshake cannot see it). Exception-
+   *  Only: no tag when the daemon reports no revision (an old daemon) or
+   *  this app cannot read its own HEAD. The one-click fix is right there
+   *  in the Settings panel ("restart daemon"). */
+  @Published var daemonBehind = false
 
   // auto-update (Sparkle + the edge channel)
   @Published var updateStatus: String? = nil
@@ -1345,6 +1353,13 @@ final class AppModel: ObservableObject {
       conn = .unreachable
       return
     }
+    // Code-staleness (issue #49): compare MY row's boot `revision` against
+    // this checkout's CURRENT HEAD (read fresh — the whole point is that
+    // the tree moves under a running daemon). Exception-only: an old
+    // daemon that reports no revision renders as before. Client-side by
+    // design: the arbiter has no view of the operator's repo tree.
+    let meRevision = (c["revision"] as? String)
+    daemonBehind = Self.daemonBehind(reported: meRevision, checkout: currentCheckoutRevision())
     // Client rows carry NO `online` flag (that lives on the arbiter's
     // projects[].workers rows) — liveness = last_seen within 90s, the same
     // window the arbiter uses for workers.
@@ -1765,6 +1780,36 @@ final class AppModel: ObservableObject {
     return nil
   }
 
+  /** The code-staleness rule (issue #49), PURE so the headless harness
+   *  proves what renders. `reported` is the daemon's boot commit from the
+   *  client row (`revision` — the FULL SHA), `checkout` this app's own
+   *  `git rev-parse --short HEAD`. The short form is unique in this repo
+   *  (the update machinery already relies on short-sha identity), so an
+   *  unambiguous prefix match counts as the SAME commit. Any real
+   *  mismatch -> true (the tag clears when the daemon restarts and
+   *  re-registers with its new boot commit — one heartbeat, well inside
+   *  the 5s poll). Absent/blank on either side (an old daemon, an
+   *  unreadable checkout) -> false: render exactly as before. */
+  static func daemonBehind(reported: String?, checkout: String?) -> Bool {
+    let r = (reported ?? "").trimmingCharacters(in: .whitespaces).lowercased()
+    let h = (checkout ?? "").trimmingCharacters(in: .whitespaces).lowercased()
+    guard !r.isEmpty, !h.isEmpty else { return false }
+    return !(r == h || r.hasPrefix(h) || h.hasPrefix(r))
+  }
+
+  /** This checkout's current HEAD (`git rev-parse --short HEAD` in
+   *  `repoRoot`) — best-effort, nil on any failure (no git, not a repo).
+   *  Read fresh on each poll: the tree moves ahead while the daemon
+   *  keeps running, and that gap is exactly what the comparison needs.
+   *  One local git call per 5s poll — cheap, and the launchd-state tick
+   *  already runs launchctl per tick. */
+  func currentCheckoutRevision() -> String? {
+    let (st, out) = runCmd("/usr/bin/git", ["-C", repoRoot, "rev-parse", "--short", "HEAD"])
+    guard st == 0 else { return nil }
+    let s = out.trimmingCharacters(in: .whitespacesAndNewlines)
+    return s.isEmpty ? nil : s
+  }
+
   /** Run a command, capturing stdout/stderr to a TEMP FILE (a Pipe +
    *  waitUntilExit deadlocks once the child emits more than the 64 KB pipe
    *  buffer — see the menubar's daemonPIDs pattern). Returns (exit, output).
@@ -2083,6 +2128,13 @@ struct StatePanel: View {
       VStack(spacing: 4) {
         KVRow(k: "arbiter", v: m.conn.word, vcolor: m.conn.color)
         KVRow(k: "this machine", v: statusRow)
+        // Code-staleness (issue #49) — Exception-Only: renders only when
+        // the running daemon predates this checkout (amber, the exception
+        // color this panel's markers use). The fix is the Settings tab's
+        // "restart daemon" button — one heartbeat clears the tag.
+        if m.daemonBehind {
+          KVRow(k: "", v: "daemon behind", vcolor: Pal.warn)
+        }
         KVRow(k: "queue", v: "\(m.queueDepth)")
         KVRow(k: "today", v: "\(m.today.finished) ok · \(m.today.failed) failed")
         if m.lease.1 > 0 {

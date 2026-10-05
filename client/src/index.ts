@@ -71,6 +71,7 @@ import { loadClientConfig, type ClientConfig, type ClientProjectConfig, type Sch
 import { startLlmProxy, waitProxyReady, type LlmProxy } from './proxy.js';
 import { SessionGate, type SessionStateRow } from './session-gate.js';
 import { resolveVersion } from './version.js';
+import { resolveRevision } from './revision.js';
 
 const clientDir = dirname(fileURLToPath(import.meta.url));
 
@@ -86,6 +87,15 @@ export const WIRE_PROTOCOL = 1;
 
 /** This checkout's version (root package.json) — `--version` + handshake. */
 const clientVersion = resolveVersion(clientDir);
+
+/**
+ * The commit this process's code was loaded from (issue #49) — computed
+ * ONCE at startup, so it stays the boot identity even after the working
+ * tree moves ahead (the exact staleness this reports). Undefined for a
+ * non-git checkout / missing git: the field is then simply omitted from
+ * the handshake (a pre-revision client stays a pre-revision client).
+ */
+const clientRevision = resolveRevision(clientDir);
 
 // ---------------------------------------------------------------------------
 // Logging (rotate at 10 MB, keep 1)
@@ -1067,6 +1077,14 @@ export class ClientDaemon {
       // connected (pre-version clients send neither and keep working).
       version: clientVersion,
       protocol: WIRE_PROTOCOL,
+      // Code-staleness (issue #49): the commit this process's code was
+      // loaded from, computed once at startup. The surfaces compare it
+      // against their own checkout HEAD and flag `daemon behind` when the
+      // tree moved ahead of the running process. undefined (non-git
+      // checkout) drops the key from the JSON body — the arbiter treats
+      // the field exactly like the version handshake: absent is normal,
+      // never a rejection.
+      ...(clientRevision ? { revision: clientRevision } : {}),
       // The arbiter stores this per-project view for the dashboard
       // (Projects → workers allocated). Re-registration is a heartbeat:
       // last_seen refreshes and queue depths update on every tick. `stats`

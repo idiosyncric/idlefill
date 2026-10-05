@@ -88,7 +88,7 @@ function bearer(req: { headers: Record<string, unknown>; query: unknown }): stri
 function projectView(
   arbiter: Arbiter,
   cfg: ServerConfig,
-  clients: { name: string; last_seen: number; projects: { name: string; model: string; estimated_seconds: number; queue_depth: number; queue_preview?: QueuePreviewRow[]; stats?: Record<string, number | string>; last_rebuild?: RebuildRunState }[]; version?: string; protocol?: number }[],
+  clients: { name: string; last_seen: number; projects: { name: string; model: string; estimated_seconds: number; queue_depth: number; queue_preview?: QueuePreviewRow[]; stats?: Record<string, number | string>; last_rebuild?: RebuildRunState }[]; version?: string; protocol?: number; revision?: string }[],
   day: string,
   now: number,
   today: Record<string, { finished: number; failed: number }>,
@@ -117,6 +117,9 @@ function projectView(
           // reported them — the dashboard renders them exception-only too).
           ...(c.version ? { version: c.version } : {}),
           ...(c.protocol !== undefined ? { protocol: c.protocol } : {}),
+          // Code-staleness (issue #49): the daemon's boot commit, same
+          // exception-only rule (absent on pre-#49 clients).
+          ...(c.revision ? { revision: c.revision } : {}),
         };
       })
       .sort((a, b) => Number(b.online) - Number(a.online) || a.client.localeCompare(b.client));
@@ -260,7 +263,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   // ------------------------------------------------------------------
 
   app.post('/api/clients/register', async (req, reply) => {
-    const body = (req.body ?? {}) as { name?: string; ip?: string; projects?: ProjectAllocation[]; version?: unknown; protocol?: unknown };
+    const body = (req.body ?? {}) as { name?: string; ip?: string; projects?: ProjectAllocation[]; version?: unknown; protocol?: unknown; revision?: unknown };
     const name = typeof body.name === 'string' ? body.name.trim() : '';
     if (!name) return reply.code(400).send({ error: 'name required' });
     const remote = (req.ip ?? '').split(':').pop() ?? 'unknown';
@@ -337,13 +340,19 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     // ≤64 chars; protocol: integer 0..1000; malformed → dropped).
     const version = typeof body.version === 'string' ? body.version : undefined;
     const protocol = typeof body.protocol === 'number' ? body.protocol : undefined;
+    // Code-staleness (issue #49): the commit the client's running process
+    // loaded its code from. Same edge posture — a plain string pass-through,
+    // sanitized in registerClient; absent on pre-#49 clients.
+    const revision = typeof body.revision === 'string' ? body.revision : undefined;
     const res = arbiter.registerClient(
       name,
       typeof body.ip === 'string' && body.ip.trim() ? body.ip.trim() : undefined,
       remote,
       projects,
       undefined,
-      version !== undefined || protocol !== undefined ? { version, protocol } : undefined,
+      version !== undefined || protocol !== undefined || revision !== undefined
+        ? { version, protocol, revision }
+        : undefined,
     );
     return reply.code(200).send({ client_id: res.client_id, created: res.created });
   });

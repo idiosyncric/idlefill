@@ -939,6 +939,100 @@ test('version handshake: malformed version/protocol values are dropped, never re
 
 
 // ---------------------------------------------------------------------------
+// Code-staleness (issue #49): registration carries the daemon's boot
+// `revision` (the git commit its running code loaded from); the arbiter
+// sanitizes it like version (string ≤64, malformed → dropped), stores it,
+// and echoes it on the client row + the per-project worker row. Absent is
+// normal (pre-#49 daemons), never a rejection. The arbiter only stores +
+// echoes — the behind-check lives in the surfaces (no view of client
+// repo trees). (No projects[] rows here: these clients never enter a
+// per-project worker count.)
+
+test('code-staleness: a register WITH revision echoes it on the client row + worker rows', async () => {
+  const sha = 'a'.repeat(40);
+  const reg = await fetch(`${base}/api/clients/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({
+      name: 'rev-v1',
+      version: '2',
+      protocol: 1,
+      revision: sha,
+      projects: [{ name: 'career-ops', model: 'Qwen3.8-27B', estimated_seconds: 900, queue_depth: 0 }],
+    }),
+  });
+  assert.equal(reg.status, 200);
+  const st = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: { name: string; revision?: string }[];
+    projects: { name: string; workers: { client: string; revision?: string }[] }[];
+  };
+  const row = st.clients.find((c) => c.name === 'rev-v1')!;
+  assert.equal(row.revision, sha, 'the client row carries the boot revision');
+  const w = st.projects.find((p) => p.name === 'career-ops')!.workers.find((x) => x.client === 'rev-v1')!;
+  assert.equal(w.revision, sha, 'the per-project worker row carries it too (the surfaces read either)');
+});
+
+test('code-staleness: a register WITHOUT revision keeps registering with no revision key (old daemon)', async () => {
+  const reg = await fetch(`${base}/api/clients/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ name: 'rev-legacy' }),
+  });
+  assert.equal(reg.status, 200, 'pre-#49 clients keep registering');
+  const st = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: { name: string; revision?: string }[];
+  };
+  const row = st.clients.find((c) => c.name === 'rev-legacy')!;
+  assert.ok(!('revision' in row), 'no revision key on a pre-#49 client row (surfaces render as before)');
+});
+
+test('code-staleness: malformed revision values are dropped, never rejected; a later valid report updates the row', async () => {
+  const reg = await fetch(`${base}/api/clients/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ name: 'rev-bad', revision: 'x'.repeat(65) }),
+  });
+  assert.equal(reg.status, 200, 'a malformed revision never rejects a registration');
+  const st = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: { name: string; revision?: string }[];
+  };
+  const row = st.clients.find((c) => c.name === 'rev-bad')!;
+  assert.ok(!('revision' in row), 'a >64-char revision is dropped');
+
+  // A non-string type is dropped the same way.
+  await fetch(`${base}/api/clients/register`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({ name: 'rev-bad2', revision: 12345 }),
+  });
+  const st2 = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: { name: string; revision?: string }[];
+  };
+  assert.ok(!('revision' in st2.clients.find((c) => c.name === 'rev-bad2')!), 'a non-string revision is dropped');
+
+  // The heartbeat rule: a later report with a valid revision updates the
+  // row (this is how a daemon restart clears the surfaces' tag within one
+  // heartbeat). An omitted field leaves the stored row as-is.
+  const sha2 = 'b'.repeat(40);
+  await fetch(`${base}/api/clients/register`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({ name: 'rev-bad', revision: sha2 }),
+  });
+  const st3 = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: { name: string; revision?: string }[];
+  };
+  assert.equal(st3.clients.find((c) => c.name === 'rev-bad')!.revision, sha2, 'a later valid report updates the row');
+  await fetch(`${base}/api/clients/register`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({ name: 'rev-bad' }),
+  });
+  const st4 = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: { name: string; revision?: string }[];
+  };
+  assert.equal(st4.clients.find((c) => c.name === 'rev-bad')!.revision, sha2, 'an omitted field leaves the stored row untouched');
+});
+
+
+// ---------------------------------------------------------------------------
 // Scheduled rebuild (issue #3): last_rebuild rides register → /api/state,
 // and a NEW run emits a `rebuild` event (queue 445 → 512 style detail).
 // ---------------------------------------------------------------------------

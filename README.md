@@ -841,6 +841,17 @@ the desktop feed's `sparkle:version` and the menubar bundle's
 daemon resolves it the same way at runtime — its registration carries
 `version` + `protocol` (the version handshake), echoed on `/api/state`
 per worker row and shown on the dashboard's per-worker row when present.
+The registration also carries `revision` (issue #49): the git commit the
+daemon's RUNNING process loaded its code from (`git rev-parse HEAD`, once
+at startup; a full SHA, sanitized like `version`). The version handshake
+cannot see a daemon that predates its own working tree — the release
+number only bumps on a tag, and launchd relaunches only on crash — so the
+surfaces compare `revision` against their own checkout HEAD and show an
+exception-only `daemon behind` marker (menubar panel + desktop STATE tab);
+the daemon's boot revision clears it within one heartbeat of a restart.
+The arbiter only stores + echoes it: the comparison is client-side, since
+the arbiter has no view of any client's repo tree. A non-git checkout
+reports nothing and renders exactly as before.
 ```bash
 node client/src/index.ts --version    # the daemon prints its version (exit 0)
 menubar/IdlefillMenubar.app/Contents/MacOS/IdlefillMenubar --version

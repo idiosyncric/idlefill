@@ -34,3 +34,4 @@ New issue reports land **here**, never at the repo root.
 | #53 | [../architecture/dev-cycles.md](../architecture/dev-cycles.md) | Dev-cycle grilling: cycle state machine on the lease/queue primitives + noop-adapter spike ([ISSUE53-GRILL-REPORT.md](ISSUE53-GRILL-REPORT.md)) |
 | #51 | [../architecture/metrics-history.md](../architecture/metrics-history.md) | Metrics history grilling: JSONL retention store, query surface, mesh boundary |
 | #51 | [ISSUE51-GRILL-REPORT.md](ISSUE51-GRILL-REPORT.md) | Metrics history grill: verified gaps + settled decisions |
+| #49 | [ISSUE49-REPORT.md](ISSUE49-REPORT.md) | Daemon code-staleness: boot-revision handshake + `daemon behind` flag |

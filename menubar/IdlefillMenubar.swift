@@ -710,15 +710,22 @@ final class AppModel: ObservableObject {
   @Published var tokensToday: (label: String, cap: Double, value: Double) = ("", 0, 0)
   @Published var tokenRowVisible = false
   /// The revision of THIS checkout's tree, as the operator should read it:
-  /// `git rev-parse --short HEAD`. Refreshed at launch (init) and on every
-  /// completed Update Code (where the deployed revision is exactly the
-  /// merged origin/main HEAD — no extra git call needed). Not polled on
-  /// the 10s cadence: the revision only changes when Update Code runs, so
-  /// polling would just burn a git call per tick for a value that cannot
-  /// change between updates. The panel shows it in a dedicated `revision`
-  /// row (always visible once known) — it is the standing answer to
-  /// "what is deployed?".
+  /// `git rev-parse --short HEAD`. Refreshed at launch (init), on every
+  /// completed Update Code, and on each poll tick since issue #49 — the
+  /// old "only Update Code changes it" premise is exactly what a direct
+  /// merge/pull breaks, and the daemon-behind comparison needs the
+  /// CURRENT HEAD (a stale cache would hide the exception it exists to
+  /// show). A non-git repo leaves it nil and the revision row stays
+  /// hidden until a successful read.
   @Published var deployedRevision: String? = nil
+  /** Code-staleness (issue #49): true when the daemon's reported boot
+   *  commit and this checkout's HEAD differ — i.e. the running process
+   *  predates the tree it runs from (launchd `KeepAlive` relaunches only
+   *  on crash, so a direct merge/push never restarts it and the release
+   *  `version` handshake cannot see it). Exception-only: no tag when the
+   *  daemon reports no revision (an old daemon) or this app cannot read
+   *  its own HEAD. */
+  @Published var daemonBehind = false
   @Published var updateNote: String? = nil
 
   /** The repo the update machinery acts on. `repoRootOverride` (headless
@@ -801,6 +808,24 @@ final class AppModel: ObservableObject {
       rows.append(PanelActionRow(label: "Install Update \(v)"))
     }
     return rows
+  }
+
+  /** The panel's `daemon behind` exception rule (issue #49), PURE so the
+   *  headless harness proves what renders. `reported` is the daemon's boot
+   *  commit from the client row (`revision`), `checkout` this app's own
+   *  `git rev-parse --short HEAD`. The daemon reports the FULL SHA; the
+   *  checkout value is short — a short form is unique in this repo (the
+   *  update machinery already relies on short-sha identity), so an
+   *  unambiguous prefix match counts as the SAME commit. Any real
+   *  mismatch → true (the flag's only clear path is a daemon restart,
+   *  which re-registers with the new boot commit on its next heartbeat).
+   *  Absent/blank on either side (an old daemon, an unreadable checkout)
+   *  → false: render exactly as before. */
+  static func daemonBehind(reported: String?, checkout: String?) -> Bool {
+    let r = (reported ?? "").trimmingCharacters(in: .whitespaces).lowercased()
+    let h = (checkout ?? "").trimmingCharacters(in: .whitespaces).lowercased()
+    guard !r.isEmpty, !h.isEmpty else { return false }
+    return !(r == h || r.hasPrefix(h) || h.hasPrefix(r))
   }
 
   init() {
@@ -1067,6 +1092,28 @@ final class AppModel: ObservableObject {
       meLastSeen = clients.compactMap { $0["last_seen"] as? Double }.max() ?? 0
     }
     daemonRunning = meLastSeen > 0 && nowMs - meLastSeen < 90_000
+    // Code-staleness (issue #49): compare the daemon's boot `revision`
+    // (same name-matched row the liveness above reads) against THIS
+    // checkout's CURRENT HEAD. The launch-only `deployedRevision` cache
+    // cannot serve this: its "the revision only changes when Update Code
+    // runs" premise is exactly what direct merges/pulls break — the tree
+    // moves ahead and neither the daemon nor the cache moves with it. So
+    // the poll refreshes the value (one local `git rev-parse --short
+    // HEAD`, ~ms, every 10s — cheap and it makes the revision row
+    // honest too: after a direct pull the panel shows the tree's new
+    // HEAD and the daemon-behind tag together). Exception-only: an old
+    // daemon that reports no revision renders as before. The comparison
+    // is client-side by design: the arbiter has no view of the
+    // operator's repo tree.
+    if let rev = UpdateLog.currentRevision(repo: repoRoot) { deployedRevision = rev }
+    let meRevision: String?
+    if let cn = config.clientName,
+       let c = clients.first(where: { ($0["name"] as? String) == cn }) {
+      meRevision = (c["revision"] as? String)
+    } else {
+      meRevision = nil
+    }
+    daemonBehind = Self.daemonBehind(reported: meRevision, checkout: deployedRevision)
     let scopeRows: [Double]
     if machine.key == ScopeView.allMachinesKey {
       scopeRows = clients.compactMap { $0["last_seen"] as? Double }
@@ -3104,6 +3151,13 @@ struct ContentView: View {
         KVRow(k: machineLabelKey, v: statusRow)
         if let rev = m.deployedRevision {
           KVRow(k: "revision", v: rev)
+        }
+        // Code-staleness (issue #49) — Exception-Only: the row renders
+        // only when the running daemon predates this checkout (the amber
+        // exception color the paused/budget tags use). The operator's
+        // fix is one click: the Restart row above.
+        if m.daemonBehind {
+          KVRow(k: "", v: "daemon behind", vcolor: Pal.warn)
         }
         KVRow(k: "queue", v: "\(m.queueDepth)")
         KVRow(k: "today", v: "\(m.today.finished) ok · \(m.today.failed) failed")
