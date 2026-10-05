@@ -211,6 +211,9 @@ function serverView(arbiter: Arbiter, cfg: ServerConfig, now: number) {
           // Feed-off providers (#60 A1): false = this row declares no feed
           // and log mtime alone carries the verdict. ADD key.
           feed_enabled: sig.feed_enabled,
+          // Honest fail-closed (#62): why NO signal can resolve on a
+          // feed-less row whose log glob matches nothing. ADD key.
+          no_signal_reason: sig.no_signal_reason ?? null,
           reidle_gated: arbiter.reidleGated(row.id),
           // Session folding (#32): the newest session activity on this server.
           session_last_activity_age_s: (() => {
@@ -632,6 +635,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       url?: string;
       activity_path?: string;
       log_glob?: string;
+      provider?: string;
       auth_token?: string;
       models?: string[];
       peers?: string[];

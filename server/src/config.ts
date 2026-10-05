@@ -12,7 +12,9 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { ServerConfig } from './types.js';
+import { defaultActivityPathFor } from './idle.js';
+import type { ServerConfig, ServerProvider } from './types.js';
+import { PROVIDER_KINDS } from './types.js';
 
 export const DEFAULTS: Omit<ServerConfig, 'state_file'> & {
   state_file: string;
@@ -52,8 +54,17 @@ export function applyDefaults(raw: Partial<ServerConfig> | null | undefined): Se
     api_tokens: Array.isArray(r.api_tokens) ? r.api_tokens.filter((t) => typeof t === 'string') : [],
     llama_swap_url: str(r.llama_swap_url, DEFAULTS.llama_swap_url),
     // An EXPLICIT empty string is the feed-off declaration (#60 A1) and
-    // must survive; an absent/garbage key falls back to the default path.
-    activity_path: typeof r.activity_path === 'string' ? r.activity_path : DEFAULTS.activity_path,
+    // must survive; an absent/garbage key falls back to the kind's
+    // default feed shape (#62: llama-swap contract, strata /metrics,
+    // omlx feed-off) — the kind selects the shape, path included.
+    activity_path:
+      typeof r.activity_path === 'string'
+        ? r.activity_path
+        : defaultActivityPathFor(
+            typeof r.server_provider === 'string' && (PROVIDER_KINDS as string[]).includes(r.server_provider.trim())
+              ? (r.server_provider.trim() as ServerProvider)
+              : undefined,
+          ),
     server_name: str(r.server_name, DEFAULTS.server_name),
     server_models: Array.isArray(r.server_models)
       ? r.server_models.filter((m): m is string => typeof m === 'string' && m.trim() !== '')
@@ -66,6 +77,13 @@ export function applyDefaults(raw: Partial<ServerConfig> | null | undefined): Se
     // never do, but the config file is the operator's input; trim here so
     // a trailing newline from an editor paste does not poison the header).
     server_auth_token: typeof r.server_auth_token === 'string' ? r.server_auth_token.trim() : DEFAULTS.server_auth_token,
+    // Provider kind for the watched row (#60 B): validated; garbage falls
+    // back to undefined (= llama-swap, the pre-#60-B behavior).
+    server_provider: typeof r.server_provider === 'string' && (PROVIDER_KINDS as string[]).includes(r.server_provider.trim())
+      ? (r.server_provider.trim() as ServerConfig['server_provider'])
+      : undefined,
+    // oMLX usage-store path for the 'omlx' kind's metrics sampler (#62).
+    omlx_usage_db: typeof r.omlx_usage_db === 'string' && r.omlx_usage_db.trim() !== '' ? r.omlx_usage_db.trim() : undefined,
     // Mesh federation read plane (#50). mesh_peers is the peer registry —
     // deliberately NOT server_peers (llama-swap backends). Entries are
     // {url, name?}; a blank url is dropped (a peer with no url cannot be

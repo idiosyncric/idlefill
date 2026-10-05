@@ -50,11 +50,12 @@
 
 import { randomBytes } from 'node:crypto';
 import type { IdleDetector } from './idle.js';
-import { activeLeaseExemptIps } from './idle.js';
+import { activeLeaseExemptIps, defaultActivityPathFor } from './idle.js';
 import { mintInstanceId } from './mesh.js';
 import type { IdleSignal, JobResultRow, JobThrottle, SessionOverride, SessionRecord } from './types.js';
 import type { StateStore } from './state.js';
-import type { ClientOverride, Lease, ProjectAllocation, ServerConfig, ServerConnection, UtcDate } from './types.js';
+import type { ClientOverride, Lease, ProjectAllocation, ServerConfig, ServerConnection, ServerProvider, UtcDate } from './types.js';
+import { PROVIDER_KINDS } from './types.js';
 
 /**
  * The id of the seeded watched-server row (cfg.llama_swap_url). Leases and
@@ -63,6 +64,23 @@ import type { ClientOverride, Lease, ProjectAllocation, ServerConfig, ServerConn
  * unchanged.
  */
 export const WATCHED_SERVER_ID = 'srv-watched';
+
+/** Feed path on strata engines (#60 B): /metrics on the service origin. */
+export const STRATA_FEED_PATH = '/metrics';
+
+/**
+ * The scheme://host[:port] origin of a server URL. strata operators paste
+ * the OpenAI-style base (`https://host/v1`); its /metrics feed lives on
+ * the ORIGIN, so strata rows normalize the url to origin and keep the
+ * feed path separate. Unparseable urls pass through untouched.
+ */
+export function feedOrigin(url: string): string {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return url;
+  }
+}
 
 /** The server a lease belongs to (absent server_id = the watched server). */
 export function leaseServerId(lease: { server_id?: string }): string {
@@ -1133,8 +1151,11 @@ export class Arbiter {
     s.servers.push({
       id: WATCHED_SERVER_ID,
       name: this.cfg.server_name ?? 'llama-swap',
-      url: this.cfg.llama_swap_url,
+      // strata rows normalize to the service origin (#60 B): the feed
+      // lives at origin+/metrics; operators paste the OpenAI base /v1.
+      url: this.cfg.server_provider === 'strata' ? feedOrigin(this.cfg.llama_swap_url) : this.cfg.llama_swap_url,
       activity_path: this.cfg.activity_path,
+      ...(this.cfg.server_provider ? { provider: this.cfg.server_provider } : {}),
       ...(this.cfg.log_glob ? { log_glob: this.cfg.log_glob } : {}),
       ...(this.cfg.server_auth_token ? { auth_token: this.cfg.server_auth_token } : {}),
       models: [...(this.cfg.server_models ?? [])],
@@ -1159,6 +1180,7 @@ export class Arbiter {
     url?: string;
     activity_path?: string;
     log_glob?: string;
+    provider?: string;
     auth_token?: string;
     models?: string[];
     peers?: string[];
@@ -1168,6 +1190,16 @@ export class Arbiter {
       Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && x.trim() !== '') : undefined;
     const models = strList(input.models);
     const peers = strList(input.peers);
+    // Provider kind (#60 B): the feed SHAPE this row answers. Invalid
+    // values are rejected rather than silently defaulted — a wrong kind
+    // silently mis-parses the feed and lands the row degraded.
+    let provider: ServerProvider | undefined;
+    if (typeof input.provider === 'string' && input.provider.trim() !== '') {
+      const p = input.provider.trim();
+      if (!(PROVIDER_KINDS as string[]).includes(p))
+        return { ok: false, reason: `unknown provider kind: ${p} (expected ${PROVIDER_KINDS.join(' or ')})`, created: false };
+      provider = p as ServerProvider;
+    }
     const nowMs = Date.now();
     if (typeof input.id === 'string' && input.id.trim() !== '') {
       const row = s.servers.find((x) => x.id === input.id!.trim());
@@ -1185,6 +1217,19 @@ export class Arbiter {
       if (typeof input.activity_path === 'string')
         touch(() => void (row.activity_path = input.activity_path!.trim()));
       if (typeof input.log_glob === 'string') touch(() => void (row.log_glob = input.log_glob!.trim()));
+      // Kind change (#60 B, #62): switching kinds re-derives the feed
+      // defaults UNLESS this same body sets activity_path explicitly —
+      // the operator picking a kind in the form is a one-save fix for a
+      // row that was pointing at the wrong feed shape. 'strata' also
+      // normalizes the url to the service origin (its feed lives at
+      // origin+/metrics); 'omlx' declares feed-off (no HTTP feed exists).
+      if (provider !== undefined && provider !== (row.provider ?? 'llama-swap')) {
+        touch(() => void (row.provider = provider));
+        if (typeof input.activity_path !== 'string') {
+          touch(() => void (row.activity_path = defaultActivityPathFor(provider)));
+        }
+        if (provider === 'strata') touch(() => void (row.url = feedOrigin(row.url)));
+      }
       // Per-server credential (#60 B): WRITE-ONLY. A non-empty string sets
       // it; the sentinel null/empty string REMOVES it (explicit clear —
       // an absent key leaves the stored token untouched, so a read-modify
@@ -1210,19 +1255,23 @@ export class Arbiter {
     const url = typeof input.url === 'string' ? input.url.trim() : '';
     if (!name || !url) return { ok: false, reason: 'name and url required', created: false };
     if (!/^https?:\/\//.test(url)) return { ok: false, reason: 'url must be an http(s) address', created: false };
-    // Create: an absent activity_path falls back to the llama-swap default
-    // (back-compat); an EXPLICIT empty string declares a feed-off provider
+    // Create: an absent activity_path falls back to the kind's default
+    // feed shape (#62: llama-swap contract, strata /metrics, omlx
+    // feed-off); an EXPLICIT empty string declares a feed-off provider
     // (#60 A1) and sticks.
+    // 'strata' also normalizes the url to the service ORIGIN: the feed
+    // lives at origin+/metrics, and operators paste the OpenAI-style base
+    // (.../v1) — concatenating that with the feed path 404s.
+    const createUrl = provider === 'strata' ? feedOrigin(url) : url;
     const activityPath =
-      typeof input.activity_path === 'string'
-        ? input.activity_path.trim()
-        : '/api/metrics/activity';
-    const dupe = s.servers.find((x) => x.url === url && x.activity_path === activityPath);
+      typeof input.activity_path === 'string' ? input.activity_path.trim() : defaultActivityPathFor(provider);
+    const dupe = s.servers.find((x) => x.url === createUrl && x.activity_path === activityPath);
     if (dupe) return { ok: false, reason: `duplicate connection: ${dupe.name} already declared at this url + activity path`, created: false };
     const server: ServerConnection = {
       id: `srv-${randomBytes(4).toString('hex')}`,
       name,
-      url,
+      url: createUrl,
+      ...(provider ? { provider } : {}),
       activity_path: activityPath,
       ...(typeof input.log_glob === 'string' && input.log_glob.trim() !== '' ? { log_glob: input.log_glob.trim() } : {}),
       ...(typeof input.auth_token === 'string' && input.auth_token.trim() !== '' ? { auth_token: input.auth_token.trim() } : {}),

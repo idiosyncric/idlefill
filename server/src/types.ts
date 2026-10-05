@@ -35,6 +35,13 @@ export interface ServerConfig {
   server_models?: string[];
   /** llama-swap `peer:` backends routed behind the single entry point (display metadata). */
   server_peers?: string[];
+  /** Provider kind for the watched server (#60 B): 'llama-swap' (default) or 'strata'. */
+  server_provider?: ServerProvider;
+  /**
+   * oMLX usage-store sqlite path for the 'omlx' kind (#62). Default:
+   * ~/.omlx/usage.sqlite3. Read-only; co-located kinds only.
+   */
+  omlx_usage_db?: string;
   /**
    * Credential for the watched server (#60 B): seeded onto the watched
    * row at boot and sent as `Authorization: Bearer <token>` on its feed
@@ -209,6 +216,35 @@ export interface RebuildRunState {
 }
 
 /**
+ * Provider kind (#60 B, #62): the dialect a server answers — selects the
+ * idle-signal implementation AND the metrics sampler.
+ * 'llama-swap' (default) = the activity-feed contract ({data:[{id,
+ * timestamp, src, model, ...}]}), request counts as feed-id deltas.
+ * 'strata' = strata's /metrics JSON (engine/live/requests/totals),
+ * adapted into feed entries by parseStrataMetrics; request + token
+ * truth from the totals counters (HTTP only — works remote).
+ * 'omlx' = co-located oMLX: idle = log mtime (feed-off), metrics =
+ * model_usage_hourly rows from the oMLX usage sqlite store.
+ */
+export type ServerProvider = 'llama-swap' | 'strata' | 'omlx';
+export const PROVIDER_KINDS: ServerProvider[] = ['llama-swap', 'strata', 'omlx'];
+
+/**
+ * Engine-reported cumulative counters (#62): monotonic since engine boot
+ * (strata /metrics totals) or since install (oMLX usage store sums).
+ * Diffs between consecutive samples ride the engine sample line; a
+ * backwards counter (engine restart) reads unknown, never negative.
+ */
+export interface EngineCounters {
+  requests: number;
+  tokens_in: number;
+  tokens_out: number;
+}
+
+/** Where a sample's request/token numbers came from (ADD key). */
+export type RequestsSource = 'feed-delta' | 'metrics-counter' | 'sqlite';
+
+/**
  * A declared inference-server connection. The arbiter watches ONE feed
  * (cfg.llama_swap_url + cfg.activity_path); the connection list is the
  * operator-managed inventory of the server(s) behind it — today exactly the
@@ -238,6 +274,15 @@ export interface ServerConnection {
   models: string[];
   /** llama-swap `peer:` backends routed behind this entry point (display only). */
   peers: string[];
+  /**
+   * Provider kind (#60 B): selects the feed SHAPE, not just the path.
+   * Absent or 'llama-swap' = the activity-feed contract ({data:[{id,
+   * timestamp, src, model, ...}]}). 'strata' = strata's /metrics JSON
+   * (engine/live/requests), adapted into feed entries by
+   * parseStrataMetrics. ADD key: existing rows carry no field and behave
+   * exactly as before.
+   */
+  provider?: ServerProvider;
   /**
    * Per-server credential for key-gated engines (#60 B): when set, the
    * arbiter sends it as `Authorization: Bearer <token>` on this server's
@@ -489,6 +534,12 @@ export interface IdleSignal {
    * rename).
    */
   feed_enabled: boolean;
+  /**
+   * Honest fail-closed reason when NO signal can resolve (#62): a feed-less
+   * row whose log glob matches nothing. The kind gap is named instead of a
+   * fetch that never happened. null when a signal resolves. ADD key.
+   */
+  no_signal_reason?: string | null;
 }
 
 export type EventKind =

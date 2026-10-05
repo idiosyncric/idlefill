@@ -32,6 +32,7 @@
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { WATCHED_SERVER_ID, type Arbiter } from './arbiter.js';
+import type { RequestsSource } from './types.js';
 
 export const HOUR_MS = 3_600_000;
 export const DAY_MS = 86_400_000;
@@ -60,6 +61,19 @@ export interface EngineSampleLine {
   active_leases: number;
   /** D2: until #45 lands, the session series is only this count. */
   active_sessions: number;
+  /**
+   * Where this sample's request count came from (#62). Absent = 'feed-delta'
+   * (every pre-#62 line reads unchanged). ADD key.
+   */
+  requests_source?: RequestsSource;
+  /**
+   * Engine-reported token deltas since the previous sample (#62): strata
+   * /metrics totals or the oMLX usage store. null = unknown (first sample,
+   * backwards counter, unreachable store). Only present for the
+   * counter-backed kinds. ADD keys.
+   */
+  tokens_in_delta?: number | null;
+  tokens_out_delta?: number | null;
 }
 
 export interface LeaseOutcomeLine {
@@ -96,6 +110,14 @@ export interface EngineHourLine {
   revoked: number;
   tokens_out: number;
   tokens_in: number;
+  /**
+   * #62 ADD-keys: the source the hour's req/token numbers rode, and the
+   * engine-reported TOKEN truth (sum of the raw-line deltas; null = no
+   * counter-backed sample contributed, distinct from a real 0).
+   */
+  requests_source?: RequestsSource;
+  engine_tokens_in?: number | null;
+  engine_tokens_out?: number | null;
 }
 
 export interface LeaseHourLine {
@@ -351,11 +373,20 @@ export class MetricsStore {
         revoked: 0,
         tokens_out: 0,
         tokens_in: 0,
+        // #62: last source seen this hour (one row = one kind, so it is
+        // stable); engine token truth sums the counter deltas, null until
+        // a counter-backed sample lands (distinct from a real 0).
+        requests_source: l.requests_source,
+        engine_tokens_in: null,
+        engine_tokens_out: null,
       };
       e.samples += 1;
       if (l.req_delta !== null) e.req_total += l.req_delta;
       if (l.idle) e.idle_samples += 1;
       e.grants += l.grants;
+      if (l.requests_source !== undefined) e.requests_source = l.requests_source;
+      if (typeof l.tokens_in_delta === 'number') e.engine_tokens_in = (e.engine_tokens_in ?? 0) + l.tokens_in_delta;
+      if (typeof l.tokens_out_delta === 'number') e.engine_tokens_out = (e.engine_tokens_out ?? 0) + l.tokens_out_delta;
       engine.set(l.server_id, e);
     }
     for (const l of inHour) {

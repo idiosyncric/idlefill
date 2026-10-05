@@ -9,11 +9,13 @@ import { fileURLToPath } from 'node:url';
 import { buildApi, attachWebSocket } from './api.js';
 import { Arbiter, leaseServerId, WATCHED_SERVER_ID } from './arbiter.js';
 import { loadConfig } from './config.js';
-import { IdleDetector, makeRealActivityFetcher, makeRealLogMtimeSource } from './idle.js';
+import { IdleDetector, makeActivityFetcherFor, makeRealActivityFetcher, makeRealLogMtimeSource } from './idle.js';
+import type { ActivityFetcher } from './idle.js';
 import { FeedDeltaTracker, MetricsStore, HOUR_MS, instrumentArbiterForMetrics } from './metrics.js';
+import { CounterDeltaTracker, OmlxUsageReaders } from './omlx.js';
 import { MeshFederation, makeRealMeshFetcher } from './mesh.js';
 import { StateStore } from './state.js';
-import type { ActivityEntry, ServerConnection } from './types.js';
+import type { ActivityEntry, EngineCounters, RequestsSource, ServerConnection, ServerProvider } from './types.js';
 
 const entryDir = dirname(fileURLToPath(import.meta.url));
 
@@ -28,11 +30,24 @@ async function main(): Promise<void> {
   // newest entry id. A backwards id (llama-swap restart) reads as an
   // unknown delta, never a negative count.
   const feedDelta = new FeedDeltaTracker();
-  const baseFetchActivity = makeRealActivityFetcher();
-  const fetchActivity = async (url: string, auth?: string): Promise<ActivityEntry[]> => {
-    const entries = await baseFetchActivity(url, auth);
-    feedDelta.observe(url, entries);
-    return entries;
+  // Engine-reported counters (#62): strata /metrics totals ride the SAME
+  // poll as the feed adapter; the omlx sqlite store is summed on the
+  // sample tick. Keyed per server row. Deltas follow FeedDeltaTracker's
+  // posture: first sample + backwards counters read unknown, never
+  // negative.
+  const counterDelta = new CounterDeltaTracker();
+  const omlxReaders = new OmlxUsageReaders(log);
+  // One wrapped fetch per provider kind (#60 B, #62): the kind selects the
+  // PARSE (llama-swap feed contract vs strata /metrics); the transport,
+  // the credential header, and the delta observers are shared.
+  const fetchByKind = (row: ServerConnection): ActivityFetcher => {
+    const counters = (c: EngineCounters) => counterDelta.observe(row.id, c);
+    const base = makeActivityFetcherFor(row.provider, row.provider === 'strata' ? counters : undefined);
+    return async (url: string, auth?: string): Promise<ActivityEntry[]> => {
+      const entries = await base(url, auth);
+      feedDelta.observe(url, entries);
+      return entries;
+    };
   };
 
   // Per-engine idle watching (#38): one detector per declared server row.
@@ -41,7 +56,7 @@ async function main(): Promise<void> {
   const logMtime = makeRealLogMtimeSource();
   const makeDetector = (row: ServerConnection): IdleDetector =>
     new IdleDetector({
-      fetchActivity,
+      fetchActivity: fetchByKind(row),
       logMtime,
       llama_swap_url: row.url,
       activity_path: row.activity_path,
@@ -49,6 +64,8 @@ async function main(): Promise<void> {
       // Per-server credential (#60 B): the watched row's seed comes from
       // config.server_auth_token at boot; other rows carry their own.
       ...(row.auth_token ? { auth_token: row.auth_token } : {}),
+      // Provider kind (#62): names the fail-closed reason when nothing resolves.
+      ...(row.provider ? { provider: row.provider } : {}),
       idle_seconds: cfg.idle_seconds,
     });
 
@@ -117,12 +134,48 @@ async function main(): Promise<void> {
   // delta from the feed ids, the grant/denial window counters, and the
   // active lease/session counts. Sessions ride as a count until #45 lands
   // (D2: no second session history).
+  // #62: the counter-backed kinds (strata /metrics totals, omlx usage
+  // store) replace the feed-id delta as the request source and add engine
+  // token truth. llama-swap rows keep feed-id deltas exactly as before.
   const sampleEngines = (now: number) => {
     for (const row of store.state.servers) {
       const sig = arbiter.serverSignal(row.id, now);
       if (!sig) continue; // no detector = no sample for this row
       const url = `${String(row.url ?? '').replace(/\/$/, '')}${row.activity_path ?? ''}`;
-      const { req_delta, feed_last_id } = feedDelta.delta(url);
+      const kind: ServerProvider = row.provider ?? 'llama-swap';
+
+      let req_delta: number | null = null;
+      let feed_last_id: number | null = null;
+      let requests_source: RequestsSource = 'feed-delta';
+      let tokens_in_delta: number | null | undefined = undefined;
+      let tokens_out_delta: number | null | undefined = undefined;
+
+      if (kind === 'omlx') {
+        // Engine truth from the usage store, diffed like a counter. The
+        // read is a SUM over the hourly table — cheap (rows are per
+        // hour+model), and the store is read-only (query_only pragma).
+        const totals = omlxReaders.forPath(cfg.omlx_usage_db).readTotals();
+        if (totals) counterDelta.observe(row.id, totals);
+        const d = counterDelta.delta(row.id);
+        req_delta = d.req_delta;
+        tokens_in_delta = d.tokens_in_delta;
+        tokens_out_delta = d.tokens_out_delta;
+        requests_source = 'sqlite';
+      } else if (kind === 'strata') {
+        // The strata fetcher observed /metrics totals on this same poll;
+        // the feed-id delta rides as unknown because the adapter's ids
+        // are derived from the counter anyway (the counter is the truth).
+        const d = counterDelta.delta(row.id);
+        req_delta = d.req_delta;
+        tokens_in_delta = d.tokens_in_delta;
+        tokens_out_delta = d.tokens_out_delta;
+        requests_source = 'metrics-counter';
+      } else {
+        const fd = feedDelta.delta(url);
+        req_delta = fd.req_delta;
+        feed_last_id = fd.feed_last_id;
+      }
+
       const win = metrics.takeWindow(row.id);
       const activeLeases = arbiter.activeLeases(now).filter((l) => leaseServerId(l) === row.id).length;
       const activeSessions = store.state.sessions.filter((sess) => leaseServerId(sess) === row.id).length;
@@ -139,6 +192,8 @@ async function main(): Promise<void> {
         denials: win.denials,
         active_leases: activeLeases,
         active_sessions: activeSessions,
+        requests_source,
+        ...(tokens_in_delta !== undefined ? { tokens_in_delta, tokens_out_delta } : {}),
       });
     }
   };

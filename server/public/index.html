@@ -502,6 +502,14 @@ function srvBlock(s, st) {
     if (sig.degraded) {
       signalRows += '<div class="kv"><span class="k">signal health</span><span class="v err">DEGRADED ' + esc(sig.degraded_reason ?? "") + "</span></div>";
     }
+    // Honest fail-closed (#62): a feed-less row with no log signal names
+    // the kind gap instead of showing an "unknown" with no explanation.
+    if (sig.no_signal_reason) {
+      signalRows += '<div class="kv"><span class="k">signal health</span><span class="v err">NO SIGNAL ' + esc(sig.no_signal_reason) + "</span></div>";
+    }
+    // Provider kind (#62): the source word — the operator can see WHY the
+    // row is judged the way it is (feed vs counters vs local files).
+    signalRows += '<div class="kv"><span class="k">provider</span><span class="v">' + esc(s.provider ?? "llama-swap") + "</span></div>";
     if (sig.reidle_gated) {
       signalRows += '<div class="kv"><span class="k">re-idle gate</span><span class="v warn">armed (wait for full idle)</span></div>';
     }
@@ -1531,8 +1539,22 @@ function projectFormHtml(p) {
 }
 
 // Server connection form (create = the pane head's "+ add server", no
-// activity_path row — the server defaults it; edit = per-server "edit
-// connection", patch by id).
+// activity_path row — the server defaults it by provider kind; edit =
+// per-server "edit connection", patch by id).
+const PROVIDER_CHOICES = [
+  ["llama-swap", "llama-swap (activity feed)"],
+  ["strata", "strata (/metrics counters — works remote)"],
+  ["omlx", "oMLX (log mtime + usage store — same machine only)"],
+];
+// Co-location warning (#62): the omlx kind reads a local log file and a
+// local sqlite store — it cannot work across the network. Plain words.
+function coLocationWarning(url, provider) {
+  if (provider !== "omlx") return "";
+  let host = "";
+  try { host = new URL(url).hostname; } catch { return ""; }
+  if (host === "127.0.0.1" || host === "localhost" || host === "::1") return "";
+  return '<div class="note warn">oMLX is watched through local files (its log + usage store) — this kind needs the engine on THIS machine. A remote url stays permanently un-judgeable.</div>';
+}
 function serverFormHtml(s, mode) {
   const cid = "sf-" + (mode === "add" ? "add" : cssEscape(s.id)) + "-";
   const text = (id, label, value, ph) =>
@@ -1551,11 +1573,25 @@ function serverFormHtml(s, mode) {
         ? '<label class="units" style="display:inline-flex;gap:4px;align-items:center;flex:0 0 auto">' +
           '<input type="checkbox" id="' + cid + 'auth-clear" style="flex:0 0 auto" title="send the clear sentinel">remove</label>'
         : ""));
+  // Provider kind (#62): the engine dialect — selects the idle signal AND
+  // the metrics sampler. Picking a different kind re-derives the feed path
+  // on the server (unless a path is typed below for an add).
+  const kind = s.provider ?? "llama-swap";
+  const kindRow =
+    formRow(cid + "provider", "provider kind", "",
+      '<select id="' + cid + 'provider">' +
+      PROVIDER_CHOICES.map(([v, label]) =>
+        '<option value="' + esc(v) + '"' + (v === kind ? " selected" : "") + ">" + esc(label) + "</option>").join("") +
+      "</select>");
   const rows =
     formRow(cid + "name", "name", "", text(cid + "name", "the label in the pane", s.name ?? "", "llama-swap")) +
     formRow(cid + "url", "url (http or https)", "", text(cid + "url", "the activity feed's address", s.url ?? "", "http://100.105.225.1:11434")) +
+    kindRow +
+    '<div class="settings-form-note" id="' + cid + 'colocation" style="padding:0 8px">' +
+    (mode === "edit" ? coLocationWarning(s.url ?? "", kind) : "") +
+    "</div>" +
     (mode === "add"
-      ? formRow(cid + "path", "activity path (blank = default)", "", text(cid + "path", "the feed's activity path", s.activity_path ?? "", "/api/metrics/activity"))
+      ? formRow(cid + "path", "activity path (blank = default for the kind)", "", text(cid + "path", "the feed's activity path", s.activity_path ?? "", ""))
       : "") +
     authRow +
     formRow(cid + "models", "models, comma separated", "", text(cid + "models", "the queueable resources", (s.models || []).map((m) => m.name).join(", "), "Qwen3.8-27B, Llama-3.1-8B")) +
@@ -1591,6 +1627,23 @@ wireSettingsToggles("servers", "data-server", (id) => {
   const s = serversCache.find((x) => x.id === id);
   return s ? () => serverFormHtml(s, "edit") : null;
 });
+// Co-location warning (#62): live while the form is open — the omlx kind
+// against a remote url is a dead row, say so before the save.
+function refreshColocation(form) {
+  const box = form.querySelector(".settings-form-note");
+  if (!box) return;
+  const url = form.querySelector('[id$="-url"]')?.value.trim() ?? "";
+  const provider = form.querySelector('[id$="-provider"]')?.value ?? "llama-swap";
+  box.innerHTML = coLocationWarning(url, provider);
+}
+for (const sel of ["#add-server-form", "#servers"]) {
+  const box = document.querySelector(sel);
+  if (!box) continue;
+  box.addEventListener("input", (e) => {
+    const form = e.target.closest(".settings-form");
+    if (form && (e.target.id?.endsWith("-provider") || e.target.id?.endsWith("-url"))) refreshColocation(form);
+  });
+}
 wireSettingsToggles("projects", "data-proj-settings", (name) => {
   const p = projectsCache.find((x) => x.name === name);
   return p ? () => projectFormHtml(p) : null;
@@ -1729,6 +1782,11 @@ $("servers").addEventListener("click", async (e) => {
   const body = {};
   if (val("name") && val("name") !== s.name) body.name = val("name");
   if (val("url") && val("url") !== s.url) body.url = val("url");
+  // Provider kind (#62): only sent when it changed. A change re-derives
+  // the kind's default feed path on the server (the stored key is not
+  // echoed here, so the form cannot round-trip it — it stays untouched).
+  const kind = val("provider") || "llama-swap";
+  if (kind !== (s.provider ?? "llama-swap")) body.provider = kind;
   // API key (#60 B): typing a key SETS it; the remove tick box sends the
   // empty-string sentinel that CLEARS it; an untouched field sends nothing
   // (the stored key stays — the server never echoes it, so we cannot
@@ -1793,6 +1851,10 @@ if (addBtn && addForm) {
       models: val("models").split(",").map((x) => x.trim()).filter(Boolean),
       peers: val("peers").split(",").map((x) => x.trim()).filter(Boolean),
     };
+    // Provider kind (#62): the server defaults the feed path by kind, so
+    // an add with no typed path gets the kind's shape (strata /metrics,
+    // omlx feed-off). A typed path overrides.
+    if (val("provider") && val("provider") !== "llama-swap") body.provider = val("provider");
     if (val("path")) body.activity_path = val("path");
     if (val("auth")) body.auth_token = val("auth"); // #60 B: optional key
     if (!body.name || !body.url) {
@@ -1885,7 +1947,19 @@ async function refreshUsage() {
     const pts = s.points;
     // requests per hour (the doc's chart 1)
     const reqs = pts.map((p) => p.req_total ?? 0);
-    rows.push(usageRow(s.key + " req/hour", reqs, "--accent", String(reqs.reduce((a, b) => a + b, 0)), "requests per hour bucket, last 7 days"));
+    const src = pts.map((p) => p.requests_source).filter(Boolean).slice(-1)[0];
+    rows.push(usageRow(s.key + (src === "sqlite" || src === "metrics-counter" ? " req/hour (engine)" : " req/hour"), reqs, "--accent", String(reqs.reduce((a, b) => a + b, 0)), "requests per hour bucket, last 7 days" + (src ? " · source: " + src : "")));
+    // engine-reported tokens per hour (#62): the strata /metrics counters
+    // and the oMLX usage store carry token truth the lease reports never
+    // saw. Exception-only: no counter-backed samples = no rows.
+    const tokOut = pts.map((p) => p.engine_tokens_out);
+    if (tokOut.some((v) => typeof v === "number" && v > 0)) {
+      rows.push(usageRow(s.key + " tok out/hour (engine)", tokOut.map((v) => v ?? 0), "--warn", tokOut.reduce((a, b) => a + (b ?? 0), 0).toLocaleString(), "engine-reported output tokens per hour bucket, last 7 days"));
+    }
+    const tokIn = pts.map((p) => p.engine_tokens_in);
+    if (tokIn.some((v) => typeof v === "number" && v > 0)) {
+      rows.push(usageRow(s.key + " tok in/hour (engine)", tokIn.map((v) => v ?? 0), "--warn", tokIn.reduce((a, b) => a + (b ?? 0), 0).toLocaleString(), "engine-reported input tokens per hour bucket, last 7 days"));
+    }
     // idle share per hour (the doc's "idle hours" as a per-hour ratio)
     const idleShare = pts.map((p) => (p.samples ? Math.round(((p.idle_samples ?? 0) / p.samples) * 100) : 0));
     rows.push(usageRow(s.key + " idle %", idleShare, "--ok", idleShare.length ? Math.round(idleShare.reduce((a, b) => a + b, 0) / idleShare.length) + "% avg" : "—", "idle samples per hour bucket, last 7 days"));
