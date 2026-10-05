@@ -105,6 +105,7 @@ function makeGate(opts: {
   holdCapMs?: number;
   register?: (token: string, gate: SessionGateSnapshot | null) => Promise<boolean>;
   now?: () => number;
+  clientName?: string;
 } = {}): { gate: SessionGate; registered: string[]; calls: { token: string; gate: SessionGateSnapshot | null }[] } {
   const registered: string[] = [];
   const calls: { token: string; gate: SessionGateSnapshot | null }[] = [];
@@ -112,6 +113,7 @@ function makeGate(opts: {
     maxActive: opts.maxActive ?? 1,
     holdCapMs: opts.holdCapMs ?? 30_000,
     now: opts.now,
+    clientName: opts.clientName,
     register:
       opts.register ??
       (async (token, gateSnapshot) => {
@@ -483,4 +485,23 @@ test('daemon integration: session registers with client identity; pause override
   await waitFor(() => up.hits.length === 2, 2000, 'held request forwarded on unpause');
   up.release();
   assert.equal((await r2p).status, 200, 'unpause releases the hold transparently');
+});
+
+// ---------------------------------------------------------------------------
+// (h) #54 fleet adoption — arbiter session rows name their owner
+// ---------------------------------------------------------------------------
+
+test('(h) a session row owned by ANOTHER client is not adopted (fleet)', async () => {
+  const { gate, registered } = makeGate({ maxActive: 1, clientName: 'urza' });
+  // mac-sam owns tokMac (its gate tag is live there); urza owns tokMine;
+  // tokOld predates #50 mesh attribution (no owner named) → adopted.
+  gate.onStatePoll([
+    { token: 'tokMac', client_name: 'mac-sam' },
+    { token: 'tokMine', client_name: 'urza' },
+    { token: 'tokOld' },
+  ]);
+  gate.heartbeat(); // what the daemon tick does for adopted rows
+  await new Promise((r) => setTimeout(r, 100));
+  assert.deepEqual(registered.sort(), ['tokMine', 'tokOld'], 'foreign-owned row never registered; own + ownerless adopted');
+  assert.equal(gate.snapshot('tokMac'), null, 'foreign row never enters local tracking');
 });

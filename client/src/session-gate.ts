@@ -54,6 +54,9 @@ export interface SessionGateSnapshot {
 export interface SessionStateRow {
   token: string;
   override?: { override: string; until?: number | null } | null;
+  /** The client the arbiter attributes this session to (#50 mesh, read
+   *  for adoption in #54). Absent = pre-#50 arbiter or a test fixture. */
+  client_name?: string;
 }
 
 /** The proxy's forwarder: pipe req → upstream at `path`, stream the reply. */
@@ -67,6 +70,11 @@ export interface SessionGateDeps {
    * true on 2xx. Rejections/false never block admission (fail-open).
    */
   register: (token: string, gate: SessionGateSnapshot | null) => Promise<boolean>;
+  /** #54: this client's registered name (client/config.json client_name).
+   *  Arbiter session rows naming a DIFFERENT client are not adopted —
+   *  see onStatePoll. Unset (tests, odd configs) keeps the old
+   *  adopt-everything behavior. */
+  clientName?: string;
   /** Ask the daemon to re-poll /api/state now (on-demand override learn). */
   refreshState?: () => void;
   /** max_active_agent_sessions — concurrent sessions holding a slot. */
@@ -397,6 +405,15 @@ export class SessionGate {
     const seen = new Set<string>();
     for (const row of rows) {
       if (!row || typeof row.token !== 'string' || !row.token) continue;
+      // #54 (fleet): the arbiter row names its owning client. A row owned
+      // by ANOTHER client is not ours to adopt — ensure() registers +
+      // heartbeats the token, and registerSession is last-writer-wins
+      // (arbiter): adopting STEALS attribution, the real owner's rows stop
+      // being updated by it, its gate goes dark for the arbiter, and OUR
+      // idle snapshots clear the owner's gate tags. Pre-fleet there was
+      // exactly one client, so adopting everything was safe. Rows naming
+      // no owner (pre-#50 arbiter, fixtures) keep the old behavior.
+      if (row.client_name && this.deps.clientName && row.client_name !== this.deps.clientName) continue;
       seen.add(row.token);
       const s = this.ensure(row.token);
       const ov = normalizeOverride(row.override?.override);

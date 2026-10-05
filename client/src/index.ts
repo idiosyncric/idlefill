@@ -1415,6 +1415,7 @@ export class ClientDaemon {
       this.gate = new SessionGate({
         maxActive: this.cfg.max_active_agent_sessions ?? 2,
         holdCapMs: this.cfg.session_hold_cap_ms ?? 120_000,
+        clientName: this.cfg.client_name,
         log: (m) => this.log.info(m),
         register: async (token, gate) => {
           const { status } = await api(this.cfg, 'POST', '/api/sessions/register', {
