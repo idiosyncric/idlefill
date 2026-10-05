@@ -593,7 +593,8 @@ ground truth.
   `/Applications` (or a target dir passed as the first argument), and
   relaunches.
 - **URL scheme `idlefill://`.** Hosts: `""` or `open` → **State** (the
-  default), `sessions` → **Sessions**, `logs` → **Logs**, `projects` →
+  menu-bar handoff default), `dashboard` → **Dashboard** (the webview),
+  `sessions` → **Sessions**, `logs` → **Logs**, `projects` →
   **Projects**; any unknown host
   → State. A URL that *launches* the app opens on the requested tab; a URL
   delivered to a *running* app activates it, brings the window forward, and
@@ -601,8 +602,28 @@ ground truth.
   window). Parsing is the pure `AppModel.route(for:)` (unit-tested by the
   headless driver). This is how the menu bar's double-click and its
   re-routed rows hand off to the desktop app.
-- **Five tabs in the window** (a tab strip; the deep links and the tab
-  buttons both set the active tab)
+- **The DASHBOARD tab (issue #61 step 1) — the app hosts the web page.**
+  The window opens on **Dashboard**: a `WKWebView` (system WebKit, zero new
+  dependencies) loading the arbiter's **live origin** — `server_url` from
+  `client/config.json` + `/`, never a hardcoded host and never a bundled
+  copy of `server/public/index.html` (a copied page re-creates the drift
+  bug inside the bundle; the arbiter serves its own version-matched page).
+  The gate token from `client/config.json` is injected via a `WKUserScript`
+  at `.documentStart` — before the page's inline script runs — into the
+  page's own `localStorage` key (`idlefill.token`, the same key the header
+  token box writes), so every write works with **zero pasting**; the token
+  rides as a JSON-quoted literal (no breakout), a nil token injects
+  nothing, and the page's own token box stays functional for browser
+  users (the injection is additive — no page or server contract change).
+  The webview instance lives on the model, so a tab switch re-hosts the
+  same live page; a slim native strip names the origin + Reload (a
+  rotated token takes effect on the next reload). ATS: the bundle's
+  existing `NSAllowsArbitraryLoads` exception covers the plain-HTTP
+  loopback load (proven by the live run). The five legacy Swift tabs stay
+  reachable for the parity audit that retires them section-by-section
+  (#61's migration order).
+- **Five legacy tabs** (kept for the parallel period; the tab strip and
+  deep links drive them as before)
   - **State** — the color-coded state word, this machine's status, queue
     depth, today's finished/failed, and the running lease. Polls
     `GET /api/state` every 5s with the Bearer token.

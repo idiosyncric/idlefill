@@ -2,8 +2,22 @@
 //  IdlefillDesktop.swift — the idlefill desktop app (macOS 14+).
 //
 //  A windowed companion (WindowGroup, NOT a MenuBarExtra) built with bare
-//  swiftc (no Xcode project). Five tabs in one window:
+//  swiftc (no Xcode project). One window, DASHBOARD first + five legacy tabs:
 //
+//    dashboard — THE surface (issue #61 step 1): a WKWebView (system
+//                WebKit, zero new dependencies) loading the arbiter's LIVE
+//                origin — server_url from client/config.json, never a
+//                hardcoded host, never a bundled copy of index.html (a copied
+//                page re-creates the drift bug inside the bundle). The gate
+//                token from client/config.json is injected via a
+//                WKUserScript at .documentStart — BEFORE the page's inline
+//                script runs — into the page's own localStorage key, so
+//                every write works with zero pasting. The injection is
+//                additive: the page's own token box stays functional for
+//                browser users. The five Swift tabs stay (parallel period
+//                for the parity audit); the webview is the default view.
+//                ATS: the bundle's NSAllowsArbitraryLoads covers the
+//                plain-HTTP loopback load (live-proven, see build.sh's note).
 //    state     — color-coded state word, this machine's status, queue depth,
 //                today finished/failed, the running lease (polls /api/state
 //                every 5s with the Bearer token)
@@ -52,6 +66,7 @@ import AppKit
 import SwiftUI
 import Sparkle
 import CryptoKit
+import WebKit
 
 // MARK: - build marker (issue #26)
 
@@ -142,6 +157,9 @@ enum Pal {
   static let warn     = Color(red: 0xd2 / 255, green: 0x99 / 255, blue: 0x22 / 255)
   static let err      = Color(red: 0xf8 / 255, green: 0x51 / 255, blue: 0x49 / 255)
   static let accent   = Color(red: 0x58 / 255, green: 0xa6 / 255, blue: 0xff / 255)
+  /// The canvas color for AppKit surfaces (the webview under-page fill —
+  /// same #0d1117 as `canvas`, which is a SwiftUI Color AppKit rejects).
+  static let canvasNS = NSColor(srgbRed: 0x0d / 255.0, green: 0x11 / 255.0, blue: 0x17 / 255.0, alpha: 1)
 }
 
 // MARK: - state
@@ -172,8 +190,12 @@ enum Conn: String {
 }
 
 /// The main window's tabs — and the deep-link target type.
+/// DASHBOARD is first: it is the primary surface (issue #61 step 1 — the
+/// app hosts the arbiter's own page) and the default on launch. The five
+/// legacy Swift tabs stay reachable through the parallel period of the
+/// parity audit.
 enum MainTab: String, CaseIterable {
-  case state, sessions, logs, projects, settings
+  case dashboard, state, sessions, logs, projects, settings
 
   var title: String { rawValue.uppercased() }
 }
@@ -327,8 +349,9 @@ struct LogLine: Identifiable, Equatable {
 }
 
 final class AppModel: ObservableObject {
-  // active tab (the tab strip binds to it; deep links set it)
-  @Published var activeTab: MainTab = .state
+  // active tab (the tab strip binds to it; deep links set it). DASHBOARD
+  // by default: the embedded arbiter page is the primary surface (#61).
+  @Published var activeTab: MainTab = .dashboard
 
   // state panel
   @Published var conn: Conn = .off
@@ -1253,12 +1276,14 @@ final class AppModel: ObservableObject {
 
   // MARK: deep-link routing (pure — testable headlessly)
 
-  /** Map a URL to the tab it should open on. Hosts: "" or "open" → State
-   *  (the default), "sessions" → Sessions, "logs" → Logs, "projects" →
-   *  Projects; any other host — or a non-idlefill scheme — → State. */
+  /** Map a URL to the tab it should open on. Hosts: "dashboard" → the
+   *  embedded arbiter page, "sessions" → Sessions, "logs" → Logs,
+   *  "projects" → Projects; "" or "open" → State (the settled menu-bar
+   *  handoff), any other host — or a non-idlefill scheme — → State. */
   static func route(for url: URL) -> MainTab {
     guard url.scheme == "idlefill" else { return .state }
     switch url.host {
+    case "dashboard": return .dashboard
     case "sessions": return .sessions
     case "logs": return .logs
     case "projects": return .projects
@@ -1287,6 +1312,27 @@ final class AppModel: ObservableObject {
       self.activeTab = AppModel.route(for: url)
     }
   }
+
+  // MARK: dashboard webview (issue #61 step 1) — stored members
+
+  /// The page's gate-token localStorage key — the exact constant the
+  /// dashboard reads on every write (server/public/index.html:
+  /// `const GATE_TOKEN_KEY = "idlefill.token"` + gateToken()). Mirrored
+  /// here deliberately: the page's contract is the contract; the app
+  /// injects into it, never around it. If the page ever renames the key,
+  /// this constant and the live eyeball are the two places to change.
+  static let gateTokenKey = "idlefill.token"
+
+  /// THE dashboard webview — ONE instance kept on the model so a tab
+  /// switch re-hosts the same live view instead of tearing the page down
+  /// and reloading it. The user script is re-armed on every (re)load so a
+  /// rotated token in client/config.json takes effect on the next reload.
+  private(set) lazy var dashboardWebView: WKWebView = {
+    let w = WKWebView(frame: NSRect(x: 0, y: 0, width: 1100, height: 760),
+                      configuration: WKWebViewConfiguration())
+    w.underPageBackgroundColor = Pal.canvasNS
+    return w
+  }()
 
   // MARK: config (token + server url, read at runtime — never baked in)
 
@@ -2782,6 +2828,97 @@ struct SettingsPanel: View {
   }
 }
 
+// MARK: - dashboard webview (issue #61 step 1) — behavior
+
+extension AppModel {
+  /// The WKUserScript source that satisfies the page's own gate mechanism
+  /// at documentStart — BEFORE the page's inline script ever runs — so
+  /// every write works with zero pasting. The injection is ADDITIVE: the
+  /// page's own token box stays fully functional for browser users (they
+  /// still paste, the page still persists to the same key). The token
+  /// rides as a JSON string literal so no character can break out of it;
+  /// the value is NEVER printed, logged, or returned in any other form.
+  /// nil token (config unreadable) -> nil script: the page still loads
+  /// read-only and its own "gate needs the arbiter API token" hint works.
+  static func gateTokenScript(gateToken: String?) -> String? {
+    guard let t = gateToken, !t.isEmpty else { return nil }
+    guard let d = try? JSONSerialization.data(withJSONObject: [t]),
+          let arr = String(data: d, encoding: .utf8) else { return nil }
+    // ["tok…"] -> "tok…" (JSON-quoted, escaped — the array is just the
+    // encoder's way to get a compliant string literal).
+    let literal = String(arr.dropFirst().dropLast())
+    return "(function(){try{localStorage.setItem(\"\(AppModel.gateTokenKey)\", \(literal));}catch(e){}})();"
+  }
+
+  /// The page's live origin: server_url from client/config.json (0600),
+  /// root path. Never a hardcoded host, never a file: URL into a bundled
+  /// copy of index.html — a copied page re-creates the drift bug inside
+  /// the bundle. The arbiter serves its own version-matched page.
+  func dashboardURL() -> URL? {
+    let u = serverURL()
+    guard !u.isEmpty, let url = URL(string: u.hasSuffix("/") ? u : u + "/") else { return nil }
+    return url
+  }
+
+  /// Arm the documentStart token script for the CURRENT config, then load
+  /// (or reload) the live origin. Called at first display and by the
+  /// Reload affordance. The token is read at call time — never baked in.
+  func reloadDashboard() {
+    let w = dashboardWebView
+    w.configuration.userContentController.removeAllUserScripts()
+    if let src = AppModel.gateTokenScript(gateToken: token()) {
+      w.configuration.userContentController.addUserScript(
+        WKUserScript(source: src, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+    }
+    if let url = dashboardURL() {
+      w.load(URLRequest(url: url))
+    }
+  }
+}
+
+/// Hosts the model's single WKWebView inside the SwiftUI tree.
+struct DashboardWebView: NSViewRepresentable {
+  let m: AppModel
+  func makeNSView(context: Context) -> WKWebView { m.dashboardWebView }
+  func updateNSView(_ nsView: WKWebView, context: Context) {}
+}
+
+/// The DASHBOARD tab: the arbiter's own page, hosted. The slim strip
+/// carries only facts the page cannot know (which origin the app points
+/// at) and the one action the page must not own (reload the host).
+struct DashboardPanel: View {
+  @ObservedObject var m: AppModel
+  var body: some View {
+    VStack(spacing: 0) {
+      HStack(spacing: 8) {
+        Text("arbiter origin")
+          .font(.system(size: 11, design: .monospaced))
+          .foregroundStyle(Pal.dim)
+        Text(m.dashboardURL()?.host ?? "—")
+          .font(.system(size: 11, design: .monospaced))
+          .foregroundStyle(Pal.text)
+        Text("token auto-injected")
+          .font(.system(size: 11, design: .monospaced))
+          .foregroundStyle(Pal.dim)
+        Spacer()
+        Button("Reload") { m.reloadDashboard() }
+          .controlSize(.small)
+          .help("reload the page and re-inject the current token")
+      }
+      .padding(.horizontal, 14).padding(.vertical, 6)
+      DividerLine()
+      DashboardWebView(m: m)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .onAppear {
+      // Load once; later reloads go through the Reload button (a page
+      // refresh timer is the page's own job — it polls every 5s itself).
+      if m.dashboardWebView.url == nil { m.reloadDashboard() }
+    }
+  }
+}
+
 // MARK: content
 
 struct ContentView: View {
@@ -2845,6 +2982,9 @@ struct ContentView: View {
 
       Group {
         switch m.activeTab {
+        case .dashboard:
+          DashboardPanel(m: m)
+            .frame(maxHeight: .infinity)
         case .state:
           StatePanel(m: m)
         case .sessions:

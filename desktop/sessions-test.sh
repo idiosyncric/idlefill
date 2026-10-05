@@ -399,14 +399,46 @@ check("(f) 404: the one-line note names the arbiter-truth refresh",
 check("(f) re-poll landed arbiter truth (fresh stub row, running)",
       m.sessions[0].paused == false && m.sessions[0].actionTitle == "Pause")
 
-// The deep-link host + tab order (the settled design: state, sessions,
-// logs, projects, settings; unknown host -> State).
+// The deep-link host + tab order (the settled design + #61 step 1:
+// dashboard FIRST, then state, sessions, logs, projects, settings; the
+// menu-bar handoff hosts ("", open) still route to State; unknown host ->
+// State).
 check("(g) idlefill://sessions routes to .sessions",
       AppModel.route(for: URL(string: "idlefill://sessions")!) == .sessions)
+check("(g) idlefill://dashboard routes to .dashboard",
+      AppModel.route(for: URL(string: "idlefill://dashboard")!) == .dashboard)
+check("(g) idlefill://open still routes to .state (menu-bar handoff)",
+      AppModel.route(for: URL(string: "idlefill://open")!) == .state)
 check("(g) unknown host still routes to .state",
       AppModel.route(for: URL(string: "idlefill://bogus")!) == .state)
-check("(g) tab order state, sessions, logs, projects, settings",
-      MainTab.allCases.map(\.rawValue) == ["state", "sessions", "logs", "projects", "settings"])
+check("(g) tab order dashboard, state, sessions, logs, projects, settings",
+      MainTab.allCases.map(\.rawValue) == ["dashboard", "state", "sessions", "logs", "projects", "settings"])
+
+// ==========================================================================
+// (i) #61 step 1 — the webview token injection is PURE: gateTokenScript
+//     builds the WKUserScript source that satisfies the PAGE's own gate
+//     mechanism (localStorage key idlefill.token, the page's GATE_TOKEN_KEY)
+//     at documentStart. No config read, no network — canned tokens in,
+//     the exact script shape out. The injection is additive: the page's
+//     own token box stays functional (this only sets the same key the
+//     page's change listener writes).
+// ==========================================================================
+check("(i) nil token -> nil script (page loads read-only, its own hint works)",
+      AppModel.gateTokenScript(gateToken: nil) == nil)
+check("(i) empty token -> nil script",
+      AppModel.gateTokenScript(gateToken: "") == nil)
+let script = AppModel.gateTokenScript(gateToken: "abc123") ?? ""
+check("(i) the script sets the page's exact localStorage key",
+      script.contains("localStorage.setItem(\"idlefill.token\""))
+check("(i) the token rides as a JSON-quoted literal",
+      script.contains("\"abc123\""))
+check("(i) injection happens via a setItem call, not an inline bare token use",
+      script.hasPrefix("(function(){") && script.contains("}catch(e){}})();"))
+let tricky = AppModel.gateTokenScript(gateToken: "he said \"hi\"\ntab\tdash—") ?? ""
+check("(i) quote/newline-hostile token stays inside the literal (escaped)",
+      tricky.contains("\\\"hi\\\"") && tricky.contains("\\n") && tricky.contains("\\t"))
+check("(i) the gate key constant matches the page contract",
+      AppModel.gateTokenKey == "idlefill.token")
 
 // ==========================================================================
 // (h) gate-state: the router's queue truth renders as an ADDITIONAL tag
