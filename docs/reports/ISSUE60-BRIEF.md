@@ -1,7 +1,8 @@
 # Mac-local arbiter: first fused instance, provider-aware server connections, oMLX metrics
 
 Owner-directed 2026-10-05. Sequencing: (1) stand up the first local arbiter on
-the Mac, (2) dashboard/UI work to add providers, (3) basic metrics wiring.
+the Mac, (2) dashboard/UI work to add providers + model fail-over across them,
+(3) basic metrics wiring.
 
 ## Why
 
@@ -44,15 +45,15 @@ same fail-closed posture when the glob matches nothing.
   existing `com.sam.idlefill.client` (the daemon stays one process).
 - Seed it with the oMLX engine as its watched server (log-mtime signal on
   `~/Library/Application Support/oMLX/logs/server.log`).
-- FORK LOCKED (owner decision 2026-10-05): the daemon MOVES to the local
-  arbiter now. Engine ownership is exclusive per mesh D2/D3: the Mac arbiter
-  holds the detector for oMLX, and urza's llama-swap enters the Mac config as
-  a reference row (`watched: false`, fail-closed for grants). `career-ops`
-  must therefore allocate a Mac-owned model and run its executor against the
-  local loopback proxy — or its grants fail closed (`unknown engine` /
-  degraded signal) and the queue stops draining. Deliberate: the fleet moves
-  to the target topology now, the transitional shape does not linger. urza
-  keeps its own arbiter, its engine, and its own career-ops view.
+- FORK LOCKED (owner decisions 2026-10-05, refined the same day): the daemon
+  MOVES to the local arbiter now. Engine ownership is exclusive per mesh
+  D2/D3: the Mac arbiter holds the detector for oMLX; urza's llama-swap can
+  enter the Mac config as a reference row (`watched: false`, fail-closed for
+  grants). `career-ops` does NOT move engines yet: it is deliberately
+  configured `paused: true` on the Mac arbiter, so its grants fail closed by
+  design and its queue stalling is the APPROVED state until Slice B + B2
+  land. Do not repair career-ops in this slice. urza keeps its own arbiter,
+  its engine, and its own career-ops view.
 
 ## Slice B — dashboard: add providers
 
@@ -69,6 +70,28 @@ Gaps to close:
   `/v1/*`; today no route or row carries a secret). Token must live in the
   arbiter's store/config, never in the page.
 
+## Slice B2 — model fail-over across connected providers (owner ask 2026-10-05)
+
+Idlefill gives an OPTION to fail over to models served by any provider
+connected to idlefill. Shape:
+
+- Per-project fallback chain (`model_fallback: [model, ...]` in the project
+  config, edited in the dashboard's per-project settings form next to the
+  grant knobs). Evaluated in order; unset chain = today's fail-closed
+  behavior (fail-over is strictly opt-in).
+- At grant time the arbiter walks the chain: the job's primary model first,
+  then each fallback. A model is grantable only when one of THAT arbiter's
+  own watched servers carries it and its signal is not degraded. Engine
+  ownership stays exclusive — the arbiter never fails over onto a remote
+  reference row (mesh D2/D3).
+- The substitution rides the lease row and the executor payload's `model`
+  field, so adapters run against the fail-over model knowing nothing about
+  fail-over. The lease/dashboard row shows the substitution exception-only
+  (rendered only when it differs from the queued model).
+- The Slice B provider UI is what makes the chain visible to build: the
+  dashboard shows which models each connected provider actually serves, and
+  the operator (or an agent via MCP later) composes chains from that.
+
 ## Slice C — basic metrics
 
 oMLX publishes hourly per-model usage locally. Two candidate shapes: a thin
@@ -84,11 +107,15 @@ to feed it.
 
 - Mac arbiter answers `/api/state` and `/` on loopback; the oMLX row shows a
   live signal word and an `idle for` countdown, not a degraded row.
+- The daemon's heartbeat lands on the Mac arbiter (worker row online);
+  `career-ops` renders paused there; a stalled career-ops queue is expected,
+  not a defect.
 - urza and the Mac list each other in the Machines strip with `online` true
   (static `mesh_peers` + shared `peer_token` on both sides; peer_token grants
   ONLY `/api/mesh`).
 - Desktop app repointed at the local origin still renders every tab.
-- `career-ops` queue depth/today/cycle rows stay correct on BOTH dashboards.
+- career-ops stays correct-but-paused on BOTH dashboards (urza's own view
+  unaffected until the operator unpauses it there too).
 - Gates: `npm run test`, `npm run build`, per-package `npx tsc --noEmit`.
 
 Blocks / relates: #52 (exporter sidecar), #59 (menubar live load for connected

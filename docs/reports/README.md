@@ -38,4 +38,5 @@ New issue reports land **here**, never at the repo root.
 | #48 | [ISSUE48-REPORT.md](ISSUE48-REPORT.md) | Sessions-tab visual cleanup: R1–R9 acceptance pass + after-screenshot (`sessions-tab-after.png`) |
 | #54 | [ISSUE54-REPORT.md](ISSUE54-REPORT.md) | Linux client service: systemd user unit + installer on urza, portable control, fleet-safe me-row, session-gate adoption fix, Linux CI green |
 | #56 | [ISSUE56-GRILL-REPORT.md](ISSUE56-GRILL-REPORT.md) | Multi-cycle concurrency grill: D9 addendum in [../architecture/dev-cycles.md](../architecture/dev-cycles.md) — admission rule already shipped, project-shared budget, per-cycle status shape + two-cycle spike |
+| #60 | [ISSUE60-BRIEF.md](ISSUE60-BRIEF.md) | Mac-local arbiter brief: first fused instance, the feed-less provider blocker in `IdleDetector`, provider-aware add-server UI, oMLX metrics options (build reports for the slices append here) |
 | #53 | [ISSUE53-CYCLE-STRIP-REPORT.md](ISSUE53-CYCLE-STRIP-REPORT.md) | Dashboard cycle strip: client publishes per-cycle rows + cap on register, arbiter echoes verbatim, dashboard Cycles section (live screenshot `cycle-strip-live.png`) |
