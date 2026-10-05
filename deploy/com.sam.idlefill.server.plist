@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  idlefill arbiter (server) — macOS LaunchAgent (issue #60 Slice A: the
+  first Mac-local fused instance; loopback :8787).
+
+  Installs to: ~/Library/LaunchAgents/com.sam.idlefill.server.plist
+  Config:      ~/Software/idlefill/server/config.json  (gitignored: api
+               tokens + peer token — the agent reads its own config, the
+               plist carries NO secrets)
+  State:       ~/Library/Application Support/idlefill/state.json (+ the
+               metrics family next to it), pinned by the config's
+               state_file key.
+
+  load:   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.sam.idlefill.server.plist
+  unload: launchctl bootout gui/$(id -u)/com.sam.idlefill.server
+  logs:   ~/Software/idlefill/server/logs/launchd.{out,err}.log
+
+  KeepAlive SuccessfulExit=false restarts the arbiter on crash; leases
+  survive via state.json (a lease active at boot expires at its TTL).
+  Label is deliberately distinct from com.sam.idlefill.client (the daemon
+  stays one process) and from com.sam.idlefill.menubar.
+
+  Install via deploy/install-server-agent.sh (renders + byte-verifies this
+  template; do not copy it by hand).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.sam.idlefill.server</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/npx</string>
+        <!-- npx resolves tsx from the repo's hoisted node_modules
+             (WorkingDirectory is inside the workspace) — same pattern as
+             the client agent -->
+        <string>tsx</string>
+        <string>/Users/sam/Software/idlefill/server/src/index.ts</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/sam/Software/idlefill/server</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>NODE_ENV</key>
+        <string>production</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/sam/Software/idlefill/server/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/sam/Software/idlefill/server/logs/launchd.err.log</string>
+</dict>
+</plist>
