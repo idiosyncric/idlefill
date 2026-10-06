@@ -220,9 +220,11 @@ identical one (`client/src/session-gate.ts:183-187`). Pinned mechanics:
    and llama-swap and FAILS for the llama.cpp family (the 241 row
    answers 400 "No messages provided" for a chunked body, correct model
    + credential, direct and through the router — see Open questions 3).
-   This awaits the owner's call on the scoped full-body-buffer posture
-   recorded there. Until then the chunked clause stays as written and
-   the build-wave byte tests are the pinned discovery mechanism.
+   OWNER DECISION (2026-10-06): the scoped full-body-buffer posture is
+   APPROVED. For the aliased class the router buffers the full body
+   (bounded cap, a larger body is rejected), splices, and forwards with
+   a correct content-length. Bare-name traffic keeps today's pipe
+   posture byte-for-byte. Built in commit `cebb974`.
 5. If the sniff did NOT find the name in the first chunk, routing already
    could not have chosen the alias — that request falls to the machine's
    default target exactly as an unknown model does today
@@ -415,8 +417,9 @@ Untouched (fenced by D6 and the inherited locks):
 2. ~~The unconfirmed-pair pin (oMLX today)~~ — LOCKED by the owner
    2026-10-06: un-probed pairs are not pickable in the form. The
    exception-only `declared` marker carries it (no confirmation tick).
-3. Chunked-forward acceptance — OPEN, evidence gathered 2026-10-06,
-   the doc's assumption REFUTED by live probes. The design ships
+3. ~~Chunked-forward acceptance~~ — LOCKED by the owner 2026-10-06:
+   the scoped-buffer call recorded below is APPROVED. Evidence was
+   gathered 2026-10-06. The doc's assumption was REFUTED by live probes. The design ships
    `transfer-encoding: chunked` for chunked clients with a spliced body,
    assuming "engines already accept chunked from the same SDKs." They do
    not, all of them:
@@ -451,7 +454,14 @@ Untouched (fenced by D6 and the inherited locks):
    (content-length senders) only pay a body copy when the model is
    aliased. The rejected option (a) was buffering EVERYTHING. This
    buffers only the aliased class. NOTE: forward-time buffering does
-   NOT close the chunk-boundary sniff gap (the sniff feeds ROUTING,
-   which already happened). Closing that gap needs a bounded
-   multi-chunk peek at the SNIFF seam instead (peek more chunks,
-   unshift them all back — the gate's body-whole invariant holds).
+ NOT close the chunk-boundary sniff gap (the sniff feeds ROUTING,
+ which already happened). Closing that gap needs a bounded
+ multi-chunk peek at the SNIFF seam instead (peek more chunks,
+ unshift them all back — the gate's body-whole invariant holds).
+
+ OWNER DECISION (2026-10-06, second call): the bounded multi-chunk
+ peek at the sniff seam is DEFERRED to #67, which owns the drag/pin
+ work in the same region. The #66 wave keeps the first-chunk sniff
+ byte-for-byte. Its suite asserts the fallback parity — a name
+ spanning the chunk boundary falls to the default target exactly as
+ an unknown model does today.
