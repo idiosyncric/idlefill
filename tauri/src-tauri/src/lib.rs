@@ -661,6 +661,42 @@ fn route_deep_link(app: &AppHandle, url: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// window-event rule (D1), pure spec so the cargo tests assert what ships
+// ---------------------------------------------------------------------------
+
+/// The event kinds the rule cares about, abstracted so tests can build
+/// them (tauri's WindowEvent is #[non_exhaustive] and CloseRequestApi is
+/// not constructible outside the crate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowEventKind {
+    CloseRequested,
+    Blurred,
+    Other,
+}
+
+/// The native action the handler performs, decided by the pure rule.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WindowDirective {
+    /// D1 close-to-tray: the app keeps running behind the tray
+    /// (prevent_close + hide). #71: BOTH halves — prevent alone left the
+    /// red button doing nothing.
+    CloseToTray,
+    /// D1 cost (1) blur-dismiss for the glance.
+    Dismiss,
+    /// No native action (the settings window keeps its plain close).
+    NoAction,
+}
+
+/// The D1 window rule as a pure function: label + event kind -> verdict.
+pub fn window_directive(label: &str, kind: WindowEventKind) -> WindowDirective {
+    match (label, kind) {
+        (MAIN_LABEL, WindowEventKind::CloseRequested) => WindowDirective::CloseToTray,
+        (GLANCE_LABEL, WindowEventKind::Blurred) => WindowDirective::Dismiss,
+        _ => WindowDirective::NoAction,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // entry
 // ---------------------------------------------------------------------------
 
@@ -702,20 +738,33 @@ pub fn build() -> tauri::Result<()> {
         .plugin(tauri_plugin_deep_link::init())
         .manage(shared)
         // Window events: close-to-tray for the main window (D1:
-        // CloseRequested -> prevent_close, webview_window.rs:1643 /
+        // CloseRequested -> prevent_close + hide, webview_window.rs:1643 /
         // app.rs:103), blur-dismiss for the glance (D1 cost (1)).
-        // Builder-level: this is the Builder's API (app.rs:2197), not
-        // App's — setup has no on_window_event.
+        // The verdict is the pure window_directive (#71: prevent alone
+        // left the red button doing nothing — CloseToTray carries BOTH
+        // halves). Builder-level: this is the Builder's API (app.rs:2197),
+        // not App's — setup has no on_window_event.
         .on_window_event(|window, event| {
-            if window.label() == GLANCE_LABEL {
-                if let tauri::WindowEvent::Focused(false) = event {
+            let kind = match event {
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    if window_directive(window.label(), WindowEventKind::CloseRequested)
+                        == WindowDirective::CloseToTray
+                    {
+                        api.prevent_close();
+                    }
+                    return;
+                }
+                tauri::WindowEvent::Focused(false) => WindowEventKind::Blurred,
+                _ => WindowEventKind::Other,
+            };
+            match window_directive(window.label(), kind) {
+                WindowDirective::Dismiss => {
                     let _ = window.hide();
                 }
-            }
-            if window.label() == MAIN_LABEL {
-                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                    api.prevent_close();
+                WindowDirective::CloseToTray => {
+                    let _ = window.hide();
                 }
+                WindowDirective::NoAction => {}
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -781,4 +830,66 @@ pub fn build() -> tauri::Result<()> {
         }
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // #71: the red close button on the main window must close-to-tray —
+    // prevent AND hide. The handler executes this verdict; the directive
+    // is the pin (the bug was the missing hide half).
+    #[test]
+    fn main_window_close_goes_to_tray() {
+        assert_eq!(
+            window_directive(MAIN_LABEL, WindowEventKind::CloseRequested),
+            WindowDirective::CloseToTray
+        );
+    }
+
+    // D1 cost (1): the glance dismisses on blur.
+    #[test]
+    fn glance_blur_dismisses() {
+        assert_eq!(
+            window_directive(GLANCE_LABEL, WindowEventKind::Blurred),
+            WindowDirective::Dismiss
+        );
+    }
+
+    // D1 pins ONLY the main window's close. The settings window keeps
+    // its plain close (close-and-destroy, re-built by show_settings).
+    #[test]
+    fn settings_window_close_is_plain() {
+        assert_eq!(
+            window_directive(SETTINGS_LABEL, WindowEventKind::CloseRequested),
+            WindowDirective::NoAction
+        );
+    }
+
+    // Nothing else reacts: labels outside the rule ignore both event
+    // kinds, the glance never intercepts a close, the main window never
+    // reacts to blur.
+    #[test]
+    fn no_other_label_or_pair_reacts() {
+        assert_eq!(
+            window_directive("glance", WindowEventKind::CloseRequested),
+            WindowDirective::NoAction
+        );
+        assert_eq!(
+            window_directive("main", WindowEventKind::Blurred),
+            WindowDirective::NoAction
+        );
+        assert_eq!(
+            window_directive(GLANCE_LABEL, WindowEventKind::CloseRequested),
+            WindowDirective::NoAction
+        );
+        assert_eq!(
+            window_directive(MAIN_LABEL, WindowEventKind::Other),
+            WindowDirective::NoAction
+        );
+        assert_eq!(
+            window_directive("whatever", WindowEventKind::Blurred),
+            WindowDirective::NoAction
+        );
+    }
 }
