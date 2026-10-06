@@ -77,6 +77,8 @@ pub struct Shared {
     /// Last tray click position (physical px) — the glance anchors there
     /// (the NSPopover-anchor substitute, D1).
     tray_pos: Mutex<Option<(f64, f64)>>,
+    /// Last logged arbiter (loaded, running) pair — edge-only logging.
+    last_launchd_live: Mutex<Option<(bool, bool)>>,
 }
 
 impl Shared {
@@ -322,6 +324,18 @@ fn refresh_launchd(app: &AppHandle) {
     st.menubar_runs = m.as_deref().and_then(lifecycle::first_argument);
     // loaded != live: the pid line decides (e737411).
     st.arbiter_running = a.as_deref().and_then(lifecycle::pid_line).is_some();
+    // Acceptance proof channel (gate 5): one log line per arbiter
+    // loaded/running EDGE — the headless harness greps these. No state
+    // churn, edges only.
+    let live = (st.arbiter_loaded, st.arbiter_running);
+    let mut last = shared.last_launchd_live.lock().unwrap();
+    if *last != Some(live) {
+        eprintln!(
+            "LAUNCHD arbiter loaded={} running={}",
+            live.0 as i32, live.1 as i32
+        );
+        *last = Some(live);
+    }
     drop(st);
 
     // Q-a one-shot auto-reload: exactly one reload() per dead->live
@@ -671,6 +685,7 @@ pub fn build() -> tauri::Result<()> {
         first_tick: AtomicBool::new(true),
         tray: Mutex::new(None),
         tray_pos: Mutex::new(None),
+        last_launchd_live: Mutex::new(None),
     });
 
     let app = tauri::Builder::default()

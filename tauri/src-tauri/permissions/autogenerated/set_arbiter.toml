@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-arbiter"
+description = "Enables the set_arbiter command without any pre-configured scope."
+commands.allow = ["set_arbiter"]
+
+[[permission]]
+identifier = "deny-set-arbiter"
+description = "Denies the set_arbiter command without any pre-configured scope."
+commands.deny = ["set_arbiter"]

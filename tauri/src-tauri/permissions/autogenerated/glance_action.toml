@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-glance-action"
+description = "Enables the glance_action command without any pre-configured scope."
+commands.allow = ["glance_action"]
+
+[[permission]]
+identifier = "deny-glance-action"
+description = "Denies the glance_action command without any pre-configured scope."
+commands.deny = ["glance_action"]

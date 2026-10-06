@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-glance-state"
+description = "Enables the glance_state command without any pre-configured scope."
+commands.allow = ["glance_state"]
+
+[[permission]]
+identifier = "deny-glance-state"
+description = "Denies the glance_state command without any pre-configured scope."
+commands.deny = ["glance_state"]
