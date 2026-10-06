@@ -84,6 +84,7 @@ before(async () => {
     ip: '100.94.165.102',
     proxy_port: 0, // not used by the daemon unless a job runs the real proxy
     llm_target: 'http://127.0.0.1:1',
+    aggregate_port: 0,
     repo_root: here,
     state_dir: join(dir, 'state'),
     state_file: join(dir, 'state.json'),

@@ -83,3 +83,11 @@ This issue is additive on main (direct-to-main mode). The Hermes-core
 `X-Hermes-Session-Id` injection and the profile config re-point ride
 separate owner actions; the endpoint must behave correctly with them
 absent (D3's fallback).
+
+## Build status
+
+Built + live on the Mac 2026-10-05/06 (tsc clean per package, 300 tests
+pass, build rc=0, live :8800 acceptance incl. the D5 server_id on the
+derived-key session row). Report: [ISSUE64-REPORT.md](ISSUE64-REPORT.md).
+Left as owner actions: Hermes-core `X-Hermes-Session-Id` injection, the
+profile config re-point to `http://127.0.0.1:8800/v1`.

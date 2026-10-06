@@ -10,6 +10,7 @@ import { buildApi, attachWebSocket } from './api.js';
 import { Arbiter, leaseServerId, WATCHED_SERVER_ID } from './arbiter.js';
 import { loadConfig } from './config.js';
 import { IdleDetector, makeActivityFetcherFor, makeRealActivityFetcher, makeRealLogMtimeSource } from './idle.js';
+import { makeRealModelsFetcher } from './catalog.js';
 import type { ActivityFetcher } from './idle.js';
 import { FeedDeltaTracker, MetricsStore, HOUR_MS, instrumentArbiterForMetrics } from './metrics.js';
 import { CounterDeltaTracker, OmlxUsageReaders } from './omlx.js';
@@ -69,7 +70,12 @@ async function main(): Promise<void> {
       idle_seconds: cfg.idle_seconds,
     });
 
-  const arbiter = new Arbiter(store, cfg, new Map(), { detectorFactory: makeDetector });
+  const arbiter = new Arbiter(store, cfg, new Map(), {
+    detectorFactory: makeDetector,
+    // #64 D4: the /v1/models probe fetcher (credentialed per row, same
+    // family as the feed fetchers above).
+    modelsFetcher: makeRealModelsFetcher(),
+  });
 
   // Metrics retention store (#51): append-only JSONL next to state.json.
   // The recorder never throws into its caller; the rollup reads raw files.
@@ -222,6 +228,11 @@ async function main(): Promise<void> {
   const tickOnce = async () => {
     try {
       const { revoked } = await arbiter.tick();
+      // Catalog probe (#64 D4): per-row credentialed GET /v1/models on
+      // the SAME poll tick. probeCatalog never throws (a blocked row keeps
+      // its declared list); the result publishes through arbiter.catalog()
+      // onto /api/state's `catalog` ADD-key for the router.
+      await arbiter.probeCatalog();
       for (const r of revoked) {
         log(`lease ${r.lease.lease_id} (${r.lease.project}/${r.lease.job_id}) → ${r.lease.status} [${r.reason}]`);
         broadcast({ type: 'revoked', lease_id: r.lease.lease_id, project: r.lease.project, job_id: r.lease.job_id, reason: r.reason });

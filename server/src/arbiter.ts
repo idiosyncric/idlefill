@@ -51,6 +51,7 @@
 import { randomBytes } from 'node:crypto';
 import type { IdleDetector } from './idle.js';
 import { activeLeaseExemptIps, defaultActivityPathFor } from './idle.js';
+import { buildCatalog, modelsProbeUrl, type CatalogEntry, type ModelsFetcher } from './catalog.js';
 import { mintInstanceId } from './mesh.js';
 import type { IdleSignal, JobResultRow, JobThrottle, SessionOverride, SessionRecord } from './types.js';
 import type { StateStore } from './state.js';
@@ -193,6 +194,19 @@ export class Arbiter {
   /** Optional factory so servers added via the API get a detector too. */
   private readonly detectorFactory?: (row: ServerConnection) => IdleDetector;
   /**
+   * #64 D4: per-row `/v1/models` probe fetcher (credentialed per row, the
+   * #60 B fetcher family). Absent = NO probe runs (tests + arbiter builds
+   * without the wiring): the catalog then carries the declared union with
+   * catalog_source 'declared' — never a false 'probed'.
+   */
+  private modelsFetcher?: ModelsFetcher;
+  /**
+   * #64: the catalog published to the router on the LAST probe cycle
+   * (in-memory, ephemeral — never persisted; the token NEVER enters it).
+   * `/api/state` echoes it as the `catalog` ADD-key.
+   */
+  private catalogPublished: CatalogEntry[] = [];
+  /**
    * Per-server post-revocation reidle gates: server_id -> armed-at epoch-ms.
    * Armed when a lease on that server is revoked/expired; disarmed when a
    * later poll reports THAT server fully idle. One engine's preempt never
@@ -223,12 +237,13 @@ export class Arbiter {
     store: StateStore,
     cfg: ServerConfig,
     detectors: IdleDetector | Map<string, IdleDetector>,
-    opts?: { detectorFactory?: (row: ServerConnection) => IdleDetector },
+    opts?: { detectorFactory?: (row: ServerConnection) => IdleDetector; modelsFetcher?: ModelsFetcher },
   ) {
     this.store = store;
     this.cfg = cfg;
     this.detectors = detectors instanceof Map ? detectors : new Map([[WATCHED_SERVER_ID, detectors]]);
     this.detectorFactory = opts?.detectorFactory;
+    this.modelsFetcher = opts?.modelsFetcher;
     // A fresh Arbiter must see the seeded server inventory, not just one
     // that went through index.ts: the API/tests construct the arbiter
     // directly. Idempotent — a non-empty state file is left untouched.
@@ -765,6 +780,48 @@ export class Arbiter {
   /** The live idle signal for one server (null when it has no detector). */
   serverSignal(serverId: string, now?: number): IdleSignal | null {
     return this.detectors.get(serverId)?.signal(now ?? Date.now()) ?? null;
+  }
+
+  // ------------------------------------------------------------------
+  // Catalog (aggregate endpoint #64 D4 — arbiter-built, router-published)
+  // ------------------------------------------------------------------
+
+  /**
+   * One catalog cycle: probe every declared row's `/v1/models` WITH the
+   * row's `auth_token` (the credentialed fetcher family, #60 B), merge
+   * probe results over the declared lists, and publish the deduped
+   * catalog in memory for `/api/state`'s `catalog` ADD-key.
+   *
+   * Rules honored (doc D4): a probe success REPLACES that row's declared
+   * list; a probe failure keeps it (the row lands 'declared', never
+   * falsely 'probed'); a bare name on N rows renders ONCE and pins to the
+   * FIRST row in declaration order. The published block NEVER carries a
+   * token — `auth_set` only. Never throws: a fetcher blip just means that
+   * row keeps its declared inventory this round.
+   */
+  async probeCatalog(): Promise<CatalogEntry[]> {
+    const rows = this.store.state.servers;
+    const probed = new Map<string, string[]>();
+    if (this.modelsFetcher) {
+      const fetcher = this.modelsFetcher;
+      await Promise.all(
+        rows.map(async (row) => {
+          try {
+            const names = await fetcher(modelsProbeUrl(row.url), row.auth_token);
+            if (Array.isArray(names) && names.length > 0) probed.set(row.id, names);
+          } catch {
+            /* probe-blocked: the declared list stands (drop-don't-reject) */
+          }
+        }),
+      );
+    }
+    this.catalogPublished = buildCatalog(rows, probed);
+    return this.catalogPublished;
+  }
+
+  /** The catalog the last probe cycle published (never contains tokens). */
+  catalog(): CatalogEntry[] {
+    return this.catalogPublished;
   }
 
   // ------------------------------------------------------------------

@@ -69,6 +69,7 @@ import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import { loadClientConfig, type ClientConfig, type ClientProjectConfig, type ScheduledRebuildConfig } from './config.js';
 import { startLlmProxy, waitProxyReady, type LlmProxy } from './proxy.js';
+import { startAggregateRouter, type AggregateCatalogEntry, type AggregateRouter, type ServerKeyRow } from './aggregate.js';
 import { SessionGate, type SessionStateRow } from './session-gate.js';
 import { resolveVersion } from './version.js';
 import { resolveRevision } from './revision.js';
@@ -1041,6 +1042,20 @@ export class ClientDaemon {
   private readonly hooks: { pollMs: number; killGraceMs: number; log: { info: (msg: string) => void } };
   private proxy: LlmProxy | null = null;
   /**
+   * Aggregate endpoint (#64 D1): the daemon's SECOND loopback listener
+   * (default :8800), in front of the SAME SessionGate instance. Null when
+   * `aggregate_port` is 0 (disabled).
+   */
+  private aggregate: AggregateRouter | null = null;
+  /**
+   * #64 D5: derived session key → catalog-chosen server_id for aggregate
+   * traffic. The register heartbeat carries it as `server_id` so the
+   * arbiter's idle folding + preemption land on the RIGHT engine row
+   * (absent it, the row falls back to the watched server via
+   * leaseServerId — wrong for an off-watched-row engine).
+   */
+  private readonly aggregateServers = new Map<string, string>();
+  /**
    * Session gate (issue #9 Part A): the router/gate for /s/<token>/ traffic,
    * live inside the loopback proxy. Null only when session_gate=false.
    */
@@ -1114,6 +1129,11 @@ export class ClientDaemon {
     return this.gate;
   }
 
+  /** Aggregate endpoint base URL once up (#64); null when disabled/not booted. */
+  get aggregateUrl(): string | null {
+    return this.aggregate?.base_url ?? null;
+  }
+
   async start(): Promise<void> {
     if (this.running) return;
     this.running = true;
@@ -1145,6 +1165,7 @@ export class ClientDaemon {
     // Release the session gate cleanly: parked requests proceed rather than
     // dying with the daemon.
     this.gate?.releaseAll();
+    await this.aggregate?.stop();
     await this.proxy?.stop();
   }
 
@@ -1317,6 +1338,8 @@ export class ClientDaemon {
       active_leases: { lease_id: string }[];
       clients?: { client_id: string; override?: { override: string } | null }[];
       sessions?: SessionStateRow[];
+      // #64 D4: the arbiter-built catalog (ADD-key; absent on an old arbiter).
+      catalog?: AggregateCatalogEntry[];
     }>(this.cfg, 'GET', '/api/state');
     if (status !== 200) {
       this.log.info(`state poll HTTP ${status}`);
@@ -1326,6 +1349,18 @@ export class ClientDaemon {
       return;
     }
     const st = body;
+
+    // Aggregate endpoint refresh (#64): the catalog rides THIS poll (an
+    // ADD-key the arbiter publishes every tick); the engine keys come from
+    // the dedicated loopback route on the SAME cadence. Tokens stay in
+    // the router's memory — never persisted, never logged, never re-
+    // published (D2). A poll failure leaves the last catalog + keys in
+    // place: the endpoint degrades to routing with what it last knew,
+    // never wedges.
+    if (this.aggregate) {
+      if (Array.isArray(st.catalog)) this.aggregate.updateCatalog(st.catalog);
+      void this.refreshServerKeys();
+    }
 
     // Session gate (issue #9 Part A): the arbiter is reachable — re-arm the
     // gate, feed it the operator overrides, and fold the session
@@ -1517,6 +1552,23 @@ export class ClientDaemon {
     }
   }
 
+  /**
+   * Pull the engine keys for the aggregate router (#64 D2): the ONE
+   * authenticated request to the loopback-scoped GET /api/server-keys,
+   * on the same cadence as the state poll. Tokens live ONLY in the
+   * router's memory — never written to disk, never logged, never put on
+   * any other surface. A failure keeps the last table in place.
+   */
+  private async refreshServerKeys(): Promise<void> {
+    if (!this.aggregate) return;
+    try {
+      const { status, body } = await api<{ server_keys?: ServerKeyRow[] }>(this.cfg, 'GET', '/api/server-keys');
+      if (status === 200 && Array.isArray(body.server_keys)) this.aggregate.updateKeys(body.server_keys);
+    } catch {
+      /* keep the last-known key table; the next tick retries */
+    }
+  }
+
   private async ensureProxy(): Promise<LlmProxy> {
     if (this.proxy) return this.proxy;
     if (this.cfg.session_gate !== false) {
@@ -1526,10 +1578,18 @@ export class ClientDaemon {
         clientName: this.cfg.client_name,
         log: (m) => this.log.info(m),
         register: async (token, gate, sessionId, history) => {
+          // #64 D5: an aggregate-derived session key (model name / header
+          // id) carries the catalog-chosen row as `server_id` — idle
+          // folding + preemption then land on the engine the request
+          // actually hits, not the leaseServerId watched-row fallback. A
+          // `/s/<token>` key never enters that map, so its heartbeat body
+          // stays exactly as before (D6).
+          const aggregateServerId = this.aggregateServers.get(token);
           const { status } = await api(this.cfg, 'POST', '/api/sessions/register', {
             token,
             ...(this.clientId ? { client_id: this.clientId } : {}),
             client_name: this.cfg.client_name,
+            ...(aggregateServerId ? { server_id: aggregateServerId } : {}),
             last_activity: Date.now(),
             // Gate-state visibility: the router's queue truth for this
             // session at heartbeat time. null (idle) ⇒ NO gate block — the
@@ -1561,6 +1621,36 @@ export class ClientDaemon {
     this.log.info(
       `proxy up: ${this.proxy.base_url} → ${this.cfg.llm_target}${this.gate ? ` (session gate on: max ${this.cfg.max_active_agent_sessions ?? 2} sessions, hold cap ${this.cfg.session_hold_cap_ms ?? 120000}ms)` : ' (session gate off)'}`,
     );
+    // Aggregate endpoint (#64 D1): the SECOND loopback listener inside
+    // this SAME process (mesh D5 counts processes, not listeners), in
+    // front of the SAME SessionGate instance — one shared slot cap. 11435
+    // stays byte-for-byte untouched (D6).
+    if (this.cfg.aggregate_port !== 0) {
+      this.aggregate = startAggregateRouter({
+        port: this.cfg.aggregate_port,
+        defaultTarget: this.cfg.llm_target,
+        gate: this.gate,
+        // D5: remember the catalog-chosen row per derived key so the
+        // register heartbeat reports the CORRECT server_id (idle folding
+        // + preemption land on the engine the request actually hits).
+        onSessionRoute: (key, serverId) => {
+          this.aggregateServers.set(key, serverId);
+        },
+        log: (m) => this.log.info(m),
+      });
+      try {
+        await waitProxyReady(this.aggregate.server);
+        this.log.info(`aggregate endpoint up: ${this.aggregate.base_url}/v1 → catalog-routed (default ${this.cfg.llm_target})`);
+      } catch {
+        // Port taken / bind never completed: the aggregate endpoint is
+        // OFF this run. It never wedges the daemon — 11435 + leases stand.
+        this.log.info(
+          `aggregate endpoint NOT listening on :${this.cfg.aggregate_port} (port busy?) — running without it; set aggregate_port in client/config.json to retarget`,
+        );
+        await this.aggregate.stop().catch(() => {});
+        this.aggregate = null;
+      }
+    }
     return this.proxy;
   }
 

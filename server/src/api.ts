@@ -19,6 +19,7 @@ import { WebSocketServer } from 'ws';
 import { utcDay, type Arbiter, WATCHED_SERVER_ID } from './arbiter.js';
 import { seriesKeyOf, type MetricsBucket, type MetricsSeries, type MetricsStore } from './metrics.js';
 import { buildMeshSnapshot, type MeshFederation } from './mesh.js';
+import { isLoopbackAddress } from './catalog.js';
 import type { CycleStatusRow, ProjectAllocation, QueuePreviewRow, RebuildRunState, ServerConfig, ServerConnection } from './types.js';
 
 export interface ApiDeps {
@@ -641,6 +642,35 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   });
 
   /**
+   * GET /api/server-keys (#64 D2): the router's loopback-scoped key pull.
+   * The ONE read surface that ever carries an engine credential, and it
+   * answers ONLY a loopback caller — the arbiter binds 0.0.0.0
+   * (index.ts:251), so the check lives INSIDE the route on
+   * `req.socket.remoteAddress` (the raw socket, not req.ip: Fastify's
+   * req.ip honors trust-proxy settings the arbiter does not configure).
+   * Auth: the standard /api/* hook (admin api_tokens) still applies —
+   * this route ADDS the loopback requirement on top, it never loosens
+   * auth. A non-loopback caller with a VALID admin token is refused 403.
+   *
+   * This is deliberately NOT part of /api/state (that view is
+   * anonymous-readable). No other read surface carries a token (#60 B
+   * write-only posture, doc D2 rule 3). Tokens here are the arbiter's
+   * stored row values, handed to the machine's own router for in-memory
+   * use only.
+   */
+  app.get('/api/server-keys', async (req, reply) => {
+    if (!isLoopbackAddress(req.socket.remoteAddress)) {
+      return reply.code(403).send({ error: 'loopback-only route', hint: 'GET /api/server-keys answers only the machine\'s own router' });
+    }
+    const s = arbiter['store'].state;
+    return {
+      server_keys: s.servers
+        .filter((row: ServerConnection) => row.auth_token !== undefined && row.auth_token !== '')
+        .map((row: ServerConnection) => ({ id: row.id, name: row.name, url: row.url, auth_token: row.auth_token })),
+    };
+  });
+
+  /**
    * Add (no id) or update (with id) a declared server connection:
    * { name, url, activity_path?, models?, peers? }. Inventory only — the
    * arbiter watches its single configured feed; a declared row is where a
@@ -903,6 +933,14 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       ...(mesh ? { mesh: { instance_id: arbiter.instanceId(), peers: mesh.view(now) } } : {}),
       projects: projectView(arbiter, cfg, s.clients, day, now, todayTotals(s.leases, day)),
       servers: serverView(arbiter, cfg, now),
+      // Aggregate endpoint catalog (#64 D4): the arbiter-built, deduped
+      // model→row map the router's :8800 listener routes on. ADD key —
+      // present from the first tick; an old router ignores it. Carries
+      // name/server_id/url/auth_set ONLY: the credential NEVER rides
+      // here (this view is anonymous-readable; the write-only posture,
+      // #60 B, stays intact — the token crosses only over the
+      // loopback-scoped GET /api/server-keys).
+      catalog: arbiter.catalog(),
       events: s.events.slice(Math.max(0, s.events.length - limit)).reverse(),
     };
   });

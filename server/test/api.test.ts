@@ -1805,3 +1805,161 @@ test('dashboard renders the session history facts (#45) exception-only', async (
   assert.ok(html.includes('last model this session negotiated'), 'the model tag carries a tooltip');
   assert.ok(html.includes('sspark'), 'the inline sparkline class exists for session rows');
 });
+
+// ---------------------------------------------------------------------------
+// Aggregate endpoint server plane (#64): the arbiter-built catalog published
+// as the `catalog` ADD-key + the loopback-scoped GET /api/server-keys.
+// Self-contained: its own Arbiter + Fastify app driven by app.inject, so the
+// custom `remoteAddress` (the loopback test seam) is exact and the tests
+// above stay untouched. No network.
+// ---------------------------------------------------------------------------
+
+import { buildCatalog, isLoopbackAddress, modelsProbeUrl, parseModelsPayload } from '../src/catalog.js';
+
+const AGG_TOKEN = 'agg-' + 'test-' + 'tk7c';
+
+test('#64 catalog merge rules (buildCatalog): probe replaces, dedup pins row order, token never rides', () => {
+  const now = Date.now();
+  const mk = (id: string, url: string, models: string[], auth?: string) => ({
+    id, name: id, url, activity_path: '', ...(auth ? { auth_token: auth } : {}),
+    models, peers: [], configured_at: now, updated_at: now,
+  });
+  const rows = [mk('row-a', 'http://a.local:8000', ['Shared', 'AOnly'], 'tok-a'), mk('row-b', 'http://b.local:8080', ['Shared', 'BOnly'])];
+  const cat = buildCatalog(rows, new Map([['row-a', ['NewOnly', 'Shared']]]));
+  const byName = new Map(cat.map((e) => [e.name, e]));
+  assert.deepEqual([...byName.keys()].sort(), ['BOnly', 'NewOnly', 'Shared'], 'bare names dedup');
+  assert.equal(byName.get('Shared')!.server_id, 'row-a', 'first row in declaration order owns the collision');
+  assert.ok(!byName.has('AOnly'), 'probe success REPLACES the row declared list');
+  assert.equal(byName.get('NewOnly')!.catalog_source, 'probed');
+  assert.equal(byName.get('BOnly')!.catalog_source, 'declared', 'an unprobed row is never falsely probed');
+  assert.equal(byName.get('NewOnly')!.auth_set, true);
+  assert.equal(byName.get('BOnly')!.auth_set, false);
+  for (const e of cat) assert.ok(!('auth_token' in e), 'no catalog entry carries the token');
+});
+
+test('#64 modelsProbeUrl / parseModelsPayload / isLoopbackAddress helpers', () => {
+  assert.equal(modelsProbeUrl('http://h:8000'), 'http://h:8000/v1/models');
+  assert.equal(modelsProbeUrl('http://h:8000/'), 'http://h:8000/v1/models');
+  assert.equal(modelsProbeUrl('https://strata.example/v1'), 'https://strata.example/v1/models');
+  assert.deepEqual(parseModelsPayload({ data: [{ id: 'a' }, { name: 'c' }, null, 3] }), ['a', 'c']);
+  assert.deepEqual(parseModelsPayload({ models: ['x', 'x', ' y '] }), ['x', 'y']);
+  assert.deepEqual(parseModelsPayload(['p', 'q']), ['p', 'q']);
+  assert.deepEqual(parseModelsPayload(null), []);
+  for (const loop of ['127.0.0.1', '127.42.1.7', '::1', '::ffff:127.0.0.1']) assert.ok(isLoopbackAddress(loop), `${loop} is loopback`);
+  for (const away of ['100.105.225.1', '10.10.10.241', '::ffff:10.10.10.241', undefined]) assert.ok(!isLoopbackAddress(away), `${away} is not loopback`);
+});
+
+test('#64 probeCatalog: blocked probe keeps the declared list (never falsely probed); probe is credentialed per row', async () => {
+  const aggDir = mkdtempSync(join(tmpdir(), 'idlefill-agg-'));
+  try {
+    const aggCfg: ServerConfig = { ...cfg, state_file: join(aggDir, 'state.json') };
+    const seen: { url: string; auth: string | undefined }[] = [];
+    const aggArbiter = new Arbiter(new StateStore(aggCfg.state_file), aggCfg, det, {
+      modelsFetcher: async (url, auth) => {
+        seen.push({ url, auth });
+        if (url.includes('omlx')) throw new Error('probe HTTP 401');
+        return ['WatchedProbed'];
+      },
+    });
+    const up = aggArbiter.upsertServerConnection({
+      name: 'omlx', url: 'http://omlx.local:8000', models: ['MlxDeclared'], activity_path: '', auth_token: 'sekret-omlx-token',
+    });
+    assert.ok(up.ok && up.created);
+    const cat = await aggArbiter.probeCatalog();
+    const watched = seen.find((s) => s.url.includes('fake'));
+    const omlx = seen.find((s) => s.url.includes('omlx'));
+    assert.ok(watched && omlx, 'every declared row gets a probe');
+    assert.equal(omlx!.auth, 'sekret-omlx-token', 'the row token reaches the fetcher (credentialed probe)');
+    assert.equal(watched!.auth, undefined, 'a keyless row sends no credential');
+    const mlx = cat.find((e) => e.name === 'MlxDeclared');
+    assert.ok(mlx, 'a blocked probe NEVER loses the declared inventory');
+    assert.equal(mlx!.catalog_source, 'declared', 'probe-blocked row stays declared');
+    assert.equal(mlx!.auth_set, true, 'auth_set rides; the token does not');
+    assert.ok(cat.some((e) => e.name === 'WatchedProbed' && e.catalog_source === 'probed'));
+  } finally {
+    rmSync(aggDir, { recursive: true, force: true });
+  }
+});
+
+test('#64 /api/state catalog ADD-key: shape + auth_set, and no token anywhere (anonymous AND authed)', async () => {
+  const aggDir = mkdtempSync(join(tmpdir(), 'idlefill-agg2-'));
+  try {
+    const aggCfg: ServerConfig = { ...cfg, api_tokens: [AGG_TOKEN], state_file: join(aggDir, 'state.json') };
+    const aggArbiter = new Arbiter(new StateStore(aggCfg.state_file), aggCfg, det, {
+      modelsFetcher: async (url) => {
+        if (url.includes('omlx')) throw new Error('probe HTTP 401');
+        return ['WatchedProbed'];
+      },
+    });
+    aggArbiter.upsertServerConnection({ name: 'omlx', url: 'http://omlx.local:8000', models: ['MlxDeclared'], activity_path: '', auth_token: 'sekret-omlx-token' });
+    await aggArbiter.probeCatalog();
+    const aggApp = buildApi({ arbiter: aggArbiter, cfg: aggCfg, publicDir: join(__dirname, '..', 'public') });
+    await aggApp.ready();
+    try {
+      for (const inject of [
+        { method: 'GET' as const, url: '/api/state' },
+        { method: 'GET' as const, url: '/api/state', headers: { authorization: `Bearer ${AGG_TOKEN}` } },
+      ]) {
+        const res = await aggApp.inject(inject);
+        assert.equal(res.statusCode, 200);
+        const st = res.json() as { catalog?: { name: string; server_id: string; url: string; auth_set: boolean; catalog_source: string }[] };
+        assert.ok(Array.isArray(st.catalog), 'catalog block present on /api/state');
+        assert.ok(st.catalog!.some((e) => e.name === 'WatchedProbed' && e.catalog_source === 'probed'));
+        const mlx = st.catalog!.find((e) => e.name === 'MlxDeclared');
+        assert.ok(mlx && mlx.auth_set === true && mlx.catalog_source === 'declared');
+        for (const e of st.catalog!) {
+          assert.equal(typeof e.name, 'string');
+          assert.equal(typeof e.server_id, 'string');
+          assert.equal(typeof e.url, 'string');
+          assert.equal(typeof e.auth_set, 'boolean');
+        }
+        assert.ok(!res.body.includes('auth_token'), 'the field name auth_token never appears in the state view');
+        assert.ok(!res.body.includes('sekret-omlx-token'), 'the token VALUE never appears in the state view');
+      }
+    } finally {
+      await aggApp.close();
+    }
+  } finally {
+    rmSync(aggDir, { recursive: true, force: true });
+  }
+});
+
+test('#64 GET /api/server-keys: loopback + admin token answers keyed rows; non-loopback is 403 even with a valid admin token; no token never passes', async () => {
+  const aggDir = mkdtempSync(join(tmpdir(), 'idlefill-keys-'));
+  try {
+    const aggCfg: ServerConfig = { ...cfg, api_tokens: [AGG_TOKEN], state_file: join(aggDir, 'state.json') };
+    const aggArbiter = new Arbiter(new StateStore(aggCfg.state_file), aggCfg, det);
+    aggArbiter.upsertServerConnection({ name: 'omlx', url: 'http://omlx.local:8000', models: [], activity_path: '', auth_token: 'sekret-omlx-token' });
+    aggArbiter.upsertServerConnection({ name: 'lmstudio', url: 'http://lms.local:1234', models: [], activity_path: '' });
+    const aggApp = buildApi({ arbiter: aggArbiter, cfg: aggCfg, publicDir: join(__dirname, '..', 'public') });
+    await aggApp.ready();
+    try {
+      const ok = await aggApp.inject({ method: 'GET', url: '/api/server-keys', remoteAddress: '127.0.0.1', headers: { authorization: `Bearer ${AGG_TOKEN}` } });
+      assert.equal(ok.statusCode, 200);
+      const body = ok.json() as { server_keys: { id: string; name: string; url: string; auth_token: string }[] };
+      assert.ok(Array.isArray(body.server_keys));
+      const omlx = body.server_keys.find((r) => r.name === 'omlx');
+      assert.ok(omlx, 'the keyed row is handed to the machine own router');
+      assert.equal(omlx!.auth_token, 'sekret-omlx-token');
+      assert.equal(omlx!.url, 'http://omlx.local:8000');
+      assert.ok(!body.server_keys.some((r) => r.name === 'lmstudio'), 'a keyless row is not returned');
+      assert.ok(body.server_keys.every((r) => r.auth_token !== ''));
+
+      for (const remote of ['100.105.225.1', '10.10.10.241', '100.94.165.103']) {
+        const denied = await aggApp.inject({ method: 'GET', url: '/api/server-keys', remoteAddress: remote, headers: { authorization: `Bearer ${AGG_TOKEN}` } });
+        assert.equal(denied.statusCode, 403, `non-loopback ${remote} refused despite a valid admin token`);
+        assert.ok(!denied.body.includes('sekret-omlx-token'), 'the refusal body carries no token');
+      }
+      const anon = await aggApp.inject({ method: 'GET', url: '/api/server-keys', remoteAddress: '127.0.0.1' });
+      assert.equal(anon.statusCode, 401, 'the key route is NOT an anonymous exception');
+      const wrong = await aggApp.inject({ method: 'GET', url: '/api/server-keys', remoteAddress: '127.0.0.1', headers: { authorization: 'Bearer ' + 'no-pe-9' } });
+      assert.equal(wrong.statusCode, 401, 'the loopback check never loosens auth');
+      const peer = await aggApp.inject({ method: 'GET', url: '/api/server-keys', remoteAddress: '127.0.0.1', headers: { authorization: 'Bearer nope' } });
+      assert.equal(peer.statusCode, 401);
+    } finally {
+      await aggApp.close();
+    }
+  } finally {
+    rmSync(aggDir, { recursive: true, force: true });
+  }
+});

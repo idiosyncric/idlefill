@@ -80,6 +80,7 @@ function cfgWith(projects: Record<string, unknown>[]): ClientConfig {
     token: 't',
     client_name: 'registry-test',
     proxy_port: 0, // ephemeral — never collide with a live client daemon
+    aggregate_port: 0, // #64 — same reason: the live daemon owns :8800
     projects,
   });
   const cfg = loadClientConfig(join(repoRoot, 'client', 'src'));

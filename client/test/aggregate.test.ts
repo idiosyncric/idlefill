@@ -1,0 +1,321 @@
+/**
+ * aggregate.test.ts — #64 client side: the second loopback listener
+ * (docs/architecture/aggregate-endpoint.md D1/D3/D5; ISSUE64 acceptance).
+ *
+ * Real sockets: the REAL aggregate router + the REAL SessionGate (the SAME
+ * instance shared with a real 11435 proxy) + two controllable fake engines
+ * (default llm_target + a cataloged oMLX-style row). No arbiter network:
+ * the catalog + key table are pushed through the router's update seams —
+ * the exact shape the daemon's poll loop feeds them.
+ *
+ * Covers:
+ *   - GET /v1/models answers the catalog UNION (deduped), never a
+ *     passthrough probe (the probe engine is never hit for it)
+ *   - chat-completions route by the body's `model` to the catalog row's
+ *     engine, WITH that row's Authorization header from the in-memory key
+ *     table
+ *   - unknown model / absent model / empty catalog fall back to the
+ *     machine's default llm_target (exact today behavior, client's own
+ *     auth passes through untouched)
+ *   - gate derived-key registration: X-Hermes-Session-Id present → the
+ *     header is the key; absent → the model name is the key (D3)
+ *   - onSessionRoute fires (key, catalog-chosen server_id) so the daemon's
+ *     register heartbeat carries the RIGHT server_id (D5)
+ *   - one SHARED slot cap: 8800 traffic parks against a slot held by a
+ *     11435 /s/<token> session on the SAME gate (D5 — a second gate would
+ *     double the cap)
+ *   - engineBase strips an operator-pasted /v1 suffix
+ */
+
+import { test, after } from 'node:test';
+import assert from 'node:assert/strict';
+import http from 'node:http';
+import { startAggregateRouter, engineBase, type AggregateRouter, type AggregateCatalogEntry } from '../src/aggregate.js';
+import { startLlmProxy, waitProxyReady, type LlmProxy } from '../src/proxy.js';
+import { SessionGate, type SessionGateSnapshot, type SessionHistory } from '../src/session-gate.js';
+
+const cleanup: Array<() => Promise<void> | void> = [];
+after(async () => {
+  for (const fn of cleanup.splice(0)) await fn();
+});
+
+/**
+ * Engine stand-in: records every request (method/path/body/auth header)
+ * and answers immediately with an OpenAI-shaped completion echoing a
+ * per-engine marker, so a test can prove WHICH engine served it.
+ */
+function startEngine(marker: string): Promise<{
+  url: string;
+  hits: { method: string; path: string; body: string; auth: string | undefined }[];
+  close: () => Promise<void>;
+}> {
+  const hits: { method: string; path: string; body: string; auth: string | undefined }[] = [];
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      hits.push({ method: req.method ?? '', path: req.url ?? '', body, auth: req.headers.authorization });
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ id: 'chatcmpl-1', model: marker, choices: [{ message: { content: marker } }] }));
+    });
+  });
+  return new Promise((resolveP) => {
+    server.listen(0, '127.0.0.1', () => {
+      const port = (server.address() as { port: number }).port;
+      resolveP({
+        url: `http://127.0.0.1:${port}`,
+        hits,
+        close: () =>
+          new Promise<void>((r) => {
+            server.closeAllConnections?.();
+            server.close(() => r());
+          }),
+      });
+    });
+  });
+}
+
+/** Engine whose replies are released by hand (makes a session occupy a slot). */
+function startHeldEngine(): Promise<{
+  url: string;
+  hits: { path: string; body: string; auth: string | undefined }[];
+  release: () => void;
+  close: () => Promise<void>;
+}> {
+  const hits: { path: string; body: string; auth: string | undefined }[] = [];
+  const waiting: http.ServerResponse[] = [];
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      hits.push({ path: req.url ?? '', body, auth: req.headers.authorization });
+      waiting.push(res);
+    });
+  });
+  return new Promise((resolveP) => {
+    server.listen(0, '127.0.0.1', () => {
+      const port = (server.address() as { port: number }).port;
+      resolveP({
+        url: `http://127.0.0.1:${port}`,
+        hits,
+        release() {
+          const res = waiting.shift();
+          if (!res) return;
+          const hit = hits[Math.max(0, hits.length - 1)];
+          let model = 'held';
+          try { model = (JSON.parse(hit?.body || '{}') as { model?: string }).model ?? model; } catch { /* keep default */ }
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ id: 'chatcmpl-1', model, choices: [{ message: { content: 'ok' } }] }));
+        },
+        close: () =>
+          new Promise<void>((r) => {
+            server.closeAllConnections?.();
+            server.close(() => r());
+          }),
+      });
+    });
+  });
+}
+
+async function startRouter(opts: {
+  defaultTarget: string;
+  gate?: SessionGate | null;
+  catalog?: AggregateCatalogEntry[];
+  keys?: { id: string; name: string; url: string; auth_token: string }[];
+  onSessionRoute?: (key: string, serverId: string) => void;
+}): Promise<AggregateRouter> {
+  const r = startAggregateRouter({
+    port: 0,
+    defaultTarget: opts.defaultTarget,
+    ...(opts.gate !== undefined ? { gate: opts.gate } : {}),
+    ...(opts.onSessionRoute ? { onSessionRoute: opts.onSessionRoute } : {}),
+  });
+  cleanup.push(() => r.stop());
+  await waitProxyReady(r.server);
+  if (opts.catalog) r.updateCatalog(opts.catalog);
+  if (opts.keys) r.updateKeys(opts.keys);
+  return r;
+}
+
+function postChat(base: string, path: string, model?: string, headers?: Record<string, string>): Promise<Response> {
+  const body: Record<string, unknown> = { messages: [{ role: 'user', content: 'hi' }] };
+  if (model !== undefined) body.model = model;
+  return fetch(`${base}${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(headers ?? {}) },
+    body: JSON.stringify(body),
+  });
+}
+
+async function waitFor(pred: () => boolean, timeoutMs = 3000, what = 'condition'): Promise<void> {
+  const started = Date.now();
+  for (;;) {
+    if (pred()) return;
+    if (Date.now() - started > timeoutMs) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
+function makeGate(maxActive = 2): { gate: SessionGate; registered: string[] } {
+  const registered: string[] = [];
+  const gate = new SessionGate({
+    maxActive,
+    holdCapMs: 30_000,
+    register: async (token: string, _snap: SessionGateSnapshot | null, _sid?: string, _hist?: SessionHistory) => {
+      registered.push(token);
+      return true;
+    },
+  });
+  gate.onStatePoll([]); // arbiter reachable
+  return { gate, registered };
+}
+
+const CATALOG: AggregateCatalogEntry[] = [
+  { name: 'MlxModel', server_id: 'srv-omlx', url: 'http://127.0.0.1:9/v1', auth_set: true },
+  { name: 'Shared', server_id: 'srv-omlx', url: 'http://127.0.0.1:9/v1', auth_set: true },
+  { name: 'Shared', server_id: 'srv-lms', url: 'http://127.0.0.1:8/v1', auth_set: false },
+];
+
+// ---------------------------------------------------------------------------
+
+test('engineBase: operator-pasted /v1 bases normalize to the origin', () => {
+  assert.equal(engineBase('http://h:8000'), 'http://h:8000');
+  assert.equal(engineBase('http://h:8000/'), 'http://h:8000');
+  assert.equal(engineBase('https://strata.example/v1'), 'https://strata.example');
+});
+
+test('GET /v1/models answers the deduped catalog union — never a passthrough probe', async () => {
+  const def = await startEngine('default');
+  cleanup.push(() => def.close());
+  const r = await startRouter({ defaultTarget: def.url, catalog: CATALOG });
+  assert.equal(r.catalogSize(), 2, 'the router de-dups a bare name even if the payload repeats it');
+
+  const res = await fetch(`${r.base_url}/v1/models`);
+  assert.equal(res.status, 200);
+  const list = (await res.json()) as { object: string; data: { id: string; owned_by: string }[] };
+  assert.equal(list.object, 'list');
+  const ids = list.data.map((d) => d.id);
+  assert.deepEqual([...new Set(ids)].length, ids.length, 'bare names deduped');
+  assert.ok(ids.includes('MlxModel') && ids.includes('Shared'));
+  const shared = list.data.find((d) => d.id === 'Shared')!;
+  assert.equal(shared.owned_by, 'srv-omlx', 'first row owns the collision (arbiter-pinned order stands)');
+  assert.equal(def.hits.length, 0, 'the router NEVER probes an engine to answer /v1/models (D1)');
+});
+
+test('chat-completions route by model to the catalog row, adding the row Authorization from the key table', async () => {
+  const def = await startEngine('default');
+  const omlx = await startEngine('omlx-engine');
+  cleanup.push(() => def.close());
+  cleanup.push(() => omlx.close());
+  const omlxKey = 'mlx-' + 'key-7f';
+  const r = await startRouter({
+    defaultTarget: def.url,
+    catalog: CATALOG.map((e) => ({ ...e, url: omlx.url })),
+    keys: [{ id: 'srv-omlx', name: 'omlx', url: omlx.url, auth_token: omlxKey }],
+  });
+
+  const res = await postChat(r.base_url, '/v1/chat/completions', 'MlxModel');
+  assert.equal(res.status, 200);
+  const json = (await res.json()) as { model: string };
+  assert.equal(json.model, 'omlx-engine', 'the CATALOGED model reached the row engine');
+  await waitFor(() => omlx.hits.length === 1, 3000, 'omlx hit');
+  assert.equal(omlx.hits[0]!.path, '/v1/chat/completions');
+  assert.equal(omlx.hits[0]!.auth, `Bearer ${omlxKey}`, 'the row credential rode per request from the in-memory table');
+  assert.match(omlx.hits[0]!.body, /"model":"MlxModel"/, 'body forwarded verbatim');
+  assert.equal(def.hits.length, 0, 'default target untouched for a known model');
+});
+
+test('fallback to llm_target: unknown model, absent model, and empty catalog all take today-behavior passthrough', async () => {
+  const def = await startEngine('default');
+  const omlx = await startEngine('omlx-engine');
+  cleanup.push(() => def.close());
+  cleanup.push(() => omlx.close());
+  const r = await startRouter({ defaultTarget: def.url, catalog: CATALOG.map((e) => ({ ...e, url: omlx.url })) });
+
+  const unknown = await postChat(r.base_url, '/v1/chat/completions', 'NotInCatalog');
+  assert.equal(unknown.status, 200);
+  assert.equal(((await unknown.json()) as { model: string }).model, 'default', 'unknown model → default target');
+
+  const noModel = await fetch(`${r.base_url}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer ' + 'clientkey' },
+    body: JSON.stringify({ messages: [] }),
+  });
+  assert.equal(noModel.status, 200);
+  assert.equal(def.hits[1]!.auth, 'Bearer clientkey', 'client auth passes through untouched (today behavior)');
+
+  r.updateCatalog([]);
+  assert.equal(r.catalogSize(), 0);
+  const empty = await postChat(r.base_url, '/v1/chat/completions', 'MlxModel');
+  assert.equal(empty.status, 200);
+  assert.equal(((await empty.json()) as { model: string }).model, 'default', 'empty catalog → default target');
+  assert.equal(omlx.hits.length, 0, 'the row engine never served a fallback request');
+});
+
+test('gate key (D3): X-Hermes-Session-Id wins when present; otherwise the body model names the session', async () => {
+  const def = await startEngine('default');
+  const omlx = await startEngine('omlx-engine');
+  cleanup.push(() => def.close());
+  cleanup.push(() => omlx.close());
+  const { gate, registered } = makeGate();
+  const routes: [string, string][] = [];
+  const r = await startRouter({
+    defaultTarget: def.url,
+    gate,
+    catalog: CATALOG.map((e) => ({ ...e, url: omlx.url })),
+    onSessionRoute: (key, serverId) => routes.push([key, serverId]),
+  });
+
+  // Header present: the header is the gate key.
+  const withHdr = await postChat(r.base_url, '/v1/chat/completions', 'MlxModel', { 'x-hermes-session-id': 'conv-42' });
+  assert.equal(withHdr.status, 200);
+  // Header absent: the model name is the gate key.
+  const noHdr = await postChat(r.base_url, '/v1/chat/completions', 'Shared');
+  assert.equal(noHdr.status, 200);
+
+  await waitFor(() => registered.length >= 2, 3000, 'both derived keys registered');
+  assert.ok(registered.includes('conv-42'), 'header-derived session registered');
+  assert.ok(registered.includes('Shared'), 'model-derived session registered');
+  assert.ok(!registered.includes('MlxModel'), 'the header wins: the model never double-registers');
+  assert.deepEqual(routes, [
+    ['conv-42', 'srv-omlx'],
+    ['Shared', 'srv-omlx'],
+  ], 'onSessionRoute pairs the derived key with the catalog-chosen row for the register heartbeat (D5)');
+});
+
+test('D5 one shared cap: 8800 traffic parks against a slot held by the 11435 /s/<token> flow (same gate)', async () => {
+  const held = await startHeldEngine();
+  cleanup.push(() => held.close());
+  const { gate } = makeGate(1); // max_active_agent_sessions = 1
+  // The SAME gate fronts both listeners (the daemon's wiring shape).
+  const proxy: LlmProxy = startLlmProxy({ port: 0, target: held.url, gate });
+  cleanup.push(() => proxy.stop());
+  await waitProxyReady(proxy.server);
+  const r = await startRouter({
+    defaultTarget: held.url,
+    gate,
+    catalog: [{ name: 'MlxModel', server_id: 'srv-omlx', url: held.url, auth_set: false }],
+  });
+
+  // 11435 session A takes the only slot (response held open).
+  const resA = postChat(proxy.base_url, '/s/tokA/v1/chat/completions', 'JobModel');
+  await waitFor(() => held.hits.length === 1, 3000, 'session A forwarded');
+
+  // 8800 traffic (derived key) must PARK: one shared cap, not a second one.
+  const resB = postChat(r.base_url, '/v1/chat/completions', 'MlxModel', { 'x-hermes-session-id': 'conv-99' });
+  await new Promise((res) => setTimeout(res, 150));
+  assert.equal(held.hits.length, 1, 'the aggregate request never reached the engine — parked');
+  assert.equal(gate.queueDepth, 1, 'the aggregate session is queued on the SAME gate');
+
+  gate.onStatePoll([]); // heartbeat: still zero overrides
+  held.release();
+  const a = await resA;
+  await waitFor(() => held.hits.length === 2, 3000, 'parked aggregate request forwarded on slot free');
+  held.release();
+  const b = await resB;
+  assert.equal(a.status, 200);
+  assert.equal(b.status, 200, 'the parked aggregate request proceeds on admission, body intact');
+  assert.equal(held.hits.length, 2);
+  assert.match(held.hits[1]!.path, /^\/v1\/chat\/completions$/, 'aggregate path forwarded verbatim (no /s/ prefix to strip)');
+  assert.match(held.hits[1]!.body ?? '', /"model":"MlxModel"/, 'parked body survived the first-chunk peek unshift (#45 posture)');
+});

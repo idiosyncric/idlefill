@@ -204,6 +204,7 @@ test('the register heartbeat carries cycles + cycle_cap on the project entry, an
     ip: '',
     proxy_port: 0,
     llm_target: 'http://127.0.0.1:1',
+    aggregate_port: 0,
     repo_root: dir,
     state_dir: join(dir, 'state'),
     state_file: join(dir, 'state.json'),

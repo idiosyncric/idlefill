@@ -113,6 +113,16 @@ export interface ClientConfig {
   /** LLM target the loopback proxy forwards to. */
   llm_target: string;
   /**
+   * Aggregate inference endpoint (#64 D1): a SECOND loopback listener
+   * (127.0.0.1 only) inside this SAME process, in front of the SAME
+   * SessionGate instance. Every Hermes profile points at
+   * `http://127.0.0.1:<aggregate_port>/v1`; the router answers /v1/models
+   * from the arbiter-published catalog and routes chat traffic by the
+   * body's `model` to the catalog row's engine. `0` disables the listener.
+   * ADD key (mesh D5 counts processes, not listeners).
+   */
+  aggregate_port: number;
+  /**
    * Session gate (issue #9 Part A): when true (default) the loopback proxy
    * also acts as the per-Mac router/gate for interactive agent traffic on
    * `/s/<token>/v1/...` — self-registration, capacity-limited admission,
@@ -150,6 +160,8 @@ const DEFAULTS = {
   ip: '',
   proxy_port: 11435,
   llm_target: 'http://100.105.225.1:11434',
+  // Aggregate endpoint port (#64 D1, owner decision 4: 8800 fleet-wide).
+  aggregate_port: 8800,
   session_gate: true,
   max_active_agent_sessions: 2,
   session_hold_cap_ms: 120_000,
@@ -207,6 +219,9 @@ export function loadClientConfig(
     ip: str(r.ip, env.IDLEFILL_CLIENT_IP ?? DEFAULTS.ip),
     proxy_port: num(r.proxy_port, DEFAULTS.proxy_port),
     llm_target: str(r.llm_target, DEFAULTS.llm_target),
+    // Aggregate endpoint (#64): `0` disables the second listener; a
+    // garbage/negative value falls back to the default.
+    aggregate_port: Math.max(0, Math.floor(num(r.aggregate_port, DEFAULTS.aggregate_port))),
     // Session gate (issue #9 Part A). `session_gate` accepts an explicit
     // boolean; anything else falls back to the default (true).
     session_gate: typeof r.session_gate === 'boolean' ? r.session_gate : DEFAULTS.session_gate,
