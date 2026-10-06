@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- TEMPLATE for the app's own LaunchAgent (Q-d LOCKED: ONE agent,
+     com.sam.idlefill.app, RunAtLoad). tauri/install.sh renders this with
+     the checkout's repo root, label, program and log dir — the same
+     render discipline as menubar/IdlefillMenubar.plist. The hardcoded
+     paths below are the MAIN checkout's defaults. Net-new for the
+     combined app: the desktop shell has no LaunchAgent today, and the
+     menubar label retires at the cutover. No KeepAlive: this is a
+     login autostart, not a supervisor (the app restores as a GUI app). -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.sam.idlefill.app</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/sam/Software/idlefill/tauri/src-tauri/target/release/bundle/macos/Idlefill.app/Contents/MacOS/idlefill-app</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/sam/Software/idlefill</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/sam/Software/idlefill/logs/app.launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/sam/Software/idlefill/logs/app.launchd.err.log</string>
+</dict>
+</plist>
