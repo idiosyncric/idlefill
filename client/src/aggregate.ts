@@ -21,6 +21,17 @@
  * folding/preemption) — the daemon records the pair via `onSessionRoute`
  * before the gate sees the request.
  *
+ * Model aliases (#66, docs/architecture/model-aliases.md): an alias map
+ * rides beside `catalogByName`, fed by the `model_aliases` sibling on the
+ * SAME /api/state poll. Alias beats bare at routing and at /v1/models
+ * (D2/D3). An alias whose `engine_model` differs from the requested name
+ * splices the engine's own id into the body at the forward seam — AFTER
+ * gate admission, so parked bodies stay unconsumed (the session-gate
+ * invariant). The aliased class buffers the full body under a bounded cap
+ * (413 over it) and forwards with a recomputed content-length (owner Q3
+ * posture, 2026-10-06: the llama.cpp family drops chunked bodies). Every
+ * non-aliased route keeps today's `req.pipe` posture byte-for-byte.
+ *
  * The #45 trap this walks around: the model is sniffed from the FIRST
  * body chunk, then the chunk is put BACK (`unshift`) and the stream
  * paused, so a parked request keeps its body unconsumed and the
@@ -41,6 +52,33 @@ export interface AggregateCatalogEntry {
   catalog_source?: 'probed' | 'declared';
 }
 
+/**
+ * One published alias as the arbiter resolves it (#66 D3: the
+ * `model_aliases` ADD-key sibling of `catalog` on the same poll). The
+ * winner pair is ALREADY applied server-side — the router never recomputes
+ * it (mesh rule: published, not computed remotely). `engine_model` is the
+ * winner row's OWN model id: the string the forward seam splices into the
+ * body when the request named the alias.
+ */
+export interface AggregateAliasEntry {
+  name: string;
+  server_id: string;
+  url: string;
+  auth_set: boolean;
+  engine_model: string;
+  catalog_source: 'probed' | 'declared';
+}
+
+/**
+ * #66 Q3 (owner-approved 2026-10-06): the aliased forward buffers the FULL
+ * body so the splice can recompute a correct content-length — the llama.cpp
+ * family drops chunked request bodies (live probe, doc D3 AMENDMENT). The
+ * cap is generous (Hermes tool payloads run to megabytes) and an over-cap
+ * body is refused with 413 BEFORE any engine sees a byte. Bare-name
+ * traffic never buffers: today's `req.pipe` posture byte-for-byte.
+ */
+export const ALIAS_BODY_BUFFER_CAP = 64 * 1024 * 1024; // 64 MiB
+
 /** One row of GET /api/server-keys (loopback-scoped pull, #64 D2). */
 export interface ServerKeyRow {
   id: string;
@@ -55,10 +93,14 @@ export interface AggregateRouter {
   base_url: string;
   /** Replace the routing catalog (from the /api/state poll). */
   updateCatalog(entries: AggregateCatalogEntry[]): void;
+  /** Replace the routing alias map (#66 D3 — from the `model_aliases` ADD-key on the SAME poll). */
+  updateAliases(entries: AggregateAliasEntry[]): void;
   /** Replace the in-memory engine-key table (from GET /api/server-keys). */
   updateKeys(rows: ServerKeyRow[]): void;
   /** Current catalog size (tests + live check). */
   catalogSize(): number;
+  /** Current alias size (tests + live check). */
+  aliasSize(): number;
   stop(): Promise<void>;
 }
 
@@ -86,6 +128,36 @@ function cleanKey(v: unknown): string | undefined {
   // eslint-disable-next-line no-control-regex
   if (/[^\x20-\x7e]/.test(s)) return undefined;
   return s;
+}
+
+/**
+ * #66 D3 (as amended by the owner's Q3 scoped-buffer decision): splice the
+ * quoted `model` value from the requested alias to the engine's OWN id.
+ *
+ * The regex is the SNIFF's own class, character for character
+ * (`peekModelFromFirstChunk` above, `client/src/session-gate.ts:183-187`):
+ * rewrite feasibility is therefore identical to routing feasibility — the
+ * same find, the same class. Only the FIRST match is replaced, and only
+ * when the value equals the requested name exactly. Everything before and
+ * after the match rides byte-for-byte; the D1 write-side bound (no `"` no
+ * `\`) makes a quote breakage impossible.
+ *
+ * Returns the buffer unchanged when the name is not found (defensive: the
+ * engine then sees what the client sent, exactly like a non-aliased
+ * forward of the same bytes).
+ */
+export function spliceModelName(body: Buffer, fromModel: string, toModel: string): Buffer {
+  if (fromModel === toModel) return body;
+  const text = body.toString('utf8');
+  // Same class as the sniff; the name is escaped into a literal for the
+  // find so a stored id with regex metacharacters cannot over-match.
+  const needle = new RegExp('("model"\\s*:\\s*")(' + fromModel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')(")');
+  const m = needle.exec(text);
+  if (!m) return body;
+  const [whole, open, name, close] = m;
+  if (whole === undefined || open === undefined || name === undefined || close === undefined) return body;
+  const at = text.indexOf(whole, m.index) + open.length;
+  return Buffer.from(text.slice(0, at) + toModel + text.slice(at + name.length), 'utf8');
 }
 
 /**
@@ -138,22 +210,27 @@ export function startAggregateRouter(opts: {
   /** Fires when a request is keyed to a catalog row: (gate key, chosen server_id). */
   onSessionRoute?: (key: string, serverId: string) => void;
   log?: (msg: string) => void;
+  /**
+   * Test seam: override the aliased-body buffer cap (default
+   * ALIAS_BODY_BUFFER_CAP). Production callers never pass it.
+   */
+  aliasBodyCapBytes?: number;
 }): AggregateRouter {
   const log = opts.log ?? (() => {});
+  const bodyCap = opts.aliasBodyCapBytes ?? ALIAS_BODY_BUFFER_CAP;
   const target = new URL(opts.defaultTarget);
   let catalog: AggregateCatalogEntry[] = [];
   const catalogByName = new Map<string, AggregateCatalogEntry>();
+  // #66 D2: the alias map rides BESIDE the catalog map, fed by the
+  // `model_aliases` sibling on the same poll. At routing it WINS over a
+  // bare catalog entry of the same name (alias > bare precedence).
+  let aliases: AggregateAliasEntry[] = [];
+  const aliasByName = new Map<string, AggregateAliasEntry>();
   /** In-memory engine keys (#64 D2) — never persisted, never logged. */
   let keys = new Map<string, string>();
 
-  /** Forward `req` to `base` (http/https per protocol), path verbatim. */
-  const forwardTo = (
-    req: http.IncomingMessage,
-    res: http.ServerResponse,
-    path: string,
-    base: URL,
-    authToken?: string,
-  ): void => {
+  /** Request headers minus the per-hop ones (identical posture for both forwards). */
+  const copyRequestHeaders = (req: http.IncomingMessage, authToken?: string): Record<string, string | string[]> => {
     const headers: Record<string, string | string[]> = {};
     for (const [k, v] of Object.entries(req.headers)) {
       if (k === 'host') continue; // rewritten by the request
@@ -163,7 +240,133 @@ export function startAggregateRouter(opts: {
     // The row credential rides per request (#64 D2). No row token: the
     // client's own headers pass through untouched (today's behavior).
     if (authToken) headers['authorization'] = `Bearer ${authToken}`;
+    return headers;
+  };
 
+  const upstreamOpts = (base: URL, req: http.IncomingMessage, headers: Record<string, string | string[]>) => ({
+    protocol: base.protocol,
+    hostname: base.hostname,
+    port: base.port || (base.protocol === 'https:' ? 443 : 80),
+    path: '', // filled by the caller (rawUrl, verbatim)
+    method: req.method,
+    headers,
+  });
+
+  /** The upstream-response plumbing, shared by the pipe and the buffered forward. */
+  const relayUpstream = (up: http.IncomingMessage, res: http.ServerResponse): void => {
+    // #65: the engine's STATUS rides through too. Without this the
+    // response stays at Node's default 200 while the engine's error
+    // body arrives — an SDK sees 200 + no choices and reports an
+    // empty stream. Fallback 502 only when the status is absent.
+    res.statusCode = up.statusCode ?? 502;
+    const skip = new Set(['transfer-encoding', 'connection', 'content-length']);
+    for (const [k, v] of Object.entries(up.headers)) {
+      if (skip.has(k.toLowerCase()) || v === undefined) continue;
+      res.setHeader(k, v);
+    }
+    up.pipe(res);
+    up.on('error', () => {
+      try {
+        res.destroy();
+      } catch {
+        /* ignore */
+      }
+    });
+  };
+
+  /**
+   * #66 Q3 (owner-approved): the ALIASED forward — buffer the full body
+   * under the cap, splice the quoted model name to the engine's OWN id,
+   * forward with a recomputed `content-length`. Framing normalizes: a
+   * chunked client gets a content-length (the llama.cpp family drops
+   * chunked bodies — doc D3 AMENDMENT). An over-cap body is a 413; the
+   * engine never sees a byte of it. Everything before and after the match
+   * rides byte-for-byte (the D1 id bounds keep the JSON quoting intact).
+   */
+  const forwardBuffered = (
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    rawUrl: string,
+    base: URL,
+    authToken: string | undefined,
+    fromModel: string,
+    toModel: string,
+  ): void => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let over = false;
+    req.on('data', (c: Buffer) => {
+      if (over) return; // drain-and-discard: memory stays bounded until the client stops
+      total += c.length;
+      if (total > bodyCap) {
+        over = true;
+        chunks.length = 0;
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('error', () => {
+      if (!res.headersSent) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'request body failed' }));
+      }
+    });
+    req.on('end', () => {
+      if (over) {
+        res.writeHead(413, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            error: 'aliased request body over the rewrite cap',
+            detail: `the alias rewrite buffers the body; cap ${bodyCap} bytes`,
+          }),
+        );
+        return;
+      }
+      const body = Buffer.concat(chunks);
+      const spliced = spliceModelName(body, fromModel, toModel);
+      const headers = copyRequestHeaders(req, authToken);
+      // The recomputed length replaces whatever the client sent (a
+      // content-length of the OLD size would truncate/mangle the spliced
+      // body; transfer-encoding must not ride alongside a length).
+      delete headers['content-length'];
+      delete headers['transfer-encoding'];
+      delete headers['Content-Length'];
+      delete headers['Transfer-Encoding'];
+      headers['content-length'] = String(spliced.length);
+      const transport = base.protocol === 'https:' ? https : http;
+      const upstream = transport.request(
+        { ...upstreamOpts(base, req, headers), path: rawUrl },
+        (up) => relayUpstream(up, res),
+      );
+      upstream.on('error', (err) => {
+        if (!res.headersSent) {
+          res.writeHead(502, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'llm target down', detail: `${base.hostname}: ${err.message}` }));
+        } else {
+          try {
+            res.destroy();
+          } catch {
+            /* ignore */
+          }
+        }
+      });
+      upstream.end(spliced);
+    });
+    // The peek paused the stream (the #45 posture); a plain `data`
+    // listener does NOT resume a paused stream (only pipe()/resume() do)
+    // — so the buffered forward resumes it explicitly.
+    req.resume();
+  };
+
+  /** Forward `req` to `base` (http/https per protocol), path verbatim, body PIPED untouched. */
+  const forwardTo = (
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    path: string,
+    base: URL,
+    authToken?: string,
+  ): void => {
+    const headers = copyRequestHeaders(req, authToken);
     const transport = base.protocol === 'https:' ? https : http;
     const upstream = transport.request(
       {
@@ -174,26 +377,7 @@ export function startAggregateRouter(opts: {
         method: req.method,
         headers,
       },
-      (up) => {
-        // #65: the engine's STATUS rides through too. Without this the
-        // response stays at Node's default 200 while the engine's error
-        // body arrives — an SDK sees 200 + no choices and reports an
-        // empty stream. Fallback 502 only when the status is absent.
-        res.statusCode = up.statusCode ?? 502;
-        const skip = new Set(['transfer-encoding', 'connection', 'content-length']);
-        for (const [k, v] of Object.entries(up.headers)) {
-          if (skip.has(k.toLowerCase()) || v === undefined) continue;
-          res.setHeader(k, v);
-        }
-        up.pipe(res);
-        up.on('error', () => {
-          try {
-            res.destroy();
-          } catch {
-            /* ignore */
-          }
-        });
-      },
+      (up) => relayUpstream(up, res),
     );
     upstream.on('error', (err) => {
       if (!res.headersSent) {
@@ -214,13 +398,30 @@ export function startAggregateRouter(opts: {
   /**
    * The gate's forward seam for one request: chosen row (or default
    * target). A parked request arrives here only on admission — its body
-   * was never consumed (the peek unshifted its first chunk back).
+   * was never consumed (the peek unshifted its first chunk back). The
+   * splice happens HERE, at forward time, AFTER admission: a parked body
+   * stays unconsumed until this moment (the session-gate invariant,
+   * `client/src/session-gate.ts:286`).
+   *
+   * #66: an ALIAS-routed entry whose engine id differs from the requested
+   * name takes the scoped buffered forward (Q3 owner posture). Every other
+   * route — bare catalog entry, alias whose engine id EQUALS the name, the
+   * default target — keeps today's `req.pipe` posture byte-for-byte.
    */
-  const forwardFor = (entry: AggregateCatalogEntry | undefined): ForwardFn => (req, res, path) => {
+  const forwardFor = (
+    entry: AggregateCatalogEntry | AggregateAliasEntry | undefined,
+    requestedName?: string,
+  ): ForwardFn => (req, res, path) => {
     if (entry) {
       const base = new URL(engineBase(entry.url) + '/');
       const token = keys.get(entry.server_id);
-      forwardTo(req, res, path, base, token !== undefined && token !== '' ? token : undefined);
+      const auth = token !== undefined && token !== '' ? token : undefined;
+      const engineModel = 'engine_model' in entry ? entry.engine_model : undefined;
+      if (engineModel !== undefined && requestedName !== undefined && engineModel !== requestedName) {
+        forwardBuffered(req, res, path, base, auth, requestedName, engineModel);
+        return;
+      }
+      forwardTo(req, res, path, base, auth);
       return;
     }
     forwardTo(req, res, path, target);
@@ -229,13 +430,15 @@ export function startAggregateRouter(opts: {
   const serveModelList = (_req: http.IncomingMessage, res: http.ServerResponse): void => {
     // The router answers from the catalog union — NEVER a passthrough
     // probe (D1). Bare names, first-row pin already applied upstream.
+    // #66 D3 dedup: alias winners come FIRST, and a bare entry whose name
+    // an alias shadows is skipped — one string still appears ONCE.
+    const data = aliases.map((a) => ({ id: a.name, object: 'model', owned_by: a.server_id }));
+    for (const e of catalog) {
+      if (aliasByName.has(e.name)) continue; // the alias owns this name
+      data.push({ id: e.name, object: 'model', owned_by: e.server_id });
+    }
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(
-      JSON.stringify({
-        object: 'list',
-        data: catalog.map((e) => ({ id: e.name, object: 'model', owned_by: e.server_id })),
-      }),
-    );
+    res.end(JSON.stringify({ object: 'list', data }));
   };
 
   const server = http.createServer((req, res) => {
@@ -250,19 +453,23 @@ export function startAggregateRouter(opts: {
     const headerKey = cleanKey(req.headers[SESSION_ID_HEADER]);
 
     const dispatch = (model: string | undefined): void => {
-      const entry = model ? catalogByName.get(model) : undefined;
+      // #66 D2 precedence: the alias map WINS over a bare catalog entry of
+      // the same name — at routing as well as at publish. An unknown or
+      // absent model leaves the machine `llm_target` untouched (D6 fence).
+      const alias = model ? aliasByName.get(model) : undefined;
+      const entry = alias ?? (model ? catalogByName.get(model) : undefined);
       const key = headerKey ?? model;
       if (entry && key) opts.onSessionRoute?.(key, entry.server_id);
       if (opts.gate && key) {
         // D5: aggregate traffic is session traffic — same gate, same cap,
         // overrides by derived key, fail-open.
-        opts.gate.route(req, res, key, rawUrl, forwardFor(entry));
+        opts.gate.route(req, res, key, rawUrl, forwardFor(entry, model));
         return;
       }
       // Gate off (session_gate=false) or no identity to key on: still
       // model-routed when the catalog knows the model; unknown/absent
       // model falls to the machine's default target (today behavior).
-      forwardFor(entry)(req, res, rawUrl);
+      forwardFor(entry, model)(req, res, rawUrl);
     };
 
     if (headerKey) {
@@ -316,6 +523,23 @@ export function startAggregateRouter(opts: {
         catalog.push(e);
       }
     },
+    updateAliases(entries) {
+      // Same defensive posture as updateCatalog: a malformed entry is
+      // dropped, a repeated alias name keeps its FIRST entry. An empty /
+      // absent block clears the map (the arbiter stopped publishing it —
+      // every alias unpublished this tick, not a stale pin).
+      aliases = [];
+      aliasByName.clear();
+      for (const e of Array.isArray(entries) ? entries : []) {
+        if (!e || typeof e.name !== 'string' || e.name === '') continue;
+        if (typeof e.server_id !== 'string' || e.server_id === '') continue;
+        if (typeof e.url !== 'string' || e.url === '') continue;
+        if (typeof e.engine_model !== 'string' || e.engine_model === '') continue;
+        if (aliasByName.has(e.name)) continue;
+        aliasByName.set(e.name, e);
+        aliases.push(e);
+      }
+    },
     updateKeys(rows) {
       keys = new Map<string, string>();
       for (const r of rows ?? []) {
@@ -326,6 +550,9 @@ export function startAggregateRouter(opts: {
     },
     catalogSize() {
       return catalog.length;
+    },
+    aliasSize() {
+      return aliases.length;
     },
     stop() {
       return new Promise<void>((resolveStop) => {

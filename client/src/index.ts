@@ -69,7 +69,7 @@ import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import { loadClientConfig, type ClientConfig, type ClientProjectConfig, type ScheduledRebuildConfig } from './config.js';
 import { startLlmProxy, waitProxyReady, type LlmProxy } from './proxy.js';
-import { startAggregateRouter, type AggregateCatalogEntry, type AggregateRouter, type ServerKeyRow } from './aggregate.js';
+import { startAggregateRouter, type AggregateAliasEntry, type AggregateCatalogEntry, type AggregateRouter, type ServerKeyRow } from './aggregate.js';
 import { SessionGate, type SessionStateRow } from './session-gate.js';
 import { resolveVersion } from './version.js';
 import { resolveRevision } from './revision.js';
@@ -1412,6 +1412,10 @@ export class ClientDaemon {
       sessions?: SessionStateRow[];
       // #64 D4: the arbiter-built catalog (ADD-key; absent on an old arbiter).
       catalog?: AggregateCatalogEntry[];
+      // #66 D3: the arbiter-resolved alias block (ADD-key sibling of
+      // `catalog`; absent on an old arbiter — an old arbiter simply has no
+      // aliases, so clearing on absence is the correct reading).
+      model_aliases?: AggregateAliasEntry[];
     }>(this.cfg, 'GET', '/api/state');
     if (status !== 200) {
       this.log.info(`state poll HTTP ${status}`);
@@ -1431,6 +1435,11 @@ export class ClientDaemon {
     // never wedges.
     if (this.aggregate) {
       if (Array.isArray(st.catalog)) this.aggregate.updateCatalog(st.catalog);
+      // #66 D3: the alias block rides the SAME poll as its catalog
+      // sibling (pull posture — the router never recomputes the winner).
+      // An absent block clears the map (an old arbiter has no aliases; a
+      // re-pin lands the same way a pause/force override does).
+      this.aggregate.updateAliases(st.model_aliases ?? []);
       void this.refreshServerKeys();
     }
 
