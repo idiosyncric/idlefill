@@ -54,3 +54,30 @@ fi
 
 BIN="$APP/Contents/MacOS/idlefill-app"
 [ -x "$BIN" ] && "$BIN" --version || "$SRC/target/release/idlefill-app" --version || true
+
+# Post-bundle byte-verify (gate 4): the bundle's Info.plist must be a
+# valid plist carrying BOTH the idlefill URL scheme and the ATS merge.
+#
+# ROOT CAUSE of the "corrupted bundle" scare (2026-10-06, twice): the
+# VERIFY command was the writer. On macOS 26+, `plutil -extract <key>
+# json <file>` WITHOUT -o overwrites the INPUT file with the extracted
+# JSON and prints nothing. That turned the good 1363-byte plist into a
+# bare 115-byte CFBundleURLTypes JSON array (mtime matches the check,
+# not the build). The bundler always writes a valid XML plist
+# (tauri-bundler 2.9.4 macos/app.rs:366, to_file_xml). Probed on this
+# host: `json` and `xml1` formats rewrite the input file, `raw` prints
+# to stdout, `json -o -` prints to stdout. This gate therefore uses
+# ONLY the raw form; any human re-check must use `-o -`.
+if [ -d "$APP" ]; then
+  PL="$APP/Contents/Info.plist"
+  plutil -lint "$PL" >/dev/null || { echo "error: bundle Info.plist is not a valid plist" >&2; exit 1; }
+  plutil -extract CFBundleURLTypes raw "$PL" >/dev/null \
+    || { echo "error: bundle Info.plist has no CFBundleURLTypes" >&2; exit 1; }
+  plutil -extract NSAppTransportSecurity.NSAllowsArbitraryLoads raw "$PL" >/dev/null \
+    || { echo "error: bundle Info.plist has no ATS merge" >&2; exit 1; }
+  # Guard the guard: if a future plutil mutates the file under the
+  # probe again, fail here instead of shipping the corpse.
+  plutil -lint "$PL" >/dev/null \
+    || { echo "error: bundle Info.plist corrupted BY THE GATE CHECK itself" >&2; exit 1; }
+  echo "info.plist verified: URL scheme + ATS present"
+fi
