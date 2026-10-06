@@ -260,6 +260,19 @@
   .fbtns button.primary { border-color: var(--accent); }
   .fbtns .fmsg { font-size: 11px; }
   .note { margin-top: 4px; color: var(--dim); font-size: 11px; }
+  /* Model aliases (#66): the pair rows inside an alias form — the engine
+     pick + that row's EXACT probed model pick + the row's remove button,
+     and the pane's per-alias winner buttons. */
+  .apair { gap: 6px; }
+  .apair select { flex: 1 1 160px; background: var(--panel); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px; font: inherit;
+    font-size: 12px; padding: 3px 6px; max-width: 340px; }
+  .apair select:focus { outline: 1px solid var(--accent); }
+  .apair button { background: var(--panel); color: var(--dim); border: 1px solid var(--border);
+    border-radius: 4px; font: inherit; font-size: 13px; padding: 2px 8px; cursor: pointer; }
+  .frow select { background: var(--panel); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px; font: inherit;
+    font-size: 12px; padding: 3px 6px; }
   /* Queue detail page — /[project]/[worker]/queue (the same single-file
      dashboard; the script shows #queue-section and hides the panes). The
      table is client-published preview data, shown verbatim. */
@@ -367,6 +380,7 @@
     <button id="vtab-overview" type="button" class="active" role="tab" aria-selected="true" data-view="overview">Overview</button>
     <button id="vtab-projects" type="button" role="tab" aria-selected="false" data-view="projects">Projects</button>
     <button id="vtab-sessions" type="button" role="tab" aria-selected="false" data-view="sessions">Sessions<span class="vbadge" id="badge-sessions" hidden></span></button>
+    <button id="vtab-models" type="button" role="tab" aria-selected="false" data-view="models">Models</button>
     <button id="vtab-usage" type="button" role="tab" aria-selected="false" data-view="usage">Usage</button>
   </div>
 </div>
@@ -447,6 +461,20 @@
   <section id="usage-section" data-view="usage" style="display:none">
     <h2>Usage <span class="sub" style="text-transform:none;letter-spacing:0">· last 7 days</span></h2>
     <div id="usage"></div>
+  </section>
+
+  <!-- Model aliases (#66) — the Models view: one row per operator-declared
+       alias (name, its pairs with the per-pair probe marker — exception-
+       only, `probed` renders nothing —, the resolved winner, and the pin
+       control). An alias pins ONE model name to exact engine inventory
+       entries; the winner answers with that pair's own id (the client
+       router rewrites the body). Pairs are picked ONLY from probed engine
+       inventories (D5 — never a fuzzy match); the arbiter never sees a
+       token here (aliases carry none by construction). -->
+  <section id="models-section" data-view="models">
+    <h2>Model aliases <button id="add-alias" class="settings-toggle" type="button" title="declare a model alias — one name pinned to exact engine inventory entries">+ add alias</button></h2>
+    <div id="add-alias-form" class="settings-form"></div>
+    <div id="models"><div class="empty">no aliases declared</div></div>
   </section>
 
   <!-- Queue search — client-side filter of the per-worker PUBLISHED
@@ -1294,6 +1322,11 @@ async function refresh() {
   //     fetches from the client only when the operator opens it).
   renderLocalConfig(st);
 
+  // --- Model aliases (#66) — the Models view renders from the alias
+  //     cache (the token-gated GET /api/aliases read), with the probed
+  //     pick-list derived from THIS payload's catalog block.
+  renderModelsPane(st);
+
   // --- Throttled jobs (the anti-thrash backstop — exception-only: the
   //     section stays hidden while nothing is throttled, and each block
   //     carries the recovery control).
@@ -1526,8 +1559,8 @@ function renderQueueSearch() {
 // the queue route (body.queuepage) hides the bar entirely — that route owns
 // the main area.
 // ---------------------------------------------------------------------------
-const VIEW_TABS = ["overview", "projects", "sessions", "usage"];
-const VIEW_TAB_IDS = { overview: "vtab-overview", projects: "vtab-projects", sessions: "vtab-sessions", usage: "vtab-usage" };
+const VIEW_TABS = ["overview", "projects", "sessions", "models", "usage"];
+const VIEW_TAB_IDS = { overview: "vtab-overview", projects: "vtab-projects", sessions: "vtab-sessions", models: "vtab-models", usage: "vtab-usage" };
 
 function currentView() {
   try {
@@ -1560,6 +1593,7 @@ const VIEW_EMPTY_MSG = {
   overview: "nothing on this machine yet — no servers declared",
   projects: "no projects configured on this arbiter",
   sessions: "no interactive sessions registered — point a session at the local proxy to see it here",
+  models: "no aliases declared — an alias pins one model name to exact engine inventory entries",
   usage: "no usage recorded yet — the metrics store fills as the box runs",
 };
 
@@ -1568,7 +1602,7 @@ const VIEW_EMPTY_MSG = {
 // wins over the stored tab on load ONLY — after that the stored tab (and
 // tab clicks) own the view; a hash change re-applies. Non-view hashes (the
 // queue route, anchors) change nothing.
-const HASH_VIEW_RE = /^#(overview|projects|sessions|usage)$/;
+const HASH_VIEW_RE = /^#(overview|projects|sessions|models|usage)$/;
 
 function syncViewEmpty() {
   const box = $("view-empty");
@@ -1598,6 +1632,7 @@ function syncViewEmpty() {
     const btn = e.target.closest("button[data-view]");
     if (!btn) return;
     applyView(btn.dataset.view);
+    if (btn.dataset.view === "models") refreshAliases(); // the authoring read on open
   });
 })();
 
@@ -2097,6 +2132,7 @@ $("gate-token").addEventListener("change", () => {
   } catch { }
   $("gate-token-hint").textContent = gateToken() ? "stored ✓" : "(not set)";
   $("gate-token").value = ""; // clear the field; the hint shows the stored state
+  refreshAliases(); // #66: the Models pane's read needs the token — fill it now
 });
 
 // ---------------------------------------------------------------------------
@@ -2516,6 +2552,349 @@ if (addBtn && addForm) {
 }
 
 // ---------------------------------------------------------------------------
+// Model aliases (#66) — the Models view. One row per stored alias: name,
+// its pairs (per-pair source marker — exception-only: 'probed' renders
+// nothing; 'declared' / 'dropped' / 'unprobed' mark the exception), the
+// resolved winner, the pin control, and the update time. The authoring
+// read is GET /api/aliases (token-gated — never the anonymous /api/state
+// exception); the write is POST /api/aliases (the shared settingsPost
+// ?token= pattern). Pair suggestions come ONLY from the probed `catalog`
+// entries /api/state already publishes, grouped by server_id (D5:
+// explicit verbatim picks, never a fuzzy match). A stored pair the probe
+// never confirmed still round-trips (it renders as an explicit "not
+// probed" pick). No token fields ever: an alias carries no secret by
+// construction (D1) — the row credential stays write-only on its row.
+// ---------------------------------------------------------------------------
+let aliasesCache = [];
+let probedByServer = {}; // server_id -> the exact probed model ids (from the /api/state catalog)
+
+function probedInventory(st) {
+  const by = {};
+  for (const e of st.catalog || []) {
+    if (e.catalog_source !== "probed") continue; // D5: only probe-confirmed inventory is pickable
+    (by[e.server_id] = by[e.server_id] || []).push(e.name);
+  }
+  return by;
+}
+
+const PAIR_SOURCE_TAG = {
+  declared: ' <span class="tag" title="the probe never confirmed this pair — the operator declaration stands">declared</span>',
+  dropped: ' <span class="tag revoked" title="the probe ANSWERED without this id — the pair is skipped this tick (the alias survives on its other pairs)">dropped</span>',
+  unprobed: ' <span class="tag" title="no probe cycle has checked this pair yet">unprobed</span>',
+};
+
+function aliasSrvName(id) {
+  const s = serversCache.find((x) => x.id === id);
+  return s ? s.name : id;
+}
+
+function aliasBlock(a, st) {
+  const winnerId = a.pinned_server_id || (a.pairs[0] && a.pairs[0].server_id) || "";
+  const winnerPair = a.pairs.find((p) => p.server_id === winnerId) || a.pairs[0];
+  const pairsHtml = a.pairs.length === 0
+    ? '<div class="empty">no pairs (the alias publishes nothing)</div>'
+    : a.pairs.map((p) => {
+        return '<div class="kv"><span class="k">' + esc(aliasSrvName(p.server_id)) + "</span>" +
+          '<span class="v"><code>' + esc(p.model) + "</code>" + (PAIR_SOURCE_TAG[p.source] || "") + "</span></div>";
+      }).join("");
+  // The pin control (the drag's keyboard stand-in per D4): pin per pair,
+  // plus the default (first pair) when a pin is stored. Single-pair
+  // aliases with no pin need no control (the pin already matches the
+  // default).
+  let pinHtml = "";
+  if (a.pairs.length >= 2 || a.pinned_server_id) {
+    let btns = a.pairs.map((p) =>
+      '<button type="button" data-act="pin" data-pin="' + esc(p.server_id) + '"' +
+      (p.server_id === winnerId ? ' disabled title="this pair answers the alias"' : ' title="pin ' + esc(aliasSrvName(p.server_id)) + ' as the answer for ' + esc(a.alias) + '"') +
+      ">pin " + esc(aliasSrvName(p.server_id)) + "</button>").join(" ");
+    if (a.pinned_server_id) btns += ' <button type="button" data-act="unpin" title="clear the pin — the first pair answers">default</button>';
+    pinHtml = '<div class="fbtns">' + btns + "</div>";
+  }
+  const winNote = winnerPair
+    ? esc(aliasSrvName(winnerPair.server_id)) + " <code>" + esc(winnerPair.model) + "</code> " +
+      (a.pinned_server_id ? "(pinned)" : "(first pair)")
+    : "none — all pairs are dead this tick";
+  return '<div class="srv">' +
+    '<div class="srv-head"><span class="name">' + esc(a.alias) + "</span>" +
+    '<span class="wmeta">' + ago(st.now - (a.updated_at || 0)) + "</span></div>" +
+    '<div class="kv"><span class="k">winner</span><span class="v">' + winNote + "</span></div>" +
+    pairsHtml + pinHtml +
+    '<button class="settings-toggle collapsed" data-alias="' + esc(a.alias) + '" type="button" title="edit the alias ' + esc(a.alias) + '"><span class="chev">&#9650;</span>edit alias</button>' +
+    '<div class="settings-form" data-alias-form="' + esc(a.alias) + '"></div>' +
+    "</div>";
+}
+
+function renderModelsPane(st) {
+  if (QUEUE_PAGE) return;
+  probedByServer = probedInventory(st);
+  const box = $("models");
+  if (!box) return;
+  if (!gateToken()) {
+    box.innerHTML = '<div class="empty">paste the arbiter token into the header to list and edit aliases</div>';
+    return;
+  }
+  if (aliasesCache.length === 0) {
+    box.innerHTML = '<div class="empty">no aliases declared — “+ add alias” pins one model name to exact engine inventory entries</div>';
+    return;
+  }
+  box.innerHTML = aliasesCache.map((a) => aliasBlock(a, st)).join("");
+}
+
+// Alias form (create = the section head's "+ add alias"; edit = per-alias).
+// Pair rows are two verbatim picks: the server row, then its EXACT probed
+// model id. A stored pair the probe never confirmed round-trips as an
+// explicit "(not probed — stored)" pick; NEW picks are probed-only (D5).
+function aliasFormHtml(a, mode) {
+  const pre = "af-" + (mode === "add" ? "add" : cssEscape(a.alias)) + "-";
+  const nameRow = mode === "add"
+    ? formRow(pre + "name", "alias name", "≤128 printable chars",
+        '<input id="' + pre + 'name" type="text" spellcheck="false" placeholder="e.g. Qwen3.Flagship" maxlength="128">')
+    : '<div class="kv"><span class="k">alias</span><span class="v"><code>' + esc(a.alias) + "</code></span></div>";
+  return nameRow +
+    '<div class="apairs">' + (a ? a.pairs.map((p, i) => pairRowHtml(pre, p.server_id, p.model, false)).join("") : pairRowHtml(pre, "", "", false)) + "</div>" +
+    '<div class="fbtns"><button type="button" data-act="add-pair">+ pair</button>' +
+    '<span class="fmsg dim">a pair = the engine row + its EXACT probed model id</span></div>' +
+    '<div class="frow"><label for="' + pre + 'pin">winner (pin)</label><select id="' + pre + 'pin" data-ak="pin"><option value="">first pair (default)</option></select></div>' +
+    '<div class="fbtns"><button type="button" class="primary" data-act="save">Save</button>' +
+    (mode === "edit" ? '<button type="button" data-act="del">delete alias</button>' : "") +
+    '<button type="button" data-act="cancel">Cancel</button></div>' +
+    '<div class="note">pairs list EVERY engine that can answer this name; the winner answers with that pair&#39;s own model id (the local router rewrites the request body). Probed-only picks: a row whose probe fails offers nothing new here.</div>';
+}
+
+function pairRowHtml(_pre, serverId, model, storedUnprobed) {
+  const opts = ['<option value="">— engine row —</option>']
+    .concat(serversCache.map((s) => '<option value="' + esc(s.id) + '"' + (s.id === serverId ? " selected" : "") + ">" + esc(s.name) + " · " + esc(s.url) + "</option>"));
+  const modelOpts = modelOptionsHtml(serverId, model, storedUnprobed);
+  return '<div class="apair frow" data-apair>' +
+    '<select data-ak="server" title="the declared engine row this pair points at">' + opts.join("") + "</select>" +
+    '<select data-ak="model" title="the EXACT model id this row&#39;s probe reported">' + modelOpts + "</select>" +
+    '<button type="button" data-act="rm-pair" title="remove this pair">&times;</button>' +
+    "</div>";
+}
+
+function modelOptionsHtml(serverId, keep, storedUnprobed) {
+  const list = probedByServer[serverId] || [];
+  let html = '<option value="">— model id —</option>';
+  if (keep && !list.includes(keep)) {
+    // The stored pair round-trips verbatim; it is marked, not hidden.
+    html += '<option value="' + esc(keep) + '" selected>' + esc(keep) + (storedUnprobed ? " (not probed — stored)" : " (kept)") + "</option>";
+  }
+  html += list.map((m) => '<option value="' + esc(m) + '"' + (m === keep ? " selected" : "") + ">" + esc(m) + "</option>").join("");
+  if (list.length === 0 && !keep) html += '<option value="" disabled>(no probed inventory for that row)</option>';
+  return html;
+}
+
+// Rebuild one row's model select from its server pick (the probed
+// inventory only), keeping the current value honest.
+function repopulateModelSelect(row) {
+  const serverSel = row.querySelector('[data-ak="server"]');
+  const modelSel = row.querySelector('[data-ak="model"]');
+  if (!serverSel || !modelSel) return;
+  const keep = modelSel.value;
+  modelSel.innerHTML = modelOptionsHtml(serverSel.value, keep, keep && !(probedByServer[serverSel.value] || []).includes(keep));
+}
+
+// The winner select mirrors the rows currently in the form (a pin can
+// only name a server the alias actually pairs to).
+function rebuildPinSelect(form) {
+  const pin = form.querySelector('[data-ak="pin"]');
+  if (!pin) return;
+  const cur = pin.value;
+  const ids = [];
+  for (const row of form.querySelectorAll(".apair")) {
+    const id = row.querySelector('[data-ak="server"]')?.value || "";
+    if (id && !ids.includes(id)) ids.push(id);
+  }
+  pin.innerHTML = '<option value="">first pair (default)</option>' +
+    ids.map((id) => '<option value="' + esc(id) + '"' + (id === cur ? " selected" : "") + ">pin " + esc(aliasSrvName(id)) + "</option>").join("");
+}
+
+function collectAliasForm(form, aliasName) {
+  const rows = [];
+  for (const row of form.querySelectorAll(".apair")) {
+    const server = row.querySelector('[data-ak="server"]')?.value.trim() || "";
+    const model = row.querySelector('[data-ak="model"]')?.value.trim() || "";
+    if (!server && !model) continue; // an untouched empty row is noise, not a pair
+    if (!server || !model) return { error: "a pair needs BOTH the engine row and its model id" };
+    rows.push({ server_id: server, model });
+  }
+  if (rows.length === 0) return { error: "at least one pair is required" };
+  const seen = new Set();
+  for (const r of rows) {
+    const k = r.server_id + "::" + r.model;
+    if (seen.has(k)) return { error: "duplicate pair: " + aliasSrvName(r.server_id) + " / " + r.model };
+    seen.add(k);
+  }
+  const pin = form.querySelector('[data-ak="pin"]')?.value.trim() || "";
+  if (pin && !rows.some((r) => r.server_id === pin)) return { error: "the winner pin must name a row the alias pairs to" };
+  return { pairs: rows, pin, alias: aliasName };
+}
+
+// One save: collect → patch-by-difference against the stored row → POST.
+// Unchanged pairs and pin are NOT in the body (the server keeps what it
+// holds); an edited alias name is refused client-side (the key IS the
+// identity — rename = delete + create).
+let addAliasOpen = false; // declared before saveAliasForm's reference (TDZ)
+async function saveAliasForm(form, aliasName, getStored) {
+  const stored = getStored();
+  const got = collectAliasForm(form, aliasName);
+  if (got.error) { formMsg(form, got.error, "err"); return; }
+  const body = { alias: aliasName };
+  const same = stored &&
+    stored.pairs.length === got.pairs.length &&
+    stored.pairs.every((p, i) => p.server_id === got.pairs[i].server_id && p.model === got.pairs[i].model);
+  if (!same) body.pairs = got.pairs;
+  const storedPin = (stored && stored.pinned_server_id) || "";
+  if (got.pin !== storedPin) body.pin = got.pin || null; // null = explicit clear (the server sentinel)
+  if (Object.keys(body).length === 1) {
+    formMsg(form, "nothing to save — the pairs and the winner already match", "dim");
+    return;
+  }
+  const r = await settingsPost("/api/aliases", body);
+  if (!r.ok) { formMsg(form, r.detail, "err"); return; }
+  const addAliasForm = $("add-alias-form");
+  if (addAliasForm && form === addAliasForm) {
+    addAliasOpen = false;
+    closeForm(addAliasForm);
+    $("add-alias")?.classList.add("collapsed");
+  } else {
+    closeForm(form);
+    const t = form.previousElementSibling;
+    if (t) t.classList.add("collapsed");
+  }
+  flashGateMsg("alias saved: " + aliasName, "ok");
+  refreshAliases();
+  refresh();
+}
+
+// The authoring read: GET /api/aliases (the token rides the query, the
+// settingsPost family's pattern). Fills the cache the pane renders from;
+// a non-200 keeps the rows already in hand (drop-don't-wipe).
+async function refreshAliases() {
+  const token = gateToken();
+  if (!token) return;
+  try {
+    const res = await fetch("/api/aliases?token=" + encodeURIComponent(token), { cache: "no-store" });
+    if (!res.ok) return;
+    aliasesCache = (await res.json()).aliases || [];
+  } catch { /* the pane keeps its last good rows */ }
+  if (LAST_ST) renderModelsPane(LAST_ST);
+}
+
+// Pair-row dynamic affordances (add / remove a row, refresh the model
+// pick and the winner pick when a row changes) — one delegated handler
+// per form container (the pane's forms AND the fixed add form).
+function wireAliasFormDynamics(box) {
+  if (!box) return;
+  box.addEventListener("click", async (e) => {
+    const btn = e.target.closest("button[data-act]");
+    if (!btn) return;
+    // The winner pin lives on the ROW (outside any form) — handle it
+    // before the form resolution below, or the form guard would eat it.
+    if (btn.dataset.act === "pin" || btn.dataset.act === "unpin") {
+      const name = btn.closest(".srv")?.querySelector("[data-alias]")?.dataset.alias ||
+        btn.closest(".settings-form")?.dataset.aliasForm;
+      const a = aliasesCache.find((x) => x.alias === name);
+      if (!a) return;
+      const body = { alias: name, pin: btn.dataset.act === "pin" ? btn.dataset.pin : null };
+      const r = await settingsPost("/api/aliases", body);
+      if (!r.ok) { flashGateMsg("pin failed: " + r.detail, "err", true); return; }
+      flashGateMsg(name + ": winner is " + (btn.dataset.act === "pin" ? aliasSrvName(btn.dataset.pin) : "the first pair"), "ok");
+      refreshAliases();
+      refresh();
+      return;
+    }
+    const form = btn.closest(".settings-form");
+    if (!form || !form.querySelector(".apairs")) return;
+    if (btn.dataset.act === "add-pair") {
+      const holder = form.querySelector(".apairs");
+      holder.insertAdjacentHTML("beforeend", pairRowHtml("", "", "", false));
+      rebuildPinSelect(form);
+      return;
+    }
+    if (btn.dataset.act === "rm-pair") {
+      const row = btn.closest(".apair");
+      const holder = form.querySelector(".apairs");
+      if (row && holder.querySelectorAll(".apair").length > 1) row.remove();
+      else if (row) { // the last row: clear it instead of stranding an empty form
+        row.querySelector('[data-ak="server"]').value = "";
+        row.querySelector('[data-ak="model"]').innerHTML = '<option value="">— model id —</option>';
+      }
+      rebuildPinSelect(form);
+      return;
+    }
+    if (btn.dataset.act === "cancel") {
+      if (form === $("add-alias-form")) { addAliasOpen = false; closeForm($("add-alias-form")); $("add-alias")?.classList.add("collapsed"); }
+      else closeForm(form);
+      return;
+    }
+    if (btn.dataset.act === "del") {
+      const name = form.dataset.aliasForm;
+      if (!window.confirm("delete the alias " + name + "? the name falls back to the bare catalog routing")) return;
+      const r = await settingsPost("/api/aliases", { alias: name, delete: true });
+      if (!r.ok) { formMsg(form, r.detail, "err"); return; }
+      closeForm(form);
+      flashGateMsg("alias deleted: " + name, "ok");
+      refreshAliases();
+      refresh();
+      return;
+    }
+    if (btn.dataset.act !== "save") return;
+    const name = form.dataset.aliasForm;
+    if (name) {
+      const a = aliasesCache.find((x) => x.alias === name);
+      if (a) await saveAliasForm(form, name, () => a);
+      return;
+    }
+    // The add form: validate the name, then save the fresh entry.
+    const nameInp = form.querySelector("#af-add-name");
+    const alias = (nameInp?.value || "").trim();
+    if (!alias) { formMsg(form, "an alias name is required", "err"); return; }
+    if (aliasesCache.some((x) => x.alias === alias)) {
+      formMsg(form, "an alias with that name already exists — edit it from its row (rename = delete + create)", "err");
+      return;
+    }
+    await saveAliasForm(form, alias, () => null);
+  });
+  box.addEventListener("change", (e) => {
+    const row = e.target.closest(".apair");
+    if (row) { repopulateModelSelect(row); rebuildPinSelect(row.closest(".settings-form")); return; }
+    const form = e.target.closest(".settings-form");
+    if (form && e.target.matches('[data-ak="pin"]')) return; // the pin select owns itself
+  });
+}
+
+(function wireModelsView() {
+  const addBtn = $("add-alias");
+  const addForm = $("add-alias-form");
+  if (addBtn && addForm) {
+    addBtn.addEventListener("click", () => {
+      addAliasOpen = !addAliasOpen;
+      toggleForm(addBtn, addForm, addAliasOpen ? () => aliasFormHtml(null, "add") : null);
+    });
+  }
+  wireAliasFormDynamics($("models"));
+  wireAliasFormDynamics(addForm);
+  // Enter inside an open alias field = Save (the family posture).
+  for (const sel of ["#add-alias-form", "#models"]) {
+    const box = document.querySelector(sel);
+    if (!box) continue;
+    box.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter") return;
+      const form = e.target.closest(".settings-form.open");
+      if (!form || !form.querySelector(".apairs")) return;
+      const save = form.querySelector('button[data-act="save"]');
+      if (save) { e.preventDefault(); save.click(); }
+    });
+  }
+  // Per-alias edit form renders on open (the servers/projects posture).
+  wireSettingsToggles("models", "data-alias", (name) => {
+    const a = aliasesCache.find((x) => x.alias === name);
+    return a ? () => aliasFormHtml(a, "edit") : null;
+  });
+})();
+
+// ---------------------------------------------------------------------------
 // Usage (#51) — charts over the metrics retention store. Its OWN timer:
 // charts over days do not need the 5s /api/state cadence (the store's
 // pitfall list says so explicitly). Reads GET /api/metrics anonymously
@@ -2606,6 +2985,8 @@ async function refreshUsage() {
 
 refresh();
 setInterval(refresh, 5000);
+refreshAliases(); // #66: the Models view's token-gated read (the 5s state poll owns the pick-list)
+setInterval(refreshAliases, 30000); // 30 s — authoring data, not the 5s live cadence
 refreshUsage();
 setInterval(refreshUsage, 300000); // 5 min — its own timer, not the state poll
 </script>

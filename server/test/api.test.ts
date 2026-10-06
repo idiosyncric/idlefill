@@ -2081,6 +2081,54 @@ test('dashboard carries the #61 step 3 surfaces (daemon behind tag, Client log t
   assert.ok(html.includes('HASH_VIEW_RE'), 'the page honours a #view deep link');
 });
 
+test('dashboard carries the #66 Models tab (alias rows + pair picks + pin), and alias beats bare at publish', async () => {
+  const html = await (await fetch(base + '/')).text();
+  // The tab + section follow the data-view pattern exactly.
+  assert.ok(html.includes('id="vtab-models"') && html.includes('data-view="models"'), 'the Models tab and its section exist');
+  assert.ok(/HASH_VIEW_RE = \/\^\#\(overview\|projects\|sessions\|models\|usage\)\$\//.test(html), 'the deep-link regex covers the models view');
+  // Authoring surface: the + add affordance, the pair pickers, the pin, and
+  // the write/read routes the handlers talk to. No token field ever appears
+  // in an alias form (the note text names the posture).
+  assert.ok(html.includes('id="add-alias"') && html.includes('aliasFormHtml'), 'the add-alias affordance + form renderer exist');
+  assert.ok(html.includes('"/api/aliases"') && html.includes('"/api/aliases?token="'), 'the read + write talk to the alias routes');
+  assert.ok(html.includes('catalog_source !== "probed"') && html.includes('probedInventory'), 'pair picks come ONLY from probed catalog entries (D5)');
+  assert.ok(html.includes('data-act="pin"') && html.includes('data-act="unpin"'), 'the pin control renders per pair (D4 winner)');
+  assert.ok(!/aliasFormHtml[\s\S]{0,2000}auth_token/.test(html.slice(html.indexOf('function aliasFormHtml'), html.indexOf('function aliasFormHtml') + 2500)), 'the alias form has NO token field (write-only rule)');
+
+  // Alias beats bare AT PUBLISH: an alias over a name a bare row also
+  // declares publishes in model_aliases with the WINNER applied, while the
+  // catalog block keeps its bare entry untouched (the client dedups).
+  const aggDir = mkdtempSync(join(tmpdir(), 'idlefill-alias-beat-'));
+  try {
+    const aggCfg: ServerConfig = { ...cfg, api_tokens: [AGG_TOKEN], state_file: join(aggDir, 'state.json') };
+    const aggArbiter = new Arbiter(new StateStore(aggCfg.state_file), aggCfg, det, {
+      modelsFetcher: async (url) => (url.includes('omlx') ? ['Shared-Name'] : ['Shared-Name']),
+    });
+    const watched = aggArbiter.upsertServerConnection({ name: 'watched', url: 'http://fake', models: ['Shared-Name'], activity_path: '' });
+    const omlx = aggArbiter.upsertServerConnection({ name: 'omlx', url: 'http://omlx.local:8000', models: ['Shared-Name'], activity_path: '', auth_token: 'sekret-omlx-token' });
+    assert.ok(watched.ok && omlx.ok);
+    // Alias whose ONLY pair is the CREDENTIALED omlx row — row order would
+    // otherwise pin the bare name to `watched`.
+    aggArbiter.putModelAlias({ alias: 'Shared-Name', pairs: [{ server_id: omlx.server!.id, model: 'Shared-Name' }] });
+    await aggArbiter.probeCatalog();
+    const aggApp = buildApi({ arbiter: aggArbiter, cfg: aggCfg, publicDir: join(__dirname, '..', 'public') });
+    await aggApp.ready();
+    try {
+      const res = await aggApp.inject({ method: 'GET', url: '/api/state' });
+      const st = res.json() as { catalog: { name: string; server_id: string }[]; model_aliases: { name: string; server_id: string }[] };
+      assert.equal(st.model_aliases.length, 1, 'the alias publishes under the shared name');
+      assert.equal(st.model_aliases[0]!.server_id, omlx.server!.id, 'the alias entry resolves to the PAIRED row, not the row-order winner');
+      const bare = st.catalog.filter((e) => e.name === 'Shared-Name');
+      assert.equal(bare.length, 1, 'the bare catalog keeps its single entry (row-order pin, untouched — the CLIENT applies alias precedence)');
+      assert.notEqual(bare[0]!.server_id, omlx.server!.id, 'the bare block keeps its ROW-ORDER pin — the alias plane does not move it (#63 semantics intact)');
+    } finally {
+      await aggApp.close();
+    }
+  } finally {
+    rmSync(aggDir, { recursive: true, force: true });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // #66 — model aliases on the API plane: the /api/state `model_aliases`
 // ADD-key (catalog untouched, no token ever), the authoring read
