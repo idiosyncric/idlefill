@@ -41,9 +41,14 @@
 //                0600 mode; a successful save shows a "daemon restart to apply"
 //                note with a Restart affordance (the same launchd path the
 //                Settings toggle uses).
-//    settings  — opt-in launchd management of the two LaunchAgents (daemon +
-//                menu bar) in the user's gui/<uid> domain; the toggles reflect
-//                REAL launchctl state, re-checked on every poll
+//    settings  — opt-in launchd management of the three LaunchAgents (daemon +
+//                menu bar + local arbiter) in the user's gui/<uid> domain; the
+//                toggles reflect REAL launchctl state, re-checked on every
+//                poll. The arbiter row additionally detects the LOADED-BUT-
+//                EXITED state (print exit 0, no pid line — a clean SIGTERM
+//                with KeepAlive SuccessfulExit=false leaves the service
+//                loaded and the dashboard blank while every "loaded" check
+//                reads healthy) and relaunches it with `launchctl kickstart`.
 //
 //  Deep links: the bundle registers the `idlefill://` URL scheme
 //  (CFBundleURLTypes in the generated Info.plist). Hosts: "" or "open" →
@@ -407,6 +412,20 @@ final class AppModel: ObservableObject {
    *  this app cannot read its own HEAD. The one-click fix is right there
    *  in the Settings panel ("restart daemon"). */
   @Published var daemonBehind = false
+
+  /** The LOCAL arbiter agent (com.sam.idlefill.server, issue #60 Slice A —
+   *  the fused Mac instance the Dashboard tab's webview loads). Three
+   *  states matter, and `launchctl print` exit 0 alone cannot see them:
+   *  loaded+running (a `pid =` line in the print dump), loaded+exited
+   *  (print exit 0, NO pid line — the clean-SIGTERM death that left the
+   *  dashboard blank while every "loaded" check read healthy), and not
+   *  loaded. The toggle reflects loaded; the exception row fires on
+   *  loaded+exited; "relaunch" is `launchctl kickstart` (no -k: it starts
+   *  an exited job and is a no-op-while-running, proven live 2026-10-05
+   *  against a scratch label). */
+  @Published var arbiterLoaded = false
+  @Published var arbiterRunning = false
+  @Published var arbiterNote: String? = nil
 
   // auto-update (Sparkle + the edge channel)
   @Published var updateStatus: String? = nil
@@ -1766,12 +1785,23 @@ final class AppModel: ObservableObject {
       ? (ProcessInfo.processInfo.environment["IDLEFILL_DESKTOP_TEST_LABEL_MENUBAR"] ?? testLabel)
       : "com.sam.idlefill.menubar"
   }
+  /** The local arbiter agent (issue #60 Slice A, fused Mac instance — the
+   *  origin the Dashboard tab loads). A remote-arbiter checkout has no
+   *  such agent: the Settings row renders from its ABSENT state, and the
+   *  install path refuses rather than starting a second arbiter that
+   *  would race the real host. */
+  var arbiterLabel: String {
+    testDir != nil
+      ? (ProcessInfo.processInfo.environment["IDLEFILL_DESKTOP_TEST_LABEL_ARBITER"] ?? testLabel)
+      : "com.sam.idlefill.server"
+  }
 
   private var plistDir: String {
     testDir ?? ((NSHomeDirectory() as NSString).appendingPathComponent("Library/LaunchAgents"))
   }
   var daemonPlistPath: String { (plistDir as NSString).appendingPathComponent("\(daemonLabel).plist") }
   var menubarPlistPath: String { (plistDir as NSString).appendingPathComponent("\(menubarLabel).plist") }
+  var arbiterPlistPath: String { (plistDir as NSString).appendingPathComponent("\(arbiterLabel).plist") }
 
   /** Is the label loaded in our gui domain? exit 0 = loaded. */
   func isLoaded(_ label: String) -> Bool {
@@ -1823,8 +1853,10 @@ final class AppModel: ObservableObject {
     // executable come from the same LOADED view.
     let dPrint = launchctlPrint(daemonLabel)
     let mPrint = launchctlPrint(menubarLabel)
+    let aPrint = launchctlPrint(arbiterLabel)
     daemonLoaded = dPrint != nil
     menubarLoaded = mPrint != nil
+    arbiterLoaded = aPrint != nil
     // Issue #23: surface WHAT each agent runs. The drift marker is
     // exception-only: it fires only when the loaded menubar agent runs a
     // different executable than this checkout's built bundle — a stale
@@ -1832,6 +1864,14 @@ final class AppModel: ObservableObject {
     daemonRuns = dPrint.flatMap { firstArgument($0) }
     menubarRuns = mPrint.flatMap { firstArgument($0) }
     menubarStale = menubarLoaded && (menubarRuns != menubarBundleExecutable())
+    // The arbiter's liveness is NOT loaded-ness: a loaded service can sit
+    // EXITED (clean SIGTERM + KeepAlive SuccessfulExit=false = no
+    // relaunch), and its print dump still exits 0 — with NO `pid =` line.
+    // That is the exact blank-dashboard state: the toggle reads ON, the
+    // page is dead. Liveness = the pid line's presence (proven live
+    // against a scratch label: exited-but-loaded prints state "not
+    // running" with no pid, and `launchctl kickstart` starts it).
+    arbiterRunning = aPrint.map { AppModel.pidLine($0) != nil } ?? false
   }
 
   /// The first ProgramArguments entry from a `launchctl print` dump.
@@ -1842,6 +1882,22 @@ final class AppModel: ObservableObject {
       let t = line.trimmingCharacters(in: .whitespaces)
       if t == "}" { return nil }
       if !t.isEmpty { return t }
+    }
+    return nil
+  }
+
+  /** The service's live pid from a `launchctl print` dump: a trimmed
+   *  `pid = <n>` line, or nil when the dump carries none. A LOADED service
+   *  with no pid line is the exited-but-loaded state (the blank-dashboard
+   *  shape); a missing pid value parses to nil too (fail closed — "the
+   *  arbiter is not running" is the safe read when the dump is odd).
+   *  Pure + static so the headless harness proves the parse directly. */
+  static func pidLine(_ printOutput: String) -> Int? {
+    for line in printOutput.split(separator: "\n") {
+      let t = line.trimmingCharacters(in: .whitespaces)
+      guard t.hasPrefix("pid =") else { continue }
+      let v = t.dropFirst("pid =".count).trimmingCharacters(in: .whitespaces)
+      if let n = Int(v), n > 0 { return n }
     }
     return nil
   }
@@ -2029,6 +2085,154 @@ final class AppModel: ObservableObject {
       projSavedPendingRestart = false
     } else {
       daemonNote = "restart failed: \(out)"
+    }
+    refreshLaunchdState()
+  }
+
+  // MARK: local arbiter agent (issue #60 Slice A)
+
+  /** The port this checkout's arbiter binds (server/config.json `listen`,
+   *  absent -> the 8787 default). Only the number is read; the config
+   *  holds tokens and is never printed. */
+  func serverConfigPort() -> Int {
+    let path = (repoRoot as NSString).appendingPathComponent("server/config.json")
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+          let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let n = o["listen"] as? Double, n > 0 else { return 8787 }
+    return Int(n)
+  }
+
+  /** Is the arbiter port served by a process this label does NOT own?
+   *  (install-server-agent.sh's check_port_foreign, same rule): a
+   *  hand-run `npm run dev` arbiter would silently shadow the agent, so
+   *  the app refuses to bootstrap over it. nil = no foreign listener
+   *  (port free, or owned by this label's job); non-nil = the owner's
+   *  message. `lsof` needs the PATH runCmd prepends (a GUI app carries
+   *  none of /usr/sbin by default). */
+  private func foreignPortOwner(_ port: Int) -> String? {
+    let (st, out) = runCmd("/usr/sbin/lsof", ["-nP", "-iTCP:\(port)", "-sTCP:LISTEN", "-t"])
+    if st != 0 || out.isEmpty { return nil }
+    let myPid = launchctlPrint(arbiterLabel).flatMap { AppModel.pidLine($0) }
+    for line in out.split(separator: "\n") {
+      let p = line.trimmingCharacters(in: .whitespaces)
+      if p.isEmpty { continue }
+      if p == String(myPid ?? -1) { return nil }  // owned by this label
+      if let n = Int(p) { return "pid \(n)" }
+    }
+    return nil
+  }
+
+  /** The arbiter plist, rendered from THIS checkout (the same values
+   *  deploy/install-server-agent.sh substitutes into its template): npx +
+   *  tsx on server/src/index.ts, WorkingDirectory server/, logs under
+   *  server/logs. The plist carries NO secrets — the arbiter reads
+   *  server/config.json itself. KeepAlive SuccessfulExit=false matches
+   *  the shipped template (the reason a clean exit stays down — which is
+   *  why this row's exception marker + Relaunch exist). */
+  func arbiterPlistXML() -> String {
+    let repo = repoRoot
+    let cwd = (repo as NSString).appendingPathComponent("server")
+    let entry = (cwd as NSString).appendingPathComponent("src/index.ts")
+    let logDir = cwd
+    return """
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+        <key>Label</key>
+        <string>\(arbiterLabel)</string>
+        <key>ProgramArguments</key>
+        <array>
+            <string>/opt/homebrew/bin/npx</string>
+            <string>tsx</string>
+            <string>\(entry)</string>
+        </array>
+        <key>WorkingDirectory</key>
+        <string>\(cwd)</string>
+        <key>EnvironmentVariables</key>
+        <dict>
+            <key>PATH</key>
+            <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+            <key>NODE_ENV</key>
+            <string>production</string>
+        </dict>
+        <key>RunAtLoad</key>
+        <true/>
+        <key>KeepAlive</key>
+        <dict>
+            <key>SuccessfulExit</key>
+            <false/>
+        </dict>
+        <key>ThrottleInterval</key>
+        <integer>30</integer>
+        <key>StandardOutPath</key>
+        <string>\(logDir)/logs/launchd.out.log</string>
+        <key>StandardErrorPath</key>
+        <string>\(logDir)/logs/launchd.err.log</string>
+    </dict>
+    </plist>
+    """
+  }
+
+  func setArbiter(on: Bool) {
+    if on {
+      // The remote-arbiter refusal: this checkout's client points the
+      // dashboard at another host (urza), so a Mac-local agent would
+      // start a second arbiter the dashboard never reads and which could
+      // race the real one's feed. Only when the arbiter's own config is
+      // ALSO absent — a genuinely remote setup — does it refuse. (A fused
+      // checkout points server_url at loopback and proceeds.)
+      if testDir == nil, Self.isArbiterRemote(clientServerURL: serverURL(), hasServerConfig: serverConfigExists()) {
+        arbiterNote = "this checkout's server_url is a remote arbiter — a local agent would shadow it; not installed"
+        refreshLaunchdState()
+        return
+      }
+      let port = serverConfigPort()
+      if testDir == nil, let owner = foreignPortOwner(port) {
+        arbiterNote = "port \(port) is served by \(owner), not this agent — stop the hand-run arbiter first"
+        refreshLaunchdState()
+        return
+      }
+      let xml = testDir != nil ? testPlistXML(arbiterLabel) : arbiterPlistXML()
+      install(label: arbiterLabel, plistPath: arbiterPlistPath, plistXML: xml, note: \.arbiterNote)
+    } else {
+      uninstall(label: arbiterLabel, note: \.arbiterNote)
+    }
+  }
+
+  /** PURE so the harness proves the rule: a fused checkout (loopback
+   *  server_url, or a server/config.json that exists) may run the local
+   *  agent; a checkout whose client points at a REMOTE host AND has no
+   *  local arbiter config refuses. Loopback = localhost or 127.x. */
+  static func isArbiterRemote(clientServerURL: String, hasServerConfig: Bool) -> Bool {
+    if hasServerConfig { return false }
+    guard let host = URL(string: clientServerURL)?.host?.lowercased() else { return true }
+    return !(host == "localhost" || host.hasPrefix("127."))
+  }
+
+  func serverConfigExists() -> Bool {
+    FileManager.default.fileExists(atPath: (repoRoot as NSString).appendingPathComponent("server/config.json"))
+  }
+
+  /** The arbiter agent's live pid (nil = not loaded, or loaded but
+   *  exited). Exposed for the headless harness — the shipped liveness
+   *  read is `arbiterRunning`, which parses the same dump. */
+  func arbiterPid() -> Int? {
+    launchctlPrint(arbiterLabel).flatMap { AppModel.pidLine($0) }
+  }
+
+  /** Bring the arbiter back. `kickstart` WITHOUT -k: it starts an
+   *  exited-but-loaded job (proven live: rc 0, new pid) and is a no-op
+   *  while the job already runs — the safe one-button fix for the blank-
+   *  dashboard state, and the right call even when the label is not
+   *  loaded at all (then it fails "could not find service" and the note
+   *  tells the operator to flip the toggle on instead). */
+  func relaunchArbiter() {
+    if arbiterLoaded {
+      let (st, out) = runCmd("/bin/launchctl", ["kickstart", "gui/\(uid)/\(arbiterLabel)"])
+      arbiterNote = st == 0 ? nil : "relaunch failed: \(out)"
+    } else {
+      setArbiter(on: true)
     }
     refreshLaunchdState()
   }
@@ -2644,11 +2848,54 @@ struct SettingsPanel: View {
           .frame(maxWidth: .infinity, alignment: .leading)
         }
 
+        // The LOCAL arbiter agent (the origin the Dashboard tab loads).
+        // The toggle reflects loaded-ness — but loaded is NOT live: a
+        // clean exit under KeepAlive SuccessfulExit=false leaves the
+        // service loaded and the process gone, print still exits 0, and
+        // every loaded-check reads healthy while the dashboard renders
+        // blank. So this row carries its own exception: "stopped" fires
+        // only in the loaded-but-exited state, with the one-button fix
+        // (kickstart = start it under the same agent).
+        Toggle(isOn: Binding(
+          get: { m.arbiterLoaded },
+          set: { m.setArbiter(on: $0) }
+        )) {
+          Text("arbiter").font(.system(.body, design: .monospaced)).foregroundStyle(Pal.text)
+        }
+        .toggleStyle(SwitchToggleStyle(tint: Pal.accent))
+        .controlSize(.small)
+        if m.arbiterLoaded {
+          if m.arbiterRunning {
+            Text("running: \(m.arbiterLabel)").font(.system(size: 11, design: .monospaced))
+              .foregroundStyle(Pal.dim)
+              .frame(maxWidth: .infinity, alignment: .leading)
+          } else {
+            HStack(spacing: 6) {
+              Text("stopped").font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundStyle(Pal.err)
+              Text("loaded but not running — the dashboard origin is down")
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(Pal.dim)
+              Spacer(minLength: 4)
+              Button("Relaunch") { m.relaunchArbiter() }
+                .font(.system(size: 11, design: .monospaced))
+                .buttonStyle(.plain)
+                .foregroundStyle(Pal.ok)
+                .help("launchctl kickstart — start the agent's job without changing the plist")
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+          }
+        }
+
         if let note = m.daemonNote {
           Text(note).font(.system(.caption, design: .monospaced)).foregroundStyle(Pal.err)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         if let note = m.menubarNote {
+          Text(note).font(.system(.caption, design: .monospaced)).foregroundStyle(Pal.err)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        if let note = m.arbiterNote {
           Text(note).font(.system(.caption, design: .monospaced)).foregroundStyle(Pal.err)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -2900,6 +3147,21 @@ struct DashboardPanel: View {
         Text("token auto-injected")
           .font(.system(size: 11, design: .monospaced))
           .foregroundStyle(Pal.dim)
+        // The one fact the page cannot state about itself: its origin is
+        // a local agent process that is loaded but NOT running (the
+        // clean-exit death — the service reads "loaded", the page renders
+        // blank against the canvas fill). Exception-Only: nothing here
+        // while the agent runs. The fix is inline — same kickstart the
+        // Settings row uses — then Reload re-points the webview.
+        if m.arbiterLoaded && !m.arbiterRunning {
+          Text("arbiter stopped").font(.system(size: 11, weight: .semibold, design: .monospaced))
+            .foregroundStyle(Pal.err)
+          Button("Relaunch") { m.relaunchArbiter() }
+            .font(.system(size: 11, design: .monospaced))
+            .buttonStyle(.plain)
+            .foregroundStyle(Pal.ok)
+            .help("launchctl kickstart the arbiter agent, then reload this page")
+        }
         Spacer()
         Button("Reload") { m.reloadDashboard() }
           .controlSize(.small)

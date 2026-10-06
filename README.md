@@ -732,20 +732,47 @@ ground truth.
     picker + a branch field (default `main`), persisted alongside the
     repo path in `~/Library/Application Support/Idlefill/config.json`
     (the same read-modify-write save that preserves every other key).
-- **launchd management model (opt-in).** Two toggles — **daemon** and
-  **menu bar** — each manage a LaunchAgent in the user's `gui/<uid>` domain
-  (no root, no system domain). **ON** writes the agent's plist and runs
-  `launchctl bootstrap gui/<uid>`; **OFF** runs `launchctl bootout`. The
+- **launchd management model (opt-in).** Three toggles — **daemon**,
+  **menu bar**, and **arbiter** — each manage a LaunchAgent in the user's
+  `gui/<uid>` domain (no root, no system domain). **ON** writes the agent's
+  plist and runs `launchctl bootstrap gui/<uid>`; **OFF** runs `launchctl
+  bootout`. The
   daemon plist points the repo's `node_modules/.bin/tsx` at
   `client/src/index.ts` (working dir `client/`, `KeepAlive SuccessfulExit=false`,
   `ThrottleInterval 30`, a real `PATH`); the menu-bar plist points at
   `<repo>/menubar/IdlefillMenubar.app/Contents/MacOS/IdlefillMenubar`
   (building the bundle first via `menubar/build.sh` if it is missing).
+  The **arbiter** toggle (issue #60 Slice A — the Mac-local fused instance
+  the **Dashboard** tab loads) renders the same values
+  `deploy/install-server-agent.sh` substitutes into its template: `npx tsx`
+  on `server/src/index.ts` (working dir `server/`, `NODE_ENV production`,
+  logs under `server/logs/`). It refuses rather than starting a second
+  arbiter: it will not bootstrap over a foreign process already serving the
+  arbiter's port (a hand-run `npm run dev`), and it declines when this
+  checkout's `server_url` names a remote host with no local
+  `server/config.json` (a local agent would shadow the real one).
   **The plist carries no
   token** — the daemon reads `client/config.json` itself at startup. The
   toggles reflect **real launchctl state** (`launchctl print gui/<uid>/<label>`
   exit 0 = loaded), re-checked every 5s, so a failed bootstrap shows an
   error note and leaves the toggle OFF rather than a stale "on".
+- **Loaded is not live (the blank-dashboard fix).** A loaded service can sit
+  EXITED: a clean exit (SIGTERM → exit 0) under `KeepAlive SuccessfulExit=false`
+  does NOT relaunch, and `launchctl print` still exits 0 — so a plain
+  loaded-check reads healthy while the process is gone. For the arbiter that
+  means a **blank Dashboard tab** (the webview loads an unreachable origin and
+  paints the canvas fill over WebKit's error page). The arbiter row therefore
+  reads liveness from the print dump's `pid =` line, not from exit 0: it shows
+  an exception-only **stopped** marker ("loaded but not running — the
+  dashboard origin is down") with a one-button **Relaunch**
+  (`launchctl kickstart`, no `-k`: it starts an exited job and is a no-op while
+  running — proven live against scratch labels). The same marker + Relaunch
+  appear inline on the **Dashboard** tab's strip, where the blank page shows,
+  so the fix does not require opening Settings. Headless coverage:
+  `desktop/arbiter-test.sh` (the pure `pidLine` parse + the pure remote-refusal
+  rule + the shipped `setArbiter`/`relaunchArbiter` path end-to-end against a
+  scratch label via the `IDLEFILL_DESKTOP_TEST` hook, with a before/after
+  `launchctl print` of the real labels as the production-untouched proof).
 - **Settings drift marker (issue #23).** Each toggle row also shows what
   its agent ACTUALLY runs — the `ProgramArguments.0` of the LOADED
   `launchctl print` view (not the on-disk plist, which may not be what
