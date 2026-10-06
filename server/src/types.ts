@@ -361,6 +361,31 @@ export interface ClientRecord {
    * 1..65535, else dropped), absent on old clients and gate-less daemons.
    */
   proxy_port?: number;
+  /**
+   * Code-staleness verdict computed WHERE THE FACTS LIVE (#61 step 3, A1):
+   * the client compares its own boot revision against the live
+   * `git rev-parse HEAD` of the checkout it runs from, and publishes the
+   * boolean on the register heartbeat. `true` only when BOTH sides resolve
+   * and differ; the key is omitted when either side cannot resolve (no git,
+   * not a repo). A `true` report stores the marker; a `false` report
+   * CLEARS it (same precedent as the session gate block: an explicit
+   * no-exception report clears the stored exception, an absent report
+   * leaves the row as-is) — so the surfaces' `daemon behind` tag clears
+   * within one heartbeat of a daemon restart. Surfaces render it
+   * exception-only: no tag is the healthy state. The arbiter stores the
+   * verdict verbatim — it has no view of any client's repo tree.
+   */
+  daemon_behind?: boolean;
+  /**
+   * The client daemon's own log tail (#61 step 3, A2): the last ~120
+   * formatted lines from client.log, published on the register heartbeat
+   * ONLY when the arbiter it reports to is loopback (the mesh must not
+   * carry log payloads; a remote arbiter gets the key omitted). Lines are
+   * display data — capped per line, oldest first, stored verbatim. An
+   * empty array CLEARS the stored tail (a daemon that moved to a remote
+   * arbiter stops leaking lines). Absent on old clients.
+   */
+  client_log?: string[];
 }
 
 /**

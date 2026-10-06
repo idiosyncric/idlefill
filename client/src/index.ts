@@ -98,6 +98,22 @@ const clientVersion = resolveVersion(clientDir);
  */
 const clientRevision = resolveRevision(clientDir);
 
+/**
+ * True when a URL's hostname is loopback (localhost, 127.0.0.0/8, ::1).
+ * #61 step 3 A2 gates the client-log publication on this: log payloads
+ * must never cross the mesh. Malformed URL = not loopback (fail closed).
+ */
+export function isLoopbackUrl(url: string): boolean {
+  let host = '';
+  try {
+    host = new URL(url).hostname;
+  } catch {
+    return false;
+  }
+  if (host.startsWith('[')) host = host.slice(1, -1); // IPv6 literal [::1]
+  return host === 'localhost' || host.startsWith('127.') || host === '::1';
+}
+
 // ---------------------------------------------------------------------------
 // Logging (rotate at 10 MB, keep 1)
 // ---------------------------------------------------------------------------
@@ -105,6 +121,15 @@ const clientRevision = resolveRevision(clientDir);
 class RotatingLog {
   private readonly file: string;
   private readonly max = 10 * 1024 * 1024;
+  /**
+   * In-memory tail of the formatted lines this process wrote (#61 step 3
+   * A2): the page's Client log dock reads it from the register heartbeat,
+   * so the daemon never re-reads its own log file. Bounded (oldest dropped)
+   * — the same shape the Swift LogViewer kept, minus the file offset.
+   */
+  private readonly ring: string[] = [];
+  private static readonly RING_MAX = 120;
+  private static readonly LINE_CAP = 300;
 
   constructor(dir: string) {
     mkdirSync(dir, { recursive: true });
@@ -129,6 +154,10 @@ class RotatingLog {
     } catch {
       /* logging must never kill the daemon */
     }
+    // The ring holds the formatted line (minus the trailing newline),
+    // capped like the wire field, oldest-first, newest at the end.
+    this.ring.push(stamped.slice(0, -1).slice(0, RotatingLog.LINE_CAP));
+    if (this.ring.length > RotatingLog.RING_MAX) this.ring.splice(0, this.ring.length - RotatingLog.RING_MAX);
     const stream = process.env.IDLEFILL_CLIENT_QUIET ? undefined : process.stdout;
     if (stream) process.stdout.write(stamped);
   }
@@ -136,6 +165,11 @@ class RotatingLog {
   /** Console-only line (config dump etc. that duplicates file state). */
   info(msg: string): void {
     this.line(msg);
+  }
+
+  /** A copy of the in-memory tail, oldest first (empty before any write). */
+  tail(): string[] {
+    return [...this.ring];
   }
 }
 
@@ -1119,6 +1153,25 @@ export class ClientDaemon {
     return this.hooks.log as RotatingLog;
   }
 
+  /**
+   * The code-staleness verdict for this heartbeat (#61 step 3 A1): this
+   * process's boot revision (computed once at startup, `clientRevision`)
+   * vs the LIVE `git rev-parse HEAD` of the same checkout — re-read every
+   * heartbeat so a merge/pull is visible on the dashboard within one tick.
+   * Best-effort by contract (revision.ts rule): no git / not a repo / any
+   * failure yields undefined and the register body OMITS the key. `true`
+   * only when both sides resolve and differ — prefix-tolerant, so a short
+   * boot identity still matches the full live HEAD when they agree.
+   */
+  private daemonBehind(): boolean | undefined {
+    if (!clientRevision) return undefined;
+    const live = resolveRevision(clientDir);
+    if (!live) return undefined;
+    const a = clientRevision.toLowerCase();
+    const b = live.toLowerCase();
+    return a === b || a.startsWith(b) || b.startsWith(a) ? false : true;
+  }
+
   /** Loopback proxy base URL once up (tests / operators); null before boot. */
   get proxyUrl(): string | null {
     return this.proxy?.base_url ?? null;
@@ -1172,6 +1225,10 @@ export class ClientDaemon {
   // ------------------------------------------------------------------
 
   private async register(): Promise<void> {
+    // The staleness + log-tail blocks computed once per heartbeat (each
+    // also feeds the register body below exactly once).
+    const behind = this.daemonBehind();
+    const logTail = typeof this.log.tail === 'function' ? this.log.tail() : undefined;
     const { status, body } = await api<{ client_id: string; created?: boolean }>(this.cfg, 'POST', '/api/clients/register', {
       name: this.cfg.client_name,
       ip: this.cfg.ip || undefined,
@@ -1205,6 +1262,21 @@ export class ClientDaemon {
       // ADD-key: an old arbiter ignores it; a daemon whose proxy never came
       // up reports nothing.
       ...(this.proxy ? { proxy_port: this.proxy.port } : {}),
+      // Code-staleness verdict (#61 step 3 A1): the client is the ONLY
+      // process holding both facts — the boot revision it loaded code from
+      // and the live HEAD of the same checkout (it runs FROM that tree).
+      // `true` only when both resolve and differ; the key is OMITTED when
+      // either side cannot resolve (no git / not a repo / any git failure —
+      // resolveRevision is best-effort by contract), and `false` says the
+      // daemon is current, which CLEARS the arbiter's stored marker. A
+      // false report is what clears the surfaces' `daemon behind` tag
+      // within one heartbeat of a daemon restart.
+      ...(behind !== undefined ? { daemon_behind: behind } : {}),
+      // Client log tail (#61 step 3 A2): the in-memory ring the logger
+      // already feeds (no file re-read). Published ONLY when the arbiter
+      // this daemon talks to is loopback — the mesh must not carry log
+      // payloads, so a remote arbiter gets the key omitted entirely.
+      ...(logTail !== undefined && isLoopbackUrl(this.cfg.server_url) ? { client_log: logTail } : {}),
       // The arbiter stores this per-project view for the dashboard
       // (Projects → workers allocated). Re-registration is a heartbeat:
       // last_seen refreshes and queue depths update on every tick. `stats`
@@ -1616,7 +1688,18 @@ export class ClientDaemon {
         },
       });
     }
-    this.proxy = startLlmProxy({ port: this.cfg.proxy_port, target: this.cfg.llm_target, ...(this.gate ? { gate: this.gate } : {}) });
+    this.proxy = startLlmProxy({
+      port: this.cfg.proxy_port,
+      target: this.cfg.llm_target,
+      ...(this.gate ? { gate: this.gate } : {}),
+      // Client-config editor (#61 step 3 A3): the page's local-config
+      // editor talks to THIS loopback bind. The token compared here is the
+      // one this daemon already holds (config.json `token`) — the same
+      // credential the desktop webview injects into the page, so zero
+      // pasting holds. No config FILE (env-config launch) = routes answer
+      // 503 rather than inventing a file to write.
+      clientProjects: { token: this.cfg.token, configPath: this.cfg.config_path ?? null },
+    });
     await waitProxyReady(this.proxy.server);
     this.log.info(
       `proxy up: ${this.proxy.base_url} → ${this.cfg.llm_target}${this.gate ? ` (session gate on: max ${this.cfg.max_active_agent_sessions ?? 2} sessions, hold cap ${this.cfg.session_hold_cap_ms ?? 120000}ms)` : ' (session gate off)'}`,

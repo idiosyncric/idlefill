@@ -285,6 +285,25 @@
   #queue-search:focus { outline: 1px solid var(--accent); }
   #queue-search-results .qsr-head { margin: 4px 0; }
   #queue-search-results table { margin-top: 4px; }
+  /* Client log dock tab (#61 step 3 A2): one block per client — the
+     daemon's published log tail, rendered verbatim (the last_rebuild
+     discipline). Mono canvas lines, newest at the bottom; the follow rule
+     is in JS (auto-scroll only when already at the bottom — the Swift
+     LogViewer's rule). Exception-only: no client publishes a tail = the
+     tab itself hides. */
+  .clog-client { padding: 6px 0; border-bottom: 1px solid rgba(48,54,61,0.5); }
+  .clog-client:last-child { border-bottom: none; }
+  .clog-client .cname { font-weight: 600; }
+  .clog-lines { margin: 3px 0 2px 15px; color: var(--dim); font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  /* Local client-config editor (#61 step 3 A3): the page edits THIS
+     machine's client/config.json THROUGH the local client's loopback proxy
+     (the client owns the file; the page never touches it directly). Same
+     settings-form/toggle pattern as the project knobs — a settings-form
+     that is open pauses the 5s refresh (the existing mid-edit guard). */
+  .lcfg { padding: 8px 0; border-bottom: 1px solid rgba(48,54,61,0.5); }
+  .lcfg:last-child { border-bottom: none; }
+  .lcfg .lcfg-proj { margin: 6px 0 2px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--panel); }
+  .lcfg .lcfg-proj .pname { font-weight: 600; font-size: 12px; }
   /* View switch: the queue detail route shows ONLY the queue section — the
      search section excepted (it filters the overview's worker previews and
      is useful from the queue page too). */
@@ -444,6 +463,19 @@
     <div id="queue-search-results"></div>
   </section>
 
+  <!-- Local client config (#61 step 3 A3): the LOCAL project entries of
+       this machine's client/config.json (name, model, queue_file,
+       estimated_seconds, timeout_seconds). The page cannot write a local
+       file — the LOCAL CLIENT can, and the page reaches it through the
+       client's already-bound loopback proxy (the proxy_port the client
+       publishes). Exception-only: the section shows ONLY on a loopback
+       page origin AND when an online client reports proxy_port. Restart
+       stays native (launchd); this editor never restarts anything. -->
+  <section id="lcfg-section" data-view="projects" style="display:none">
+    <h2>Local client config</h2>
+    <div id="lcfg"></div>
+  </section>
+
   <!-- Queue detail — /[project]/[worker]/queue (the SAME single-file
        dashboard: the script shows this section and hides the panes above,
        or the reverse on the root path). Holds one worker's published queue
@@ -478,6 +510,14 @@
         <tbody id="leases"><tr><td colspan="10" class="empty">no leases yet</td></tr></tbody>
       </table>
     </div>
+    <!-- Client log (#61 step 3 A2): the daemon log tail PUBLISHED by each
+         client on its register heartbeat (loopback arbiter only — a remote
+         arbiter never sees log payloads). Rendered verbatim, newest at the
+         bottom; auto-follow only while already at the bottom. Exception-
+         only: the TAB hides while no client publishes a tail. -->
+    <div id="pane-clientlog" style="display:none">
+      <div id="clientlog"><div class="empty">no client publishes a log tail</div></div>
+    </div>
   </div>
   <div class="tray-head">
     <button id="logs-toggle" type="button" title="expand / collapse logs">
@@ -486,6 +526,9 @@
     <div class="tabs" role="tablist">
       <button id="tab-events" type="button" class="active" role="tab" aria-selected="true">Events</button>
       <button id="tab-leases" type="button" role="tab" aria-selected="false">Leases</button>
+      <!-- Client log tab (#61 step 3 A2) — exception-only: hidden while no
+           client publishes a log tail (no exception = no tab). -->
+      <button id="tab-clientlog" type="button" role="tab" aria-selected="false" hidden>Client log</button>
     </div>
     <select id="logs-limit" title="records to show" aria-label="records to show">
       <option value="10" selected>10</option>
@@ -718,6 +761,16 @@ function workBlock(p, st) {
     const postureBadge = w.gate_posture === "fail_open"
       ? ' <span class="tag" style="color:var(--warn);border-color:var(--warn)" title="this machine\'s arbiter link is down — its session gate is FAIL-OPEN: every session is admitted and the session slot cap is off until the link returns">gate fail-open</span>'
       : "";
+    // Code-staleness (#61 step 3 A1): the daemon compares its own boot
+    // revision against the live HEAD of the checkout it runs from and
+    // publishes the verdict (it is the only process holding both facts).
+    // Exception-only: the tag shows ONLY when the verdict is `true`; a
+    // current daemon and a pre-#61-step-3 client both render nothing. The
+    // fix is restarting the daemon (the native toolbar / launchctl
+    // kickstart) — same warn framing as the 90s `stale` tag.
+    const behindTag = w.daemon_behind === true
+      ? ' <span class="tag" style="color:var(--warn);border-color:var(--warn)" title="this daemon runs code older than its own checkout — restart it (native toolbar, or launchctl kickstart) to pick up the current tree">daemon behind</span>'
+      : "";
     const stats = w.stats || {};
     const statKeys = Object.keys(stats);
     const statsHtml = statKeys.length
@@ -729,7 +782,7 @@ function workBlock(p, st) {
       '<span class="dot ' + (w.online ? "on" : "off") + '" title="' + (w.online ? "online (saw a heartbeat within 90s)" : "offline (no recent heartbeat)") + '"></span>' +
       // The worker's own version (the version handshake — exception-only:
       // absent on pre-version workers, rendered dimmed after the name).
-      '<span class="wname">' + esc(w.client) + (w.version ? ' <span class="wmeta" title="version reported by this worker at registration">' + esc(w.version) + '</span>' : "") + (w.online ? "" : ' <span class="wmeta">(offline)</span>') + pausedBadge + postureBadge + "</span>" +
+      '<span class="wname">' + esc(w.client) + (w.version ? ' <span class="wmeta" title="version reported by this worker at registration">' + esc(w.version) + '</span>' : "") + (w.online ? "" : ' <span class="wmeta">(offline)</span>') + pausedBadge + postureBadge + behindTag + "</span>" +
       '<span class="wmeta">' + esc(w.model || "—") + (w.estimated_seconds ? " · " + durFmt(w.estimated_seconds) + "/job" : "") + "</span>" +
       '<span class="wqueue">' + (w.queue_depth || 0).toLocaleString() + " queued" +
       (w.queue_depth > 0
@@ -1235,6 +1288,12 @@ async function refresh() {
   //     first request hits the router.
   renderLauncher(st);
 
+  // --- Local client config (#61 step 3 A3) — exception-only: shown only
+  //     on a loopback page origin AND when an online client reports
+  //     proxy_port. Rendered from the same payload (the form itself
+  //     fetches from the client only when the operator opens it).
+  renderLocalConfig(st);
+
   // --- Throttled jobs (the anti-thrash backstop — exception-only: the
   //     section stays hidden while nothing is throttled, and each block
   //     carries the recovery control).
@@ -1291,6 +1350,9 @@ async function refresh() {
         "</tr>";
     }).join("");
   }
+  // --- Client log dock tab (#61 step 3 A2) — the per-client published
+  //     tails, exception-only (the tab itself hides while none publish).
+  renderClientLog(st);
   // Re-check the per-view empty line AFTER the section toggles above: an
   // exception-only section may have just hidden or shown itself, and the
   // active view's area can go blank underneath an open tab.
@@ -1501,6 +1563,13 @@ const VIEW_EMPTY_MSG = {
   usage: "no usage recorded yet — the metrics store fills as the box runs",
 };
 
+// Deep links (#61 step 3 / Slice B): the desktop app's idlefill:// routes
+// land on the live origin with #<view> appended. A hash naming a real view
+// wins over the stored tab on load ONLY — after that the stored tab (and
+// tab clicks) own the view; a hash change re-applies. Non-view hashes (the
+// queue route, anchors) change nothing.
+const HASH_VIEW_RE = /^#(overview|projects|sessions|usage)$/;
+
 function syncViewEmpty() {
   const box = $("view-empty");
   if (!box || QUEUE_PAGE) return;
@@ -1518,7 +1587,13 @@ function syncViewEmpty() {
 
 (function wireViewTabs() {
   if (QUEUE_PAGE) return; // the queue detail route hides the bar (body.queuepage)
-  applyView(currentView());
+  const hashView = HASH_VIEW_RE.exec(location.hash);
+  if (hashView) applyView(hashView[1]); // deep link wins on load (Slice B)
+  else applyView(currentView());
+  window.addEventListener("hashchange", () => {
+    const v = HASH_VIEW_RE.exec(location.hash);
+    if (v) applyView(v[1]);
+  });
   $("view-tabs").addEventListener("click", (e) => {
     const btn = e.target.closest("button[data-view]");
     if (!btn) return;
@@ -1564,22 +1639,27 @@ function setTray(expanded) {
 }
 try { setTray(localStorage.getItem("idlefill.logsExpanded") === "1"); } catch { }
 logsToggle.addEventListener("click", () => setTray(!tray.classList.contains("expanded")));
-[["tab-events", "pane-events"], ["tab-leases", "pane-leases"]].forEach(([tabId, paneId]) => {
+[["tab-events", "pane-events"], ["tab-leases", "pane-leases"], ["tab-clientlog", "pane-clientlog"]].forEach(([tabId, paneId]) => {
   const tab = $(tabId);
   tab.addEventListener("click", () => {
-    ["tab-events", "tab-leases"].forEach((id) => {
+    ["tab-events", "tab-leases", "tab-clientlog"].forEach((id) => {
       const on = id === tabId;
       $(id).classList.toggle("active", on);
       $(id).setAttribute("aria-selected", on ? "true" : "false");
     });
     $("pane-events").style.display = tabId === "tab-events" ? "" : "none";
     $("pane-leases").style.display = tabId === "tab-leases" ? "" : "none";
+    $("pane-clientlog").style.display = tabId === "tab-clientlog" ? "" : "none";
     try { localStorage.setItem("idlefill.logsTab", tabId); } catch { }
   });
 });
 try {
   const savedTab = localStorage.getItem("idlefill.logsTab");
   if (savedTab === "tab-leases") $("tab-leases").click();
+  // #61 step 3 A2: the Client log tab is exception-only (it hides while no
+  // client publishes a tail) — a persisted choice only restores while the
+  // tab is actually present.
+  if (savedTab === "tab-clientlog" && !$("tab-clientlog").hidden) $("tab-clientlog").click();
 } catch { }
 $("logs-limit").addEventListener("change", () => refresh());
 
@@ -1594,6 +1674,205 @@ $("projects").addEventListener("click", (e) => {
   btn.classList.toggle("collapsed", collapsed);
   try { localStorage.setItem("idlefill.projWorkers." + name, collapsed ? "0" : "1"); } catch { }
 });
+
+// ---------------------------------------------------------------------------
+// Client log dock tab (#61 step 3 A2) — the daemon log tail each client
+// PUBLISHES on its register heartbeat (loopback arbiter only: a remote
+// arbiter never carries log payloads). Rows render verbatim — the page
+// computes nothing. Newest line at the BOTTOM (the file's order); the
+// follow rule is the Swift LogViewer's: auto-scroll to the bottom ONLY
+// when the pane was already at the bottom, so a scroll-up never fights
+// the 5s refresh. Exception-only: no client publishes a tail = the TAB
+// itself hides (the healthy state shows no extra tab).
+// ---------------------------------------------------------------------------
+const CLOG_AT_BOTTOM_SLOP = 24; // px of slack counted as "at the bottom"
+
+function renderClientLog(st) {
+  const tab = $("tab-clientlog");
+  const body = $("logs-body");
+  const rows = (st.clients || []).filter((c) => Array.isArray(c.client_log) && c.client_log.length > 0);
+  if (rows.length === 0) {
+    tab.hidden = true;
+    if (!$("tab-events").classList.contains("active")) {
+      // The operator was ON the client log pane and it just emptied: fall
+      // back to Events so the tray body never shows a hidden-content pane.
+      $("tab-events").click();
+    }
+    $("clientlog").innerHTML = '<div class="empty">no client publishes a log tail</div>';
+    return;
+  }
+  tab.hidden = false;
+  // Follow decision BEFORE rebuilding (scroll position belongs to the old
+  // body; rebuilding resets it).
+  const following = body.scrollHeight - body.scrollTop - body.clientHeight <= CLOG_AT_BOTTOM_SLOP;
+  const open = $("pane-clientlog").style.display !== "none";
+  $("clientlog").innerHTML = rows
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((c) =>
+      '<div class="clog-client"><span class="cname">' + esc(c.name) + '</span>' +
+      '<div class="clog-lines" title="the last ' + c.client_log.length + ' log lines this client published (loopback arbiter only — the mesh never carries logs)">' +
+      c.client_log.map(esc).join("\n") +
+      "</div></div>"
+    )
+    .join("");
+  if (open && following) body.scrollTop = body.scrollHeight;
+}
+
+// ---------------------------------------------------------------------------
+// Local client config (#61 step 3 A3) — the LOCAL project entries of this
+// machine's client/config.json. The page cannot write a local file; the
+// LOCAL client can, and it answers GET/PUT /client/projects on its own
+// already-bound loopback proxy (the proxy_port each client publishes on
+// the register heartbeat). Exception-only: the section shows ONLY when the
+// page origin is loopback AND an online client reports proxy_port (the
+// same 90s liveness precedent as the launcher). Cross-port fetch: the
+// client answers with loopback-allow CORS; auth rides X-Idlefill-Edit with
+// the page's own gate token — the desktop webview injects it, so zero
+// pasting holds. A successful save says RESTART REQUIRED: the restart
+// stays a native/launchd action; this editor never restarts anything.
+// ---------------------------------------------------------------------------
+function pageOriginLoopback() {
+  const h = location.hostname;
+  return h === "localhost" || h.startsWith("127.") || h === "[::1]" || h === "::1";
+}
+
+// Render-on-open editor state lives per client: the GET result is fetched
+// when the toggle opens (never on the 5s tick — the form is the operator's
+// hand in the file). A settings-form with .open pauses the 5s refresh (the
+// existing mid-edit guard), so keystrokes survive.
+async function localConfigFormHtml(clientName, port) {
+  const box = $("lcfg").querySelector('.settings-form[data-lcfg-form="' + cssEscape(clientName) + '"]');
+  if (!box) return;
+  box.innerHTML = '<div class="empty">reading client/config.json…</div>';
+  const token = gateToken();
+  if (!token) {
+    box.innerHTML = '<div class="empty">the edit needs the arbiter token — paste it into the header first</div>';
+    return;
+  }
+  let projects = [];
+  try {
+    const res = await fetch("http://127.0.0.1:" + encodeURIComponent(port) + "/client/projects", {
+      headers: { "x-idlefill-edit": token },
+    });
+    if (!res.ok) {
+      let detail = "HTTP " + res.status;
+      try { detail += ": " + ((await res.json()).error ?? ""); } catch { }
+      box.innerHTML = '<div class="empty">read failed: ' + esc(detail) + "</div>";
+      return;
+    }
+    projects = (await res.json()).projects || [];
+  } catch (err) {
+    box.innerHTML = '<div class="empty">the local client at 127.0.0.1:' + esc(String(port)) + " is unreachable: " + esc(err.message) + "</div>";
+    return;
+  }
+  if (projects.length === 0) {
+    box.innerHTML = '<div class="empty">this client has no projects in its config</div>';
+    return;
+  }
+  box.innerHTML =
+    projects.map((p, i) => {
+      const pre = "lcfg-" + cssEscape(clientName) + "-" + i;
+      const f = (key, label, val, type) =>
+        '<div class="frow"><label for="' + pre + "-" + key + '">' + label + "</label>" +
+        '<input id="' + pre + "-" + key + '" data-lcfg="' + key + '" type="' + (type || "text") + '" value="' + esc(val ?? "") + '"' + (type === "number" ? ' min="1" step="any"' : "") + "></div>";
+      const extras = Object.keys(p).filter((k) => !["name", "model", "queue_file", "estimated_seconds", "timeout_seconds"].includes(k));
+      return '<div class="lcfg-proj" data-lcfg-proj="' + i + '">' +
+        '<div class="pname">' + esc(p.name || "project") + "</div>" +
+        f("name", "name", p.name) +
+        f("model", "model", p.model) +
+        f("queue_file", "queue_file", p.queue_file) +
+        f("estimated_seconds", "estimated_seconds", p.estimated_seconds, "number") +
+        f("timeout_seconds", "timeout_seconds", p.timeout_seconds, "number") +
+        (extras.length ? '<div class="note" title="these keys pass through untouched: ' + esc(extras.join(", ")) + '">' + extras.length + " other key(s) preserved</div>" : "") +
+        // The untouched entry rides in the dataset so save re-sends the
+        // WHOLE entry with only the five edited fields replaced.
+        '<input type="hidden" data-lcfg-raw="' + esc(JSON.stringify(p)) + '">' +
+        "</div>";
+    }).join("") +
+    '<div class="fbtns"><button class="primary" data-lcfg-save data-client="' + esc(clientName) + '" data-port="' + esc(String(port)) + '" type="button">save</button>' +
+    '<span class="fmsg dim" data-lcfg-msg></span></div>' +
+    '<div class="note">writes client/config.json on THIS machine through the local client (every other key, the token included, and the 0600 mode are preserved) — the daemon picks the changes up on its next start; restart it from the desktop app.</div>';
+}
+
+function renderLocalConfig(st) {
+  if (QUEUE_PAGE) return;
+  const sec = $("lcfg-section");
+  const hosted = (st.clients || [])
+    .filter((c) => c.proxy_port && st.now - (c.last_seen ?? 0) < SESSION_ONLINE_MS)
+    .sort((a, b) => a.name.localeCompare(b.name));
+  if (!pageOriginLoopback() || hosted.length === 0) {
+    sec.style.display = "none";
+    syncViewEmpty();
+    return;
+  }
+  sec.style.display = "";
+  syncViewEmpty();
+  $("lcfg").innerHTML = hosted.map((c) =>
+    '<div class="lcfg">' +
+    '<button class="settings-toggle collapsed" data-lcfg-settings="' + esc(c.name) + '" data-port="' + esc(String(c.proxy_port)) + '" type="button" title="edit ' + esc(c.name) + '&#39;s LOCAL project entries (client/config.json on this machine)">' +
+    '<span class="chev">&#9650;</span>' + esc(c.name) + ' · 127.0.0.1:' + esc(String(c.proxy_port)) + "</button>" +
+    '<div class="settings-form" data-lcfg-form="' + esc(c.name) + '"></div>' +
+    "</div>"
+  ).join("");
+}
+
+(function wireLocalConfig() {
+  const box = $("lcfg");
+  if (!box) return;
+  box.addEventListener("click", async (e) => {
+    const toggle = e.target.closest("button[data-lcfg-settings]");
+    if (toggle) {
+      const name = toggle.dataset.lcfgSettings;
+      const form = box.querySelector('.settings-form[data-lcfg-form="' + cssEscape(name) + '"]');
+      if (!form) return;
+      const open = form.classList.toggle("open");
+      toggle.classList.toggle("collapsed", !open);
+      if (open && !form.innerHTML) {
+        await localConfigFormHtml(name, toggle.dataset.port);
+      }
+      return;
+    }
+    const save = e.target.closest("button[data-lcfg-save]");
+    if (save) {
+      const msg = box.querySelector('[data-lcfg-msg]');
+      const projects = [];
+      for (const blk of box.querySelectorAll(".lcfg-proj")) {
+        const raw = JSON.parse(blk.querySelector("[data-lcfg-raw]").dataset.lcfgRaw);
+        for (const inp of blk.querySelectorAll("input[data-lcfg]")) {
+          const key = inp.dataset.lcfg;
+          if (key === "estimated_seconds" || key === "timeout_seconds") {
+            const t = inp.value.trim();
+            if (t === "") delete raw[key];
+            else raw[key] = Number(t);
+          } else raw[key] = inp.value;
+        }
+        projects.push(raw);
+      }
+      save.disabled = true;
+      if (msg) { msg.textContent = "saving…"; msg.className = "fmsg dim"; }
+      try {
+        const res = await fetch("http://127.0.0.1:" + encodeURIComponent(save.dataset.port) + "/client/projects", {
+          method: "PUT",
+          headers: { "content-type": "application/json", "x-idlefill-edit": gateToken() },
+          body: JSON.stringify({ projects }),
+        });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          if (msg) { msg.textContent = "refused: " + (body.error ?? "HTTP " + res.status); msg.className = "fmsg err"; }
+          return;
+        }
+        if (msg) {
+          msg.textContent = body.restart_required ? "saved — restart the daemon to apply" : "saved";
+          msg.className = "fmsg warn";
+        }
+      } catch (err) {
+        if (msg) { msg.textContent = "save failed: " + err.message; msg.className = "fmsg err"; }
+      } finally {
+        save.disabled = false;
+      }
+    }
+  });
+})();
 
 // ---------------------------------------------------------------------------
 // Gate control — writes need the arbiter token (the dashboard poll is

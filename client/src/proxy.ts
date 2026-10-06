@@ -21,6 +21,7 @@
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { SESSION_PATH_RE, type SessionGate } from './session-gate.js';
+import { handleClientProjects, type ClientProjectsOpts } from './client-projects.js';
 
 export interface ProxyLogEntry {
   ts: number;
@@ -58,6 +59,14 @@ export function startLlmProxy(opts: {
    * precisely as before.
    */
   gate?: SessionGate;
+  /**
+   * Client-config editor routes (#61 step 3 A3): when set, GET/PUT
+   * `/client/projects` are answered ON THIS SAME loopback server (never
+   * passthrough — the paths are the client's own control surface, guarded
+   * Host/Origin/token inside handleClientProjects). Absent = the proxy
+   * behaves exactly as before (the path falls to plain passthrough).
+   */
+  clientProjects?: ClientProjectsOpts;
 }): LlmProxy {
   const target = new URL(opts.target);
   const log: ProxyLogEntry[] = [];
@@ -159,6 +168,18 @@ export function startLlmProxy(opts: {
 
   const server = http.createServer((req, res) => {
     const rawUrl = req.url ?? '/';
+    // Client-config editor (#61 step 3 A3): the client's own control
+    // surface on this same loopback bind — answered BEFORE the session /
+    // passthrough paths so config writes can never reach the LLM target.
+    if (opts.clientProjects) {
+      let u: URL;
+      try {
+        u = new URL(rawUrl, 'http://127.0.0.1');
+      } catch {
+        u = new URL('http://127.0.0.1/');
+      }
+      if (handleClientProjects(req, res, u, opts.clientProjects)) return;
+    }
     const m = opts.gate ? SESSION_PATH_RE.exec(rawUrl) : null;
     if (opts.gate && m) {
       // Session traffic: /s/<token>/v1/... → gate, forwarded as /v1/...

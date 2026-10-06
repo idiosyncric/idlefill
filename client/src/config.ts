@@ -151,6 +151,14 @@ export interface ClientConfig {
   state_dir: string;
   /** Crash-safe operator-state file (last lease + overrides); lives outside state_dir. */
   state_file: string;
+  /**
+   * The config FILE the config was loaded from, or undefined when it came
+   * from IDLEFILL_CLIENT_CONFIG (#61 step 3 A3). The /client/projects
+   * editor writes back to exactly this file (tmp-then-rename, 0600); no
+   * path = no file to write = the routes answer 503 instead of inventing
+   * one. ADD-key: optional, so hand-built ClientConfig fixtures stay valid.
+   */
+  config_path?: string;
 }
 
 const DEFAULTS = {
@@ -188,6 +196,7 @@ export function loadClientConfig(
   const pkgDir = clientDir;
   const srcParent = dirname(clientDir);
   let raw: Record<string, unknown> | null = null;
+  let configPath: string | undefined;
 
   if (env.IDLEFILL_CLIENT_CONFIG?.trim()) {
     raw = JSON.parse(env.IDLEFILL_CLIENT_CONFIG);
@@ -200,6 +209,7 @@ export function loadClientConfig(
     ]) {
       if (existsSync(cand)) {
         raw = JSON.parse(readFileSync(cand, 'utf-8'));
+        configPath = cand; // the editor (#61 A3) writes back to THIS file
         break;
       }
     }
@@ -265,6 +275,7 @@ export function loadClientConfig(
     repo_root: repoRoot,
     state_dir: resolve(clientPkgDir, 'data'),
     state_file: resolve(clientPkgDir, 'data', 'idlefill-client-state.json'),
+    ...(configPath ? { config_path: resolve(configPath) } : {}),
   };
 }
 

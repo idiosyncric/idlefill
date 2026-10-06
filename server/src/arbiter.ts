@@ -283,7 +283,7 @@ export class Arbiter {
     observedIp: string,
     projects?: ProjectAllocation[],
     now?: number,
-    info?: { version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open'; proxy_port?: number },
+    info?: { version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open'; proxy_port?: number; daemon_behind?: boolean; client_log?: string[] },
   ): { client_id: string; created: boolean } {
     const s = this.store.state;
     const seen = now ?? Date.now();
@@ -323,6 +323,34 @@ export class Arbiter {
       typeof info?.proxy_port === 'number' && Number.isInteger(info.proxy_port) && info.proxy_port >= 1 && info.proxy_port <= 65535
         ? info.proxy_port
         : undefined;
+    // Code-staleness verdict (#61 step 3 A1): a plain boolean, computed
+    // WHERE THE FACTS LIVE (the client runs from the checkout; the arbiter
+    // cannot see any client's repo tree). Drop-don't-reject like every
+    // other reported display field: a non-boolean is dropped. A `true`
+    // report stores the marker; `false` CLEARS it (the explicit
+    // no-exception report clears the stored exception — the same posture
+    // as the session gate block: an absent report leaves the row as-is, so
+    // a pre-#61-step-3 client's row never changes).
+    const daemonBehind = typeof info?.daemon_behind === 'boolean' ? info.daemon_behind : undefined;
+    // Client log tail (#61 step 3 A2): client-published display data —
+    // bounded hard like the queue preview (state-file bloat is the same
+    // risk): ≤120 lines, each line trimmed and capped at 300 chars,
+    // non-string entries dropped. A non-array drops the whole key
+    // (malformed → absent, never a rejection); an EMPTY (or all-dropped)
+    // array clears the stored tail — a daemon that stops publishing lines
+    // must not leave stale lines on the row forever.
+    let clientLog: string[] | undefined;
+    let clientLogPresent = false;
+    if (Array.isArray(info?.client_log)) {
+      clientLogPresent = true;
+      clientLog = [];
+      for (const l of info!.client_log as unknown[]) {
+        if (clientLog.length >= 120) break;
+        if (typeof l !== 'string') continue;
+        const t = l.trim();
+        if (t !== '') clientLog.push(t.slice(0, 300));
+      }
+    }
     const existing = s.clients.find((c) => c.name === name);
     if (existing) {
       if (validIp(observedIp)) existing.ip = observedIp; // observed wins
@@ -356,6 +384,19 @@ export class Arbiter {
       // row (the proxy rebind on restart is reflected within one tick);
       // absent leaves it as-is.
       if (proxyPort) existing.proxy_port = proxyPort;
+      // Code-staleness verdict (#61 step 3 A1): present updates (true
+      // stores, false clears — the restart clears the tag inside one
+      // heartbeat); absent (a pre-#61-step-3 client) leaves the row exactly
+      // as it was.
+      if (daemonBehind === true) existing.daemon_behind = true;
+      else if (daemonBehind === false) delete existing.daemon_behind;
+      // Client log tail (#61 step 3 A2): a present (array) report replaces
+      // the stored tail — a cleaned empty tail deletes the key (no
+      // exception, no row key); absent leaves it as-is.
+      if (clientLogPresent) {
+        if (clientLog && clientLog.length > 0) existing.client_log = clientLog;
+        else delete existing.client_log;
+      }
       this.store.save();
       return { client_id: existing.client_id, created: false };
     }
@@ -376,6 +417,11 @@ export class Arbiter {
       ...(revision ? { revision } : {}),
       ...(gatePosture ? { gate_posture: gatePosture } : {}),
       ...(proxyPort ? { proxy_port: proxyPort } : {}),
+      // Same store rule as the heartbeat path: only an EXCEPTION key lands
+      // on the row (daemon_behind false = no exception = no key; an empty
+      // log tail = no key).
+      ...(daemonBehind === true ? { daemon_behind: true } : {}),
+      ...(clientLog && clientLog.length > 0 ? { client_log: clientLog } : {}),
     });
     this.store.appendEvent({ kind: 'client_registered', detail: `${name} (${client_id})` });
     // A fresh registration that already carries rebuild state (client

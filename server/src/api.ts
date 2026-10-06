@@ -89,7 +89,7 @@ function bearer(req: { headers: Record<string, unknown>; query: unknown }): stri
 function projectView(
   arbiter: Arbiter,
   cfg: ServerConfig,
-  clients: { name: string; last_seen: number; projects: { name: string; model: string; estimated_seconds: number; queue_depth: number; queue_preview?: QueuePreviewRow[]; stats?: Record<string, number | string>; last_rebuild?: RebuildRunState; cycles?: CycleStatusRow[]; cycle_cap?: number }[]; version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open'; proxy_port?: number }[],
+  clients: { name: string; last_seen: number; projects: { name: string; model: string; estimated_seconds: number; queue_depth: number; queue_preview?: QueuePreviewRow[]; stats?: Record<string, number | string>; last_rebuild?: RebuildRunState; cycles?: CycleStatusRow[]; cycle_cap?: number }[]; version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open'; proxy_port?: number; daemon_behind?: boolean }[],
   day: string,
   now: number,
   today: Record<string, { finished: number; failed: number }>,
@@ -133,6 +133,11 @@ function projectView(
           // Session launcher (#43): the port the router's proxy bound, so
           // the Sessions view can mint sessions against THIS machine.
           ...(c.proxy_port ? { proxy_port: c.proxy_port } : {}),
+          // Code-staleness verdict (#61 step 3 A1): the client's own
+          // boot-vs-HEAD comparison, echoed exception-only like the other
+          // display facts (absent = current or a pre-#61-step-3 client —
+          // both render the row unchanged).
+          ...(c.daemon_behind ? { daemon_behind: true } : {}),
         };
       })
       .sort((a, b) => Number(b.online) - Number(a.online) || a.client.localeCompare(b.client));
@@ -289,7 +294,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   // ------------------------------------------------------------------
 
   app.post('/api/clients/register', async (req, reply) => {
-    const body = (req.body ?? {}) as { name?: string; ip?: string; projects?: ProjectAllocation[]; version?: unknown; protocol?: unknown; revision?: unknown; gate_posture?: unknown; proxy_port?: unknown };
+    const body = (req.body ?? {}) as { name?: string; ip?: string; projects?: ProjectAllocation[]; version?: unknown; protocol?: unknown; revision?: unknown; gate_posture?: unknown; proxy_port?: unknown; daemon_behind?: unknown; client_log?: unknown };
     const name = typeof body.name === 'string' ? body.name.trim() : '';
     if (!name) return reply.code(400).send({ error: 'name required' });
     const remote = (req.ip ?? '').split(':').pop() ?? 'unknown';
@@ -416,14 +421,24 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     // the key simply arrives on a later heartbeat; old clients never send
     // it at all.
     const proxy_port = typeof body.proxy_port === 'number' ? body.proxy_port : undefined;
+    // Code-staleness verdict (#61 step 3 A1): the client computed it where
+    // the facts live (boot revision vs live HEAD of the checkout it runs
+    // from). A plain pass-through here — sanitized (exact boolean, else
+    // dropped) in registerClient. Absent on pre-#61-step-3 clients: the
+    // row renders exactly as before.
+    const daemon_behind = typeof body.daemon_behind === 'boolean' ? body.daemon_behind : undefined;
+    // Client log tail (#61 step 3 A2): the client publishes it ONLY to a
+    // loopback arbiter. A plain array pass-through here — bounded (≤120
+    // lines, per-line cap, non-strings dropped) in registerClient.
+    const client_log = Array.isArray(body.client_log) ? (body.client_log as string[]) : undefined;
     const res = arbiter.registerClient(
       name,
       typeof body.ip === 'string' && body.ip.trim() ? body.ip.trim() : undefined,
       remote,
       projects,
       undefined,
-      version !== undefined || protocol !== undefined || revision !== undefined || gate_posture !== undefined || proxy_port !== undefined
-        ? { version, protocol, revision, gate_posture, proxy_port }
+      version !== undefined || protocol !== undefined || revision !== undefined || gate_posture !== undefined || proxy_port !== undefined || daemon_behind !== undefined || client_log !== undefined
+        ? { version, protocol, revision, gate_posture, proxy_port, daemon_behind, client_log }
         : undefined,
     );
     return reply.code(200).send({ client_id: res.client_id, created: res.created });

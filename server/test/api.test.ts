@@ -1963,3 +1963,120 @@ test('#64 GET /api/server-keys: loopback + admin token answers keyed rows; non-l
     rmSync(aggDir, { recursive: true, force: true });
   }
 });
+
+
+// ---------------------------------------------------------------------------
+// #61 step 3 A1 — `daemon behind` in the page: the client computes the
+// verdict where the facts live (boot revision vs the live HEAD of ITS OWN
+// checkout) and publishes the boolean on the register heartbeat. Posture:
+// exact boolean or dropped (drop-don't-reject); `true` stores the marker,
+// `false` CLEARS it (the explicit no-exception report clears the stored
+// exception — the surfaces' tag must clear within one heartbeat of a
+// restart); ABSENT (old client) leaves the row exactly as it was.
+// ---------------------------------------------------------------------------
+
+test('daemon_behind (#61 A1): true stores and echoes on the client + worker rows; false clears', async () => {
+  await fetch(`${base}/api/clients/register`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({ name: 'behind-true', projects: [{ name: 'career-ops', model: 'm', estimated_seconds: 1, queue_depth: 0 }] }),
+  });
+  await fetch(`${base}/api/clients/register`, { method: 'POST', headers: auth, body: JSON.stringify({ name: 'behind-true', daemon_behind: true }) });
+  let st = (await (await fetch(`${base}/api/state?limit=1`, { headers: auth })).json()) as {
+    clients: { name: string; daemon_behind?: boolean }[];
+    projects: { name: string; workers: { client: string; daemon_behind?: boolean }[] }[];
+  };
+  assert.equal(st.clients.find((c) => c.name === 'behind-true')!.daemon_behind, true, 'the client row carries the verdict');
+  assert.equal(st.projects.find((p) => p.name === 'career-ops')!.workers.find((w) => w.client === 'behind-true')!.daemon_behind, true, 'the worker row carries it too (the tag renders from this)');
+
+  // A current daemon reports false: the marker CLEARS within one heartbeat.
+  await fetch(`${base}/api/clients/register`, { method: 'POST', headers: auth, body: JSON.stringify({ name: 'behind-true', daemon_behind: false }) });
+  st = (await (await fetch(`${base}/api/state?limit=1`, { headers: auth })).json()) as typeof st;
+  assert.ok(!('daemon_behind' in st.clients.find((c) => c.name === 'behind-true')!), 'false clears the stored marker (no exception, no key)');
+});
+
+test('daemon_behind (#61 A1): non-booleans drop without rejecting; absent leaves the row as-is', async () => {
+  for (const bad of ['yes', 1, null, {}, 'true']) {
+    const r = await fetch(`${base}/api/clients/register`, { method: 'POST', headers: auth, body: JSON.stringify({ name: 'behind-bad', daemon_behind: bad }) });
+    assert.equal(r.status, 200, 'a malformed verdict never rejects the heartbeat');
+  }
+  let st = (await (await fetch(`${base}/api/state?limit=1`, { headers: auth })).json()) as { clients: { name: string; daemon_behind?: boolean }[] };
+  assert.ok(!('daemon_behind' in st.clients.find((c) => c.name === 'behind-bad')!), 'every malformed value is dropped');
+
+  // A stored true survives a LATER heartbeat that omits the key (a
+  // pre-#61-step-3 client never changes the row).
+  await fetch(`${base}/api/clients/register`, { method: 'POST', headers: auth, body: JSON.stringify({ name: 'behind-keep', daemon_behind: true }) });
+  await fetch(`${base}/api/clients/register`, { method: 'POST', headers: auth, body: JSON.stringify({ name: 'behind-keep' }) });
+  st = (await (await fetch(`${base}/api/state?limit=1`, { headers: auth })).json()) as typeof st;
+  assert.equal(st.clients.find((c) => c.name === 'behind-keep')!.daemon_behind, true, 'an absent report leaves the stored verdict as-is');
+});
+
+// ---------------------------------------------------------------------------
+// #61 step 3 A2 — the client log tail: an array of short strings published
+// ONLY to a loopback arbiter. Bounded hard (state-file discipline): ≤120
+// lines, per-line cap ~300, non-strings dropped; a malformed (non-array)
+// report drops the whole key; an empty array CLEARS the tail; an absent
+// report leaves the row untouched. A legacy register leaves rows
+// byte-identical.
+// ---------------------------------------------------------------------------
+
+test('client_log (#61 A2): stores verbatim, bounds lines/count, clears on empty, absent leaves rows as-is', async () => {
+  const lines = Array.from({ length: 200 }, (_, i) => `line ${i} ${'x'.repeat(400)}`);
+  await fetch(`${base}/api/clients/register`, { method: 'POST', headers: auth, body: JSON.stringify({ name: 'clog-a', client_log: [...lines, 42, null, '  '] }) });
+  let st = (await (await fetch(`${base}/api/state?limit=1`, { headers: auth })).json()) as { clients: { name: string; client_log?: string[] }[] };
+  const row = st.clients.find((c) => c.name === 'clog-a')!;
+  assert.equal(row.client_log!.length, 120, 'the tail is capped at 120 lines');
+  assert.ok(row.client_log!.every((l) => l.length <= 300), 'every line is capped at 300 chars');
+  assert.equal(row.client_log![0]!.slice(0, 6), 'line 0', 'oldest-first order preserved');
+  assert.ok(!row.client_log!.some((l) => l === '' || l === 'null' || l === '42'), 'non-string / blank entries dropped');
+
+  // Malformed: a non-array drops the whole key (the previously stored tail
+  // stays — a garbage report never rewrites it).
+  await fetch(`${base}/api/clients/register`, { method: 'POST', headers: auth, body: JSON.stringify({ name: 'clog-a', client_log: 'tail -f' }) });
+  st = (await (await fetch(`${base}/api/state?limit=1`, { headers: auth })).json()) as typeof st;
+  assert.equal(st.clients.find((c) => c.name === 'clog-a')!.client_log!.length, 120, 'a non-array leaves the stored tail untouched');
+
+  // An empty array CLEARS (a daemon that moved to a remote arbiter stops
+  // publishing lines; stale lines must not sit on the row forever).
+  await fetch(`${base}/api/clients/register`, { method: 'POST', headers: auth, body: JSON.stringify({ name: 'clog-a', client_log: [] }) });
+  st = (await (await fetch(`${base}/api/state?limit=1`, { headers: auth })).json()) as typeof st;
+  assert.ok(!('client_log' in st.clients.find((c) => c.name === 'clog-a')!), 'empty tail deletes the key');
+});
+
+test('legacy register (#61): a client sending neither new key leaves rows byte-identical', async () => {
+  const body = { name: 'legacy-61', ip: '10.9.9.9', projects: [{ name: 'career-ops', model: 'Qwen3.8-27B', estimated_seconds: 60, queue_depth: 3 }] };
+  await fetch(`${base}/api/clients/register`, { method: 'POST', headers: auth, body: JSON.stringify(body) });
+  const before = await (await fetch(`${base}/api/state?limit=1`, { headers: auth })).json() as { clients: any[]; projects: any[] };
+  const rowBefore = JSON.stringify(before.clients.find((c) => c.name === 'legacy-61')!);
+  assert.ok(!('daemon_behind' in before.clients.find((c) => c.name === 'legacy-61')!) && !('client_log' in before.clients.find((c) => c.name === 'legacy-61')!), 'no new keys appear on a legacy row');
+
+  // A second legacy heartbeat: the row is byte-identical apart from the
+  // liveness timestamp (last_seen moves — liveness is its purpose).
+  await fetch(`${base}/api/clients/register`, { method: 'POST', headers: auth, body: JSON.stringify(body) });
+  const after = await (await fetch(`${base}/api/state?limit=1`, { headers: auth })).json() as typeof before;
+  const rowAfter = after.clients.find((c) => c.name === 'legacy-61')!;
+  const strip = (r: any) => { const { last_seen, ...rest } = r; return JSON.stringify(rest); };
+  assert.equal(strip(rowAfter), strip(before.clients.find((c) => c.name === 'legacy-61')!), 'every field except last_seen is byte-identical across legacy heartbeats');
+  assert.ok(rowAfter.last_seen >= before.clients.find((c) => c.name === 'legacy-61')!.last_seen, 'last_seen still moves (the heartbeat stays a heartbeat)');
+});
+
+// ---------------------------------------------------------------------------
+// #61 step 3 — the page carries the three new surfaces: the exception-only
+// `daemon behind` tag, the Client log dock tab, and the loopback-only
+// local client-config editor section.
+// ---------------------------------------------------------------------------
+
+test('dashboard carries the #61 step 3 surfaces (daemon behind tag, Client log tab, local config)', async () => {
+  const html = await (await fetch(base + '/')).text();
+  // A1: the worker-row exception tag (the same warn tag family as `stale`).
+  assert.ok(html.includes('daemon behind') && html.includes('launchctl kickstart'), 'the daemon-behind tag exists with the restart toolhint');
+  // A2: the third logs-dock tab + its pane, exception-only.
+  assert.ok(html.includes('id="tab-clientlog"') && html.includes('id="pane-clientlog"'), 'the logs dock carries the Client log tab');
+  assert.ok(html.includes('client_log'), 'the dock reads the client-published tail');
+  assert.ok(html.includes('CLOG_AT_BOTTOM_SLOP'), 'the follow-at-bottom rule is page-side (no auto-scroll fight)');
+  // A3: the Projects-view local editor + its loopback gate.
+  assert.ok(html.includes('id="lcfg-section"') && html.includes('data-view="projects"'), 'the local-config section exists in the Projects view');
+  assert.ok(html.includes('/client/projects') && html.includes('x-idlefill-edit'), 'the editor talks to the client proxy with the edit-header auth');
+  assert.ok(html.includes('pageOriginLoopback'), 'the section is gated on a loopback page origin');
+  // Deep-link hash routing (Slice B re-routes idlefill:// onto #<view>).
+  assert.ok(html.includes('HASH_VIEW_RE'), 'the page honours a #view deep link');
+});
