@@ -2,61 +2,49 @@
 //  IdlefillDesktop.swift — the idlefill desktop app (macOS 14+).
 //
 //  A windowed companion (WindowGroup, NOT a MenuBarExtra) built with bare
-//  swiftc (no Xcode project). One window, DASHBOARD first + five legacy tabs:
+//  swiftc (no Xcode project). ONE surface (issue #61 step 3): the window IS
+//  the arbiter's own page — a WKWebView loading its live origin — under a
+//  slim native toolbar the page can never own:
 //
-//    dashboard — THE surface (issue #61 step 1): a WKWebView (system
-//                WebKit, zero new dependencies) loading the arbiter's LIVE
-//                origin — server_url from client/config.json, never a
-//                hardcoded host, never a bundled copy of index.html (a copied
-//                page re-creates the drift bug inside the bundle). The gate
+//    webview — THE surface: a WKWebView (system WebKit, zero new
+//                dependencies) loading the arbiter's LIVE origin —
+//                server_url from client/config.json, never a hardcoded
+//                host, never a bundled copy of index.html (a copied page
+//                re-creates the drift bug inside the bundle). The gate
 //                token from client/config.json is injected via a
 //                WKUserScript at .documentStart — BEFORE the page's inline
 //                script runs — into the page's own localStorage key, so
-//                every write works with zero pasting. The injection is
-//                additive: the page's own token box stays functional for
-//                browser users. The five Swift tabs stay (parallel period
-//                for the parity audit); the webview is the default view.
-//                ATS: the bundle's NSAllowsArbitraryLoads covers the
-//                plain-HTTP loopback load (live-proven, see build.sh's note).
-//    state     — color-coded state word, this machine's status, queue depth,
-//                today finished/failed, the running lease (polls /api/state
-//                every 5s with the Bearer token)
-//    sessions  — the interactive Hermes sessions the arbiter knows about
-//                (the same /api/state poll's sessions[]): every row listed
-//                with its state word (Paused > Active > Idle, the 30s/90s
-//                windows), a stale tag on a lapsed heartbeat, and the
-//                per-session gate (Pause / Resume →
-//                POST /api/sessions/<token>/override). The desktop is the
-//                INTERACTION surface for sessions (the menubar is
-//                read-only, the dashboard is remote)
-//    logs      — the client daemon log tail (client/<entry>/logs/client.log),
-//                refreshed on a ~2.5s timer, last ~2000 lines kept, auto-scroll
-//                to the tail while at the bottom, "follow tail" toggle to
-//                resume after scrolling up
-//    projects  — this client's project config (client/config.json):
-//                client_name + server_url read-only, one editable row per
-//                project (name, model, queue_file, estimated_seconds,
-//                timeout_seconds; executor + cwd read-only). Save rewrites the
-//                file preserving every other key (the token included) and the
-//                0600 mode; a successful save shows a "daemon restart to apply"
-//                note with a Restart affordance (the same launchd path the
-//                Settings toggle uses).
-//    settings  — opt-in launchd management of the three LaunchAgents (daemon +
-//                menu bar + local arbiter) in the user's gui/<uid> domain; the
-//                toggles reflect REAL launchctl state, re-checked on every
-//                poll. The arbiter row additionally detects the LOADED-BUT-
-//                EXITED state (print exit 0, no pid line — a clean SIGTERM
-//                with KeepAlive SuccessfulExit=false leaves the service
-//                loaded and the dashboard blank while every "loaded" check
-//                reads healthy) and relaunches it with `launchctl kickstart`.
+//                every write works with zero pasting. The page carries
+//                everything the retired Swift panels used to render:
+//                state facts, sessions + per-session gates, the client
+//                log tail (the logs dock's Client log tab), the local
+//                project-config editor, the `daemon behind` staleness tag
+//                (#61 step 3 A1-A3 closed those gaps IN the page). ATS:
+//                the bundle's NSAllowsArbitraryLoads covers the
+//                plain-HTTP loopback load (live-proven, build.sh's note).
+//    toolbar — the slim native strip above the webview: which origin the
+//              app points at + token auto-injected + the arbiter-stopped
+//              exception (the loaded-but-exited agent → kickstart
+//              Relaunch) + Reload + a settings disclosure. Settings
+//              re-hosts the machinery the arbiter can NEVER know about:
+//              the daemon / menu bar / arbiter launchd toggles (REAL
+//              launchctl state, re-checked every 5s, the runs: lines, the
+//              menubar stale marker, the arbiter stopped/Relaunch row),
+//              the repo path, and the update channel (Sparkle releases +
+//              the edge channel with pin, progress + confirm). Lifecycle
+//              stays native — launchd controls never move into the page
+//              (#61 lock).
 //
 //  Deep links: the bundle registers the `idlefill://` URL scheme
-//  (CFBundleURLTypes in the generated Info.plist). Hosts: "" or "open" →
-//  State (the default), "logs" → Logs, "projects" → Projects; any unknown
-//  host → State. A URL that launches the app opens on the requested tab; a
-//  URL delivered to a RUNNING app activates it, brings the window forward,
-//  and switches tabs. Parsing lives in the pure `AppModel.route(for:)` so it
-//  is testable headlessly.
+//  (CFBundleURLTypes in the generated Info.plist). Every host routes the
+//  ONE surface: the webview reloads the live origin with the page view's
+//  `#<view>` appended where a page view exists — state → #overview,
+//  sessions → #sessions, projects → #projects, usage → #usage; "" / open
+//  / dashboard / logs / unknown → the page's default view (the logs DOCK
+//  is a dock, not a hashable view). A URL that launches the app opens on
+//  the requested view; a URL delivered to a RUNNING app activates it,
+//  brings the window forward, and re-points the webview. Parsing lives in
+//  the pure `AppModel.hashView(for:)` so it is testable headlessly.
 //
 //  Design: quiet control room (DESIGN.md). Neutral canvas (#0d1117), hairline
 //  dividers (#30363d), one mono family, four signal colors used ONLY for live
@@ -167,225 +155,17 @@ enum Pal {
   static let canvasNS = NSColor(srgbRed: 0x0d / 255.0, green: 0x11 / 255.0, blue: 0x17 / 255.0, alpha: 1)
 }
 
-// MARK: - state
-
-enum Conn: String {
-  case off, busy, working, idle, degraded, unreachable
-
-  var color: Color {
-    switch self {
-    case .off: return Pal.dim
-    case .busy: return Pal.warn
-    case .working: return Pal.accent
-    case .idle: return Pal.ok
-    case .degraded: return Pal.err
-    case .unreachable: return Pal.err
-    }
-  }
-  var word: String {
-    switch self {
-    case .off: return "stopped"
-    case .busy: return "busy"
-    case .working: return "running idle tasks"
-    case .idle: return "idle"
-    case .degraded: return "degraded"
-    case .unreachable: return "unreachable"
-    }
-  }
-}
-
-/// The main window's tabs — and the deep-link target type.
-/// DASHBOARD is first: it is the primary surface (issue #61 step 1 — the
-/// app hosts the arbiter's own page) and the default on launch. The five
-/// legacy Swift tabs stay reachable through the parallel period of the
-/// parity audit.
-enum MainTab: String, CaseIterable {
-  case dashboard, state, sessions, logs, projects, settings
-
-  var title: String { rawValue.uppercased() }
-}
-
-// MARK: sessions (interactive Hermes sessions — the desktop is the gate)
-
-/** The windows the dashboard uses (server/public/index.html
- *  SESSION_ONLINE_MS / SESSION_ACTIVE_MS) — kept honest to the dashboard:
- *  online = a heartbeat within 90s; active = online AND a request seen
- *  within 30s. Stale is NOT a state word: it is the dim + tag on a row
- *  whose heartbeat lapsed past the same 90s window. */
-let kSessionOnlineMs: Double = 90_000
-let kSessionActiveMs: Double = 30_000
-
-/** One projected sessions-tab row. Produced ONLY by the pure
- *  `SessionsView.project` (never by the view), so the headless harness
- *  (desktop/sessions-test.sh) asserts the exact semantics the panel
- *  renders. Unlike the menubar's Exception-Only rule, the desktop lists
- *  EVERY session — it is the interaction surface; you need the healthy
- *  rows to pause them. */
-struct SessionRow: Identifiable, Equatable {
-  /// Identity + label: the token IS the session's identity (the /s/<token>
-  /// path). The row shows a short prefix; the full token rides in the
-  /// tooltip only (never a printed/logged surface).
-  let token: String
-  let shortToken: String
-  let clientName: String?
-  /// The state word: "Paused" | "Active" | "Idle" (the dashboard's
-  /// priority: override pause > online + recent request > idle).
-  let stateWord: String
-  /// Heartbeat lapsed past 90s — a dim + "stale" tag, NOT a state word.
-  let stale: Bool
-  /// "last request …" text (the dashboard's ago() wording), or
-  /// "no requests yet".
-  let lastRequestText: String
-  /// The engine this session routes to (shown as "→ server_id" when set).
-  let serverId: String?
-  /// True when the operator gate holds this session (override == pause).
-  let paused: Bool
-  /// The router reports parked requests waiting for admission
-  /// (gate.state == "queued"). An ADDITIONAL fact like `stale` — the state
-  /// word does not change; a paused row with parked traffic shows both.
-  /// Absent/unknown gate (old arbiter) ⇒ false, row renders as before.
-  let queued: Bool
-  /// Parked-request count when >1 (0 otherwise) — the tag reads
-  /// "queued · N waiting" only when there is more than one waiting.
-  let waitingCount: Int
-  /// The gate button's title: a paused row offers "Resume", a running
-  /// row offers "Pause".
-  let actionTitle: String
-
-  var id: String { token }
-}
-
-enum SessionsView {
-  /** PURE projection: /api/state payload (+ a fixed clock) → view rows.
-   *  Mirrors the dashboard's sessStateWord/sessBlock semantics exactly.
-   *  Rows with an empty/missing token are junk the projection drops (they
-   *  can never be named or acted on). `nowMs` is epoch-ms, injectable so
-   *  the harness runs on a fixed clock. */
-  static func project(payload: [String: Any], nowMs: Double) -> [SessionRow] {
-    let rows = (payload["sessions"] as? [[String: Any]]) ?? []
-    return rows.compactMap { s in
-      guard let tok = (s["token"] as? String), !tok.isEmpty else { return nil }
-      let lastSeen = (s["last_seen"] as? Double) ?? 0
-      let stale = nowMs - lastSeen >= kSessionOnlineMs
-      let online = !stale
-      let ov = (s["override"] as? [String: Any])?["override"] as? String
-      let paused = ov == "pause"
-      let lastActivity = (s["last_activity"] as? Double).flatMap { $0 == 0 ? nil : $0 }
-      let stateWord: String
-      if paused {
-        stateWord = "Paused"
-      } else if online, let la = lastActivity, nowMs - la < kSessionActiveMs {
-        stateWord = "Active"
-      } else {
-        stateWord = "Idle"
-      }
-      let lastRequestText: String
-      if let la = lastActivity {
-        lastRequestText = "last request " + agoText(nowMs - la)
-      } else {
-        lastRequestText = "no requests yet"
-      }
-      let name = (s["client_name"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-      let serverId = (s["server_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-      // gate-state: the router's queue truth. Missing/null/malformed (an
-      // old arbiter, or a row persisted before gate-state) ⇒ no tag — the
-      // row renders exactly as before.
-      let gate = s["gate"] as? [String: Any]
-      let queued = (gate?["state"] as? String) == "queued"
-      let waiting = (gate?["waiting"] as? Double).map { Int($0) } ?? 0
-      return SessionRow(
-        token: tok,
-        shortToken: String(tok.prefix(8)),
-        clientName: name,
-        stateWord: stateWord,
-        stale: stale,
-        lastRequestText: lastRequestText,
-        serverId: serverId,
-        paused: paused,
-        queued: queued,
-        waitingCount: waiting > 1 ? waiting : 0,
-        actionTitle: paused ? "Resume" : "Pause"
-      )
-    }
-  }
-
-  /** The dashboard's ago() wording (server/public/index.html), ported:
-   *  "45s ago" / "3m 12s ago" / "2h 5m ago". */
-  static func agoText(_ ms: Double) -> String {
-    let s = max(0, (ms / 1000).rounded())
-    if s < 60 { return "\(Int(s))s ago" }
-    let m = floor(s / 60)
-    if m < 60 { return "\(Int(m))m \(Int(s.truncatingRemainder(dividingBy: 60)))s ago" }
-    let h = floor(m / 60)
-    return "\(Int(h))h \(Int(m.truncatingRemainder(dividingBy: 60)))m ago"
-  }
-
-  /** PURE request builder for the gate write — the single write site for
-   *  sessions. `POST <serverURL>/api/sessions/<urlencoded token>/override`
-   *  with body {"override":"pause"} (pause) or {"override":null} (resume),
-   *  Authorization: Bearer <arbiter token>. The token parameter NEVER
-   *  appears in the URL or the body — only in the header — and nothing
-   *  here logs any of it. Pure (no networking) so the harness asserts the
-   *  exact wire shape. */
-  static func overrideRequest(serverURL: String, sessionToken: String,
-                              paused: Bool, arbiterToken: String) -> URLRequest {
-    // Percent-encode the session token for the path segment (RFC 3986
-    // unreserved set — the same discipline as the dashboard's
-    // encodeURIComponent).
-    var allowed = CharacterSet.alphanumerics
-    allowed.insert(charactersIn: "-._~")
-    let enc = sessionToken.addingPercentEncoding(withAllowedCharacters: allowed) ?? sessionToken
-    var req = URLRequest(url: URL(string: serverURL + "/api/sessions/" + enc + "/override")!)
-    req.httpMethod = "POST"
-    req.timeoutInterval = 5
-    req.setValue("Bearer \(arbiterToken)", forHTTPHeaderField: "Authorization")
-    req.setValue("application/json", forHTTPHeaderField: "content-type")
-    req.httpBody = try! JSONSerialization.data(withJSONObject:
-      ["override": (paused ? "pause" : (NSNull())) as Any])
-    return req
-  }
-}
-
 // MARK: - model
 
-struct LogLine: Identifiable, Equatable {
-  let id: Int
-  let text: String
-}
-
 final class AppModel: ObservableObject {
-  // active tab (the tab strip binds to it; deep links set it). DASHBOARD
-  // by default: the embedded arbiter page is the primary surface (#61).
-  @Published var activeTab: MainTab = .dashboard
-
-  // state panel
-  @Published var conn: Conn = .off
-  @Published var daemonRunning = false
-  @Published var queueDepth = 0
-  @Published var today: (finished: Int, failed: Int) = (0, 0)
-  @Published var lease: (job: String, expiresAt: Double) = ("", 0)
-  @Published var lastSeenS: Int? = nil
-
-  // sessions tab (the same /api/state poll carries sessions[])
-  @Published var sessions: [SessionRow] = []
-  /** Tokens whose gate write is in flight — the button is disabled
-   *  PER-ROW (not globally) while its own request runs. */
-  @Published var pendingSessionTokens: Set<String> = []
-  /** One-line error under the tab's rows (a failed override; cleared on
-   *  the next successful write or poll that proves the state). */
-  @Published var sessionsNote: String? = nil
-
-  // log viewer (stable ids — trimming the head must not re-identify rows)
-  @Published var logLines: [LogLine] = []
-  @Published var logPath: String = ""
-  @Published var followTail = true
-
-  // projects (this client's config.json)
-  @Published var projClientName: String = ""
-  @Published var projServerURL: String = ""
-  @Published var projRows: [ProjectRow] = []
-  @Published var projNote: String? = nil
-  @Published var projSavedPendingRestart = false
+  /** The Settings disclosure (the slim native toolbar, #61 step 3): the
+   *  re-hosted launchd/update machinery renders while open; the webview
+   *  never tears down — the page keeps its state through open/close. */
+  @Published var settingsOpen = false
+  /** The page view a deep link asked for (nil = no hash = the page's own
+   *  default). The webview loads <origin>#<view>; the page reads the hash
+   *  itself (server/public/index.html HASH_VIEW_RE). */
+  @Published var dashboardHash: String? = nil
 
   // settings
   @Published var repoPath: String = ""
@@ -404,15 +184,6 @@ final class AppModel: ObservableObject {
    *  mark when healthy; clears after a successful re-point (the state is
    *  re-read from real launchd on every poll). */
   @Published var menubarStale = false
-  /** Code-staleness (issue #49): true when the daemon's reported boot
-   *  commit and this checkout's HEAD differ — the running daemon process
-   *  predates the tree it runs from (launchd KeepAlive relaunches only
-   *  on crash; the release `version` handshake cannot see it). Exception-
-   *  Only: no tag when the daemon reports no revision (an old daemon) or
-   *  this app cannot read its own HEAD. The one-click fix is right there
-   *  in the Settings panel ("restart daemon"). */
-  @Published var daemonBehind = false
-
   /** The LOCAL arbiter agent (com.sam.idlefill.server, issue #60 Slice A —
    *  the fused Mac instance the Dashboard tab's webview loads). Three
    *  states matter, and `launchctl print` exit 0 alone cannot see them:
@@ -480,25 +251,17 @@ final class AppModel: ObservableObject {
 
   private(set) var repoRoot: String = AppModel.findRepoRoot()
 
-  private var logOffset: UInt64 = 0
-  private var logSeq = 0
-  private let maxLogLines = 2000
   private let uid = getuid()
 
   init() {
     loadConfig()
     refreshLaunchdState()
-    loadProjects()
-    pollLogs()
-    // Self-driving timers (main runloop — App init runs on the main thread).
+    // The lifecycle tick: launchd state is re-read from REAL launchctl
+    // every 5s. It is the only native poll left — every data surface
+    // lives on the embedded page, which polls the arbiter itself.
     Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-      self?.poll()
       self?.refreshLaunchdState()
     }
-    Timer.scheduledTimer(withTimeInterval: 2.5, repeats: true) { [weak self] _ in
-      self?.pollLogs()
-    }
-    poll()
   }
 
   // MARK: auto-update (Sparkle)
@@ -1283,40 +1046,41 @@ final class AppModel: ObservableObject {
     try? data.write(to: URL(fileURLWithPath: AppModel.appConfigPath()))
     repoPath = v.isEmpty ? repoRoot : v
     repoRoot = (repoPath as NSString).expandingTildeInPath
-    logOffset = 0
-    logLines = []
-    pollLogs()
-    poll()
     refreshLaunchdState()
-    loadProjects()
   }
-
-  var clientPkgDir: String { (repoRoot as NSString).appendingPathComponent("client") }
 
   // MARK: deep-link routing (pure — testable headlessly)
 
-  /** Map a URL to the tab it should open on. Hosts: "dashboard" → the
-   *  embedded arbiter page, "sessions" → Sessions, "logs" → Logs,
-   *  "projects" → Projects; "" or "open" → State (the settled menu-bar
-   *  handoff), any other host — or a non-idlefill scheme — → State. */
-  static func route(for url: URL) -> MainTab {
-    guard url.scheme == "idlefill" else { return .state }
+  /** Map a deep-link URL to the PAGE VIEW hash it should open. The one
+   *  surface is the embedded page (#61 step 3): every host re-points the
+   *  webview at the live origin with the page view's hash appended where
+   *  a page view exists — "state" → overview (the page's Overview view
+   *  carries the facts the old state tab showed), "sessions" → sessions,
+   *  "projects" → projects, "usage" → usage. "" / "open" / "dashboard" /
+   *  "logs" / any unknown host → nil: the page's default view (the logs
+   *  DOCK is a dock, not a hashable view). The page reads the hash
+   *  itself (server/public/index.html HASH_VIEW_RE). */
+  static func hashView(for url: URL) -> String? {
+    guard url.scheme == "idlefill" else { return nil }
     switch url.host {
-    case "dashboard": return .dashboard
-    case "sessions": return .sessions
-    case "logs": return .logs
-    case "projects": return .projects
-    default: return .state
+    case "state": return "overview"
+    case "sessions": return "sessions"
+    case "projects": return "projects"
+    case "usage": return "usage"
+    default: return nil
     }
   }
 
-  /** Apply a deep link: bring the app forward and switch to the tab the URL
-   *  names. Safe from both launch-time (.onOpenURL) and a running app —
-   *  activating an already-active app is a no-op. A WindowGroup app can end
-   *  up with more than one window (e.g. a URL-opened window alongside a
-   *  restored one); the deep link targets ONE window, so any extras are
-   *  closed and the first visible one is kept + focused. */
+  /** Apply a deep link: bring the app forward and re-point the webview at
+   *  the page view the URL names. Safe from both launch-time (.onOpenURL)
+   *  and a running app — activating an already-active app is a no-op. A
+   *  WindowGroup app can end up with more than one window (e.g. a
+   *  URL-opened window alongside a restored one); the deep link targets
+   *  ONE window, so any extras are closed and the first visible one is
+   *  kept + focused. The hash is stored on the model so a later Reload
+   *  keeps the operator on the view the link asked for. */
   func handleDeepLink(_ url: URL) {
+    let view = AppModel.hashView(for: url)
     DispatchQueue.main.async {
       NSApp.activate(ignoringOtherApps: true)
       let visible = NSApp.windows.filter { $0.isVisible }
@@ -1328,7 +1092,8 @@ final class AppModel: ObservableObject {
       if let win = visible.first {
         win.makeKeyAndOrderFront(nil)
       }
-      self.activeTab = AppModel.route(for: url)
+      self.dashboardHash = view
+      self.reloadDashboard()
     }
   }
 
@@ -1369,399 +1134,6 @@ final class AppModel: ObservableObject {
        let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
        let u = o["server_url"] as? String, !u.isEmpty { return u }
     return "http://100.105.225.1:8787"
-  }
-
-  /// The loopback router port from client/config.json (the sessions-tab
-  /// minting hint needs it; same file + same fallback discipline as
-  /// serverURL()). Default matches client/config.example.json.
-  func proxyPort() -> Int {
-    let path = (repoRoot as NSString).appendingPathComponent("client/config.json")
-    if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-       let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-       let p = o["proxy_port"] as? Double, p > 0 { return Int(p) }
-    return 11435
-  }
-
-  /// THIS machine's registered client name (client/config.json `client_name`
-  /// — issue #54). Registration is idempotent by name (#10), so the name is
-  /// the stable key for selecting my row on `/api/state`. nil = unreadable
-  /// config, which falls back to the old online-first guess.
-  func configuredClientName() -> String? {
-    let path = (repoRoot as NSString).appendingPathComponent("client/config.json")
-    guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-          let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-          let n = o["client_name"] as? String, !n.isEmpty else { return nil }
-    return n
-  }
-
-  // MARK: state poll (same parsing as the menubar app)
-
-  func poll() {
-    guard let tok = token() else {
-      conn = .unreachable
-      return
-    }
-    var req = URLRequest(url: URL(string: serverURL() + "/api/state")!)
-    req.timeoutInterval = 5
-    req.setValue("Bearer \(tok)", forHTTPHeaderField: "Authorization")
-    URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
-      guard let self else { return }
-      DispatchQueue.main.async { self.apply(data) }
-    }.resume()
-  }
-
-  private func apply(_ data: Data?) {
-    guard let data, let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
-      conn = .unreachable
-      return
-    }
-
-    // sessions — parsed on EVERY successful poll (before the clients
-    // guard: sessions are global interactive traffic; a payload whose
-    // clients[] is empty still carries the sessions truth). The pure
-    // projection is the single read site the Sessions panel renders.
-    sessions = SessionsView.project(payload: o, nowMs: Date().timeIntervalSince1970 * 1000)
-
-    // me — this machine's client row. ISSUE #54: a second client can now be
-    // online at the same time (a Linux box registered under its own name),
-    // so the old "first online, else first" guess can pick ANOTHER
-    // machine's row — which would point the #49 staleness comparison at
-    // the wrong daemon. Prefer the row whose name equals this checkout's
-    // configured client_name; only fall back to the old heuristic when the
-    // config is unreadable or this machine never registered under that name.
-    let clients = (o["clients"] as? [[String: Any]]) ?? []
-    let myName = configuredClientName()
-    let me = (myName.flatMap { n in clients.first(where: { ($0["name"] as? String) == n }) })
-        ?? clients.first(where: { ($0["online"] as? Bool) == true })
-        ?? clients.first
-    guard let c = me else {
-      conn = .unreachable
-      return
-    }
-    // Code-staleness (issue #49): compare MY row's boot `revision` against
-    // this checkout's CURRENT HEAD (read fresh — the whole point is that
-    // the tree moves under a running daemon). Exception-only: an old
-    // daemon that reports no revision renders as before. Client-side by
-    // design: the arbiter has no view of the operator's repo tree.
-    let meRevision = (c["revision"] as? String)
-    daemonBehind = Self.daemonBehind(reported: meRevision, checkout: currentCheckoutRevision())
-    // Client rows carry NO `online` flag (that lives on the arbiter's
-    // projects[].workers rows) — liveness = last_seen within 90s, the same
-    // window the arbiter uses for workers.
-    let lastSeen = (c["last_seen"] as? Double) ?? 0
-    if lastSeen > 0 {
-      lastSeenS = Int(Date().timeIntervalSince1970 * 1000 - lastSeen) / 1000
-    }
-    daemonRunning = lastSeen > 0 && (Date().timeIntervalSince1970 * 1000 - lastSeen) < 90_000
-
-    // my project rows
-    let projs = (c["projects"] as? [[String: Any]]) ?? []
-    queueDepth = projs.compactMap { $0["queue_depth"] as? Int }.reduce(0, +)
-    let finished = projs.compactMap { (($0["stats"] as? [String: Any])?["finished"] as? NSNumber)?.intValue }.reduce(0, +)
-    let failed = projs.compactMap { (($0["stats"] as? [String: Any])?["failed"] as? NSNumber)?.intValue }.reduce(0, +)
-    today = (finished, failed)
-
-    // running lease held by me
-    let leases = (o["active_leases"] as? [[String: Any]]) ?? []
-    let myLease = leases.first(where: { ($0["client_id"] as? String) == (c["client_id"] as? String) })
-    if let l = myLease {
-      lease = ((l["job_id"] as? String) ?? "?", (l["expires_at"] as? Double) ?? 0)
-    } else {
-      lease = ("", 0)
-    }
-
-    // the state word
-    guard daemonRunning else { conn = .off; return }
-    let idle = (o["idle"] as? [String: Any]) ?? [:]
-    switch ((idle["degraded"] as? Bool) == true, myLease != nil, (idle["idle"] as? Bool) == true) {
-    case (true, _, _): conn = .degraded
-    case (false, true, _): conn = .working
-    case (false, false, true): conn = .idle
-    default: conn = .busy
-    }
-  }
-
-  /** Test seam (the menubar's injectStatePayload precedent): run the REAL
-   *  poll-path apply() over a canned payload, headlessly. */
-  func injectStatePayload(_ payload: [String: Any]) {
-    guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
-    apply(data)
-  }
-
-  // MARK: sessions gate write (Pause / Resume — the desktop's interaction)
-
-  /** Flip one session's operator gate. The wire shape is built by the PURE
-   *  SessionsView.overrideRequest (POST /api/sessions/<token>/override,
-   *  {"override":"pause"|"null"}, Bearer header — the arbiter token rides
-   *  ONLY in the header, never the URL, never printed). Write-path UX
-   *  discipline (the Settings/Projects pattern): optimistic flip +
-   *  per-row in-flight disable; revert with a one-line error on failure;
-   *  a 404 (unknown_session — the arbiter restarted) re-polls at once so
-   *  the rows re-land on arbiter truth; success is confirmed by the next
-   *  5s poll. */
-  func setSessionOverride(sessionToken: String, paused: Bool) {
-    guard !pendingSessionTokens.contains(sessionToken) else { return }
-    guard let arbiterToken = token() else {
-      sessionsNote = "override failed: no arbiter token in client/config.json"
-      return
-    }
-    let req = SessionsView.overrideRequest(serverURL: serverURL(), sessionToken: sessionToken,
-                                           paused: paused, arbiterToken: arbiterToken)
-    // Optimistic: flip the row NOW (state word + button title follow it).
-    let prev = sessions
-    if let i = sessions.firstIndex(where: { $0.token == sessionToken }) {
-      let r = sessions[i]
-      sessions[i] = SessionRow(token: r.token, shortToken: r.shortToken, clientName: r.clientName,
-                               // Resume optimistically reads "Idle" (the
-                               // row's own timestamps are not carried on
-                               // the view row); the next poll re-derives
-                               // Active/Idle from arbiter truth.
-                               stateWord: paused ? "Paused" : "Idle",
-                               stale: r.stale, lastRequestText: r.lastRequestText,
-                               serverId: r.serverId, paused: paused,
-                               // The gate tag is the ROUTER's truth, not
-                               // the operator's — the optimistic flip
-                               // carries it unchanged until the next poll.
-                               queued: r.queued, waitingCount: r.waitingCount,
-                               actionTitle: paused ? "Resume" : "Pause")
-    }
-    pendingSessionTokens.insert(sessionToken)
-    URLSession.shared.dataTask(with: req) { [weak self] _, resp, err in
-      DispatchQueue.main.async {
-        guard let self else { return }
-        self.pendingSessionTokens.remove(sessionToken)
-        let status = (resp as? HTTPURLResponse)?.statusCode ?? -1
-        if err == nil && (status == 200 || status == 201) {
-          // Success: the optimistic row stands; the next 5s poll confirms
-          // it against arbiter truth. Clear any older error line.
-          self.sessionsNote = nil
-          return
-        }
-        // Failure: revert to the pre-click rows.
-        self.sessions = prev
-        if status == 404 {
-          // unknown_session (the arbiter restarted / the session is gone):
-          // re-poll immediately so the rows re-land on arbiter truth.
-          self.sessionsNote = "session unknown to the arbiter — refreshing"
-          self.poll()
-        } else if status == -1 {
-          self.sessionsNote = "override failed: could not reach the arbiter"
-        } else {
-          self.sessionsNote = "override failed: HTTP \(status)"
-        }
-      }
-    }.resume()
-  }
-
-  // MARK: log viewer
-
-  /** Resolve the daemon log path: <repo>/client/<entry>/logs/client.log where
-   *  <entry> is src in dev, dist after a build (mirrors the menubar's Show
-   *  Logs detection); if the entry dir's log is missing, fall back to
-   *  <repo>/client/logs/. */
-  func resolveLogPath() -> String? {
-    let fm = FileManager.default
-    let pkg = clientPkgDir
-    let entry = fm.fileExists(atPath: (pkg as NSString).appendingPathComponent("dist/index.ts")) ? "dist" : "src"
-    let entryLog = (((pkg as NSString).appendingPathComponent(entry) as NSString).appendingPathComponent("logs") as NSString).appendingPathComponent("client.log")
-    if fm.fileExists(atPath: entryLog) { return entryLog }
-    let fallback = ((pkg as NSString).appendingPathComponent("logs") as NSString).appendingPathComponent("client.log")
-    if fm.fileExists(atPath: fallback) { return fallback }
-    return nil
-  }
-
-  func pollLogs() {
-    let path = resolveLogPath()
-    if let p = path {
-      if p != logPath {
-        logPath = p
-        logOffset = 0
-        logLines = []
-      }
-      appendLog(path: p)
-    } else {
-      if logPath != "" { logPath = ""; logLines = []; logOffset = 0 }
-    }
-  }
-
-  private func appendLog(path: String) {
-    let fm = FileManager.default
-    guard let attrs = try? fm.attributesOfItem(atPath: path),
-          let size = (attrs[.size] as? NSNumber)?.uint64Value else { return }
-    if size < logOffset {
-      // rotated or truncated — restart from the top
-      logOffset = 0
-      logLines = []
-    }
-    guard size > logOffset else { return }
-    guard let handle = FileHandle(forReadingAtPath: path) else { return }
-    defer { try? handle.close() }
-    do {
-      try handle.seek(toOffset: logOffset)
-      let chunk = handle.readDataToEndOfFile()
-      logOffset += UInt64(chunk.count)
-      guard let text = String(data: chunk, encoding: .utf8) else { return }
-      for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
-        logLines.append(LogLine(id: logSeq, text: String(line)))
-        logSeq += 1
-      }
-      if logLines.count > maxLogLines {
-        logLines.removeFirst(logLines.count - maxLogLines)
-      }
-    } catch {}
-  }
-
-  // MARK: projects (this client's config.json)
-
-  /** One editable row of the Projects view. The fields map 1:1 onto the
-   *  project keys in client/config.json (see client/src/config.ts). */
-  struct ProjectRow: Identifiable {
-    let id: Int
-    var name: String
-    var model: String
-    var queueFile: String
-    var estimatedSeconds: String
-    var timeoutSeconds: String
-    let executor: String
-    let cwd: String
-  }
-
-  private var clientConfigPath: String {
-    (repoRoot as NSString).appendingPathComponent("client/config.json")
-  }
-
-  /** Read this client's config at runtime (the same pattern as token()/
-   *  serverURL() — never baked in) and fill the Projects view. The token is
-   *  parsed but NEVER copied into a view-facing property. */
-  func loadProjects() {
-    let path = clientConfigPath
-    guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-          let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-      projClientName = ""
-      projServerURL = ""
-      projRows = []
-      projNote = "no client config found at \(path)"
-      projSavedPendingRestart = false
-      return
-    }
-    projNote = nil
-    projClientName = (o["client_name"] as? String) ?? ""
-    projServerURL = (o["server_url"] as? String) ?? ""
-    var rows: [ProjectRow] = []
-    for (i, p) in ((o["projects"] as? [[String: Any]]) ?? []).enumerated() {
-      rows.append(ProjectRow(
-        id: i,
-        name: (p["name"] as? String) ?? "",
-        model: (p["model"] as? String) ?? "",
-        queueFile: (p["queue_file"] as? String) ?? "",
-        estimatedSeconds: numText(p["estimated_seconds"]),
-        timeoutSeconds: numText(p["timeout_seconds"]),
-        executor: (p["executor"] as? String) ?? "",
-        cwd: (p["cwd"] as? String) ?? ""
-      ))
-    }
-    projRows = rows
-  }
-
-  private func numText(_ v: Any?) -> String {
-    if let n = v as? NSNumber {
-      let d = n.doubleValue
-      return d == d.rounded() ? String(Int(d)) : String(d)
-    }
-    return ""
-  }
-
-  /** Validate the edited rows: per row, name / model / queue_file are
-   *  required, and the numeric fields are positive numbers when non-empty.
-   *  Returns an error message, or nil when clean. */
-  func validateProjects() -> String? {
-    for r in projRows {
-      if r.name.trimmingCharacters(in: .whitespaces).isEmpty {
-        return "row \(r.id + 1): name is required"
-      }
-      if r.model.trimmingCharacters(in: .whitespaces).isEmpty {
-        return "row \(r.id + 1): model is required"
-      }
-      if r.queueFile.trimmingCharacters(in: .whitespaces).isEmpty {
-        return "row \(r.id + 1): queue_file is required"
-      }
-      for (label, text) in [("estimated_seconds", r.estimatedSeconds), ("timeout_seconds", r.timeoutSeconds)] {
-        let t = text.trimmingCharacters(in: .whitespaces)
-        if !t.isEmpty {
-          guard let d = Double(t), d.isFinite, d > 0 else {
-            return "row \(r.id + 1): \(label) must be a positive number"
-          }
-        }
-      }
-    }
-    return nil
-  }
-
-  /** Rewrite client/config.json with the edited project rows, preserving
-   *  EVERY other key (the token included) and the file's existing mode
-   *  (read before, chmod'd back after). Only the project-row fields the view
-   *  edits are mutated; all other keys pass through untouched. On success:
-   *  the "daemon restart to apply" note with a Restart affordance. */
-  func saveProjects() {
-    let path = clientConfigPath
-    if let err = validateProjects() {
-      projNote = err
-      projSavedPendingRestart = false
-      return
-    }
-    guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
-      projNote = "save failed: could not read \(path)"
-      projSavedPendingRestart = false
-      return
-    }
-    guard let parsed = (try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])) as? [String: Any] else {
-      projNote = "save failed: could not read \(path)"
-      projSavedPendingRestart = false
-      return
-    }
-    var o = parsed
-    let fm = FileManager.default
-    // Capture the existing mode BEFORE writing — it must be restored after.
-    let existingMode = (try? fm.attributesOfItem(atPath: path)[.posixPermissions] as? NSNumber)?.int16Value
-
-    var newProjects: [[String: Any]] = []
-    for (i, p) in ((o["projects"] as? [[String: Any]]) ?? []).enumerated() {
-      guard i < projRows.count else { continue }
-      let r = projRows[i]
-      var np = p
-      np["name"] = r.name.trimmingCharacters(in: .whitespaces)
-      np["model"] = r.model.trimmingCharacters(in: .whitespaces)
-      np["queue_file"] = r.queueFile.trimmingCharacters(in: .whitespaces)
-      let est = r.estimatedSeconds.trimmingCharacters(in: .whitespaces)
-      if est.isEmpty {
-        np.removeValue(forKey: "estimated_seconds")
-      } else if let d = Double(est) {
-        np["estimated_seconds"] = d == d.rounded() ? Int(d) : d
-      }
-      let to = r.timeoutSeconds.trimmingCharacters(in: .whitespaces)
-      if to.isEmpty {
-        np.removeValue(forKey: "timeout_seconds")
-      } else if let d = Double(to) {
-        np["timeout_seconds"] = d == d.rounded() ? Int(d) : d
-      }
-      newProjects.append(np)
-    }
-    o["projects"] = newProjects
-
-    let out = (try? JSONSerialization.data(withJSONObject: o, options: [.prettyPrinted, .sortedKeys]))
-    do {
-      guard let out else { throw CocoaError(.fileWriteUnknown) }
-      try out.write(to: URL(fileURLWithPath: path), options: .atomic)
-      if let m = existingMode {
-        try? fm.setAttributes([.posixPermissions: NSNumber(value: m)], ofItemAtPath: path)
-      }
-      projNote = nil
-      projSavedPendingRestart = true
-      loadProjects()
-    } catch {
-      projNote = "save failed: \(error.localizedDescription)"
-      projSavedPendingRestart = false
-    }
   }
 
   // MARK: launchd management (opt-in, gui/<uid>, real state only)
@@ -1902,36 +1274,6 @@ final class AppModel: ObservableObject {
     return nil
   }
 
-  /** The code-staleness rule (issue #49), PURE so the headless harness
-   *  proves what renders. `reported` is the daemon's boot commit from the
-   *  client row (`revision` — the FULL SHA), `checkout` this app's own
-   *  `git rev-parse --short HEAD`. The short form is unique in this repo
-   *  (the update machinery already relies on short-sha identity), so an
-   *  unambiguous prefix match counts as the SAME commit. Any real
-   *  mismatch -> true (the tag clears when the daemon restarts and
-   *  re-registers with its new boot commit — one heartbeat, well inside
-   *  the 5s poll). Absent/blank on either side (an old daemon, an
-   *  unreadable checkout) -> false: render exactly as before. */
-  static func daemonBehind(reported: String?, checkout: String?) -> Bool {
-    let r = (reported ?? "").trimmingCharacters(in: .whitespaces).lowercased()
-    let h = (checkout ?? "").trimmingCharacters(in: .whitespaces).lowercased()
-    guard !r.isEmpty, !h.isEmpty else { return false }
-    return !(r == h || r.hasPrefix(h) || h.hasPrefix(r))
-  }
-
-  /** This checkout's current HEAD (`git rev-parse --short HEAD` in
-   *  `repoRoot`) — best-effort, nil on any failure (no git, not a repo).
-   *  Read fresh on each poll: the tree moves ahead while the daemon
-   *  keeps running, and that gap is exactly what the comparison needs.
-   *  One local git call per 5s poll — cheap, and the launchd-state tick
-   *  already runs launchctl per tick. */
-  func currentCheckoutRevision() -> String? {
-    let (st, out) = runCmd("/usr/bin/git", ["-C", repoRoot, "rev-parse", "--short", "HEAD"])
-    guard st == 0 else { return nil }
-    let s = out.trimmingCharacters(in: .whitespacesAndNewlines)
-    return s.isEmpty ? nil : s
-  }
-
   /** Run a command, capturing stdout/stderr to a TEMP FILE (a Pipe +
    *  waitUntilExit deadlocks once the child emits more than the 64 KB pipe
    *  buffer — see the menubar's daemonPIDs pattern). Returns (exit, output).
@@ -2070,23 +1412,6 @@ final class AppModel: ObservableObject {
     } else {
       uninstall(label: daemonLabel, note: \.daemonNote)
     }
-  }
-
-  /** Restart the daemon through the SAME launchd path the Settings toggle
-   *  uses (kickstart -k = kill + relaunch under the agent's KeepAlive). The
-   *  Projects view's "restart to apply" affordance calls this after a config
-   *  save; a successful kickstart clears the pending-restart note — the
-   *  daemon now runs with the saved config. In a test/scratch context the
-   *  test-hook label applies. */
-  func restartDaemon() {
-    let (st, out) = runCmd("/bin/launchctl", ["kickstart", "-k", "gui/\(uid)/\(daemonLabel)"])
-    if st == 0 {
-      daemonNote = nil
-      projSavedPendingRestart = false
-    } else {
-      daemonNote = "restart failed: \(out)"
-    }
-    refreshLaunchdState()
   }
 
   // MARK: local arbiter agent (issue #60 Slice A)
@@ -2334,19 +1659,6 @@ final class AppModel: ObservableObject {
 
 // MARK: - views
 
-struct KVRow: View {
-  let k: String
-  let v: String
-  var vcolor: Color = Pal.text
-  var body: some View {
-    HStack {
-      Text(k).font(.system(.body, design: .monospaced)).foregroundStyle(Pal.dim)
-      Spacer(minLength: 16)
-      Text(v).font(.system(.body, design: .monospaced)).foregroundStyle(vcolor)
-    }
-  }
-}
-
 struct DividerLine: View {
   var body: some View {
     Rectangle().fill(Pal.hairline).frame(height: 1)
@@ -2360,434 +1672,6 @@ struct PanelHead: View {
       .font(.system(size: 11, weight: .semibold, design: .monospaced))
       .tracking(1)
       .foregroundStyle(Pal.dim)
-  }
-}
-
-struct LogoView: View {
-  let spinning: Bool
-  @State private var angle: Double = 0
-
-  var body: some View {
-    ZStack {
-      Circle().stroke(Pal.hairline, lineWidth: 2)
-      Circle()
-        .trim(from: 0, to: 0.75)
-        .stroke(Pal.accent, style: StrokeStyle(lineWidth: 2, lineCap: .round))
-        .rotationEffect(.degrees(angle - 90))
-    }
-    .onChange(of: spinning) { _, on in
-      if on {
-        withAnimation(.linear(duration: 1.2).repeatForever(autoreverses: false)) {
-          angle += 360
-        }
-      } else {
-        withAnimation(.easeOut(duration: 0.2)) { angle = 0 }
-      }
-    }
-  }
-}
-
-// MARK: state panel
-
-struct StatePanel: View {
-  @ObservedObject var m: AppModel
-
-  var body: some View {
-    VStack(alignment: .leading, spacing: 0) {
-      PanelHead(title: "state")
-      VStack(spacing: 4) {
-        KVRow(k: "arbiter", v: m.conn.word, vcolor: m.conn.color)
-        KVRow(k: "this machine", v: statusRow)
-        // Code-staleness (issue #49) — Exception-Only: renders only when
-        // the running daemon predates this checkout (amber, the exception
-        // color this panel's markers use). The fix is the Settings tab's
-        // "restart daemon" button — one heartbeat clears the tag.
-        if m.daemonBehind {
-          KVRow(k: "", v: "daemon behind", vcolor: Pal.warn)
-        }
-        KVRow(k: "queue", v: "\(m.queueDepth)")
-        KVRow(k: "today", v: "\(m.today.finished) ok · \(m.today.failed) failed")
-        if m.lease.1 > 0 {
-          KVRow(k: "running", v: leaseRow, vcolor: Pal.accent)
-        }
-      }
-      .padding(14).padding(.vertical, 8)
-    }
-  }
-
-  private var statusRow: String {
-    if !m.daemonRunning { return "stopped" }
-    if let s = m.lastSeenS, s >= 120 { return "stale (\(s / 60) min)" }
-    return m.conn.word
-  }
-
-  private var leaseRow: String {
-    let left = Int(max(0, m.lease.1 / 1000 - Date().timeIntervalSince1970))
-    return "\(m.lease.0) · auto-cancels \(left / 60)m \(left % 60)s"
-  }
-}
-
-// MARK: sessions
-
-/** The sessions tab: EVERY interactive session the arbiter knows (the
- *  interaction surface — the healthy rows must be visible to be paused),
- *  rendered from the pure SessionsView.project rows. Row semantics mirror
- *  the dashboard (server/public/index.html sessBlock): short token +
- *  client_name, "last request …", → server_id, the stale tag + dim on a
- *  lapsed heartbeat (NOT a state word), the state word, and the one-button
- *  gate (Pause / Resume). Empty sessions[] → a quiet empty state, never a
- *  blank pane. */
-struct SessionsPanel: View {
-  @ObservedObject var m: AppModel
-
-  var body: some View {
-    VStack(alignment: .leading, spacing: 0) {
-      // R1/R6: no duplicate "SESSIONS" header (the tab already says it) —
-      // the count rides with its noun, left-aligned where the header was.
-      Text("\(m.sessions.count) session\(m.sessions.count == 1 ? "" : "s")")
-        .font(.system(size: 11, weight: .semibold, design: .monospaced))
-        .tracking(1)
-        .foregroundStyle(Pal.dim)
-        .padding(.horizontal, 14).padding(.top, 12).padding(.bottom, 6)
-      if m.sessions.isEmpty {
-        VStack(alignment: .leading, spacing: 8) {
-          Text("no sessions — Hermes sessions pointed at this router appear here")
-            .font(.system(.caption, design: .monospaced))
-            .italic()
-            .foregroundStyle(Pal.dim)
-          // R9: the void gets the one action that fills it. The port is
-          // this client's real proxy_port (config.json, default 11435).
-          Text("point one here:  /model http://127.0.0.1:\(m.proxyPort())/s/<token>")
-            .font(.system(size: 11, design: .monospaced))
-            .foregroundStyle(Pal.text.opacity(0.75))
-            .textSelection(.enabled)
-            .padding(.horizontal, 8).padding(.vertical, 4)
-            .background(RoundedRectangle(cornerRadius: 4).fill(Pal.panel))
-        }
-        .padding(14)
-      } else {
-        ScrollView {
-          VStack(spacing: 0) {
-            ForEach(m.sessions) { row in
-              sessionRow(row, pending: m.pendingSessionTokens.contains(row.token))
-              Rectangle().fill(Pal.hairline.opacity(0.5)).frame(height: 1)
-            }
-          }
-        }
-        .frame(maxHeight: .infinity)
-      }
-      if let note = m.sessionsNote {
-        Text(note)
-          .font(.system(size: 11, design: .monospaced))
-          .foregroundStyle(Pal.err)
-          .padding(.horizontal, 14).padding(.vertical, 6)
-      }
-    }
-  }
-
-  @ViewBuilder
-  private func sessionRow(_ row: SessionRow, pending: Bool) -> some View {
-    // R8: ONE vertical axis — the whole HStack is center-aligned; the old
-    // first-baseline dot vs centered right cluster made the row off-kilter.
-    // R3: the decorative dot is gone — the state WORD is the single status
-    // affordance (HIG: status is text, color only reinforces it).
-    HStack(spacing: 10) {
-      VStack(alignment: .leading, spacing: 2) {
-        HStack(spacing: 8) {
-          // The short prefix labels the row; the FULL token rides in the
-          // tooltip (the operator matches it against the router URL).
-          Text(row.shortToken)
-            .font(.system(size: 12, weight: .semibold, design: .monospaced))
-            .foregroundStyle(row.stale ? Pal.dim : Pal.text)
-            .help("session \(row.token)")
-          // R4: the host is a CHIP, not dim text glued to the name — it
-          // must not read as part of the session's name. Same treatment
-          // as the stale/queued tags (one chip language for the row).
-          if let name = row.clientName {
-            Text(name)
-              .font(.system(size: 10, design: .monospaced))
-              .foregroundStyle(Pal.dim)
-              .padding(.horizontal, 5).padding(.vertical, 1)
-              .overlay(RoundedRectangle(cornerRadius: 3).stroke(Pal.hairline))
-              .help("the machine this session's router runs on")
-          }
-          if row.stale {
-            Text("stale")
-              .font(.system(size: 10, design: .monospaced))
-              .foregroundStyle(Pal.dim)
-              .padding(.horizontal, 5).padding(.vertical, 1)
-              .overlay(RoundedRectangle(cornerRadius: 3).stroke(Pal.hairline))
-              .help("no heartbeat from this session in the last 90s — the router may have dropped it")
-          }
-        }
-        HStack(spacing: 8) {
-          Text(row.lastRequestText)
-            .font(.system(size: 11, design: .monospaced))
-            .foregroundStyle(Pal.dim)
-            .help("the newest request the router saw on this session")
-          if let sid = row.serverId {
-            Text("→ \(sid)")
-              .font(.system(size: 11, design: .monospaced))
-              .foregroundStyle(Pal.dim)
-              .help("the engine this session routes to")
-          }
-        }
-      }
-      Spacer(minLength: 16)
-      // gate-state: the router reports parked requests waiting for
-      // admission. An ADDITIONAL fact beside the state word (like `stale`
-      // is beside the token) — the state word itself never changes, so a
-      // paused row with parked traffic shows both.
-      if row.queued {
-        Text(row.waitingCount > 1 ? "queued · \(row.waitingCount) waiting" : "queued")
-          .font(.system(size: 10, design: .monospaced))
-          .foregroundStyle(Pal.dim)
-          .padding(.horizontal, 5).padding(.vertical, 1)
-          .overlay(RoundedRectangle(cornerRadius: 3).stroke(Pal.hairline))
-          .help("held at the router behind another session")
-      }
-      Text(row.stateWord)
-        .font(.system(size: 12, weight: .semibold, design: .monospaced))
-        .foregroundStyle(Self.stateColor(row.stateWord))
-        .help(Self.stateNote(row.stateWord))
-        .accessibilityLabel("status \(row.stateWord)")
-      // R5: a real control, not a ghost outline glued to the state word —
-      // filled panel background + visible border + a clear gap from the
-      // Spacer(minLength: 16) above, so "Active" never reads as its label.
-      Button(action: { m.setSessionOverride(sessionToken: row.token, paused: !row.paused) }) {
-        Text(pending ? "…" : row.actionTitle)
-          .font(.system(size: 11, weight: .semibold, design: .monospaced))
-          .foregroundStyle(Pal.text)
-          .padding(.horizontal, 12).padding(.vertical, 5)
-          .background(RoundedRectangle(cornerRadius: 5).fill(Pal.panel))
-          .overlay(RoundedRectangle(cornerRadius: 5).stroke(Pal.dim.opacity(0.7), lineWidth: 1))
-          .contentShape(Rectangle())
-      }
-      .buttonStyle(.plain)
-      .disabled(pending)
-      .help(row.paused ? "open the gate — resume this session's traffic"
-                        : "hold this session's traffic at the router")
-    }
-    .padding(.horizontal, 14).padding(.vertical, 10)
-    // Stale is a DIM, not a state word (the dashboard's rule). R7: the dim
-    // is a COLOR swap on the row's name (below), not a row opacity — the
-    // old 0.55 opacity dragged text to 2.7:1 on the near-black canvas
-    // (fails WCAG AA). A dimmed name still reads faded beside a white one,
-    // and every glyph stays >= 6:1.
-    .background(
-      // Per-row in-flight marker: a hairline accent wash while THIS row's
-      // write runs (the button shows "…" and is disabled).
-      Group { if pending { Rectangle().fill(Pal.accent.opacity(0.06)) } }
-    )
-  }
-
-  static func stateColor(_ w: String) -> Color {
-    switch w {
-    case "Paused": return Pal.warn
-    case "Active": return Pal.ok
-    default: return Pal.dim
-    }
-  }
-  static func stateNote(_ w: String) -> String {
-    switch w {
-    case "Paused": return "paused — the router holds this session's traffic"
-    case "Active": return "a request was seen on this session just now"
-    default: return "no request seen on this session recently"
-    }
-  }
-}
-
-// MARK: log viewer
-
-private struct SentinelKey: PreferenceKey {
-  static var defaultValue: Double = .infinity
-  static func reduce(value: inout Double, nextValue: () -> Double) { value = min(value, nextValue()) }
-}
-
-private struct ViewportKey: PreferenceKey {
-  static var defaultValue: Double = 0
-  static func reduce(value: inout Double, nextValue: () -> Double) { value = nextValue() }
-}
-
-struct LogViewer: View {
-  @ObservedObject var m: AppModel
-  @State private var sentinelY = Double.infinity
-  @State private var viewportH = 0.0
-  private let sentinelID = 999_999_999
-
-  /// The user is at the tail when the sentinel's top edge sits at (or past)
-  /// the bottom of the viewport.
-  private var atBottom: Bool { sentinelY <= viewportH + 2 }
-
-  var body: some View {
-    ScrollViewReader { proxy in
-      VStack(alignment: .leading, spacing: 0) {
-        HStack {
-          PanelHead(title: "logs")
-          Spacer()
-          Button(action: {
-            m.followTail.toggle()
-            if m.followTail {
-              proxy.scrollTo(sentinelID, anchor: .bottom)
-            }
-          }) {
-            Text(m.followTail ? "follow tail: on" : "follow tail: off")
-              .font(.system(size: 11, design: .monospaced))
-              .foregroundStyle(m.followTail ? Pal.dim : Pal.warn)
-          }
-          .buttonStyle(.plain)
-        }
-        .padding(.horizontal, 14).padding(.top, 8).padding(.bottom, 4)
-
-        if m.logPath == "" {
-          Text("no client log found at \(m.repoRoot)/client/")
-            .font(.system(.caption, design: .monospaced))
-            .italic()
-            .foregroundStyle(Pal.dim)
-            .padding(14)
-        } else {
-          ScrollView {
-            LazyVStack(alignment: .leading, spacing: 0) {
-              ForEach(m.logLines) { line in
-                Text(line.text.isEmpty ? " " : line.text)
-                  .font(.system(size: 11, design: .monospaced))
-                  .foregroundStyle(Pal.text)
-                  .frame(maxWidth: .infinity, alignment: .leading)
-                  .padding(.horizontal, 14).padding(.vertical, 1)
-                  .overlay(alignment: .bottom) {
-                    Rectangle().fill(Pal.hairline.opacity(0.5)).frame(height: 1)
-                  }
-                  .id(line.id)
-              }
-              // Sentinel at the tail: its position in the viewport is how we
-              // tell whether the user is at the bottom.
-              Color.clear.frame(height: 1)
-                .background(
-                  GeometryReader { geo in
-                    Color.clear.preference(key: SentinelKey.self,
-                      value: geo.frame(in: .named("logs")).minY)
-                  }
-                )
-                .id(sentinelID)
-            }
-            .padding(.bottom, 8)
-          }
-          .coordinateSpace(name: "logs")
-          .background(
-            GeometryReader { geo in
-              Color.clear.preference(key: ViewportKey.self, value: Double(geo.size.height))
-            }
-          )
-          .clipped()
-          .onChange(of: m.logLines.count) { _, _ in
-            if m.followTail && atBottom {
-              proxy.scrollTo(sentinelID, anchor: .bottom)
-            }
-          }
-          .onAppear { proxy.scrollTo(sentinelID, anchor: .bottom) }
-        }
-      }
-      .onPreferenceChange(SentinelKey.self) { sentinelY = $0 }
-      .onPreferenceChange(ViewportKey.self) { viewportH = $0 }
-    }
-  }
-}
-
-// MARK: projects
-
-struct ProjectsPanel: View {
-  @ObservedObject var m: AppModel
-
-  var body: some View {
-    VStack(alignment: .leading, spacing: 0) {
-      PanelHead(title: "projects")
-      VStack(alignment: .leading, spacing: 8) {
-        KVRow(k: "client_name", v: m.projClientName)
-        KVRow(k: "server_url", v: m.projServerURL)
-
-        ForEach(m.projRows) { r in
-          projectBlock(r)
-        }
-
-        if m.projRows.isEmpty {
-          Text(m.projNote ?? "no projects configured")
-            .font(.system(.caption, design: .monospaced))
-            .foregroundStyle(Pal.dim)
-        }
-
-        HStack(spacing: 8) {
-          Button("save") { m.saveProjects() }
-            .font(.system(.body, design: .monospaced))
-            .buttonStyle(.plain)
-            .foregroundStyle(Pal.accent)
-          if m.projSavedPendingRestart {
-            Text("saved — daemon restart to apply").font(.system(.caption, design: .monospaced)).foregroundStyle(Pal.warn)
-            Button("restart daemon") { m.restartDaemon() }
-              .font(.system(.body, design: .monospaced))
-              .buttonStyle(.plain)
-              .foregroundStyle(Pal.accent)
-          }
-        }
-
-        if let note = m.projNote {
-          Text(note).font(.system(.caption, design: .monospaced)).foregroundStyle(Pal.err)
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-
-        Text("edits rewrite client/config.json — every other key (including the token) is preserved and the file keeps its 0600 mode; the daemon picks changes up on its next start.")
-          .font(.system(size: 11, design: .monospaced))
-          .foregroundStyle(Pal.dim)
-          .frame(maxWidth: .infinity, alignment: .leading)
-      }
-      .padding(14).padding(.vertical, 8)
-    }
-  }
-
-  @ViewBuilder
-  private func projectBlock(_ r: AppModel.ProjectRow) -> some View {
-    VStack(alignment: .leading, spacing: 4) {
-      Text(r.name.isEmpty ? "project" : r.name)
-        .font(.system(.body, design: .monospaced).weight(.semibold))
-        .foregroundStyle(Pal.text)
-      editField("name", text: binding(\.name, r.id))
-      editField("model", text: binding(\.model, r.id))
-      editField("queue_file", text: binding(\.queueFile, r.id))
-      editField("estimated_seconds", text: binding(\.estimatedSeconds, r.id))
-      editField("timeout_seconds", text: binding(\.timeoutSeconds, r.id))
-      KVRow(k: "executor", v: r.executor)
-      KVRow(k: "cwd", v: r.cwd)
-    }
-    .padding(10)
-    .frame(maxWidth: .infinity, alignment: .leading)
-    .background(Pal.panel)
-    .clipShape(RoundedRectangle(cornerRadius: 6))
-  }
-
-  private func editField(_ label: String, text: Binding<String>) -> some View {
-    HStack(spacing: 8) {
-      Text(label).font(.system(.body, design: .monospaced)).foregroundStyle(Pal.dim)
-        .frame(width: 150, alignment: .leading)
-      TextField("", text: text)
-        .font(.system(.body, design: .monospaced))
-        .textFieldStyle(.plain)
-        .foregroundStyle(Pal.text)
-        .background(Pal.canvas)
-        .clipShape(RoundedRectangle(cornerRadius: 4))
-        .padding(4)
-    }
-  }
-
-  private func binding(_ kp: WritableKeyPath<AppModel.ProjectRow, String>, _ id: Int) -> Binding<String> {
-    Binding(
-      get: {
-        guard let i = m.projRows.firstIndex(where: { $0.id == id }) else { return "" }
-        return m.projRows[i][keyPath: kp]
-      },
-      set: { nv in
-        guard let i = m.projRows.firstIndex(where: { $0.id == id }) else { return }
-        m.projRows[i][keyPath: kp] = nv
-      }
-    )
   }
 }
 
@@ -3097,14 +1981,16 @@ extension AppModel {
     return "(function(){try{localStorage.setItem(\"\(AppModel.gateTokenKey)\", \(literal));}catch(e){}})();"
   }
 
-  /// The page's live origin: server_url from client/config.json (0600),
-  /// root path. Never a hardcoded host, never a file: URL into a bundled
-  /// copy of index.html — a copied page re-creates the drift bug inside
-  /// the bundle. The arbiter serves its own version-matched page.
+  /// The page's live origin: server_url from client/config.json (0600) +
+  /// the deep-link view hash when one is set (#overview/#projects/
+  /// #sessions/#usage). Never a hardcoded host, never a file: URL into a
+  /// bundled copy of index.html — a copied page re-creates the drift bug
+  /// inside the bundle. The arbiter serves its own version-matched page.
   func dashboardURL() -> URL? {
     let u = serverURL()
-    guard !u.isEmpty, let url = URL(string: u.hasSuffix("/") ? u : u + "/") else { return nil }
-    return url
+    guard !u.isEmpty else { return nil }
+    let frag = dashboardHash.map { "#" + $0 } ?? ""
+    return URL(string: (u.hasSuffix("/") ? u : u + "/") + frag)
   }
 
   /// Arm the documentStart token script for the CURRENT config, then load
@@ -3130,14 +2016,19 @@ struct DashboardWebView: NSViewRepresentable {
   func updateNSView(_ nsView: WKWebView, context: Context) {}
 }
 
-/// The DASHBOARD tab: the arbiter's own page, hosted. The slim strip
-/// carries only facts the page cannot know (which origin the app points
-/// at) and the one action the page must not own (reload the host).
+/// THE surface: the arbiter's own page, hosted, under the slim native
+/// toolbar (the #61 step 3 shape). The strip carries only facts the page
+/// cannot know (which origin the app points at, the launchd agent's REAL
+/// liveness) and the actions the page must not own (reload the host,
+/// open the native lifecycle settings the arbiter can never know about).
 struct DashboardPanel: View {
   @ObservedObject var m: AppModel
   var body: some View {
     VStack(spacing: 0) {
       HStack(spacing: 8) {
+        Text("idlefill · desktop")
+          .font(.system(size: 12, weight: .semibold, design: .monospaced))
+          .foregroundStyle(Pal.text)
         Text("arbiter origin")
           .font(.system(size: 11, design: .monospaced))
           .foregroundStyle(Pal.dim)
@@ -3152,7 +2043,7 @@ struct DashboardPanel: View {
         // clean-exit death — the service reads "loaded", the page renders
         // blank against the canvas fill). Exception-Only: nothing here
         // while the agent runs. The fix is inline — same kickstart the
-        // Settings row uses — then Reload re-points the webview.
+        // Settings toggle uses — then Reload re-points the webview.
         if m.arbiterLoaded && !m.arbiterRunning {
           Text("arbiter stopped").font(.system(size: 11, weight: .semibold, design: .monospaced))
             .foregroundStyle(Pal.err)
@@ -3163,11 +2054,26 @@ struct DashboardPanel: View {
             .help("launchctl kickstart the arbiter agent, then reload this page")
         }
         Spacer()
+        Button(m.settingsOpen ? "settings ▾" : "settings ▸") { m.settingsOpen.toggle() }
+          .font(.system(size: 11, weight: .semibold, design: .monospaced))
+          .buttonStyle(.plain)
+          .foregroundStyle(m.settingsOpen ? Pal.text : Pal.dim.opacity(0.8))
+          .help("launchd agents, repo path, updates — the native lifecycle the page can never own")
         Button("Reload") { m.reloadDashboard() }
           .controlSize(.small)
           .help("reload the page and re-inject the current token")
       }
       .padding(.horizontal, 14).padding(.vertical, 6)
+      // The disclosure: the Settings content re-hosted between the strip
+      // and the webview. The webview NEVER tears down around it — the
+      // embedded page keeps its state through an open/close.
+      if m.settingsOpen {
+        DividerLine()
+        ScrollView {
+          SettingsPanel(m: m)
+        }
+        .frame(maxHeight: 420)
+      }
       DividerLine()
       DashboardWebView(m: m)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -3183,88 +2089,16 @@ struct DashboardPanel: View {
 
 // MARK: content
 
+/// The window IS the surface: the hosted page under the slim native
+/// toolbar (#61 step 3 — the five Swift tabs retired with their parity
+/// built into the page).
 struct ContentView: View {
   @ObservedObject var m: AppModel
 
   var body: some View {
-    VStack(spacing: 0) {
-      HStack(spacing: 8) {
-        LogoView(spinning: m.lease.1 > 0)
-          .frame(width: 16, height: 16)
-          // R2: the ring spins ONLY while this machine holds a running
-          // lease — say so, so it never reads as a generic "loading".
-          .help(m.lease.1 > 0 ? "running an idle task: \(m.lease.0)" : "idle — no task running on this machine")
-        Text("idlefill · desktop")
-          .font(.system(.headline, design: .monospaced).weight(.semibold))
-          .foregroundStyle(Pal.text)
-        Spacer()
-        // R2: the word is SCOPED. Bare green "idle" beside green "Active"
-        // rows read as a contradiction — this is the ARBITER's verdict for
-        // this machine, so say whose status it is (same word/color the
-        // STATE tab's "arbiter" row shows).
-        Text("arbiter")
-          .font(.system(.body, design: .monospaced))
-          .foregroundStyle(Pal.dim)
-        Text(m.conn.word)
-          .font(.system(.body, design: .monospaced).weight(.semibold))
-          .foregroundStyle(m.conn.color)
-      }
-      .padding(.horizontal, 14).padding(.top, 12).padding(.bottom, 8)
-
-      DividerLine()
-
-      // tab strip (deep links set m.activeTab; the buttons set it too)
-      HStack(spacing: 0) {
-        ForEach(MainTab.allCases, id: \.self) { tab in
-          Button(action: { m.activeTab = tab }) {
-            Text(tab.title)
-              .font(.system(size: 11, weight: .semibold, design: .monospaced))
-              .tracking(1)
-              // R7: the active/inactive gap was white-vs-dim (both readable,
-              // nearly the same weight at a glance). A mid-tone inactive
-              // keeps the terminal look and widens the ramp. 0.8 is the
-              // floor: it composites to exactly 4.5:1 on the canvas (AA).
-              .foregroundStyle(m.activeTab == tab ? Pal.text : Pal.dim.opacity(0.8))
-              .padding(.horizontal, 14).padding(.vertical, 7)
-              .overlay(alignment: .bottom) {
-                if m.activeTab == tab {
-                  Rectangle().fill(Pal.accent).frame(height: 2)
-                }
-              }
-              .contentShape(Rectangle())
-          }
-          .buttonStyle(.plain)
-          .accessibilityLabel(tab.rawValue)
-          .accessibilityAddTraits(m.activeTab == tab ? .isSelected : [])
-        }
-        Spacer()
-      }
-
-      DividerLine()
-
-      Group {
-        switch m.activeTab {
-        case .dashboard:
-          DashboardPanel(m: m)
-            .frame(maxHeight: .infinity)
-        case .state:
-          StatePanel(m: m)
-        case .sessions:
-          SessionsPanel(m: m)
-            .frame(maxHeight: .infinity)
-        case .logs:
-          LogViewer(m: m)
-            .frame(maxHeight: .infinity)
-        case .projects:
-          ProjectsPanel(m: m)
-        case .settings:
-          SettingsPanel(m: m)
-        }
-      }
-      .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-    }
-    .background(Pal.canvas)
-    .frame(minWidth: 560, minHeight: 560)
+    DashboardPanel(m: m)
+      .background(Pal.canvas)
+      .frame(minWidth: 560, minHeight: 560)
   }
 }
 
