@@ -267,8 +267,8 @@ even with free slots; `force` bypasses the slot cap for that session.
 
 **Gate-state visibility.** The register heartbeat also carries what the
 router's queue knows about the session, so the arbiter's session rows — and
-every sessions surface: the desktop's SESSIONS tab, the dashboard's Sessions
-panel, and the menubar panel's exception one-liners — can show "queued
+every sessions surface: the page's Sessions view (the desktop app hosts
+that page), and the menubar panel's exception one-liners — can show "queued
 behind another session · N waiting" instead of just "registered". The body
 gains an optional `gate` block; a session that neither holds a slot nor
 parks anything sends NO block, and the arbiter then CLEARS any stored gate
@@ -401,8 +401,10 @@ indicator) · Install Update <v> (exception-only).
 - **Handoff rows:** **Open Dashboard** opens the desktop app's
   **Projects** view (`idlefill://projects` — this client's project config);
   if the desktop app is not installed it opens `server_url + "/"` in the
-  browser (today's behavior). **Show Logs** opens the desktop app on
-  **Logs** (`idlefill://logs`); if the desktop app is not installed it
+  browser (today's behavior). **Show Logs** opens the desktop app
+  (`idlefill://logs` — since #61 step 3 the desktop lands on the page's
+  default view; the client log tail is the logs DOCK's Client log tab on
+  the page); if the desktop app is not installed it
   opens the log dir in Finder (today's behavior). With the desktop app
   installed the menu bar no longer opens the arbiter web dashboard — the
   handoff goes to the desktop app.
@@ -632,13 +634,18 @@ config and never printed.
 ## The desktop app (macOS)
 
 `desktop/IdlefillDesktop.swift` is a windowed companion (macOS 14+, built
-with plain `swiftc` into a real `.app` bundle — no Xcode project) that shows
-the arbiter state at a glance and manages the two LaunchAgents on this
-machine. Like the menu bar app it is a *view* of the daemon, not a second
-one: liveness and the state word come from the arbiter's `/api/state`
-(client row `last_seen`, 90s window), so the daemon can be started from
-anywhere — launchd, an Orca tab, the menu bar — and the arbiter stays the
-ground truth.
+with plain `swiftc` into a real `.app` bundle — no Xcode project). Since
+issue #61 step 3 it is ONE surface: the window hosts the arbiter's own
+page (a `WKWebView` on the live origin) under a slim native toolbar that
+carries only what the page can never own — the launchd lifecycle
+toggles, the repo path, and the update channel. The five legacy Swift
+tabs (State / Sessions / Logs / Projects / Settings-as-a-tab) retired
+with their parity gaps built INTO the page: the `daemon behind` code-
+staleness tag, the client log tail (the logs dock's Client log tab), and
+the local project-config editor all live on the arbiter-served page now.
+Like the menu bar app it is a *view* of the daemon, not a second one, so
+the daemon can be started from anywhere — launchd, an Orca tab, the menu
+bar — and the arbiter stays the ground truth.
 
 - **Build:** `desktop/build.sh` → `desktop/Idlefill.app` (ad-hoc signed).
   It assembles the bundle (`Contents/MacOS/Idlefill` + `Info.plist`,
@@ -656,19 +663,22 @@ ground truth.
   leases; the daemon is a separate process), replaces the bundle in
   `/Applications` (or a target dir passed as the first argument), and
   relaunches.
-- **URL scheme `idlefill://`.** Hosts: `""` or `open` → **State** (the
-  menu-bar handoff default), `dashboard` → **Dashboard** (the webview),
-  `sessions` → **Sessions**, `logs` → **Logs**, `projects` →
-  **Projects**; any unknown host
-  → State. A URL that *launches* the app opens on the requested tab; a URL
-  delivered to a *running* app activates it, brings the window forward, and
-  switches tabs (extra restored windows are closed — the link targets one
-  window). Parsing is the pure `AppModel.route(for:)` (unit-tested by the
-  headless driver). This is how the menu bar's double-click and its
-  re-routed rows hand off to the desktop app.
-- **The DASHBOARD tab (issue #61 step 1) — the app hosts the web page.**
-  The window opens on **Dashboard**: a `WKWebView` (system WebKit, zero new
-  dependencies) loading the arbiter's **live origin** — `server_url` from
+- **URL scheme `idlefill://` (#61 step 3: every host re-points the ONE
+  surface).** The window is the hosted page, so a deep link reloads the
+  live origin with the page view's `#<view>` appended where a page view
+  exists: `state` → `#overview`, `sessions` → `#sessions`, `projects` →
+  `#projects`, `usage` → `#usage`; `""`, `open`, `dashboard`, `logs`, or
+  any unknown host → the page's default view (the logs DOCK is a dock,
+  not a hashable view — the page reads the hash itself via
+  `HASH_VIEW_RE`). A URL that *launches* the app opens on the requested
+  view; a URL delivered to a *running* app activates it, brings the
+  window forward, and re-points the webview (extra restored windows are
+  closed — the link targets one window). Parsing is the pure
+  `AppModel.hashView(for:)`. This is how the menu bar's double-click and
+  its re-routed rows hand off to the desktop app.
+- **The ONE surface (issue #61 step 1 + 3) — the app hosts the web page.**
+  The window IS a `WKWebView` (system WebKit, zero new dependencies)
+  loading the arbiter's **live origin** — `server_url` from
   `client/config.json` + `/`, never a hardcoded host and never a bundled
   copy of `server/public/index.html` (a copied page re-creates the drift
   bug inside the bundle; the arbiter serves its own version-matched page).
@@ -679,59 +689,53 @@ ground truth.
   rides as a JSON-quoted literal (no breakout), a nil token injects
   nothing, and the page's own token box stays functional for browser
   users (the injection is additive — no page or server contract change).
-  The webview instance lives on the model, so a tab switch re-hosts the
-  same live page; a slim native strip names the origin + Reload (a
-  rotated token takes effect on the next reload). ATS: the bundle's
-  existing `NSAllowsArbitraryLoads` exception covers the plain-HTTP
-  loopback load (proven by the live run). The five legacy Swift tabs stay
-  reachable for the parity audit that retires them section-by-section
-  (#61's migration order).
-- **Five legacy tabs** (kept for the parallel period; the tab strip and
-  deep links drive them as before)
-  - **State** — the color-coded state word, this machine's status, queue
-    depth, today's finished/failed, and the running lease. Polls
-    `GET /api/state` every 5s with the Bearer token.
-  - **Sessions** — the interactive Hermes sessions the arbiter knows
-    (the same `/api/state` poll's `sessions[]` — no second fetch loop).
-    Unlike the menu bar's Exception-Only glance, the desktop is the
-    *interaction surface*: EVERY session is listed (you need the healthy
-    rows to pause them). Row semantics mirror the dashboard
-    (`server/public/index.html`): state word **Paused** (override) >
-    **Active** (online + a request within 30s) > **Idle**; a lapsed
-    heartbeat (≥90s) is a dimmed row + a **stale** tag, never a state
-    word; short token prefix as the label (full token in the tooltip),
-    `client_name`, "last request …" age, `→ server_id` when set. The
-    per-row gate button (**Pause** / **Resume**) is the single write
-    site: `POST /api/sessions/<token>/override` with
-    `{"override":"pause"}` / `{"override":null}` and the Bearer header —
-    optimistic flip + per-row in-flight disable, revert with a one-line
-    error on failure, a 404 (`unknown_session`) re-polls immediately so
-    the rows re-land on arbiter truth. Empty `sessions[]` renders a
-    quiet empty state, never a blank pane. The projection is the pure
-    `SessionsView.project` and the wire shape the pure
-    `SessionsView.overrideRequest` — both proven headlessly by
-    `desktop/sessions-test.sh` (real source minus `@main` + a driver,
-    canned payloads, `env -i`, a local arbiter stub for the write path —
-    the same harness pattern as `menubar/sessions-test.sh`).
-  - **Logs** — the client daemon log (`client/<entry>/logs/client.log`,
-    `src` in dev / `dist` after a build; falls back to `client/logs/` if
-    the entry log is missing). Refreshed on a ~2.5s timer, keeps the last
-    ~2000 lines, auto-scrolls to the tail while you're at the bottom and
-    pauses when you scroll up (the "follow tail" toggle resumes it).
-  - **Projects** — this client's project config (`<repo>/client/config.json`,
-    read at runtime — never baked in): `client_name` + `server_url`
-    read-only, then one row per `projects[]` entry with editable
-    `name`, `model`, `queue_file`, `estimated_seconds`,
-    `timeout_seconds`; `executor` and `cwd` read-only. **Save** validates
-    the rows and rewrites the file preserving every other key byte-for-byte
-    (the token included — it is never displayed anywhere) and keeps the
-    file's `0600` mode; afterwards a "daemon restart to apply" note offers a
-    Restart that uses the same launchd path as Settings.
-  - **Settings** — opt-in launchd management (below), the repo-path
-    field, and the **update channel** (below): a `releases` | `branch`
-    picker + a branch field (default `main`), persisted alongside the
-    repo path in `~/Library/Application Support/Idlefill/config.json`
-    (the same read-modify-write save that preserves every other key).
+  The webview instance lives on the model, so the settings disclosure and
+  a deep link re-host the same live page instead of tearing it down; the
+  slim native toolbar above it names the origin + token state, carries the
+  exception-only **arbiter stopped** marker + one-button **Relaunch**, and
+  holds **Reload** (a rotated token takes effect on the next reload) and
+  the **settings** disclosure. ATS: the bundle's existing
+  `NSAllowsArbitraryLoads` exception covers the plain-HTTP loopback load
+  (proven by the live run).
+- **The retired Swift tabs (#61 step 3) — parity moved INTO the page.**
+  The native tab strip and the four data panels are gone. Each gap the
+  panels owned is now a page feature, so nothing regressed:
+  - **State** → the page's Overview/Projects views (state word, queue
+    depth, today's finished/failed, the running lease) — plus the
+    exception-only **daemon behind** code-staleness tag (#49's marker,
+    now computed by the client and published on the register heartbeat as
+    `daemon_behind`, so the arbiter and page can show it; toolhint names
+    the fix — restart the daemon via the native toolbar / `launchctl
+    kickstart`).
+  - **Sessions** → the page's Sessions view (pause/resume/force, FIFO
+    queue position, the session launcher, model/tokens). The desktop's
+    `SessionsView.project` / `overrideRequest` pure helpers and
+    `desktop/sessions-test.sh` retired WITH the panel (the page is the
+    interaction surface now).
+  - **Logs** → the logs dock's third tab, **Client log**: the client
+    publishes its in-memory log tail (last ~120 lines, each capped ~300
+    chars, oldest first) on the register heartbeat as `client_log`, ONLY
+    to a loopback arbiter — log payloads never cross the mesh. The dock
+    renders newest at the bottom and follows only when already at the
+    bottom (the same rule the Swift LogViewer used).
+  - **Projects** → the page's local project-config editor: on the
+    Projects view, when the page origin is loopback AND a client row
+    reports `proxy_port`, the page edits that client's
+    `client/config.json` `projects[]` entries through the client's own
+    loopback proxy (`GET`/`PUT /client/projects`, guarded by Host +
+    Origin + the `X-Idlefill-Edit` token the webview already injects). A
+    `PUT` validates every entry the way launch-time config parsing does
+    (whole-body 400 on any invalid entry, never a partial write),
+    preserves every other config key (the token included) and the file's
+    `0600` mode, writes tmp-then-rename, and answers
+    `{restart_required:true}` — the restart stays a native/launchd
+    action. This replaces the panel's Save + Restart affordance and
+    `desktop/staleness-test.sh` retired with the desktop's copy of the
+    staleness rule (the client publishes the verdict now).
+  - **Settings** → the same machinery, re-hosted in the slim native
+    toolbar's disclosure (below): the launchd toggles, the repo-path
+    field, and the update channel. These CANNOT move to the page — the
+    arbiter cannot know about launchd — so they stay native.
 - **launchd management model (opt-in).** Three toggles — **daemon**,
   **menu bar**, and **arbiter** — each manage a LaunchAgent in the user's
   `gui/<uid>` domain (no root, no system domain). **ON** writes the agent's

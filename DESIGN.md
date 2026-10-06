@@ -196,7 +196,7 @@ Key left (Muted Gray) / value right, 2px 0. The only place the 22px display size
 12px; header row is Muted Gray 600 with a 1px Hairline underneath; body rows divide with the 50% hairline; no zebra striping.
 
 ### Logs Tray
-A fixed bottom dock: a slim slate bar (5px 16px) holding an uppercase 11px toggle with a chevron (the page's only transition, 150ms ease), the Events/Leases tab group (4px radius; active tab slate-filled with Console Text, inactive canvas-filled with Muted Gray), and a records-to-show select (10/25/50/100). Expanded, the body (canvas background, 1px top hairline, max 45vh) slides above the bar.
+A fixed bottom dock: a slim slate bar (5px 16px) holding an uppercase 11px toggle with a chevron (the page's only transition, 150ms ease), the Events/Leases/Client log tab group (4px radius; active tab slate-filled with Console Text, inactive canvas-filled with Muted Gray — the Client log tab is Exception-Only: it exists only while a client publishes its log tail, and only on a loopback arbiter), and a records-to-show select (10/25/50/100). Expanded, the body (canvas background, 1px top hairline, max 45vh) slides above the bar.
 
 ### Empty States
 Muted Gray italic — "no active lease", "none registered", "no events yet". The null case is always legible; there are no illustrations.
