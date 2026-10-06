@@ -216,6 +216,13 @@ identical one (`client/src/session-gate.ts:183-187`). Pinned mechanics:
    this when no length is set). Engines already accept chunked from the
    same SDKs — the build wave pins this with byte-level tests against
    real strata + llama-swap + oMLX.
+   AMENDMENT (2026-10-06, live probes): the assumption holds for oMLX
+   and llama-swap and FAILS for the llama.cpp family (the 241 row
+   answers 400 "No messages provided" for a chunked body, correct model
+   + credential, direct and through the router — see Open questions 3).
+   This awaits the owner's call on the scoped full-body-buffer posture
+   recorded there. Until then the chunked clause stays as written and
+   the build-wave byte tests are the pinned discovery mechanism.
 5. If the sniff did NOT find the name in the first chunk, routing already
    could not have chosen the alias — that request falls to the machine's
    default target exactly as an unknown model does today
@@ -295,32 +302,41 @@ router-side.
 
 ## D5 — Authoring surface: a first-class plane, not a row knob
 
-**LOCKED in posture, PROPOSED in display shape.** Posture: aliases are
+**LOCKED (owner, 2026-10-06).** Posture: aliases are
 cross-row entities (D1), so they CANNOT live in the Servers "edit
 connection" per-row form (`server/public/index.html:683`, form builder
 at 2190-2243). A per-row form cannot own a name that spans rows or pick
 a winner between them. Rejected: extend the edit-connection form (the
 alias belongs to no single row). Config-file-only authoring is also
-rejected (the #63
-dashboard is the operator's tool, and the drag will write the same
-plane the form writes).
+rejected (the #63 dashboard is the operator's tool, and the drag will
+write the same plane the form writes).
 
-The shape: a Models view on the dashboard (the tab + `data-view`
-sections, `server/public/index.html:367-370,380` — the pattern a new
-view follows). The alias editor follows the established settings-form
-disclosure + patch-by-difference posture
-(`server/public/index.html:2400-2440`). The picker's engine model lists
-come from data the arbiter already publishes on the SAME `/api/state`
-read: the `catalog` entries grouped by `server_id` plus the
-`model_aliases` block — the probe results the arbiter already holds, no
-new probe, no new route for the form. Writes go to the admin-token
-alias POST. Token fields never appear on this plane (write-only rule
-untouched — an alias stores `server_id` + engine id, never a secret).
+Display shape: a top-level Models tab on the dashboard (the tab +
+`data-view` sections, `server/public/index.html:367-370,380` — the
+pattern a new view follows). The alias editor follows the established
+settings-form disclosure + patch-by-difference posture
+(`server/public/index.html:2400-2440`).
 
-PROPOSED for the owner: the exact display — a top-level Models tab
-versus an Overview section, and whether the per-engine pairing list
-renders inside each server card as read-only echo. This is dashboard
-taste, not architecture.
+The pairing rule (owner, 2026-10-06): every alias pair is EXPLICIT and
+verbatim. The form's engine-model picker suggests from the connected
+engines' PROBED model lists only — the catalog entries the arbiter
+already publishes grouped by `server_id` — and the operator picks the
+exact engine id for each pair. The form never proposes an implicit,
+fuzzy, or "close enough" match: a bare-name overlap must NOT pair
+`Qwen3.8-Flash-Next` with an engine's `...-REAP-288` or `...-coder`
+variation, because the operator's expectation of the alias's performance
+is per-engine-exact. A stored pair is the picked string, byte-for-byte.
+A pair for an engine the arbiter cannot probe is not pickable in the
+form. Config-file authoring stays the power path for declared-only
+pairs, and they keep the exception-only `declared` marker on the row
+(answers open question 2: the marker, no confirmation tick).
+
+The picker reads the SAME `/api/state` the dashboard already polls: the
+`catalog` entries grouped by `server_id` plus the `model_aliases` block
+— the probe results the arbiter already holds, no new probe, no new
+route for the form. Writes go to the admin-token alias POST. Token
+fields never appear on this plane (write-only rule untouched — an alias
+stores `server_id` + engine id, never a secret).
 
 ## D6 — The fence: what stays byte-for-byte
 
@@ -393,14 +409,46 @@ Untouched (fenced by D6 and the inherited locks):
 
 ## Open questions (owner input)
 
-1. D5 display shape: top-level Models tab or Overview section (the
-   posture is locked — only the placement is open).
-2. The unconfirmed-pair pin (oMLX today): does pinning an alias winner
-   onto a declared-only pair need a confirmation tick in the form, or
-   is the exception-only declared marker on the row enough?
-3. Chunked-forward acceptance: the design ships `transfer-encoding:
-   chunked` for chunked clients with a spliced body. The build-wave
-   byte tests must show strata, llama-swap and oMLX accept it. If one
-   engine refuses, the fallback for that engine is a bounded full-body
-   buffer (cap + reject over it) — the owner should pre-approve that
-   fallback rather than have the build wave improvise.
+1. ~~D5 display shape~~ — LOCKED by the owner 2026-10-06: top-level
+   Models tab. Pairs are picked from the connected engines' probed model
+   lists, explicit and verbatim (see D5).
+2. ~~The unconfirmed-pair pin (oMLX today)~~ — LOCKED by the owner
+   2026-10-06: un-probed pairs are not pickable in the form. The
+   exception-only `declared` marker carries it (no confirmation tick).
+3. Chunked-forward acceptance — OPEN, evidence gathered 2026-10-06,
+   the doc's assumption REFUTED by live probes. The design ships
+   `transfer-encoding: chunked` for chunked clients with a spliced body,
+   assuming "engines already accept chunked from the same SDKs." They do
+   not, all of them:
+
+   - llama.cpp family (the 241 row DIRECT, the exact class strata
+     fronts): content-length → 200. Chunked → **400 "No messages
+     provided"** — the model was correct, the credential was correct,
+     the body framing alone caused it, with AND without
+     `Expect: 100-continue`. llama.cpp drops chunked request bodies.
+   - oMLX: accepts chunked (200).
+   - llama-swap: accepts chunked (parsed the body. The 404 was its
+     model-routing miss, not a framing failure).
+   - The router is INNOCENT: a replica of the peek/unshift/copy-all
+     posture delivered a clean, parseable 73-byte body to an echo
+     upstream even when the client sent chunked (`peek-proof.js`,
+     scratch). The 400 is the engine's parser, not a router corruption.
+   - Real SDK clients send content-length, not chunked: Node fetch with
+     a string body (the AI SDK posture) puts `content-length: 57`, no
+     `transfer-encoding` (probed live). `curl -T -` is what forces
+     chunked. So the chunked class is rare in production traffic.
+
+   Pre-existing consequence, unrelated to aliases: a chunked client
+   through :8800 routed to the llama.cpp row ALREADY fails today with
+   400 (content-length contrast: 200, same body). The splice does not
+   create this wall. It inherits it.
+
+   The call for the owner: when the sniffed name matches an alias, the
+   router buffers the FULL body (bounded cap, reject over it), splices,
+   and forwards with a correct content-length. That normalizes framing
+   for the llama.cpp family, kills the chunk-boundary sniff gap for
+   aliased names, and stays scoped: bare-name traffic keeps today's
+   pipe posture byte-for-byte, and real SDK clients (content-length
+   senders) only pay a body copy when the model is aliased. The
+   rejected option (a) was buffering EVERYTHING. This buffers only the
+   aliased class.
