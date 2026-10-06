@@ -105,6 +105,9 @@ export function startLlmProxy(opts: {
       },
       (up) => {
         entry.status = up.statusCode ?? 0;
+        // #65: the engine's STATUS rides through too (entry.status already
+        // captured it for the log — now it reaches the caller as well).
+        res.statusCode = up.statusCode ?? 502;
         // Forward the upstream response headers (except hop-by-hop ones).
         // http.pipe copies the BODY but not the headers — a missing
         // content-type would make the eval script's SSE reader misbehave.

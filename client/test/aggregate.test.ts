@@ -319,3 +319,120 @@ test('D5 one shared cap: 8800 traffic parks against a slot held by the 11435 /s/
   assert.match(held.hits[1]!.path, /^\/v1\/chat\/completions$/, 'aggregate path forwarded verbatim (no /s/ prefix to strip)');
   assert.match(held.hits[1]!.body ?? '', /"model":"MlxModel"/, 'parked body survived the first-chunk peek unshift (#45 posture)');
 });
+
+// ---------------------------------------------------------------------------
+// #65 — the forwarder must propagate the upstream STATUS, never 200-wrap it.
+
+/** Engine answering with a fixed status + body (the live oMLX keyless-401 shape). */
+function startStatusEngine(status: number, bodyText: string, contentType = 'application/json'): Promise<{
+  url: string;
+  close: () => Promise<void>;
+}> {
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(status, { 'content-type': contentType });
+      res.end(bodyText);
+    });
+  });
+  return new Promise((resolveP) => {
+    server.listen(0, '127.0.0.1', () => {
+      const port = (server.address() as { port: number }).port;
+      resolveP({
+        url: `http://127.0.0.1:${port}`,
+        close: () =>
+          new Promise<void>((r) => {
+            server.closeAllConnections?.();
+            server.close(() => r());
+          }),
+      });
+    });
+  });
+}
+
+const ENGINE_401_BODY = '{"error":{"message":"API key required","type":"authentication_error"}}';
+
+test('#65 aggregate listener: an engine 401 reaches the caller as 401 (never 200-wrapped)', async () => {
+  const def = await startEngine('default');
+  const keyed = await startStatusEngine(401, ENGINE_401_BODY);
+  cleanup.push(() => def.close());
+  cleanup.push(() => keyed.close());
+  const r = await startRouter({
+    defaultTarget: def.url,
+    catalog: [{ name: 'KeyedModel', server_id: 'srv-omlx', url: keyed.url, auth_set: false }],
+  });
+
+  const res = await postChat(r.base_url, '/v1/chat/completions', 'KeyedModel');
+  assert.equal(res.status, 401, 'the engine status rides through the aggregate forwarder');
+  const text = await res.text();
+  assert.equal(text, ENGINE_401_BODY, 'the engine body passes through untouched');
+  assert.equal(def.hits.length, 0, 'the cataloged model never fell back to the default target');
+});
+
+test('#65 gate.route admission path: an engine 401 still lands as 401 on the caller', async () => {
+  const def = await startEngine('default');
+  const keyed = await startStatusEngine(401, ENGINE_401_BODY);
+  cleanup.push(() => def.close());
+  cleanup.push(() => keyed.close());
+  const { gate, registered } = makeGate();
+  const r = await startRouter({
+    defaultTarget: def.url,
+    gate,
+    catalog: [{ name: 'KeyedModel', server_id: 'srv-omlx', url: keyed.url, auth_set: false }],
+  });
+
+  const res = await postChat(r.base_url, '/v1/chat/completions', 'KeyedModel', { 'x-hermes-session-id': 'conv-65' });
+  assert.equal(res.status, 401, 'gate-admitted traffic keeps the engine status');
+  assert.equal(await res.text(), ENGINE_401_BODY);
+  await waitFor(() => registered.includes('conv-65'), 3000, 'session registered through the gate');
+});
+
+test('#65 posture: an engine 200 SSE keeps status 200 with byte-identical frames', async () => {
+  const frames = [
+    'data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n',
+    'data: {"choices":[{"delta":{"content":"lo"}}]}\n\n',
+    'data: [DONE]\n\n',
+  ];
+  const sse = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'transfer-encoding': 'chunked' });
+      (async () => {
+        for (const f of frames) {
+          await new Promise((r) => setTimeout(r, 5));
+          res.write(f);
+        }
+        res.end();
+      })();
+    });
+  });
+  await new Promise<void>((r) => sse.listen(0, '127.0.0.1', r));
+  const ssePort = (sse.address() as { port: number }).port;
+  cleanup.push(() =>
+    new Promise<void>((r) => {
+      sse.closeAllConnections?.();
+      sse.close(() => r());
+    }),
+  );
+  const r = await startRouter({ defaultTarget: `http://127.0.0.1:${ssePort}` });
+
+  const res = await postChat(r.base_url, '/v1/chat/completions', 'StreamModel');
+  assert.equal(res.status, 200, 'a 200 SSE stays a 200');
+  assert.ok((res.headers.get('content-type') ?? '').includes('text/event-stream'), 'content-type header still forwarded');
+  assert.equal(await res.text(), frames.join(''), 'SSE frames byte-identical (#45 sniffer stream not regressed)');
+});
+
+test('#65 posture: unreachable engine through the aggregate forwarder stays a clean 502', async () => {
+  const probe = http.createServer();
+  await new Promise<void>((r) => probe.listen(0, '127.0.0.1', r));
+  const deadPort = (probe.address() as { port: number }).port;
+  await new Promise<void>((r) => probe.close(() => r()));
+  const r = await startRouter({
+    defaultTarget: 'http://127.0.0.1:1',
+    catalog: [{ name: 'DownModel', server_id: 'srv-dead', url: `http://127.0.0.1:${deadPort}`, auth_set: false }],
+  });
+  const res = await postChat(r.base_url, '/v1/chat/completions', 'DownModel');
+  assert.equal(res.status, 502, 'the router\'s own 502 for an unreachable engine stays');
+  const body = (await res.json()) as { error: string };
+  assert.equal(body.error, 'llm target down');
+});

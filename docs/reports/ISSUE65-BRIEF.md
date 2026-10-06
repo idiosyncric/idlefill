@@ -44,3 +44,7 @@ Both forwarders: set `res.statusCode = up.statusCode ?? 502` before piping heade
 
 - The immediate operator relief is separate: set the engine token on the `srv-watched` row (write-only field, Settings/Servers). This issue fixes the **status lie**, not the key.
 - D6 fence: the 11435 contract is "headers pass through" — the status was always meant to pass too (the code already captures it into `entry.status`). This restores intended fidelity, it is not a contract change. Job adapters that mis-retried on 200+error bodies get correct 4xx instead.
+
+## Build status
+
+Built + live 2026-10-06: one `res.statusCode = up.statusCode ?? 502` line per forwarder, five new tests, 320 green, live :8800 + :11435 return the engine's 401 with its body, `qwen3.8-flash-next-iq3_s` still streams 200 ([ISSUE65-REPORT.md](ISSUE65-REPORT.md)).

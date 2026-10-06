@@ -175,6 +175,11 @@ export function startAggregateRouter(opts: {
         headers,
       },
       (up) => {
+        // #65: the engine's STATUS rides through too. Without this the
+        // response stays at Node's default 200 while the engine's error
+        // body arrives — an SDK sees 200 + no choices and reports an
+        // empty stream. Fallback 502 only when the status is absent.
+        res.statusCode = up.statusCode ?? 502;
         const skip = new Set(['transfer-encoding', 'connection', 'content-length']);
         for (const [k, v] of Object.entries(up.headers)) {
           if (skip.has(k.toLowerCase()) || v === undefined) continue;
