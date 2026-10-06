@@ -715,6 +715,42 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   });
 
   // ------------------------------------------------------------------
+  // Model aliases (#66 — docs/architecture/model-aliases.md D1–D5)
+  // ------------------------------------------------------------------
+
+  /**
+   * GET /api/aliases: the STORED alias rows for the dashboard Models tab —
+   * pairs verbatim + the last tick's per-pair source markers + the pin.
+   * No secret by construction (an alias is server_id + engine id only).
+   * NOT part of the anonymous /api/state view: this is the authoring read
+   * for an operator surface, so the standard /api/* token applies.
+   */
+  app.get('/api/aliases', async () => {
+    return { aliases: arbiter.aliasRows() };
+  });
+
+  /**
+   * POST /api/aliases: the alias write route (the drag's write path is the
+   * same). Body: { alias, pairs?, pin?, delete? } — upsert with alias +
+   * pairs (optional pin), re-pin with alias + pin on an existing alias,
+   * removal with { alias, delete: true }. WHOLE-ENTRY validation answers
+   * 400 with the reason (D1/D2 posture: a wrong entry is told, not
+   * swallowed); a delete of an unknown alias is 404. Every write appends
+   * an event (the server_connection_updated pattern) so the Sessions view
+   * and the logs dock see the change. The response echoes the STORED
+   * entry — pairs carry no secret (D1: aliases are secret-free by
+   * construction), so there is nothing to strip.
+   */
+  app.post('/api/aliases', async (req, reply) => {
+    const body = (req.body ?? {}) as { alias?: unknown; pairs?: unknown; pin?: unknown; delete?: unknown };
+    const res = arbiter.putModelAlias(body);
+    if (!res.ok) {
+      return reply.code(res.reason === 'unknown_alias' ? 404 : 400).send({ error: res.reason ?? 'invalid' });
+    }
+    return { ok: true, created: res.created === true, deleted: res.deleted === true, ...(res.alias ? { alias: res.alias } : {}) };
+  });
+
+  // ------------------------------------------------------------------
   // Sessions (router-self-registered interactive traffic — #32/#33)
   // ------------------------------------------------------------------
 
@@ -956,6 +992,13 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       // #60 B, stays intact — the token crosses only over the
       // loopback-scoped GET /api/server-keys).
       catalog: arbiter.catalog(),
+      // Model aliases (#66 D3): the arbiter-resolved alias block — one
+      // entry per alias with the WINNER pair already applied (name,
+      // server_id, url, auth_set, engine_model, catalog_source). ADD-key
+      // SIBLING of `catalog`; the `catalog` key itself stays byte-for-byte
+      // (amendment discipline). The credential NEVER rides here either —
+      // auth_set only, same write-only posture (#60 B).
+      model_aliases: arbiter.modelAliases(),
       events: s.events.slice(Math.max(0, s.events.length - limit)).reverse(),
     };
   });

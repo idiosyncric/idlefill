@@ -53,10 +53,36 @@ import type { IdleDetector } from './idle.js';
 import { activeLeaseExemptIps, defaultActivityPathFor } from './idle.js';
 import { buildCatalog, modelsProbeUrl, type CatalogEntry, type ModelsFetcher } from './catalog.js';
 import { mintInstanceId } from './mesh.js';
-import type { IdleSignal, JobResultRow, JobThrottle, SessionOverride, SessionRecord } from './types.js';
+import type { IdleSignal, JobResultRow, JobThrottle, ModelAlias, ModelAliasPair, SessionOverride, SessionRecord } from './types.js';
 import type { StateStore } from './state.js';
 import type { ClientOverride, Lease, ProjectAllocation, ServerConfig, ServerConnection, ServerProvider, UtcDate } from './types.js';
 import { PROVIDER_KINDS } from './types.js';
+
+/**
+ * #66 D3: one published alias entry — the alias name with the WINNER pair
+ * already applied. The shape `docs/architecture/model-aliases.md` locks:
+ * name, server_id, url, auth_set, engine_model, catalog_source. Never a
+ * token (write-only posture; this block rides the anonymous /api/state).
+ */
+export interface ModelAliasEntry {
+  name: string;
+  server_id: string;
+  url: string;
+  auth_set: boolean;
+  /** The winner pair's engine-OWN model id the router splices into the body. */
+  engine_model: string;
+  catalog_source: 'probed' | 'declared';
+}
+
+/**
+ * #66 D1 sanitizer bounds. Alias names take the router `cleanKey` class
+ * (printable 0x20–0x7e, at most 128 — `client/src/aggregate.ts:82-89`).
+ * Engine model ids take the body-sniff regex's own class (printable except
+ * quote and backslash, at most 80 — `client/src/aggregate.ts:114`), so a
+ * stored id can never break the first-chunk splice's JSON quoting.
+ */
+const ALIAS_NAME_RE = /^[\x20-\x7e]{1,128}$/;
+const ENGINE_MODEL_RE = /^[^\x00-\x1f"\\]{1,80}$/;
 
 /**
  * The id of the seeded watched-server row (cfg.llama_swap_url). Leases and
@@ -206,6 +232,21 @@ export class Arbiter {
    * `/api/state` echoes it as the `catalog` ADD-key.
    */
   private catalogPublished: CatalogEntry[] = [];
+  /**
+   * #66 D3: the alias block published to the router on the LAST probe
+   * cycle (in-memory, ephemeral — never persisted; one entry per alias with
+   * the winner pair resolved). `/api/state` echoes it as the
+   * `model_aliases` ADD-key beside `catalog`.
+   */
+  private aliasPublished: ModelAliasEntry[] = [];
+  /**
+   * #66: the LAST probe cycle's per-alias pair verdicts (alias -> pairs
+   * with 'probed' | 'declared' | 'dropped'). In-memory like
+   * `aliasPublished`; read by `aliasRows()` for the dashboard's
+   * exception-only markers. 'unprobed' renders when the tick never saw the
+   * pair (no cycle run yet).
+   */
+  private aliasPairStates = new Map<string, { server_id: string; model: string; source: 'probed' | 'declared' | 'dropped' }[]>();
   /**
    * Per-server post-revocation reidle gates: server_id -> armed-at epoch-ms.
    * Armed when a lease on that server is revoked/expired; disarmed when a
@@ -854,7 +895,13 @@ export class Arbiter {
         rows.map(async (row) => {
           try {
             const names = await fetcher(modelsProbeUrl(row.url), row.auth_token);
-            if (Array.isArray(names) && names.length > 0) probed.set(row.id, names);
+            // Keep an EMPTY successful list in the map: the alias pass
+            // (#66 D2) must tell "probe succeeded, listed nothing" from
+            // "probe failed" — a pair on a probe-succeeded row that lacks
+            // the id DROPS for the tick, a pair on a probe-FAILED row
+            // publishes 'declared'. buildCatalog ignores empty lists (its
+            // `length > 0` gate), so the bare-name block is byte-identical.
+            if (Array.isArray(names)) probed.set(row.id, names);
           } catch {
             /* probe-blocked: the declared list stands (drop-don't-reject) */
           }
@@ -862,12 +909,229 @@ export class Arbiter {
       );
     }
     this.catalogPublished = buildCatalog(rows, probed);
+    // #66 D2: the alias pass runs in THIS cycle over the SAME probe map —
+    // per-pair confirmation, winner resolution, the published block.
+    this.buildAliasBlock(rows, probed);
     return this.catalogPublished;
   }
 
   /** The catalog the last probe cycle published (never contains tokens). */
   catalog(): CatalogEntry[] {
     return this.catalogPublished;
+  }
+
+  // ------------------------------------------------------------------
+  // Model aliases (#66 — docs/architecture/model-aliases.md D1–D4)
+  // ------------------------------------------------------------------
+
+  /**
+   * #66 D2/D3: per-pair confirmation against the same probe map, winner
+   * selection (D4), and the resolved `model_aliases` publish block.
+   *
+   * - A pair is CONFIRMED when the row's probed list contains its model id
+   *   (confirmation is per pair, never per alias).
+   * - A pair on a probe-FAILED (or never-probed) row stays publishable
+   *   with catalog_source 'declared' — never falsely 'probed'.
+   * - A pair on a probe-SUCCEEDED row that does not list the id is dropped
+   *   for the tick. The alias itself never drops — stored pairs stand,
+   *   publish filters. All pairs dead = the alias is not published at all
+   *   that tick (exception-only, never a silent half-name).
+   * - Winner (D4): the stored `pinned_server_id` when it matches a
+   *   surviving pair; a dead/absent pin falls through to the FIRST
+   *   surviving pair. The router never recomputes it.
+   * - Publish-path sanitizers are drop-don't-reject (D1): a malformed name,
+   *   id, or row reference drops the entry for the tick, never rejects the
+   *   stored row.
+   *
+   * The per-tick pair verdicts also land in `aliasPairStates` for the
+   * dashboard read (`GET /api/aliases`) — exception-only markers.
+   */
+  private buildAliasBlock(rows: readonly ServerConnection[], probed: ReadonlyMap<string, string[]>): void {
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    const out: ModelAliasEntry[] = [];
+    const pairStates = new Map<string, { server_id: string; model: string; source: 'probed' | 'declared' | 'dropped' }[]>();
+    const stored = this.store.state.model_aliases;
+    for (const name of Object.keys(stored ?? {})) {
+      if (!ALIAS_NAME_RE.test(name)) continue; // hostile key: unpublished (drop-don't-reject)
+      const row = stored[name];
+      const pairs = Array.isArray(row?.pairs) ? row.pairs : [];
+      const survivors: { server_id: string; model: string; source: 'probed' | 'declared' }[] = [];
+      const states: { server_id: string; model: string; source: 'probed' | 'declared' | 'dropped' }[] = [];
+      for (const p of pairs) {
+        const sid = typeof p?.server_id === 'string' ? p.server_id : '';
+        const model = typeof p?.model === 'string' ? p.model : '';
+        if (!ALIAS_NAME_RE.test(sid) || !ENGINE_MODEL_RE.test(model)) {
+          states.push({ server_id: sid, model, source: 'dropped' });
+          continue;
+        }
+        const srv = byId.get(sid);
+        if (!srv) {
+          states.push({ server_id: sid, model, source: 'dropped' }); // the row is gone
+          continue;
+        }
+        if (probed.has(sid)) {
+          if (!probed.get(sid)!.includes(model)) {
+            states.push({ server_id: sid, model, source: 'dropped' }); // probed row, id vanished
+            continue;
+          }
+          survivors.push({ server_id: sid, model, source: 'probed' });
+        } else {
+          survivors.push({ server_id: sid, model, source: 'declared' }); // probe-blocked: the operator's claim stands
+        }
+        states.push({ server_id: sid, model, source: survivors[survivors.length - 1]!.source });
+      }
+      pairStates.set(name, states);
+      if (survivors.length === 0) continue; // all pairs dead this tick: not offered, not routed
+      const pin = typeof row?.pinned_server_id === 'string' ? row.pinned_server_id : '';
+      const winner = survivors.find((p) => p.server_id === pin) ?? survivors[0]!;
+      const srv = byId.get(winner.server_id)!;
+      if (typeof srv.url !== 'string' || srv.url.trim() === '') continue;
+      out.push({
+        name,
+        server_id: winner.server_id,
+        url: srv.url,
+        auth_set: srv.auth_token !== undefined && srv.auth_token !== '',
+        engine_model: winner.model,
+        catalog_source: winner.source,
+      });
+    }
+    this.aliasPublished = out;
+    this.aliasPairStates = pairStates;
+  }
+
+  /**
+   * The alias block the last probe cycle published, one RESOLVED entry per
+   * alias with the winner pair applied (D3 shape: name, server_id, url,
+   * auth_set, engine_model, catalog_source). Ephemeral like `catalog`; a
+   * token NEVER enters it. `/api/state` echoes it as the `model_aliases`
+   * ADD-key beside `catalog`.
+   */
+  modelAliases(): ModelAliasEntry[] {
+    return this.aliasPublished;
+  }
+
+  /**
+   * The stored alias rows for the dashboard read (`GET /api/aliases`):
+   * pairs verbatim + this-tick per-pair source markers ('probed' renders
+   * nothing; 'declared' / 'dropped' / 'unprobed' mark the exception).
+   * Carries no secret by construction (D1: server_id + engine ids only).
+   */
+  aliasRows(): {
+    alias: string;
+    pairs: { server_id: string; model: string; source: 'probed' | 'declared' | 'dropped' | 'unprobed' }[];
+    pinned_server_id?: string;
+    updated_at: number;
+  }[] {
+    const s = this.store.state.model_aliases;
+    return Object.keys(s ?? {}).map((name) => {
+      const row = s[name];
+      const tick = this.aliasPairStates.get(name) ?? [];
+      return {
+        alias: name,
+        pairs: (Array.isArray(row?.pairs) ? row.pairs : []).map((p) => {
+          const found = tick.find((q) => q.server_id === p?.server_id && q.model === p?.model);
+          return {
+            server_id: typeof p?.server_id === 'string' ? p.server_id : '',
+            model: typeof p?.model === 'string' ? p.model : '',
+            source: found?.source ?? 'unprobed',
+          };
+        }),
+        ...(typeof row?.pinned_server_id === 'string' && row.pinned_server_id !== '' ? { pinned_server_id: row.pinned_server_id } : {}),
+        updated_at: typeof row?.updated_at === 'number' ? row.updated_at : 0,
+      };
+    });
+  }
+
+  /**
+   * #66 D1/D2: the alias write route's engine. Upsert = `alias` + `pairs`
+   * (optional `pin`); removal = `{ alias, delete: true }`. WHOLE-ENTRY
+   * validation → a rejection is told, not swallowed (operator form input
+   * is not telemetry): an over-bound/hostile alias name or engine id, empty
+   * pairs, an unknown `server_id`, a duplicate pair, and a malformed pin
+   * all return a reason (the route maps it to 400; a delete of an unknown
+   * alias maps to 404). A POST for an UNPROBED pair is ACCEPTED here — the
+   * form is the constraint, not the API (D5): such a pair publishes
+   * 'declared' with the exception marker.
+   *
+   * Re-pin (the drag's write path): `pin` alone updates an existing alias.
+   * An alias whose stored pin no longer matches a surviving pair is legal
+   * — publish falls through to the first surviving pair (D4).
+   */
+  putModelAlias(input: { alias?: unknown; pairs?: unknown; pin?: unknown; delete?: unknown }): {
+    ok: boolean;
+    reason?: string;
+    created?: boolean;
+    deleted?: boolean;
+    alias?: ModelAlias;
+  } {
+    const s = this.store.state;
+    const key = typeof input.alias === 'string' ? input.alias.trim() : '';
+    if (!ALIAS_NAME_RE.test(key)) return { ok: false, reason: 'alias name must be printable and at most 128 chars' };
+
+    if (input.delete === true) {
+      if (!s.model_aliases[key]) return { ok: false, reason: 'unknown_alias' };
+      delete s.model_aliases[key];
+      this.store.appendEvent({ kind: 'model_alias_removed', detail: key });
+      this.store.trim();
+      this.store.save();
+      return { ok: true, deleted: true };
+    }
+
+    const existing = s.model_aliases[key];
+    const hasPairs = input.pairs !== undefined;
+    const hasPin = input.pin !== undefined;
+    if (!hasPairs && !hasPin)
+      return { ok: false, reason: existing ? 'nothing to update (provide pairs or pin, or delete: true)' : 'pairs required (non-empty)' };
+
+    let pairs: ModelAliasPair[] | undefined;
+    if (hasPairs) {
+      if (!Array.isArray(input.pairs)) return { ok: false, reason: 'pairs must be an array' };
+      if (input.pairs.length === 0) return { ok: false, reason: 'pairs must not be empty' };
+      const rowIds = new Set(s.servers.map((r) => r.id));
+      const seen = new Set<string>();
+      pairs = [];
+      for (const p of input.pairs as unknown[]) {
+        const sid = p && typeof p === 'object' && typeof (p as ModelAliasPair).server_id === 'string' ? (p as ModelAliasPair).server_id.trim() : '';
+        const model = p && typeof p === 'object' && typeof (p as ModelAliasPair).model === 'string' ? (p as ModelAliasPair).model.trim() : '';
+        if (!ALIAS_NAME_RE.test(sid)) return { ok: false, reason: 'pair server_id must be printable and at most 128 chars' };
+        if (!ENGINE_MODEL_RE.test(model))
+          return { ok: false, reason: 'engine model id must be printable except " and \\, at most 80 chars' };
+        const dupeKey = `${sid}::${model}`;
+        if (seen.has(dupeKey)) return { ok: false, reason: `duplicate pair: ${sid} / ${model} appears twice` };
+        seen.add(dupeKey);
+        if (!rowIds.has(sid)) return { ok: false, reason: `unknown server_id: ${sid}` };
+        pairs.push({ server_id: sid, model });
+      }
+    }
+
+    let pin: string | undefined;
+    if (hasPin) {
+      if (input.pin === null) pin = ''; // explicit clear → default = first pair
+      else if (typeof input.pin === 'string' && input.pin.trim() !== '') pin = input.pin.trim();
+      else return { ok: false, reason: 'pin must be a server_id string (or null to clear)' };
+      if (pin && !ALIAS_NAME_RE.test(pin)) return { ok: false, reason: 'pin server_id must be printable and at most 128 chars' };
+    }
+
+    const nowMs = Date.now();
+    if (!existing) {
+      if (!pairs) return { ok: false, reason: 'pairs required (non-empty)' };
+      const row: ModelAlias = { alias: key, pairs, ...(pin ? { pinned_server_id: pin } : {}), updated_at: nowMs };
+      s.model_aliases[key] = row;
+      this.store.appendEvent({ kind: 'model_alias_updated', detail: `${key} (${pairs.length} pair(s))` });
+      this.store.trim();
+      this.store.save();
+      return { ok: true, created: true, alias: row };
+    }
+    if (pairs) existing.pairs = pairs;
+    if (hasPin) {
+      if (pin) existing.pinned_server_id = pin;
+      else delete existing.pinned_server_id;
+    }
+    existing.updated_at = nowMs;
+    this.store.appendEvent({ kind: 'model_alias_updated', detail: key });
+    this.store.trim();
+    this.store.save();
+    return { ok: true, created: false, alias: existing };
   }
 
   // ------------------------------------------------------------------

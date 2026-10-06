@@ -22,6 +22,7 @@ export interface StateStoreOpts {
 export function emptyState(): ArbiterState {
   return {
     servers: [],
+    model_aliases: {},
     projects: [],
     clients: [],
     overrides: {},
@@ -90,6 +91,9 @@ export class StateStore {
         // Tolerate state files from before server connections existed
         // (seeded from config by the arbiter after load).
         servers: Array.isArray(raw.servers) ? raw.servers : base.servers,
+        // Tolerate state files from before the model-alias plane (#66 D1)
+        // existed.
+        model_aliases: raw.model_aliases && typeof raw.model_aliases === 'object' ? raw.model_aliases : base.model_aliases,
         // Tolerate state files from before persisted project rows existed.
         projects: Array.isArray(raw.projects) ? raw.projects : base.projects,
       };

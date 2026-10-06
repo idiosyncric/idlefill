@@ -629,6 +629,12 @@ export type EventKind =
   | 'project_settings_updated'
   | 'server_connection_added'
   | 'server_connection_updated'
+  /**
+   * Model aliases (#66 D4): an operator alias write (upsert / re-pin) and
+   * an alias removal. Detail carries the alias name.
+   */
+  | 'model_alias_updated'
+  | 'model_alias_removed'
   | 'session_registered'
   | 'session_paused'
   | 'session_forced'
@@ -668,9 +674,36 @@ export interface ProjectStateRow {
   updated_at: number;
 }
 
+/**
+ * Model aliases (#66 D1): one operator-declared name mapped to concrete
+ * engine-model pairs. An alias is a CROSS-ROW entity — it lives at the top
+ * of the state file, beside `servers`, never inside a row.
+ */
+
+/** One engine-model pair: the row plus that engine's OWN model id. */
+export interface ModelAliasPair {
+  server_id: string;
+  model: string;
+}
+
+/** One operator-declared alias. Key of the map is the alias name. */
+export interface ModelAlias {
+  alias: string; // the name the catalog publishes
+  pairs: ModelAliasPair[]; // insertion order = default pin order
+  pinned_server_id?: string; // the winner the drag writes; absent = first pair
+  updated_at: number;
+}
+
 export interface ArbiterState {
   /** Declared inference-server connections (seeded from config on first load). */
   servers: ServerConnection[];
+  /**
+   * Operator-declared model aliases (#66 D1), keyed by alias name. ADD-key
+   * sibling of `servers`. An alias carries NO secret — `server_id` + engine
+   * model name only — so the write-only token posture is untouched by
+   * construction.
+   */
+  model_aliases: Record<string, ModelAlias>;
   /**
    * Stable mesh instance identity (#50 D2): random hex, minted at first
    * boot and persisted. Tailnet IPs move; this id is the identity. The
