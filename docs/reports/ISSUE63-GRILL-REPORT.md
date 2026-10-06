@@ -1,5 +1,14 @@
 # ISSUE63 GRILL REPORT — aggregate inference endpoint: six decisions settled on verified code
 
+**Owner review (2026-10-05): all four open questions resolved.** Ambiguous
+names render bare (idlefill picks the engine inside the routing layer).
+First wave uses row declaration order with no `model_preference` key.
+The loopback-scoped key-pull route stands. The port is **8800**, not
+8888 (configurable `aggregate_port`, default 8800; verified nothing
+local binds it). Every named decision is now LOCKED; the doc's
+"Decisions (owner, 2026-10-05)" section records it. The build wave
+rides issue #64.
+
 Map: #63 (the aggregate endpoint gap) · #50 (the locked mesh topology —
 D3/D5 bind this grill) · #42 (session identity plane, intersected not
 owned) · #60 (write-only `auth_token` plane + the live Mac arbiter) ·

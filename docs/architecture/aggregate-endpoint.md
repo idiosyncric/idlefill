@@ -104,10 +104,10 @@ this grill:
 ## D1 — Who serves the aggregate endpoint: the client router, second port
 
 **LOCKED.** Option (a): the client router (the daemon's loopback proxy)
-binds a SECOND fixed loopback port — `aggregate_port`, default 8888 —
+binds a SECOND fixed loopback port — `aggregate_port`, default 8800 —
 and routes by the `model` field of the request body against a router-
 local catalog table. Every Hermes profile's config.yaml then carries the
-same `http://127.0.0.1:8888/v1` on every machine.
+same `http://127.0.0.1:8800/v1` on every machine.
 
 Rejected (b) — the arbiter serves a data plane (`:8787/v1/...`):
 
@@ -144,7 +144,7 @@ Rules for the endpoint:
 
 - Bind 127.0.0.1 only, exactly like the proxy (`client/src/proxy.ts:192`
   posture).
-- One config key on the client: `aggregate_port` (default 8888, `0` =
+- One config key on the client: `aggregate_port` (default 8800, `0` =
   disabled). It is an add key, and the loader's DEFAULTS pattern fits
   (`client/src/config.ts:146-156`).
 - Route by `model` in the request body (the `sniffModelChunk` regex
@@ -152,7 +152,7 @@ Rules for the endpoint:
   shape). `/v1/models` is answered BY THE ROUTER from the catalog — the
   union of catalog rows, not a passthrough probe.
 - With the catalog empty or the model unknown, the router forwards to
-  the machine's default `llm_target` exactly as today. A profile on 8888
+  the machine's default `llm_target` exactly as today. A profile on 8800
   can never be worse than a profile on 11435 passthrough.
 
 ## D2 — The credential plane: the router asks the arbiter to fetch, never to hand over
@@ -167,7 +167,7 @@ for feed fetches (`IdleDetectorOpts.auth_token`,
 router over an EXISTING authenticated direction: the daemon's
 `GET /api/state` poll gains an ADD-key `catalog` block — model name,
 server id, engine URL, `auth_set` boolean — and NOT the token. The
-router's 8888 listener then adds the `Authorization` header per request.
+router's 8800 listener then adds the `Authorization` header per request.
 The token reaches the outbound engine request without ever crossing an
 ordinary HTTP response.
 
@@ -209,7 +209,7 @@ memory (in-process, loopback-fetched, never persisted by the router).**
 
 ## D3 — Session identity today: derive a stable key, keep the header as the upgrade
 
-**LOCKED.** Aggregate traffic (8888) enters the SAME `SessionGate` code
+**LOCKED.** Aggregate traffic (8800) enters the SAME `SessionGate` code
 path as `/s/<token>` traffic. The gate's key is today whatever the
 router derives, in this order:
 
@@ -229,14 +229,14 @@ profile calling model X maps to exactly one row while it calls X.
 
 Rejected alternatives:
 
-- One single "aggregate" row for all of 8888: destroys the per-session
+- One single "aggregate" row for all of 8800: destroys the per-session
   pause/force control the gate exists to provide. One noisy profile
   would starve every other chat with no operator lever in between.
 - Derive identity from the connection socket: keep-alive reuse and
   per-request client connections make the socket an unstable key.
   Nothing durable maps it to a conversation.
 - Mint a token per profile config (the old `/s/flash` shape smuggled
-  into 8888): reintroduces the hand-set plane #42 exists to retire.
+  into 8800): reintroduces the hand-set plane #42 exists to retire.
 
 The deciding trade-off: the model-name key is coarse but stable,
 self-describing (the row names the model — the same fact #45 renders),
@@ -255,7 +255,7 @@ common model on two machines stays two honest rows.
 
 ## D4 — The de-duplicated catalog: declared union + live probe, collisions qualified
 
-**LOCKED (display shape PROPOSED).** The catalog is built IN THE ARBITER
+**LOCKED.** The catalog is built IN THE ARBITER
 (it owns the rows and the tokens) on the existing `poll_ms` tick (15000
 default, `server/src/config.ts:36`), then published to the router
 through D2's mechanism.
@@ -282,8 +282,9 @@ through D2's mechanism.
   operator lists first in a per-model order (config `model_preference:
   [server_name, …]`, default = row declaration order), and the request
   is pinned there — the aggregate endpoint does NOT fail over inside one
-  chat. The display shape (a `name (host)` suffix for ambiguous names in
-  `hermes model`) is PROPOSED. See open questions.
+  chat. The display shape is the bare name (owner decision, below): a
+  name served by N engines renders ONCE in `hermes model`, and idlefill
+  picks the engine.
 - What the arbiter provably CANNOT see for feed-off providers: for a
   provider kind with no supported sampler — oMLX's own `/metrics` and
   `/api/stats` 404 (`server/src/idle.ts:176`), and #62's honest
@@ -302,7 +303,7 @@ firewalled engine disappears from the operator's own list.
 
 ## D5 — Gate + lease interplay: aggregate traffic is session traffic
 
-**LOCKED.** 8888 traffic enters the SAME session gate, under D3's key.
+**LOCKED.** 8800 traffic enters the SAME session gate, under D3's key.
 It behaves exactly like `/s/<token>` traffic on every control:
 
 - slot cap (`max_active_agent_sessions`, default 2 — shared, not a
@@ -325,7 +326,7 @@ It behaves exactly like `/s/<token>` traffic on every control:
   wrong folding for an engine chosen off the watched row, so the router
   MUST set it on aggregate rows.
 
-The cap is SHARED across 11435 and 8888 because both listeners share one
+The cap is SHARED across 11435 and 8800 because both listeners share one
 `SessionGate` instance in one process. That is the honest model: the
 slot cap counts sessions at THE ENGINE, and the engines are shared.
 
@@ -359,7 +360,7 @@ this section exists to forbid.
   behavior is byte-for-byte unchanged.
 - The `flash` profile's working config
   (`base_url: http://127.0.0.1:11435/s/flash/v1`, config.yaml line 4)
-  keeps working with zero edits. Moving it to 8888 is an operator
+  keeps working with zero edits. Moving it to 8800 is an operator
   action after the build wave, not a behavior this doc changes.
 - The lease/queue/budget machinery, the mesh read plane, and every
   existing `/api/*` shape stay as-is. New surfaces are ADD keys or new
@@ -367,7 +368,7 @@ this section exists to forbid.
 
 ## Rules (restated crisp)
 
-1. The aggregate endpoint is a SECOND LISTENER (default 8888, loopback-
+1. The aggregate endpoint is a SECOND LISTENER (default 8800, loopback-
    only) inside the daemon process — never a new process, never on the
    arbiter's network-facing origin.
 2. The catalog is built in the arbiter from `ServerConnection` rows plus
@@ -376,7 +377,7 @@ this section exists to forbid.
 3. Engine tokens live in the arbiter's state file. The router may hold
    them in memory through one loopback-scoped pull route. No other read
    surface ever carries them.
-4. 8888 traffic is session traffic: one shared gate, one shared slot
+4. 8800 traffic is session traffic: one shared gate, one shared slot
    cap, overrides by derived key, fail-open, idle folding against the
    CORRECT server row (`server_id` reported).
 5. The session key today is `X-Hermes-Session-Id` when present, else the
@@ -389,7 +390,7 @@ this section exists to forbid.
 
 Changes (the build wave, after this grill):
 
-- `client/src/config.ts`: ADD `aggregate_port` (default 8888, 0 = off).
+- `client/src/config.ts`: ADD `aggregate_port` (default 8800, 0 = off).
 - `client/src/index.ts`: start a second `startLlmProxy`-shaped listener
   with a catalog router in front of the SAME `SessionGate`. Add the
   catalog fetch/refresh loop.
@@ -412,24 +413,26 @@ Untouched (fenced by D6 and the inherited mesh locks):
 - The lease engine, budgets, the job flow, the mesh read plane.
 - Every profile's config except as the OPERATOR later edits them.
 
-## Open questions (owner input)
+## Decisions (owner, 2026-10-05)
 
-1. Ambiguous-name display: in `hermes model` on 8888, should a name
-   served by N engines render bare (first preference routes it), or
-   suffixed like `Qwen3.8-Flash-Next (oMLX)` per serving row (then the
-   suffix must round-trip back as the routing key)? Suffix display +
-   suffix routing key is the unambiguous shape. Bare is the minimal one.
-   (D4's lock holds either way. This is display + key syntax.)
-2. `model_preference` order: a per-model config list, or the row
-   declaration order as the default with no new key for the first wave?
-3. Is the loopback-scoped key pull route acceptable against your intent
-   for write-only? The posture survives as "no read surface except the
-   dedicated loopback route the router itself calls" — if you want the
-   tokens to never leave the arbiter process at all, the cost is the
-   arbiter-side proxying shape rejected in D2 (arbiter in the chat hot
-   path + its network bind).
-4. `aggregate_port` fixed at 8888 fleet-wide (the owner's named port),
-   or configurable-but-defaulted with 8888 as the default? (The lock
-   says default 8888. Confirm no fleet box's local software needs it —
-   `100.95.230.70:8888` belongs to another host, so only LOCAL binds
-   matter.)
+1. **Ambiguous names render BARE.** A model name served by N engines
+   appears once in `hermes model`. No host suffix, no suffix routing
+   key. idlefill picks the engine inside the routing layer. LOCKED.
+2. **First wave: row declaration order, no new key.** The owner
+   deferred; the doc's default stands. `model_preference` stays the
+   named follow-up knob — it is added only when a real collision needs
+   an override the declaration order cannot express. Nothing blocks the
+   build wave.
+3. **Loopback key-pull accepted.** The owner deferred; D2's chosen
+   shape stands: the token lives in the arbiter state file, crosses
+   into the router's memory only over the loopback-scoped
+   `GET /api/server-keys`, and never appears on any other read surface.
+   The rejected alternative (arbiter-side proxying) costs the chat hot
+   path and the arbiter's network bind.
+4. **The port is 8800, not 8888.** The owner picked `:8800` fleet-wide
+   (configurable via `aggregate_port`, default 8800, `0` = off).
+   Verified: nothing on this machine binds 8800. The old grill probe
+   above (8888, other hosts) is the measured history at grill time.
+
+Every named decision is now LOCKED. Issue #63 closes with this
+section. The build wave rides issue #64.
