@@ -446,9 +446,12 @@ Untouched (fenced by D6 and the inherited locks):
    The call for the owner: when the sniffed name matches an alias, the
    router buffers the FULL body (bounded cap, reject over it), splices,
    and forwards with a correct content-length. That normalizes framing
-   for the llama.cpp family, kills the chunk-boundary sniff gap for
-   aliased names, and stays scoped: bare-name traffic keeps today's
-   pipe posture byte-for-byte, and real SDK clients (content-length
-   senders) only pay a body copy when the model is aliased. The
-   rejected option (a) was buffering EVERYTHING. This buffers only the
-   aliased class.
+   for the llama.cpp family and stays scoped: bare-name traffic keeps
+   today's pipe posture byte-for-byte, and real SDK clients
+   (content-length senders) only pay a body copy when the model is
+   aliased. The rejected option (a) was buffering EVERYTHING. This
+   buffers only the aliased class. NOTE: forward-time buffering does
+   NOT close the chunk-boundary sniff gap (the sniff feeds ROUTING,
+   which already happened). Closing that gap needs a bounded
+   multi-chunk peek at the SNIFF seam instead (peek more chunks,
+   unshift them all back — the gate's body-whole invariant holds).
