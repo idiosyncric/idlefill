@@ -378,40 +378,51 @@ releases parked requests cleanly too.
 `menubar/IdlefillMenubar.swift` is an AppKit `NSStatusItem` + `NSPopover`
 companion (macOS 14+, built with plain `swiftc` — no Xcode project; the
 SwiftUI `MenuBarExtra` exposes no click count, so the status item is built
-by hand and the existing panel view is hosted in a popover unchanged) that
-shows the arbiter state at a glance and controls the local client daemon.
-It is a second *view* of the same daemon, not a different daemon: liveness
-is read from the arbiter (the client row's `last_seen`, within the
-arbiter's 90s window), so the daemon can be started from anywhere — the
-menu bar, an Orca tab, launchd — and the arbiter stays the ground truth.
-The panel shows the state word (the arbiter's global verdict for the box),
-a scope (machine × project pickers — see the **Scope** bullet), the
-picked scope's queue depth, today's finished/failed, tokens out with the
-project's own cap, every running lease of the picked machine, the
-published queue peek, plus Open Dashboard · Show Logs · Start/Stop ·
-Restart · Open Desktop (right half carries the exception-only update
-indicator) · Install Update <v> (exception-only).
+by hand and the panel view is hosted in a popover unchanged). Issue #61
+step 4 demoted it from a control surface to a **glance + open window**:
+the glance answers "is the box healthy, and is an update waiting?"
+without opening anything, and one row opens the one window (the desktop
+app hosting the arbiter-served page). It is a second *view* of the same
+daemon, not a different daemon: liveness is read from the arbiter (the
+client row's `last_seen`, within the arbiter's 90s window), so the daemon
+can be started from anywhere — an Orca tab, launchd, the control CLI
+below — and the arbiter stays the ground truth. The panel shows the
+state word (the arbiter's global verdict for the box), this machine's
+status row (the name-matched client row's liveness posture — or the
+missing/rejected-token fact), the checkout revision row with the
+exception-only `daemon behind` tag, and the exception-only sessions
+block (the count line only while sessions exist; one-liners for
+paused / forced / queued / stale only), plus Open Desktop (the ONE nav
+row — its right half carries the exception-only update indicator) ·
+Install Update <v> (exception-only).
 
 - **Click routing:** a *single click* toggles the popover (the panel —
   today's behavior, exactly). A *double click* opens the **desktop app**
-  (`idlefill://open` — the `State` view), falling back to
-  `open /Applications/Idlefill.app` if the URL-scheme open is not handled.
-  "Installed" = `/Applications/Idlefill.app` exists (the standard install
-  target of `desktop/update.sh`).
-- **Handoff rows:** **Open Dashboard** opens the desktop app's
-  **Projects** view (`idlefill://projects` — this client's project config);
-  if the desktop app is not installed it opens `server_url + "/"` in the
-  browser (today's behavior). **Show Logs** opens the desktop app
-  (`idlefill://logs` — since #61 step 3 the desktop lands on the page's
-  default view; the client log tail is the logs DOCK's Client log tab on
-  the page); if the desktop app is not installed it
-  opens the log dir in Finder (today's behavior). With the desktop app
-  installed the menu bar no longer opens the arbiter web dashboard — the
-  handoff goes to the desktop app.
-- **Open Desktop row:** an always-on row that performs the *double-click
-  action* — `idlefill://open` (the desktop app's **State** view), falling
-  back to `open /Applications/Idlefill.app` when the URL-scheme open is
-  not handled. The row and the double-click routing call the SAME shared
+  (`idlefill://open` — since #61 step 3 the page's default view),
+  falling back to `open /Applications/Idlefill.app` if the URL-scheme
+  open is not handled. "Installed" = `/Applications/Idlefill.app` exists
+  (the standard install target of `desktop/update.sh`).
+- **Retired by the demotion (#61 step 4)** — each now lives in the one
+  window (the page's four views + the desktop app's Settings disclosure,
+  #61 step 3): the machine × project **scope pickers** (the page is the
+  place to look at any machine); the per-scope **stats rows** — queue
+  depth, today's finished/failed, tokens out with the project cap, the
+  running leases as rows, the queue peek (the page's four views); the
+  exception-only **scope controls** — project pause gate, grant knobs,
+  worker pause/force override (the page owns every write); the
+  **Start/Stop/Restart** rows (the Settings disclosure hosts the launchd
+  toggles; the control CLI below covers the rest). The `Open Dashboard`
+  and `Show Logs` rows retire too: step 3 re-points every `idlefill://`
+  deep link onto the page's default view anyway, and the logs dock is
+  not a hashable view — a second nav row could only land where
+  `Open Desktop` already lands. `menubar/scope-test.sh` retired WITH
+  the picker it pinned (the repo rule: harnesses retire with the code
+  they pin).
+- **Open Desktop row:** the always-on nav row that performs the
+  *double-click action* — `idlefill://open` (the desktop app; since
+  step 3 the page's default view), falling back to
+  `open /Applications/Idlefill.app` when the URL-scheme open is not
+  handled. The row and the double-click routing call the SAME shared
   helper (`MenuBarAppState.openDesktopApp`), so they cannot drift. Its
   right half carries the exception-only update indicator: when an update
   is available the tag shows the `updateAvailable` value **verbatim** (a
@@ -424,9 +435,10 @@ indicator) · Install Update <v> (exception-only).
   panel door was removed. The app's exit path is the CLI
   (`node scripts/idlefill-menubar.mjs app stop`) or launchd
   (`launchctl bootout gui/$(id -u)/com.sam.idlefill.menubar`). The row
-  set and the exception-only tag are pure (`AppModel.panelActionRows` /
-  `desktopRowTag` — the view renders that spec) and are proven headlessly
-  by `menubar/panel-test.sh` (the same harness pattern as
+  set, the exception-only tag, and the glance's status row are pure
+  (`AppModel.panelActionRows` / `desktopRowTag` / `glanceStatusRow` —
+  the view renders that spec) and are proven headlessly by
+  `menubar/panel-test.sh` (the same harness pattern as
   `menubar/uc-test.sh`).
 
 - **Build:** `menubar/build.sh` → `menubar/IdlefillMenubar.app`, a real
@@ -557,55 +569,35 @@ indicator) · Install Update <v> (exception-only).
   (`UpdatePlan`) is pure and is proven headlessly by
   `menubar/uc-update-test.sh` against scratch repos (the same harness
   pattern as `menubar/uc-test.sh`).
-- **Scope (machine × project):** the client config is parsed **once** at
-  launch (`ClientConfig`: `token` + `server_url` + `client_name` +
-  `update_channel` + `update_pin` + `update_check_minutes`) and the
-  panel's default scope is **"this machine · all projects"** — the client
-  row whose `name` equals the config's `client_name`, whatever the order
-  in the payload (registration is idempotent by name, so the name — not
-  the `client_id` — survives daemon restarts). If the payload carries no
-  row of that name the picker defaults to the explicitly labelled
-  **"all machines"** aggregate — the old first-online heuristic is that
-  labelled fallback only, never a silent default. The machine picker
-  (online dot + `last_seen` + the exception-only override tag) widens to
-  any machine; the project picker (the scope's published projects, with
-  `paused` / `budget full` / `worker paused` exception tags) narrows to
-  one project. The selection is MODEL STATE: picking re-projects the LAST
-  payload through the pure `ScopeView` — no network on selection, and a
-  key the next payload no longer carries re-resolves to the default.
-  Values come from the published per-project view, never recomputed: the
-  scope's queue depth is the scope machine's own worker rows (the
-  aggregate is the sum of its parts), `tokens out` sums the parts with
-  each project's own cap, and the header state word stays the arbiter's
-  GLOBAL verdict (a scope never rewords the header). Liveness keeps two
-  facts apart: the status row's staleness is the SCOPE machine's
-  `last_seen`, while Start/Stop still act on the LOCAL process table
-  (the row displayed and the process controlled can differ — the panel
-  says which). The published per-scope detail drives exception-only
-  controls on the EXISTING routes (no new endpoints): the project gate
-  (`POST /api/projects/:name` `{paused}`), the grant knobs
-  (`POST /api/projects/:name/settings` — the body carries only the
-  touched knob; JSON `null` clears it back to the global; the cycle
-  reads the GLOBAL knob, never the effective one, or it would chase its
-  own override), and the worker override
-  (`POST /api/clients/:ref/override`). Same token gate as the dashboard:
-  no token → NO request is issued and the status row names the missing
-  token — "no token" (amber, a local misconfiguration) is distinct on
-  screen from "unreachable" (red, the server is down), and a 401 reads
-  as "bad token" (amber). The decision core (`ScopeView`) is pure and is
-  proven headlessly by `menubar/scope-test.sh` — the same harness
-  pattern as `menubar/uc-test.sh`, against canned payloads AND a
-  throwaway arbiter instance with two fake clients and two active
-  leases.
+- **Config:** the client config is parsed **once** at launch
+  (`ClientConfig`: `token` + `server_url` + `client_name` +
+  `update_channel` + `update_pin` + `update_check_minutes`). The
+  `client_name` key selects **this machine's** row in the payload (its
+  `last_seen` drives the glance's liveness posture and the
+  `daemon behind` comparison) — registration is idempotent by name, so
+  the name, not the `client_id`, survives daemon restarts. Values come
+  from the published state payload, never recomputed: the header state
+  word is the arbiter's GLOBAL verdict for the box. The pre-demotion
+  machine × project **scope** machinery (`ScopeView`'s picker state, the
+  per-scope aggregates, the exception-only control writes through
+  `POST /api/projects/:name`, `/settings`, and
+  `/api/clients/:ref/override`) retired in #61 step 4 — the page owns
+  every control and every per-machine view. The pure `ScopeView`
+  projection itself stays as the glance's read site (`sessions-test.sh`
+  and `staleness-test.sh` pin it against canned payloads).
 - **Repo discovery:** the binary ships at `<repo>/menubar/`, so it resolves
   the repo from its own location (one level up), honoring
   `IDLEFILL_CONFIG_FILE` when set. The token is read at runtime from the
   gitignored `client/config.json` — never baked in.
-- **Starting the daemon** runs the repo's `node_modules/.bin/tsx` on
-  `client/src/index.ts` with the client dir as cwd and a real `PATH`
-  (a GUI-launched app inherits only `/usr/bin:/bin`, where `node` does not
-  live — the tsx shim resolves node via `#!/usr/bin/env node`). Stop sends
-  `SIGINT` to the whole tsx pair (clean, crash-safe shutdown).
+- **The daemon control paths** (`start()` runs the repo's
+  `node_modules/.bin/tsx` on `client/src/index.ts` with the client dir as
+  cwd and a real `PATH`; `stop()` sends `SIGINT` to the whole tsx pair —
+  clean, crash-safe) stay in the app for the update machinery
+  (`updateCode()`'s stop/start steps, proven by `uc-update-test.sh`),
+  but the panel no longer exposes them (the Settings disclosure hosts
+  the launchd toggles). A GUI-launched app inherits only
+  `/usr/bin:/bin`, where `node` does not live — the tsx shim resolves
+  node via `#!/usr/bin/env node`.
 
 **The control CLI** — `scripts/idlefill-menubar.mjs` — drives and
 troubleshoots the app and the daemon from a terminal while developing
@@ -675,7 +667,8 @@ bar — and the arbiter stays the ground truth.
   window forward, and re-points the webview (extra restored windows are
   closed — the link targets one window). Parsing is the pure
   `AppModel.hashView(for:)`. This is how the menu bar's double-click and
-  its re-routed rows hand off to the desktop app.
+  its one `Open Desktop` row (#61 step 4 demotion) hand off to the
+  desktop app.
 - **The ONE surface (issue #61 step 1 + 3) — the app hosts the web page.**
   The window IS a `WKWebView` (system WebKit, zero new dependencies)
   loading the arbiter's **live origin** — `server_url` from

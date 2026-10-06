@@ -44,6 +44,14 @@ reason to exist.
 - Linux: the same page in a browser, no native shell (already the locked
   posture; nothing forks).
 
+**Status (2026-10-06):** step 4 built + harness-proven on branch
+`issue-61-step4` — the menubar demotes to glance + open window (state
+word, this-machine glance, exception-only update indicator, one
+`Open Desktop` row; scope pickers, stats, controls, and the daemon rows
+retire to the page + the Settings disclosure).
+[ISSUE61-STEP4-REPORT.md](ISSUE61-STEP4-REPORT.md). The owner's live
+eyeball of the demoted popover follows the merge.
+
 ## Migration order (safe, reversible)
 
 1. Webview window loading the live origin + token injection. Old tabs stay
