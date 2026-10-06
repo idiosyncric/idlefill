@@ -1,0 +1,16 @@
+{
+  "$schema": "https://schema.tauri.app/capability/1",
+  "identifier": "shell-windows",
+  "description": "The lock D4-shape states: the lifecycle/glance commands reach ONLY the app's own local windows (the settings + glance views). No `remote` block means no remote origin — the arbiter page (External URL) gets NO IPC at all (tauri 2.12 authority.rs: resolve_access denies a command with no capability matching the origin/window; remote origins need capability.remote.urls, never set here).",
+  "windows": ["settings", "glance"],
+  "permissions": [
+    "core:default",
+    "allow-settings-state",
+    "allow-set-arbiter",
+    "allow-set-daemon",
+    "allow-set-menubar",
+    "allow-relaunch-arbiter-cmd",
+    "allow-glance-state",
+    "allow-glance-action"
+  ]
+}

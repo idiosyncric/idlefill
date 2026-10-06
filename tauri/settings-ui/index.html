@@ -1,0 +1,89 @@
+<!doctype html>
+<!-- The bundled settings window (D4-shape): the three launchd toggles
+     (the desktop's Settings rows, IdlefillDesktop.swift:1814-1853), the
+     runs:/note lines, the repo path, the marker. It holds NO arbiter
+     data — shell chrome only. Its IPC reach is the capability file
+     (capabilities/default.json: local windows only, no remote block),
+     so the arbiter page can never call these verbs. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>idlefill settings</title>
+<style>
+:root { color-scheme: light dark; }
+body { font: 13px -apple-system, sans-serif; margin: 0; padding: 16px 18px; }
+h2 { font-size: 14px; margin: 0 0 10px; }
+.row { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-bottom: 1px solid color-mix(in srgb, currentColor 12%, transparent); }
+.row .name { flex: 1; }
+.row .state { color: #6a6a72; font-size: 12px; }
+.row .note { width: 100%; color: #b3541e; font-size: 12px; padding: 2px 0 0; }
+button { font: inherit; padding: 3px 12px; }
+.meta { color: #6a6a72; font-size: 12px; margin-top: 14px; word-break: break-all; }
+.stopped { color: #c0392b; font-weight: 600; }
+</style>
+</head>
+<body>
+<h2>LaunchAgents</h2>
+<div class="row"><span class="name">Client daemon</span><span class="state" id="daemon-state"></span><button id="daemon-toggle"></button></div>
+<div class="row" id="daemon-note-row" hidden><div class="note" id="daemon-note"></div></div>
+<div class="row"><span class="name">Arbiter (this checkout's server)</span><span class="state" id="arbiter-state"></span><button id="arbiter-toggle"></button></div>
+<div class="row" id="arbiter-note-row" hidden><div class="note" id="arbiter-note"></div></div>
+<div class="row"><span class="name">Legacy menubar agent</span><span class="state" id="menubar-state"></span><button id="menubar-toggle"></button></div>
+<div class="row" id="menubar-note-row" hidden><div class="note" id="menubar-note"></div></div>
+<h2 style="margin-top:18px">Arbiter</h2>
+<div class="row"><span class="name" id="arbiter-exception"></span><button id="relaunch">Relaunch arbiter</button></div>
+<div class="meta" id="meta"></div>
+<script>
+function invoke(cmd, args) {
+  return window.__TAURI__.core.invoke(cmd, args || {});
+}
+
+async function refresh() {
+  const s = await invoke('settings_state');
+  render(s);
+}
+
+function stateText(loaded, runs) {
+  if (!loaded) return 'not installed';
+  return 'installed' + (runs ? ' — runs: ' + runs : '');
+}
+
+function render(s) {
+  for (const [key, loaded, runs, note] of [
+    ['daemon', s.daemon_loaded, s.daemon_runs, s.daemon_note],
+    ['arbiter', s.arbiter_loaded, s.arbiter_runs, s.arbiter_note],
+    ['menubar', s.menubar_loaded, s.menubar_runs, s.menubar_note],
+  ]) {
+    document.getElementById(key + '-state').textContent = stateText(loaded, runs);
+    const btn = document.getElementById(key + '-toggle');
+    btn.textContent = loaded ? 'Uninstall' : 'Install';
+    const noteRow = document.getElementById(key + '-note-row');
+    noteRow.hidden = !note;
+    document.getElementById(key + '-note').textContent = note || '';
+  }
+  const exc = document.getElementById('arbiter-exception');
+  exc.textContent = s.arbiter_stopped ? 'arbiter stopped — loaded but exited' : '';
+  exc.className = 'name' + (s.arbiter_stopped ? ' stopped' : '');
+  document.getElementById('relaunch').hidden = !s.arbiter_stopped;
+  document.getElementById('meta').textContent =
+    'build ' + s.marker + ' · repo ' + s.repo + ' · config ' + s.config_path;
+}
+
+async function toggle(kind) {
+  const s = await invoke('settings_state');
+  const on = !s[kind + '_loaded'];
+  render(await invoke('set_' + kind, { on }));
+}
+
+document.getElementById('daemon-toggle').onclick = () => toggle('daemon');
+document.getElementById('arbiter-toggle').onclick = () => toggle('arbiter');
+document.getElementById('menubar-toggle').onclick = () => toggle('menubar');
+document.getElementById('relaunch').onclick = async () => render(await invoke('relaunch_arbiter_cmd'));
+
+// D6: on a programmatic reload the page re-reads everything — no state
+// survives a reload (the desktop's full-rebuild posture).
+refresh();
+setInterval(() => { if (document.hasFocus()) refresh(); }, 5000);
+</script>
+</body>
+</html>

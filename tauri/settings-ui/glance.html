@@ -1,0 +1,55 @@
+<!doctype html>
+<!-- The glance surface (D1): the tray's single click (Q-c) anchors this
+     borderless window under the tray icon; blur dismisses it (the
+     hand-written popover substitute, D1 cost (1)). It renders ONLY what
+     the pure specs produce (glance_state returns glance_status_row +
+     the sessions count/exception lines + glance_action_rows + the
+     exception-only relaunch flag) — the view never recomputes a verdict
+     (the Swift harnesses' rule, kept). -->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+html,body{margin:0;font:13px -apple-system,sans-serif;background:#101014;color:#e8e8ea;user-select:none;overflow:hidden}
+.wrap{padding:10px 12px}
+.word{font-weight:600;margin-bottom:2px}
+.word.red{color:#e05555}
+.count{color:#8b8b93;margin:8px 0 2px}
+.exc{color:#d9a441;margin:2px 0}
+.row{display:block;padding:6px 8px;margin:3px -4px;border-radius:6px;color:#e8e8ea;text-decoration:none;cursor:default}
+.row:hover{background:#1d1d24}
+.row.warn{color:#d9a441}
+</style>
+</head>
+<body>
+<div class="wrap">
+<div class="word" id="word"></div>
+<div id="sessions"></div>
+<div id="rows"></div>
+</div>
+<script>
+function invoke(cmd,args){return window.__TAURI__.core.invoke(cmd,args||{});}
+async function render(){
+  const s = await invoke('glance_state');
+  const w = document.getElementById('word');
+  w.textContent = s.word;
+  w.className = 'word' + (s.red ? ' red' : '');
+  let sess = '';
+  if (s.sessionsCount) sess += '<div class="count">' + esc(s.sessionsCount) + '</div>';
+  for (const line of s.exceptionLines) sess += '<div class="exc">' + esc(line) + '</div>';
+  document.getElementById('sessions').innerHTML = sess;
+  let rows = '';
+  if (s.relaunch) rows += '<a class="row warn" data-action="relaunch">Relaunch arbiter</a>';
+  for (const r of s.rows) rows += '<a class="row" data-action="' + r.id + '">' + esc(r.label) + '</a>';
+  document.getElementById('rows').innerHTML = rows;
+}
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+document.getElementById('rows').addEventListener('click', (e) => {
+  const a = e.target.closest('[data-action]');
+  if (a) invoke('glance_action', { id: a.dataset.action });
+});
+window.__glanceRefresh = render;
+render();
+</script>
+</body>
+</html>

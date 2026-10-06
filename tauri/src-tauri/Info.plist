@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Merged into the bundle's Info.plist by bundle.macOS.infoPlist
+     (tauri-utils 2.10.1 MacConfig::info_plist :669). The ATS dict is
+     parity with desktop/build.sh:144-152: the loopback arbiter needs no
+     exception (proven by removal in the spike), but a remote plain-HTTP
+     arbiter (urza) ships the same exception the Swift shell ships. -->
+<plist version="1.0">
+<dict>
+  <key>NSAppTransportSecurity</key>
+  <dict><key>NSAllowsArbitraryLoads</key><true/></dict>
+</dict>
+</plist>

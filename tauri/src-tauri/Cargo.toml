@@ -1,0 +1,28 @@
+# idlefill Tauri v2 shell (issue #70, decision doc docs/architecture/tauri-cutover.md).
+# One artifact: window (the live arbiter page) + tray + settings window.
+# Crate versions pinned to the spike-resolved set (ISSUE69-GRILL-REPORT):
+# tauri 2.12.1, tauri-plugin-deep-link 2.6.1, tauri-plugin-single-instance 2.5.2.
+[workspace]
+
+[package]
+name = "idlefill-app"
+version = "0.0.0"
+description = "idlefill shell: hosts the live arbiter page, the tray glance, and native launchd lifecycle"
+edition = "2021"
+
+[lib]
+name = "idlefill_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+tauri = { version = "2.12", features = ["tray-icon"] }
+tauri-plugin-deep-link = "2"
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+libc = "0.2"
+ureq = { version = "2", default-features = false }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
