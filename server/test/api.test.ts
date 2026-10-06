@@ -2080,3 +2080,172 @@ test('dashboard carries the #61 step 3 surfaces (daemon behind tag, Client log t
   // Deep-link hash routing (Slice B re-routes idlefill:// onto #<view>).
   assert.ok(html.includes('HASH_VIEW_RE'), 'the page honours a #view deep link');
 });
+
+// ---------------------------------------------------------------------------
+// #66 — model aliases on the API plane: the /api/state `model_aliases`
+// ADD-key (catalog untouched, no token ever), the authoring read
+// GET /api/aliases (token-gated, per-pair markers), and the POST
+// validation matrix (400 family + 404 unknown delete + accepted unprobed
+// pair + events on every write).
+// ---------------------------------------------------------------------------
+
+test('#66 /api/state model_aliases ADD-key: present beside an untouched catalog block; no token anywhere (anonymous AND authed)', async () => {
+  const aggDir = mkdtempSync(join(tmpdir(), 'idlefill-alias-state-'));
+  try {
+    const aggCfg: ServerConfig = { ...cfg, api_tokens: [AGG_TOKEN], state_file: join(aggDir, 'state.json') };
+    const aggArbiter = new Arbiter(new StateStore(aggCfg.state_file), aggCfg, det, {
+      modelsFetcher: async (url) => {
+        // omlx's probe FAILS (401 shape): its pair stands as 'declared'.
+        if (url.includes('omlx')) throw new Error('probe HTTP 401');
+        return ['Qwen3.8-27B'];
+      },
+    });
+    const up = aggArbiter.upsertServerConnection({ name: 'omlx', url: 'http://omlx.local:8000', models: ['MlxDeclared'], activity_path: '', auth_token: 'sekret-omlx-token' });
+    assert.ok(up.ok);
+    const put = aggArbiter.putModelAlias({ alias: 'Flagship', pairs: [{ server_id: up.server!.id, model: 'MlxDeclared' }] });
+    assert.ok(put.ok, JSON.stringify(put));
+    await aggArbiter.probeCatalog();
+    const aggApp = buildApi({ arbiter: aggArbiter, cfg: aggCfg, publicDir: join(__dirname, '..', 'public') });
+    await aggApp.ready();
+    try {
+      for (const inject of [
+        { method: 'GET' as const, url: '/api/state' },
+        { method: 'GET' as const, url: '/api/state', headers: { authorization: `Bearer ${AGG_TOKEN}` } },
+      ]) {
+        const res = await aggApp.inject(inject);
+        assert.equal(res.statusCode, 200);
+        const st = res.json() as {
+          catalog?: { name: string; catalog_source?: string }[];
+          model_aliases?: { name: string; server_id: string; url: string; auth_set: boolean; engine_model: string; catalog_source: string }[];
+        };
+        assert.ok(Array.isArray(st.model_aliases), 'model_aliases rides /api/state as an ADD-key sibling');
+        assert.ok(Array.isArray(st.catalog), 'the catalog block still rides (add, never rename)');
+        const alias = st.model_aliases!.find((e) => e.name === 'Flagship');
+        assert.ok(alias, 'the alias publishes once resolved');
+        assert.equal(alias!.server_id, up.server!.id, 'resolved to the winner ROW');
+        assert.equal(alias!.engine_model, 'MlxDeclared', 'the winner pair engine-OWN id, not the alias name');
+        assert.equal(typeof alias!.auth_set, 'boolean', 'auth_set boolean, never a token');
+        assert.ok(['probed', 'declared'].includes(alias!.catalog_source));
+        assert.ok(st.catalog!.some((e) => e.name === 'MlxDeclared'), 'the bare catalog still carries the declared name (additive, not moved)');
+        assert.ok(!res.body.includes('sekret-omlx-token'), 'the row token VALUE never enters the anonymous state view');
+        assert.ok(!res.body.includes('auth_token'), 'the field name auth_token never appears');
+      }
+    } finally {
+      await aggApp.close();
+    }
+  } finally {
+    rmSync(aggDir, { recursive: true, force: true });
+  }
+});
+
+test('#66 GET /api/aliases: the authoring read is token-gated (never the anonymous exception) and carries per-pair markers with no secret', async () => {
+  const aggDir = mkdtempSync(join(tmpdir(), 'idlefill-alias-read-'));
+  try {
+    const aggCfg: ServerConfig = { ...cfg, api_tokens: [AGG_TOKEN], state_file: join(aggDir, 'state.json') };
+    const aggArbiter = new Arbiter(new StateStore(aggCfg.state_file), aggCfg, det, {
+      modelsFetcher: async () => {
+        throw new Error('probe refused');
+      },
+    });
+    const up = aggArbiter.upsertServerConnection({ name: 'omlx', url: 'http://omlx.local:8000', models: ['MlxDeclared'], activity_path: '', auth_token: 'sekret-omlx-token' });
+    aggArbiter.putModelAlias({ alias: 'Flagship', pairs: [{ server_id: up.server!.id, model: 'MlxDeclared' }], pin: up.server!.id });
+    const aggApp = buildApi({ arbiter: aggArbiter, cfg: aggCfg, publicDir: join(__dirname, '..', 'public') });
+    await aggApp.ready();
+    try {
+      const anon = await aggApp.inject({ method: 'GET', url: '/api/aliases' });
+      assert.equal(anon.statusCode, 401, 'the authoring read is NOT part of the anonymous /api/state exception');
+      const ok = await aggApp.inject({ method: 'GET', url: '/api/aliases', headers: { authorization: `Bearer ${AGG_TOKEN}` } });
+      assert.equal(ok.statusCode, 200);
+      const body = ok.json() as { aliases: { alias: string; pinned_server_id?: string; pairs: { server_id: string; model: string; source: string }[] }[] };
+      assert.equal(body.aliases.length, 1);
+      const row = body.aliases[0]!;
+      assert.equal(row.alias, 'Flagship');
+      assert.equal(row.pinned_server_id, up.server!.id, 'the pin rides for the drag affordance');
+      assert.deepEqual(row.pairs, [{ server_id: up.server!.id, model: 'MlxDeclared', source: 'unprobed' }], 'a never-cycled pair renders the unprobed marker');
+      assert.ok(!ok.body.includes('sekret-omlx-token') && !ok.body.includes('auth_token'), 'no secret by construction (D1: server_id + engine ids only)');
+    } finally {
+      await aggApp.close();
+    }
+  } finally {
+    rmSync(aggDir, { recursive: true, force: true });
+  }
+});
+
+test('#66 POST /api/aliases: the whole-entry validation matrix — 400 family, 404 unknown delete, unprobed pair ACCEPTED, re-pin alone, events on every write', async () => {
+  const aggDir = mkdtempSync(join(tmpdir(), 'idlefill-alias-post-'));
+  try {
+    const aggCfg: ServerConfig = { ...cfg, api_tokens: [AGG_TOKEN], state_file: join(aggDir, 'state.json') };
+    const store = new StateStore(join(aggDir, 'state.json'));
+    const aggArbiter = new Arbiter(store, aggCfg, det);
+    const up = aggArbiter.upsertServerConnection({ name: 'omlx', url: 'http://omlx.local:8000', models: ['MlxDeclared'], activity_path: '' });
+    const other = aggArbiter.upsertServerConnection({ name: 'alpha', url: 'http://alpha.local:9090', models: ['engine-a-id'], activity_path: '' });
+    assert.ok(up.ok && other.ok);
+    const aggApp = buildApi({ arbiter: aggArbiter, cfg: aggCfg, publicDir: join(__dirname, '..', 'public') });
+    await aggApp.ready();
+    const H = { authorization: `Bearer ${AGG_TOKEN}`, 'content-type': 'application/json' };
+    try {
+      const post = (body: unknown) => aggApp.inject({ method: 'POST', url: '/api/aliases', headers: H, body: JSON.stringify(body) });
+
+      // Anonymous write: rejected like every /api/* write.
+      assert.equal((await aggApp.inject({ method: 'POST', url: '/api/aliases', headers: { 'content-type': 'application/json' }, body: '{}' })).statusCode, 401);
+
+      // The 400 family, each with its reason in the body.
+      const hostile = await post({ alias: 'bad\nname', pairs: [{ server_id: up.server!.id, model: 'MlxDeclared' }] });
+      assert.equal(hostile.statusCode, 400);
+      assert.match(hostile.json().error, /printable/);
+      const overlong = await post({ alias: 'x'.repeat(129), pairs: [{ server_id: up.server!.id, model: 'MlxDeclared' }] });
+      assert.equal(overlong.statusCode, 400, 'alias name bounded to 128');
+      const quoteModel = await post({ alias: 'Flagship', pairs: [{ server_id: up.server!.id, model: 'has"quote' }] });
+      assert.equal(quoteModel.statusCode, 400, 'a " or \\ in the ENGINE ID would corrupt the body splice — refused at the door');
+      const bslashModel = await post({ alias: 'Flagship', pairs: [{ server_id: up.server!.id, model: 'back\\slash' }] });
+      assert.equal(bslashModel.statusCode, 400, 'backslash refused in the engine id too');
+      const emptyPairs = await post({ alias: 'Flagship', pairs: [] });
+      assert.equal(emptyPairs.statusCode, 400);
+      assert.match(emptyPairs.json().error, /pairs/);
+      const unknownRow = await post({ alias: 'Flagship', pairs: [{ server_id: 'srv-does-not-exist', model: 'MlxDeclared' }] });
+      assert.equal(unknownRow.statusCode, 400);
+      assert.match(unknownRow.json().error, /unknown server_id/);
+      const dupe = await post({ alias: 'Flagship', pairs: [{ server_id: up.server!.id, model: 'MlxDeclared' }, { server_id: up.server!.id, model: 'MlxDeclared' }] });
+      assert.equal(dupe.statusCode, 400);
+      assert.match(dupe.json().error, /duplicate pair/);
+
+      // A pair the probe never confirmed is ACCEPTED at authoring (D5):
+      // confirmation is publish-time, per pair, not write-time.
+      const okWrite = await post({ alias: 'Flagship', pairs: [{ server_id: up.server!.id, model: 'MlxDeclared' }, { server_id: other.server!.id, model: 'engine-a-id' }] });
+      assert.equal(okWrite.statusCode, 200);
+      assert.equal(okWrite.json().created, true);
+
+      // A malformed pin is refused; re-pin ALONE updates (the drag path).
+      // A pin at a NOT-present row is legal (D4: a pin that no longer
+      // matches a surviving pair falls through at publish — a row can be
+      // deleted after the write, so the authoring door cannot require it).
+      assert.equal((await post({ alias: 'Flagship', pin: '' })).statusCode, 400);
+      assert.equal((await post({ alias: 'Flagship', pin: up.server!.id })).statusCode, 200);
+      const repin = await post({ alias: 'Flagship', pin: other.server!.id });
+      assert.equal(repin.statusCode, 200, 'alias + pin alone = re-pin (no pairs in the body)');
+      assert.equal(repin.json().created, false);
+      assert.equal(repin.json().alias.pinned_server_id, other.server!.id);
+
+      // Every write appended an event (the Sessions view + log dock see it).
+      const kinds = store.state.events.filter((e) => e.kind === 'model_alias_updated');
+      assert.ok(kinds.length >= 2, `updated events appended (${kinds.length})`);
+
+      // Delete: happy path + its event; unknown alias 404.
+      const gone = await post({ alias: 'Flagship', delete: true });
+      assert.equal(gone.statusCode, 200);
+      assert.equal(gone.json().deleted, true);
+      assert.ok(store.state.events.some((e) => e.kind === 'model_alias_removed'), 'the removal appended an event');
+      const again = await post({ alias: 'Flagship', delete: true });
+      assert.equal(again.statusCode, 404, 'deleting an unknown alias is a 404, not a silent 200');
+      assert.equal(again.json().error, 'unknown_alias');
+
+      // A deleted alias no longer publishes to the client.
+      await aggArbiter.probeCatalog();
+      assert.deepEqual(aggArbiter.modelAliases(), [], 'the delete lands on the publish block next cycle');
+    } finally {
+      await aggApp.close();
+    }
+  } finally {
+    rmSync(aggDir, { recursive: true, force: true });
+  }
+});

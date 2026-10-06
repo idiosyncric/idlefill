@@ -1313,3 +1313,211 @@ test('results: projectResults orders newest-first and honors limit + job_id filt
   assert.deepEqual(h.arbiter.projectResults('nope-proj'), [], 'a project with no rows returns empty (the ROUTE 404s on unknown project)');
   rmSync(h.dir, { recursive: true, force: true });
 });
+
+// ---------------------------------------------------------------------------
+// Model aliases (#66) — the arbiter-side alias pass: per-pair confirmation
+// over the SAME probe map, the D4 winner rule with pin fall-through, and
+// the drop-don't-reject publish posture. Fake fetcher steers the probe per
+// row; no network.
+// ---------------------------------------------------------------------------
+
+/**
+ * Harness for the alias pass: two declared rows (one credentialed), a
+ * fetcher the test drives per row. `probe(lists)` runs ONE probeCatalog
+ * cycle with the given per-row model lists (an entry omitted or null = the
+ * probe FAILS for that row).
+ */
+function makeAliasHarness(probeMap: Record<string, string[] | null> = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'idlefill-alias-'));
+  const store = new StateStore(join(dir, 'state.json'));
+  const cfg: ServerConfig = {
+    listen: 0,
+    api_tokens: ['t'],
+    llama_swap_url: 'http://fake',
+    activity_path: '',
+    log_glob: '',
+    idle_seconds: 300,
+    poll_ms: 15000,
+    lease_ttl_seconds: 1800,
+    lease_ttl_safety_factor: 2,
+    lease_ttl_floor_seconds: 60,
+    max_concurrent_leases: 1,
+    job_fail_threshold: 5,
+    job_cooldown_seconds: 300,
+    projects: [],
+    state_file: join(dir, 'state.json'),
+  };
+  const arbiter = new Arbiter(store, cfg, new FakeDetector() as never, {
+    modelsFetcher: async (url) => {
+      const key = url.includes('alpha') ? 'alpha' : url.includes('beta') ? 'beta' : 'watched';
+      const list = probeMap[key];
+      if (list === undefined || list === null) throw new Error('probe refused');
+      return list;
+    },
+  });
+  const a = arbiter.upsertServerConnection({ name: 'alpha', url: 'http://alpha.local:8080', activity_path: '', auth_token: 'tok-alpha', models: ['engine-a-id'] });
+  const b = arbiter.upsertServerConnection({ name: 'beta', url: 'http://beta.local:9090', activity_path: '', models: ['engine-b-id'] });
+  assert.ok(a.ok && b.ok);
+  const idA = a.server!.id;
+  const idB = b.server!.id;
+  return { dir, store, arbiter, idA, idB };
+}
+
+// probeCatalog takes no argument; this alias helper drives the shared map.
+function aliasProbe(arbiter: Arbiter, lists: Record<string, string[] | null>, map: Record<string, string[] | null>) {
+  for (const k of ['alpha', 'beta', 'watched']) delete map[k];
+  Object.assign(map, lists);
+  return arbiter.probeCatalog();
+}
+
+test('#66 alias pass: pair CONFIRMED by the probe publishes probed; a probe-FALSED pair publishes declared (never falsely probed)', async () => {
+  const map: Record<string, string[] | null> = {};
+  const h = makeAliasHarness(map);
+  try {
+    const put = h.arbiter.putModelAlias({ alias: 'Flagship', pairs: [{ server_id: h.idA, model: 'engine-a-id' }, { server_id: h.idB, model: 'engine-b-id' }] });
+    assert.ok(put.ok, JSON.stringify(put));
+
+    // Row alpha answers with the pair id; row beta's probe FAILS (401 shape).
+    await aliasProbe(h.arbiter, { alpha: ['engine-a-id'] }, map);
+    const block = h.arbiter.modelAliases();
+    assert.equal(block.length, 1);
+    const entry = block[0]!;
+    assert.equal(entry.name, 'Flagship');
+    assert.equal(entry.server_id, h.idA, 'alpha confirmed → it owns the alias (first surviving pair)');
+    assert.equal(entry.engine_model, 'engine-a-id', 'the winner pair engine-OWN id publishes');
+    assert.equal(entry.catalog_source, 'probed', 'a probe-confirmed pair is honest-probed');
+    assert.equal(entry.auth_set, true, 'auth_set rides from the row; the token never does');
+    assert.ok(!JSON.stringify(block).includes('tok-alpha'), 'the row token NEVER enters the publish block');
+
+    // alpha now refuses the probe: its pair is UNCONFIRMED-but-not-refuted
+    // → it publishes 'declared' (the honest #64 reading).
+    await aliasProbe(h.arbiter, {}, map);
+    const second = h.arbiter.modelAliases()[0]!;
+    assert.ok(second, 'the alias survives a fully-failed probe (pairs stand, publish filters)');
+    assert.equal(second.catalog_source, 'declared', 'a probe-failed row is never falsely probed');
+  } finally {
+    rmSync(h.dir, { recursive: true, force: true });
+  }
+});
+
+test('#66 alias pass: a probe-succeeded row that lacks the id DROPS the pair for the tick — the alias survives on the other pair', async () => {
+  const map: Record<string, string[] | null> = {};
+  const h = makeAliasHarness(map);
+  try {
+    h.arbiter.putModelAlias({ alias: 'Flagship', pairs: [{ server_id: h.idA, model: 'engine-a-id' }, { server_id: h.idB, model: 'engine-b-id' }] });
+
+    // alpha probes successfully WITHOUT the pair id; beta fails (declared).
+    await aliasProbe(h.arbiter, { alpha: ['something-else'] }, map);
+    let block = h.arbiter.modelAliases();
+    assert.equal(block.length, 1, 'the alias survives (the alias never drops — the pair does)');
+    assert.equal(block[0]!.server_id, h.idB, 'the dead alpha pair is gone this tick; beta carries the alias');
+    assert.equal(block[0]!.catalog_source, 'declared');
+
+    // alpha lists it again: the pair returns (stored pairs stand).
+    await aliasProbe(h.arbiter, { alpha: ['engine-a-id'] }, map);
+    block = h.arbiter.modelAliases();
+    assert.equal(block[0]!.server_id, h.idA, 'the pair is back for the next tick');
+    assert.equal(block[0]!.catalog_source, 'probed');
+  } finally {
+    rmSync(h.dir, { recursive: true, force: true });
+  }
+});
+
+test('#66 alias pass: ALL pairs dead for a tick → the alias is not published at all (never a silent half-name)', async () => {
+  const map: Record<string, string[] | null> = {};
+  const h = makeAliasHarness(map);
+  try {
+    h.arbiter.putModelAlias({ alias: 'Flagship', pairs: [{ server_id: h.idA, model: 'engine-a-id' }, { server_id: h.idB, model: 'engine-b-id' }] });
+    // Both rows probe SUCCESSFULLY and neither lists the pair id.
+    await aliasProbe(h.arbiter, { alpha: ['not-it'], beta: ['not-it-either'] }, map);
+    assert.deepEqual(h.arbiter.modelAliases(), [], 'no surviving pair → the alias is not offered this tick');
+
+    // The stored pairs stand: alpha recovers its probe but WITHOUT the id
+    // (its pair stays dropped), beta lists the id → beta carries the alias.
+    await aliasProbe(h.arbiter, { alpha: ['not-it'], beta: ['engine-b-id'] }, map);
+    const block = h.arbiter.modelAliases();
+    assert.equal(block.length, 1);
+    assert.equal(block[0]!.server_id, h.idB, 'stored pairs were never mutated by the drop');
+    assert.equal(block[0]!.catalog_source, 'probed');
+  } finally {
+    rmSync(h.dir, { recursive: true, force: true });
+  }
+});
+
+test('#66 winner rule (D4): stored pin wins; absent pin / pin row gone / pin pair unconfirmed → first SURVIVING pair', async () => {
+  const map: Record<string, string[] | null> = {};
+  const h = makeAliasHarness(map);
+  try {
+    h.arbiter.putModelAlias({
+      alias: 'Flagship',
+      pairs: [{ server_id: h.idA, model: 'engine-a-id' }, { server_id: h.idB, model: 'engine-b-id' }],
+      pin: h.idB,
+    });
+
+    // Both pairs confirmed: the stored pin (beta, the SECOND pair) wins.
+    await aliasProbe(h.arbiter, { alpha: ['engine-a-id'], beta: ['engine-b-id'] }, map);
+    assert.equal(h.arbiter.modelAliases()[0]!.server_id, h.idB, 'the explicit pin beats insertion order');
+
+    // Pin pair unconfirmed (beta probes without the id): falls through to alpha.
+    await aliasProbe(h.arbiter, { alpha: ['engine-a-id'], beta: ['gone'] }, map);
+    assert.equal(h.arbiter.modelAliases()[0]!.server_id, h.idA, 'an unconfirmed pin pair falls through to the first surviving pair');
+
+    // Pin cleared: insertion order decides.
+    h.arbiter.putModelAlias({ alias: 'Flagship', pin: null });
+    await aliasProbe(h.arbiter, { alpha: ['engine-a-id'], beta: ['engine-b-id'] }, map);
+    assert.equal(h.arbiter.modelAliases()[0]!.server_id, h.idA, 'absent pin = first pair in insertion order');
+
+    // Pin row deleted entirely: fall through, and the alias stays publishable.
+    const rows = h.store.state.servers;
+    h.store.state.servers = rows.filter((r) => r.id !== h.idA);
+    h.arbiter.putModelAlias({ alias: 'Flagship', pin: h.idA });
+    await aliasProbe(h.arbiter, { beta: ['engine-b-id'] }, map);
+    const block = h.arbiter.modelAliases();
+    assert.equal(block.length, 1, 'the alias survives the dead pin');
+    assert.equal(block[0]!.server_id, h.idB, 'a pin pointing at a GONE row falls through to the surviving pair');
+  } finally {
+    rmSync(h.dir, { recursive: true, force: true });
+  }
+});
+
+test("#66 publish-path sanitizers are drop-don't-reject: a hostile stored key publishes nothing but never throws", async () => {
+  const map: Record<string, string[] | null> = {};
+  const h = makeAliasHarness(map);
+  try {
+    // A pre-#66 / hand-edited state file can hold a hostile key: publish
+    // drops it (the entry), the loader and the arbiter stay alive.
+    h.store.state.model_aliases['bad\nname'] = {
+      alias: 'bad\nname',
+      pairs: [{ server_id: h.idA, model: 'engine-a-id' }],
+      updated_at: Date.now(),
+    };
+    await aliasProbe(h.arbiter, { alpha: ['engine-a-id'] }, map);
+    assert.deepEqual(h.arbiter.modelAliases(), [], 'the hostile alias is not published');
+    assert.ok(h.store.state.model_aliases['bad\nname'], 'the stored row is untouched (publish filters, never rewrites)');
+  } finally {
+    rmSync(h.dir, { recursive: true, force: true });
+  }
+});
+
+test('#66 aliasRows: per-pair source markers for the dashboard (probed / declared / dropped / unprobed)', async () => {
+  const map: Record<string, string[] | null> = {};
+  const h = makeAliasHarness(map);
+  try {
+    h.arbiter.putModelAlias({
+      alias: 'Flagship',
+      pairs: [{ server_id: h.idA, model: 'engine-a-id' }, { server_id: h.idB, model: 'engine-b-id' }],
+    });
+    // Before any cycle: unprobed.
+    assert.deepEqual(h.arbiter.aliasRows()[0]!.pairs.map((p) => p.source), ['unprobed', 'unprobed']);
+    // Beta's ROW is deleted after the write (putModelAlias 400s an unknown
+    // server_id at authoring; a row vanishing later is the live case).
+    h.store.state.servers = h.store.state.servers.filter((r) => r.id !== h.idB);
+    await aliasProbe(h.arbiter, { alpha: ['engine-a-id'], beta: ['nope'] }, map);
+    const rows = h.arbiter.aliasRows();
+    assert.equal(rows.length, 1);
+    assert.deepEqual(rows[0]!.pairs.map((p) => p.source), ['probed', 'dropped'], 'confirmed pair / gone-row pair both render their marker');
+    assert.ok(rows[0]!.pairs.every((p) => !('auth_token' in p)), 'the dashboard read carries no secret by construction');
+  } finally {
+    rmSync(h.dir, { recursive: true, force: true });
+  }
+});
