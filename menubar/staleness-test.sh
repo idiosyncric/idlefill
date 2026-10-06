@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Headless test for code-staleness (issue #49) on the menubar panel:
 # compile the REAL source (minus @main) + a driver, run under env -i —
-# the same harness pattern as panel-test.sh / scope-test.sh.
+# the same harness pattern as panel-test.sh / uc-test.sh (scope-test.sh
+# retired with the scope pickers, #61 step 4).
 #
 # What is proven:
 #   1. The pure rule (AppModel.daemonBehind(reported:checkout:)):

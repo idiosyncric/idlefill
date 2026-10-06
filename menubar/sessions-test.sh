@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Headless test for the sessions-at-a-glance rows (issue #9): compile the
 # REAL source (minus @main) + a driver, run under env -i (the GUI
-# environment) — the same harness pattern as panel-test.sh / scope-test.sh.
+# environment) — the same harness pattern as panel-test.sh / uc-test.sh
+# (scope-test.sh retired with the scope pickers, #61 step 4).
 #
 # What is proven (canned /api/state payloads through the PURE
 # ScopeView.project projection — the exact read site the panel renders):

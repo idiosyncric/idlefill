@@ -3,64 +3,54 @@
 //
 //  A status-bar icon (AppKit NSStatusItem + NSPopover hosting the SwiftUI
 //  panel — MenuBarExtra exposes no click count, which the double-click
-//  routing below needs) showing the arbiter state at a glance and
-//  controlling the local client daemon:
+//  routing below needs). Issue #61 step 4 DEMOTED it from a control
+//  surface to a GLANCE + OPEN WINDOW: the glance answers "is the box
+//  healthy, and is an update waiting?" without opening anything, and one
+//  row opens the one window that owns every control:
 //
-//    status   — color-coded state word (the arbiter's global verdict for
-//               the box) + the picked scope's live status row
-//    scope    — a machine picker over clients[] (online dot, last_seen;
-//               the default "this machine" = the client row whose name
-//               matches this checkout's config client_name, whatever the
-//               payload order; the labelled "all machines" aggregate is
-//               the explicitly-chosen fallback) and, inside it, a project
-//               picker over the picked client's reported projects (the
-//               default "all projects" is today's aggregate)
-//    stats    — per picked scope: queue depth, today finished/failed,
-//               tokens out (UTC) with the project's OWN cap, the running
-//               lease(s) (every active lease of this client — max
-//               concurrent > 1 lists them all), the published queue peek
-//               (queue_preview; a worker publishing no preview degrades
-//               to the depth number)
-//    controls — the published per-scope detail drives exception-only
-//               controls on existing routes (no new endpoints): the
-//               project pause gate (POST /api/projects/:name), the grant
-//               knobs (POST /api/projects/:name/settings), the worker
-//               pause/force override (POST /api/clients/:ref/override).
-//               Same token gate as the dashboard: no token → no POST and
-//               the status row names the missing token.
-//    actions  — Open Dashboard · Show Logs · Start/Stop · Restart ·
-//               Open Desktop (the double-click action as a row; its right
-//               half carries the exception-only update tag — the
-//               updateAvailable value verbatim, no tag when up to date) ·
-//               Install Update <v> (exception-only). The Update Code and
-//               Quit rows are GONE (issue #27 — the panel door only; the
+//    glance   — color-coded state word (the arbiter's global verdict for
+//               the box) + the machine status row (THIS machine's client
+//               row — name-matched to the config's client_name — with
+//               its liveness posture: today's read of last_seen inside
+//               the arbiter's 90s window), the checkout revision row +
+//               the exception-only `daemon behind` tag (issue #49), and
+//               the exception-only interactive-session block (the count
+//               line only when sessions exist; one-liners for paused /
+//               forced / queued / stale only — Exception-Only rule).
+//    actions  — Open Desktop (the ONE nav row: the double-click action;
+//               its right half carries the exception-only update tag —
+//               the updateAvailable value verbatim, no tag when up to
+//               date) · Install Update <v> (exception-only). The Update
+//               Code and Quit rows were already gone (issue #27; the
 //               UpdatePlan/updateCode() machinery stays intact and
 //               tested); the app's exit path is the CLI
 //               (`node scripts/idlefill-menubar.mjs app stop`) or launchd.
 //
+//    RETIRED by the demotion (#61 step 4) — every one now lives in the
+//    one window (the arbiter-served page's four views + the desktop
+//    app's Settings disclosure, #61 step 3): the machine × project
+//    scope pickers; the per-scope stats (queue depth, today's
+//    finished/failed, tokens out with the project cap, the running
+//    leases as rows, the queue peek); the exception-only scope controls
+//    (project pause gate, grant knobs, worker pause/force override);
+//    the Start/Stop/Restart rows (the Settings disclosure hosts the
+//    launchd toggles; the CLI covers the rest). The `Open Dashboard`
+//    and `Show Logs` rows retire too — step 3 re-points every deep
+//    link onto the page's default view anyway, and the logs dock is
+//    not a hashable view. The menubar/scope-test.sh harness retired
+//    WITH the picker it pinned (the repo rule: harnesses retire with
+//    the code they pin).
+//
 //  Click routing (decided by the pure MenuBarRouter — testable headlessly):
 //    single click  — toggle the popover (today's behavior, exactly)
-//    double click  — open the DESKTOP app on its State view:
+//    double click  — open the DESKTOP app on the page's default view:
 //                    NSWorkspace.open of idlefill://open, falling back to
 //                    `open /Applications/Idlefill.app` when the URL-scheme
 //                    open is not handled (the desktop app not registered
-//                    yet). A double click ALWAYS attempts the desktop app —
-//                    only the two panel rows below fall back. The
-//                    `Open Desktop` panel row performs the SAME action
-//                    through the SAME shared helper (MenuBarAppState
+//                    yet). A double click ALWAYS attempts the desktop app.
+//                    The `Open Desktop` panel row performs the SAME
+//                    action through the SAME shared helper (MenuBarAppState
 //                    .openDesktopApp) so row and router cannot drift.
-//
-//  Re-routed panel rows (same button-row style; the desktop app is
-//  "installed" when /Applications/Idlefill.app exists — the standard
-//  install target per desktop/update.sh):
-//    Show Logs      — installed: idlefill://logs (the desktop app's Logs
-//                     view); not installed: open the daemon log dir in
-//                     Finder (today's behavior).
-//    Open Dashboard — installed: idlefill://projects (the desktop app's
-//                     Projects view — this client's project config); not
-//                     installed: open server_url/ in the browser (today's
-//                     behavior). With the desktop app installed, the menu
-//                     bar no longer opens the arbiter web dashboard.
 //
 //  Design: quiet control room (DESIGN.md). Neutral canvas (#0d1117), hairline
 //  dividers (#30363d), one mono family, four signal colors used ONLY for
@@ -680,35 +670,19 @@ enum ScopeView {
 final class AppModel: ObservableObject {
   @Published var conn: Conn = .off
   @Published var daemonRunning = false
-  // The scope (issue #12): the machine × project pickers drive which rows
-  // the panel shows. The DEFAULT is "this machine · all projects" — the
-  // name-matched client row (the config's client_name) and its aggregate —
-  // exactly today's behaviour; the pickers let the operator widen it.
-  @Published var machine: ScopeView.MachineOption
-    = ScopeView.MachineOption(key: ScopeView.unsetMachineKey, label: "…",
-                              online: false, lastSeen: 0)
-  @Published var projectKey: String = ScopeView.allProjectsKey
-  @Published var scopeProjects: [ScopeProject] = []
-  @Published var queueDepth = 0
-  @Published var today: (finished: Int, failed: Int) = (0, 0)
+  // Issue #61 step 4: the panel's scope PICKERS retired — the one window
+  // (the arbiter-served page) is the place to look at any machine. The
+  // glance below is always THIS machine: the pure ScopeView projection
+  // still projects every payload (sessions-test.sh / staleness-test.sh
+  // pin that read site), pinned to its DEFAULT selection — the
+  // name-matched client row + its aggregate.
   @Published var leases: [ScopeLease] = []
-  @Published var queuePreview: [ScopeQueueRow] = []
-  /// Interactive sessions (#9) — read-only display (the controls live on
-  /// the dashboard). Global: the watched server's interactive traffic, not
-  /// narrowed by the machine picker.
+  /// Interactive sessions (#9) — read-only glance (the controls live on
+  /// the page). Global: the watched server's interactive traffic.
   @Published var sessions: [ScopeSession] = []
   /// The sessions count line ("2 active, 1 paused"); nil = no sessions —
   /// the whole block hidden (Exception-Only rule).
   @Published var sessionsCountLine: String? = nil
-  @Published var lastSeenS: Int? = nil
-  /// Every clients[] row from the last payload (the machine picker's
-  /// options; the "all machines" aggregate row is added by viewMachines).
-  @Published var machines: [ScopeView.MachineOption] = []
-  /// The published per-project token budget for the picked project
-  /// ("all projects" sums the parts; a hidden row = the scope has no
-  /// budget data yet).
-  @Published var tokensToday: (label: String, cap: Double, value: Double) = ("", 0, 0)
-  @Published var tokenRowVisible = false
   /// The revision of THIS checkout's tree, as the operator should read it:
   /// `git rev-parse --short HEAD`. Refreshed at launch (init), on every
   /// completed Update Code, and on each poll tick since issue #49 — the
@@ -790,18 +764,20 @@ final class AppModel: ObservableObject {
     return (v, Pal.warn)
   }
 
-  /** The action block's row SET (issue #27): Open Dashboard · Show Logs ·
-   *  Start/Stop · Restart · Open Desktop (always-on; right half carries
-   *  `desktopRowTag`) · Install Update <v> (exception-only). NO Update
-   *  Code, NO Quit — the panel door is gone, the machinery stays. The
-   *  view renders THIS list, so the harness asserts the shipped panel. */
-  static func panelActionRows(updateAvailable: String?, daemonRunning: Bool) -> [PanelActionRow] {
+  /** The action block's row SET (issue #61 step 4 — the demoted panel):
+   *  Open Desktop (always-on; right half carries `desktopRowTag`) ·
+   *  Install Update <v> (exception-only). The nav rows to other views
+   *  (`Open Dashboard`, `Show Logs`) are GONE — step 3 re-points every
+   *  `idlefill://` deep link onto the page's default view anyway, and
+   *  the logs dock is not a hashable view, so a second nav row could only
+   *  land where this one lands. The daemon control rows (`Start`/`Stop`/
+   *  `Restart`) are GONE — the desktop app's Settings disclosure hosts
+   *  the launchd toggles and `scripts/idlefill-menubar.mjs` covers the
+   *  rest. NO Update Code, NO Quit (issue #27). The view renders THIS
+   *  list, so the harness asserts the shipped panel. */
+  static func panelActionRows(updateAvailable: String?) -> [PanelActionRow] {
     var rows: [PanelActionRow] = [
-      PanelActionRow(label: "Open Dashboard", arrow: true),
-      PanelActionRow(label: "Show Logs"),
-      PanelActionRow(label: daemonRunning ? "Stop" : "Start", dividerBefore: true),
-      PanelActionRow(label: "Restart"),
-      PanelActionRow(label: "Open Desktop", dividerBefore: true,
+      PanelActionRow(label: "Open Desktop", arrow: true,
                      tag: desktopRowTag(updateAvailable: updateAvailable)),
     ]
     if let v = updateAvailable {
@@ -810,7 +786,39 @@ final class AppModel: ObservableObject {
     return rows
   }
 
-  /** The panel's `daemon behind` exception rule (issue #49), PURE so the
+  /** The glance block's STATUS ROW (issue #61 step 4 — the demoted
+   *  panel's one always-on row), PURE so the headless harness proves what
+   *  renders (the same convention as `panelActionRows` / `desktopRowTag`:
+   *  the view renders this spec). The machine name never enters the row:
+   *  the demoted glance is always THIS machine (the name-matched client
+   *  row). Branches, in order (the token facts come first — an
+   *  unconfigured client and a rejected token are both
+   *  operator-actionable and must not read as a dead box):
+   *    .noToken       -> names the missing token + the config path
+   *    .unauthorized  -> names the rejected token + the config path
+   *    !daemonRunning -> "stopped" (the client row's last_seen sits
+   *                      outside the arbiter's 90s window)
+   *    else           -> the arbiter's state word
+   *  The pre-demotion "stale (N min)" branch is GONE with the pickers:
+   *  it named the AGE of a picked machine's row while the LOCAL daemon
+   *  ran — with the glance pinned to this machine, an out-of-window row
+   *  IS "stopped" and the branch could never fire.
+   */
+  static func glanceStatusRow(conn: Conn, daemonRunning: Bool,
+                              configPath: String) -> String {
+    if conn == .noToken {
+      // Criterion 4/5: the status row NAMES the missing token (and no
+      // request was ever sent).
+      return "no token — set the arbiter token in \(configPath)"
+    }
+    if conn == .unauthorized {
+      return "bad token — the arbiter rejected it (\(configPath))"
+    }
+    if !daemonRunning { return "stopped" }
+    return conn.word
+  }
+
+  /** The daemon-behind exception rule (issue #49), PURE so the
    *  headless harness proves what renders. `reported` is the daemon's boot
    *  commit from the client row (`revision`), `checkout` this app's own
    *  `git rev-parse --short HEAD`. The daemon reports the FULL SHA; the
@@ -1023,66 +1031,36 @@ final class AppModel: ObservableObject {
       conn = .unreachable
       return
     }
-    // The pure scope projection (ScopeView — the harness's target): the
-    // machine × project pickers' state + every value the panel shows, all
-    // straight from the payload. A token that just appeared clears the
+    // The pure scope projection (ScopeView — the harnesses' read site):
+    // every panel value comes straight from the payload. Issue #61 step 4
+    // retired the PICKERS: the selection is pinned to the projection's
+    // DEFAULT (unset → the name-matched "this machine" row, and the
+    // "all projects" aggregate). A token that just appeared clears the
     // "no token" state.
     conn = .off
     lastPayload = o
     let nowMs = Date().timeIntervalSince1970 * 1000
     let view = ScopeView.project(payload: o,
                                  configName: config.clientName,
-                                 selectedMachine: machine.key,
-                                 selectedProject: projectKey,
+                                 selectedMachine: ScopeView.unsetMachineKey,
+                                 selectedProject: ScopeView.allProjectsKey,
                                  nowMs: nowMs)
     applyProjection(view, nowMs: nowMs, o: o)
   }
 
-  /** Applies the pure projection to the model's state. Shared by apply()
-   *  (the 10s poll) and reproject() (a picker selection — no network; the
-   *  data stays the last payload's). */
+  /** Applies the pure projection to the model's state (the 10s poll's
+   *  path — issue #61 step 4 retired the picker re-projection, so this
+   *  is the ONLY applyProjection caller). */
   private func applyProjection(_ view: ScopeView.Result, nowMs: Double, o: [String: Any]) {
-    // A picker key the payload no longer carries (a renamed/removed
-    // client, a dropped project) re-resolves to the default — the model
-    // tracks the RESOLVED selection so the next tick stays put.
-    machine = ScopeView.MachineOption(key: view.selectedMachine,
-                                      label: view.machineLabel,
-                                      online: view.machines.first(where: { $0.key == view.selectedMachine })?.online ?? false,
-                                      lastSeen: view.machines.first(where: { $0.key == view.selectedMachine })?.lastSeen ?? 0)
-    machines = view.machines
-    projectKey = view.selectedProject
-    scopeProjects = view.projects
-    queueDepth = view.queueTotal
-    today = (view.finished, view.failed)
     leases = view.leases
-    queuePreview = view.queuePreview
     sessions = view.sessions
     sessionsCountLine = view.sessionsCountLine
-    // The picked project's published token budget ("all projects" sums the
-    // parts — the aggregate equals the sum of its parts). Hidden while the
-    // scope has no budget rows at all (a fresh arbiter state).
-    if view.projects.isEmpty {
-      tokensToday = ("", 0, 0)
-      tokenRowVisible = false
-    } else {
-      let isAll = projectKey == ScopeView.allProjectsKey
-      let value = view.projects.map { $0.tokensOut }.reduce(0, +)
-      let finite = view.projects.map { $0.cap > 0 && $0.cap < 9_007_199_254_740_992 ? $0.cap : 0 }.reduce(0, +)
-      tokensToday = (isAll ? "all projects" : projectKey, finite, value)
-      tokenRowVisible = true
-    }
-    // Liveness. TWO distinct facts, kept distinct (the row displayed and
-    // the process controlled can belong to different machines — nothing
-    // on screen may blur that):
-    //   - `daemonRunning` (drives the Start/Stop row) is the LOCAL
-    //     daemon's liveness — the name-matched row ("this machine") —
-    //     because those controls act on the local process table
-    //     (daemonPID()), whatever the picker shows. No name match (a
-    //     fresh config / unregistered machine) falls back to the
-    //     freshest row — the old heuristic, now only ever a fallback.
-    //   - the status row's STALENESS is the SCOPE machine's last_seen
-    //     (the operator is looking at that machine's row; "all machines"
-    //     = the freshest row).
+    // Liveness — the glance's posture for THIS machine (issue #61 step 4
+    // retired the picker, so the row displayed and the machine whose
+    // daemon the update machinery stops are now always the same one: the
+    // name-matched client row). No name match (a fresh config /
+    // unregistered machine) falls back to the freshest row — the old
+    // heuristic, only ever a fallback.
     let clients = (o["clients"] as? [[String: Any]]) ?? []
     let meLastSeen: Double
     if let cn = config.clientName,
@@ -1114,26 +1092,13 @@ final class AppModel: ObservableObject {
       meRevision = nil
     }
     daemonBehind = Self.daemonBehind(reported: meRevision, checkout: deployedRevision)
-    let scopeRows: [Double]
-    if machine.key == ScopeView.allMachinesKey {
-      scopeRows = clients.compactMap { $0["last_seen"] as? Double }
-    } else {
-      scopeRows = clients.compactMap { row in
-        ((row["client_id"] as? String) == machine.key) ? (row["last_seen"] as? Double) : nil
-      }
-    }
-    let scopeLastSeen = scopeRows.max() ?? 0
-    if scopeLastSeen > 0 {
-      lastSeenS = Int(nowMs - scopeLastSeen) / 1000
-    }
 
-    // the state word — the arbiter's GLOBAL verdict for the box (a scope
-    // the operator picked never rewords the header): degraded is a
-    // box-wide condition, idle is the arbiter's own signal, and "working"
-    // = ANY active lease (the box is running an idle task right now). A
-    // payload with NO client rows at all is still .unreachable — the
-    // arbiter answering without any registered client is indistinguishable
-    // from a dead one (today's semantics).
+    // the state word — the arbiter's GLOBAL verdict for the box: degraded
+    // is a box-wide condition, idle is the arbiter's own signal, and
+    // "working" = ANY active lease (the box is running an idle task right
+    // now). A payload with NO client rows at all is still .unreachable —
+    // the arbiter answering without any registered client is
+    // indistinguishable from a dead one (today's semantics).
     guard !clients.isEmpty else { conn = .unreachable; return }
     let idle = (o["idle"] as? [String: Any]) ?? [:]
     switch ((idle["degraded"] as? Bool) == true, activeLeasesGlobal(o).isEmpty, (idle["idle"] as? Bool) == true) {
@@ -1152,49 +1117,17 @@ final class AppModel: ObservableObject {
     }
   }
 
-  // MARK: view-facing scope facts (pure reads of the model state)
-
-  /** The machine picker's rows: the explicitly labelled "all machines"
-   *  aggregate FIRST, then every clients[] row (the dot = online). The
-   *  default selection ("this machine" — the name-matched row) sits
-   *  among its siblings; nothing about the picker's layout changes when
-   *  the operator widens the scope. */
-  var viewMachines: [ScopeView.MachineOption] {
-    let all = ScopeView.MachineOption(key: ScopeView.allMachinesKey,
-                                      label: "all machines", online: false, lastSeen: 0)
-    return [all] + machines
-  }
-
-  /** The machine row's active override (exception-only tag; nil = none). */
-  func viewMachineOverride(_ key: String) -> String? {
-    guard key != ScopeView.allMachinesKey, let o = lastPayload else { return nil }
-    return ((o["clients"] as? [[String: Any]])?.first(where: { ($0["client_id"] as? String) == key })?["override"] as? [String: Any])?["override"] as? String
-  }
-
-  /** The project-gate control row exists only for a picked (non-aggregate)
-   *  project — exception-only, the dashboard's same rule. */
-  var pickedProjectVisible: Bool { pickedProject != nil }
-
-  /** The project gate's LIVE label ("pause project X" / "resume project
-   *  X" — the state is in the label, not in a separate badge). */
-  var pickedProjectLabel: String {
-    guard let p = pickedProject else { return "" }
-    return (p.paused ? "resume project " : "pause project ") + p.name
-  }
-
-  /** The worker-override control row's LIVE label (a specific machine
-   *  only — "all machines" has no single worker to act on; nil hides it).
-   *  none → pause; pause → resume (clear); force → clear force. */
-  var scopeWorkerControlLabel: String? {
-    guard machine.key != ScopeView.allMachinesKey, lastPayload != nil else { return nil }
-    switch scopeMachineOverride ?? "none" {
-    case "pause": return "resume this worker"
-    case "force": return "clear force (this worker)"
-    default: return "pause this worker"
-    }
-  }
-
   // MARK: daemon control
+  //
+  // Issue #61 step 4 retired the panel's view-facing scope facts (the
+  // machine/project picker rows, the override tags, the gate + worker
+  // control labels) and the scope controls themselves (project pause
+  // gate, grant knobs, worker override, and the token-gated postJSON
+  // that carried them): the one window owns every control now — the
+  // page's four views + the desktop app's Settings disclosure. The
+  // daemon start/stop paths STAY: the update machinery (updateCode's
+  // stopDaemon/startDaemon steps, proven by uc-update-test.sh) still
+  // drives them.
 
   /** Absolute path to the client package dir (`<repo>/client`). `repoRoot`
    *  is the REPO root — the dir that CONTAINS `client/` — so append it here;
@@ -1307,196 +1240,22 @@ final class AppModel: ObservableObject {
     DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.poll() }
   }
 
-  func restart() {
-    stop()
-    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.start() }
-  }
+  // Issue #61 step 4 RETIRED, with the panel that rendered them:
+  //   restart()                — no row calls it (the Start/Stop/Restart
+  //                              rows are gone; updateCode drives
+  //                              stop()/start() directly).
+  //   selectMachine/selectProject/reproject + the picker model state
+  //   (issue #12)              — the page's four views are the place to
+  //                              look at any machine or project.
+  //   toggleProjectPaused/cycleProjectKnob/cycleWorkerOverride +
+  //   postJSON + urlEncode (the scope controls, issue #12) — the page
+  //                              owns every write now (project gate,
+  //                              grant knobs, worker override).
+  // `lastPayload` stays: apply() records it every poll and the
+  // exception-only glance rows read the raw payload through it.
 
-  // MARK: scope pickers (issue #12)
-  //
-  // The machine × project pickers are model state: a selection re-runs the
-  // pure ScopeView projection against the LAST state payload (no network —
-  // the next 10s tick refreshes the data under the new selection). A key
-  // the last payload does not carry is rejected (the picker rows only ever
-  // come from the last payload).
-
-  /** The last raw state payload (the picker re-projection's input; nil
-   *  until the first successful poll). */
+  /** The last raw state payload (nil until the first successful poll). */
   private var lastPayload: [String: Any]?
-
-  func selectMachine(_ key: String) {
-    guard lastPayload != nil,
-          key == ScopeView.allMachinesKey ||
-          (lastPayload?["clients"] as? [[String: Any]])?.contains(where: { ($0["client_id"] as? String) == key }) == true
-    else { return }
-    machine.key = key
-    machine.online = false
-    machine.lastSeen = 0
-    reproject()
-  }
-
-  func selectProject(_ key: String) {
-    guard lastPayload != nil,
-          key == ScopeView.allProjectsKey ||
-          scopeProjects.contains(where: { $0.name == key })
-    else { return }
-    projectKey = key
-    reproject()
-  }
-
-  private func reproject() {
-    guard let o = lastPayload else { return }
-    let nowMs = Date().timeIntervalSince1970 * 1000
-    let view = ScopeView.project(payload: o,
-                                 configName: config.clientName,
-                                 selectedMachine: machine.key,
-                                 selectedProject: projectKey,
-                                 nowMs: nowMs)
-    applyProjection(view, nowMs: nowMs, o: o)
-  }
-
-  // MARK: scope controls (issue #12)
-  //
-  // The published per-scope detail drives the panel's exception-only
-  // controls on the routes that ALREADY exist (no new endpoints — the
-  // dashboard's token gate is the reference, scripts/idlefill-control.mjs):
-  //   project pause gate     POST /api/projects/:name            {paused}
-  //   grant knobs            POST /api/projects/:name/settings   {knobs}
-  //   worker override        POST /api/clients/:ref/override     {override, until}
-  // SAME token gate as the dashboard: no token → NO request is issued and
-  // the status row names the missing token.
-
-  /** The picked project row (nil for the "all projects" aggregate). */
-  private var pickedProject: ScopeProject? {
-    projectKey == ScopeView.allProjectsKey ? nil : scopeProjects.first { $0.name == projectKey }
-  }
-
-  /** The picked client's row in the last payload (the worker override's
-   *  `:ref` — the client NAME, the key that survives daemon restarts). */
-  private var pickedClientRef: String? {
-    guard let o = lastPayload else { return nil }
-    if machine.key == ScopeView.allMachinesKey { return nil }
-    return (o["clients"] as? [[String: Any]])?.first(where: { ($0["client_id"] as? String) == machine.key })?["name"] as? String
-  }
-
-  /** Toggle the picked project's pause gate (POST /api/projects/:name).
-   *  Token-gated: no token → no request, and the status row names the
-   *  missing token (criterion 4). */
-  func toggleProjectPaused() {
-    guard let p = pickedProject else { return }
-    guard arbiterToken != nil else {
-      updateNote = "no token configured — project gate needs the arbiter token (\(configPath)) — no request sent"
-      return
-    }
-    postJSON(path: "/api/projects/\(Self.urlEncode(p.name))",
-             body: ["paused": !p.paused],
-             ok: "project \(p.paused ? "resumed" : "paused")",
-             detail: p.name)
-  }
-
-  /** Cycle the picked project's grant knobs through
-   *  global → 2 × global → 3 × global → global (POST
-   *  /api/projects/:name/settings — the body carries only the touched
-   *  knob; JSON null clears the override back to the global). The cycle
-   *  reads the GLOBAL knob (scheduling.global), never the effective one —
-   *  a cycle that read the effective value would chase its own override.
-   *  Token-gated like the gate. */
-  func cycleProjectKnob(_ knob: String) {
-    guard let p = pickedProject else { return }
-    guard arbiterToken != nil else {
-      updateNote = "no token configured — grant knobs need the arbiter token (\(configPath)) — no request sent"
-      return
-    }
-    let global: Double
-    let current: Double?
-    switch knob {
-    case "idle": global = p.globalIdleSeconds; current = p.idleOverride
-    case "max": global = p.globalMaxLeases; current = p.maxOverride
-    default: global = p.globalTtlSeconds; current = p.ttlOverride
-    }
-    let next: Double? = current == nil ? global * 2 : (current == global * 2 ? global * 3 : nil)
-    let key = knob == "idle" ? "idle_seconds" : (knob == "max" ? "max_concurrent_leases" : "lease_ttl_seconds")
-    // null (JSON) clears the knob back to the global — the dashboard's
-    // same shape (NSNull: a nil Optional would not serialize at all).
-    let value: Any = next.map { $0 as Any } ?? NSNull()
-    let body: [String: Any] = [key: value]
-    postJSON(path: "/api/projects/\(Self.urlEncode(p.name))/settings",
-             body: body,
-             ok: "project \(p.name) \(knob) → \(next.map { String(Int($0)) } ?? "global")",
-             detail: p.name)
-  }
-
-  /** Cycle the picked client's worker override: none → pause → force →
-   *  none (POST /api/clients/:ref/override — the body is exactly
-   *  {override, until}). Token-gated like the gate. */
-  func cycleWorkerOverride() {
-    guard let ref = pickedClientRef else { return }
-    guard arbiterToken != nil else {
-      updateNote = "no token configured — worker override needs the arbiter token (\(configPath)) — no request sent"
-      return
-    }
-    let cur = scopeMachineOverride ?? "none"
-    let next: String
-    switch cur {
-    case "pause": next = "force"
-    case "force": next = "none"
-    default: next = "pause"
-    }
-    postJSON(path: "/api/clients/\(Self.urlEncode(ref))/override",
-             body: ["override": next == "none" ? NSNull() : next, "until": NSNull()],
-             ok: "worker \(ref) → \(next)",
-             detail: ref)
-  }
-
-  /** The picked machine's active override (from the last payload; nil =
-   *  none) — drives the worker control row's label. */
-  private var scopeMachineOverride: String? {
-    guard let o = lastPayload, machine.key != ScopeView.allMachinesKey else { return nil }
-    return ((o["clients"] as? [[String: Any]])?.first(where: { ($0["client_id"] as? String) == machine.key })?["override"] as? [String: Any])?["override"] as? String
-  }
-
-  /** Token-gated POST to an existing route. No token → the caller has
-   *  already refused (the status row names the missing token) — this
-   *  method issues NO request without one. On 2xx the note confirms; on
-   *  anything else the note carries the HTTP status (the operator can
-   *  then look at the arbiter). The body is exactly what the route
-   *  documents — NSNull() serializes as JSON null (the clear-value shape). */
-  private func postJSON(path: String, body: [String: Any], ok: String, detail: String) {
-    guard let tok = arbiterToken,
-          let url = URL(string: serverURL() + path) else {
-      // Belt-and-braces: the public entry points (toggleProjectPaused &
-      // co.) already gate on the token and name it in the status row.
-      updateNote = "no token configured — no request sent (\(detail))"
-      return
-    }
-    var req = URLRequest(url: url)
-    req.httpMethod = "POST"
-    req.timeoutInterval = 5
-    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    req.setValue("Bearer \(tok)", forHTTPHeaderField: "Authorization")
-    do { req.httpBody = try JSONSerialization.data(withJSONObject: body) }
-    catch { updateNote = "could not encode the \(detail) request — no request sent"; return }
-    updateNote = "sending \(detail) …"
-    URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
-      guard let self else { return }
-      DispatchQueue.main.async {
-        if let e = err {
-          self.updateNote = "\(detail) failed: \(e.localizedDescription)"
-        } else if let r = resp as? HTTPURLResponse, (200..<300).contains(r.statusCode) {
-          self.updateNote = ok
-        } else {
-          self.updateNote = "\(detail) → HTTP \((resp as? HTTPURLResponse)?.statusCode ?? -1) — see the arbiter"
-        }
-        // Refresh the published view (the gate's state rides back on the
-        // next poll; fetch it now so the panel reflects the write).
-        self.poll()
-      }
-    }.resume()
-  }
-
-  static func urlEncode(_ s: String) -> String {
-    s.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? s
-  }
 
   // MARK: update code (issue #11)
   //
@@ -3027,32 +2786,8 @@ struct KVRow: View {
   }
 }
 
-/** A picker row (machine / project): a dot + label + an optional
- *  exception tag (paused/budget-full/paused-worker — DESIGN.md: tags for
- *  exceptions only) + a checkmark on the selected row. */
-struct PickRow: View {
-  let label: String
-  let selected: Bool
-  var dot: Color = Pal.dim            // online dot (green) or off (dim)
-  var showDot: Bool = true
-  var tag: (text: String, color: Color)? = nil
-  var body: some View {
-    HStack(spacing: 6) {
-      if showDot {
-        Circle().fill(dot).frame(width: 7, height: 7)
-      }
-      Text(label).font(.system(.body, design: .monospaced))
-        .foregroundStyle(selected ? Pal.text : Pal.dim)
-      if let t = tag {
-        Text(t.text).font(.system(.caption, design: .monospaced)).foregroundStyle(t.color)
-      }
-      Spacer()
-      if selected {
-        Text("•").font(.system(.body, design: .monospaced)).foregroundStyle(Pal.accent)
-      }
-    }
-  }
-}
+/** A picker row (machine / project): retired with the scope pickers
+ *  (issue #61 step 4). The kv rows it styled for live on the page now. */
 
 struct DividerLine: View {
   var body: some View {
@@ -3087,11 +2822,20 @@ struct LogoView: View {
 struct ContentView: View {
   @ObservedObject var m: AppModel
 
+  // Issue #61 step 4 — the demoted panel. What renders: the header (the
+  // state word + the lease-driven arc), the glance block (the machine
+  // status row, the revision row, the exception-only `daemon behind` tag,
+  // the exception-only sessions block), and the action block (Open
+  // Desktop with its exception-only update tag · Install Update <v>).
+  // The scope pickers, the per-scope stats rows, and the scope-control
+  // rows retired with the control surface — the one window owns them.
   var body: some View {
     VStack(spacing: 0) {
       HStack(spacing: 8) {
-        // The arc's spin stays tied to THIS client's leases (the scope
-        // machine's — every active lease, not just the first).
+        // The arc's spin stays tied to THIS client's leases — the one
+        // live element of the glance (the row that used to name them is
+        // gone; the motion that says "a lease is running right now" is
+        // part of the glance).
         LogoView(spinning: !m.leases.isEmpty)
           .frame(width: 14, height: 14)
         Text("idlefill")
@@ -3106,75 +2850,27 @@ struct ContentView: View {
 
       DividerLine()
 
-      // ---- the scope (machine × project). The default is "this machine ·
-      // all projects" (the config's client_name row — today's behaviour);
-      // the pickers widen it. The machine picker lists the explicitly
-      // labelled "all machines" aggregate FIRST, then every clients[] row
-      // (online dot + the exception-only override tag); the aggregate's
-      // dot stays dim (it is a view, not a machine). The project picker
-      // lists the scope's projects; "all projects" is the aggregate.
-      VStack(spacing: 3) {
-        Text("machine").font(.system(.caption, design: .monospaced))
-          .foregroundStyle(Pal.dim).textCase(.uppercase).kerning(0.5)
-        ForEach(Array(m.viewMachines.enumerated()), id: \.element.key) { _, opt in
-          let isAll = opt.key == ScopeView.allMachinesKey
-          let ov = m.viewMachineOverride(opt.key)
-          let ovTag: (text: String, color: Color)? = ov.map { t in
-            (text: (t == "pause" ? "paused" : t), color: (t == "pause" ? Pal.err : Pal.warn))
-          }
-          pickRow(label: isAll ? "all machines" : opt.label,
-                  selected: opt.key == m.machine.key,
-                  dot: opt.online ? Pal.ok : Pal.dim,
-                  showDot: !isAll,
-                  tag: ovTag) {
-            m.selectMachine(opt.key)
-          }
-        }
-        Text("project").font(.system(.caption, design: .monospaced))
-          .foregroundStyle(Pal.dim).textCase(.uppercase).kerning(0.5)
-        pickRow(label: "all projects",
-                selected: m.projectKey == ScopeView.allProjectsKey, showDot: false) {
-          m.selectProject(ScopeView.allProjectsKey)
-        }
-        ForEach(m.scopeProjects, id: \.name) { p in
-          pickRow(label: p.name, selected: p.name == m.projectKey, showDot: false,
-                  tag: p.paused ? ("paused", Pal.warn) : (p.budgetFull ? ("budget full", Pal.warn) : (p.mePaused == true ? ("worker paused", Pal.err) : nil))) {
-            m.selectProject(p.name)
-          }
-        }
-      }
-      .padding(14).padding(.vertical, 8)
-
-      DividerLine()
-
+      // ---- the glance. This machine's status row + the exception-only
+      // facts that answer "is the box healthy?" without opening anything.
       VStack(spacing: 4) {
-        KVRow(k: machineLabelKey, v: statusRow)
+        KVRow(k: "machine", v: statusRow)
         if let rev = m.deployedRevision {
           KVRow(k: "revision", v: rev)
         }
         // Code-staleness (issue #49) — Exception-Only: the row renders
         // only when the running daemon predates this checkout (the amber
-        // exception color the paused/budget tags use). The operator's
-        // fix is one click: the Restart row above.
+        // exception color the paused/budget tags use). The fix lives in
+        // the window's Settings disclosure (the launchd toggles).
         if m.daemonBehind {
           KVRow(k: "", v: "daemon behind", vcolor: Pal.warn)
         }
-        KVRow(k: "queue", v: "\(m.queueDepth)")
-        KVRow(k: "today", v: "\(m.today.finished) ok · \(m.today.failed) failed")
-        if m.tokenRowVisible {
-          KVRow(k: "tokens out", v: tokenRow)
-        }
-        // Every running lease of the scope machine (max concurrent > 1
-        // lists them all — today showed only the first).
-        ForEach(Array(m.leases.enumerated()), id: \.offset) { _, l in
-          KVRow(k: "running", v: leaseRow(l), vcolor: Pal.accent)
-        }
         // Interactive sessions (#9) — read-only at-a-glance (the controls
-        // live on the dashboard). The count line renders ONLY when
-        // sessions exist (Exception-Only: no sessions = no rows at all);
-        // the one-liners are the EXCEPTION states only (paused / forced /
-        // queued / stale) — a healthy session renders no row. Colors mirror the
-        // dashboard's tags: paused (override) red, forced / stale amber.
+        // live on the page). The count line renders ONLY when sessions
+        // exist (Exception-Only: no sessions = no rows at all); the
+        // one-liners are the EXCEPTION states only (paused / forced /
+        // queued / stale) — a healthy session renders no row. Colors
+        // mirror the page's tags: paused (override) red, forced / stale
+        // amber.
         if let count = m.sessionsCountLine {
           KVRow(k: "sessions", v: count)
         }
@@ -3184,39 +2880,21 @@ struct ContentView: View {
                   vcolor: s.overrideLabel == "pause" ? Pal.err : Pal.warn)
           }
         }
-        // The picked project's published queue peek (a worker publishing
-        // no preview degrades to the depth number above).
-        ForEach(Array(m.queuePreview.prefix(4).enumerated()), id: \.offset) { i, r in
-          KVRow(k: "queue \(i + 1)", v: queuePeekRow(r))
-        }
-        if !m.queuePreview.isEmpty {
-          KVRow(k: "", v: "\(m.queuePreview.count) shown of \(m.queueDepth) waiting")
-        }
       }
       .padding(14).padding(.vertical, 8)
 
       DividerLine()
 
-      // ---- the scope controls (exception-only; existing routes, the
-      // dashboard's token gate).
-      if m.pickedProjectVisible {
-        controlRow(m.pickedProjectLabel) { m.toggleProjectPaused() }
-      }
-      if m.scopeWorkerControlLabel != nil {
-        controlRow(m.scopeWorkerControlLabel!) { m.cycleWorkerOverride() }
-      }
-
-      DividerLine()
-
       // The action block renders the PURE spec (AppModel.panelActionRows)
       // — the headless harness asserts that same spec, so what the tests
-      // prove IS what ships (issue #27). Open Desktop carries the
-      // exception-only update tag (the updateAvailable value VERBATIM;
-      // no update = label-only row, no tag — DESIGN.md Exception-Only
-      // rule); Install Update <v> is exception-only. NO Update Code,
-      // NO Quit rows (the exit path is the CLI / launchd).
-      ForEach(Array(AppModel.panelActionRows(updateAvailable: m.updateAvailable,
-                                             daemonRunning: m.daemonRunning).enumerated()),
+      // prove IS what ships (issue #27, demoted by #61 step 4). Open
+      // Desktop is the ONE nav row and carries the exception-only update
+      // tag (the updateAvailable value VERBATIM; no update = label-only
+      // row, no tag — DESIGN.md Exception-Only rule); Install Update <v>
+      // is exception-only. NO Update Code, NO Quit (the exit path is the
+      // CLI / launchd).
+      ForEach(Array(AppModel.panelActionRows(updateAvailable: m.updateAvailable)
+                      .enumerated()),
               id: \.offset) { _, r in
         if r.dividerBefore { DividerLine() }
         actionRow(r.label, arrow: r.arrow, tag: r.tag)
@@ -3232,114 +2910,32 @@ struct ContentView: View {
     .frame(width: 300)
   }
 
-  // The picker rows (tappable PickRows) — the same row style as the
-  // action rows (hover-free; the whole row is the tap target).
-  private func pickRow(label: String, selected: Bool,
-                       dot: Color = Pal.dim, showDot: Bool = true,
-                       tag: (text: String, color: Color)? = nil,
-                       action: @escaping () -> Void) -> some View {
-    Button(action: action) {
-      PickRow(label: label, selected: selected, dot: dot, showDot: showDot, tag: tag)
-        .padding(.horizontal, 14).padding(.vertical, 4)
-        .contentShape(Rectangle())
-    }
-    .buttonStyle(.plain)
-  }
-
-  /** A scope-control row (the project gate / worker override): the same
-   *  row style as the pickers; the label carries the LIVE state ("pause
-   *  project" / "resume project", "pause this worker" / "unpause …"). */
-  private func controlRow(_ label: String, action: @escaping () -> Void) -> some View {
-    Button(action: action) {
-      HStack {
-        Text(label).font(.system(.body, design: .monospaced))
-          .foregroundStyle(m.conn == .noToken || m.conn == .unauthorized ? Pal.warn : Pal.accent)
-        Spacer()
-      }
-      .padding(.horizontal, 14).padding(.vertical, 4)
-      .contentShape(Rectangle())
-    }
-    .buttonStyle(.plain)
-  }
-
   private var statusRow: String {
-    if m.conn == .noToken {
-      // Criterion 4/5: the status row NAMES the missing token (and no
-      // request was ever sent).
-      return "no token — set the arbiter token in \(m.configPath)"
-    }
-    if m.conn == .unauthorized {
-      return "bad token — the arbiter rejected it (\(m.configPath))"
-    }
-    if !m.daemonRunning { return "stopped" }
-    if let s = m.lastSeenS, s >= 120 { return "stale (\(s / 60) min)" }
-    return m.conn.word
-  }
-
-  /** The machine row's key: "this machine" for the name-matched default,
-   *  "machine" when the operator widened to the aggregate. */
-  private var machineLabelKey: String {
-    m.machine.key == ScopeView.allMachinesKey ? "machines" : "machine"
-  }
-
-  private var tokenRow: String {
-    let (label, cap, v) = m.tokensToday
-    let head = label == "all projects" ? "" : "\(label) · "
-    if cap > 0 {
-      return head + String(format: "%.0f / %.0f (%.0f%%)", v, cap, v / cap * 100)
-    }
-    return head + String(format: "%.0f (cap ∞)", v)
-  }
-
-  private func leaseRow(_ l: ScopeLease) -> String {
-    let left = Int(max(0, l.expiresAt / 1000 - Date().timeIntervalSince1970))
-    let job = l.project.isEmpty ? l.jobId : "\(l.jobId) · \(l.project)"
-    return "\(job) · auto-cancels \(left / 60)m \(left % 60)s"
-  }
-
-  private func queuePeekRow(_ r: ScopeQueueRow) -> String {
-    let t = r.company.isEmpty ? r.title : "\(r.title) · \(r.company)"
-    return t.count > 34 ? String(t.prefix(34)) + "…" : t
+    // The view renders the PURE spec (AppModel.glanceStatusRow) — the
+    // same convention as the action block, so panel-test.sh proves
+    // exactly what ships.
+    AppModel.glanceStatusRow(conn: m.conn,
+                             daemonRunning: m.daemonRunning,
+                             configPath: m.configPath)
   }
 
   @ViewBuilder
   func actionRow(_ label: String, arrow: Bool = false,
                  tag: (text: String, color: Color)? = nil) -> some View {
     Button(action: {
-      switch label {
-      case "Open Dashboard":
-        // Desktop app installed → its Projects view (this client's project
-        // config). Not installed → today's behavior: the arbiter web
-        // dashboard in the browser.
-        if MenuBarAppState.desktopInstalled() {
-          MenuBarAppState.openDesktopURL("idlefill://projects")
-        } else if let url = URL(string: m.serverURL() + "/") { NSWorkspace.shared.open(url) }
-      case "Show Logs":
-        // Desktop app installed → its Logs view. Not installed → today's
-        // behavior: open the daemon log dir in Finder.
-        if MenuBarAppState.desktopInstalled() {
-          MenuBarAppState.openDesktopURL("idlefill://logs")
-        } else {
-          // The daemon anchors its log to the ENTRY dir (client/src in dev,
-          // client/dist after a build), so <client>/<entry>/logs/client.log.
-          let pkg = m.clientPkgDir
-          let logsBase = (pkg as NSString).appendingPathComponent("logs")
-          let entry = FileManager.default.fileExists(atPath: (pkg as NSString).appendingPathComponent("dist/index.ts")) ? "dist" : "src"
-          let logDir = ((pkg as NSString).appendingPathComponent(entry) as NSString).appendingPathComponent("logs")
-          let target = FileManager.default.fileExists(atPath: logDir) ? logDir : logsBase
-          NSWorkspace.shared.open(URL(fileURLWithPath: target))
-        }
-      case "Start": m.start()
-      case "Stop": m.stop()
-      case "Restart": m.restart()
       // The Open Desktop row = the double-click action, executed through
       // the SAME shared helper the router calls (issue #27 — one call
-      // path, no drift). The Update Code and Quit rows are gone: the
-      // UpdatePlan/updateCode() machinery stays (CLI/launchd drive the
-      // exit path; uc-update-test.sh still proves the core).
-      case "Open Desktop": MenuBarAppState.openDesktopApp()
+      // path, no drift). Issue #61 step 4 removed every other row: the
+      // nav rows to other views (#open lands on the page's default view
+      // either way, and the logs dock is not hashable) and the daemon
+      // control rows (the window's Settings disclosure hosts the launchd
+      // toggles). The Update Code and Quit rows were already gone
+      // (issue #27); the UpdatePlan/updateCode() machinery stays and
+      // uc-update-test.sh still proves the core.
+      switch label {
       // The Install Update row carries the version in its label (the
       // exception-only row — it only exists while one is available).
+      case "Open Desktop": MenuBarAppState.openDesktopApp()
       default:
         if label.hasPrefix("Install Update") { m.installUpdate() }
         else { break }
