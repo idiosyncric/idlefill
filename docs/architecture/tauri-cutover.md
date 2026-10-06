@@ -110,8 +110,11 @@ LOCKED. One Tauri app owns both surfaces:
 - Tray click routing: `TrayIconEvent::Click` and `TrayIconEvent::DoubleClick`
   both exist (`tray/mod.rs:71-131`, each carrying `position` and `rect`).
   `show_menu_on_left_click(false)` (`:319`) keeps the left click free for
-  routing instead of opening a native menu. This matches the Swift
-  single/double split (`MenuBarRouter.action` `:166-170`).
+  routing instead of opening a native menu. OWNER LOCK 2026-10-06 (Q-c):
+  SIMPLIFIED — single click = glance only. The Swift single/double split
+  (`MenuBarRouter.action` `:166-170`) retires. The `DoubleClick` event
+  arm stays unused, and no window-focus gesture exists. The window
+  opens from the glance's `Open Desktop` row or from deep links.
 
 Honest degradation, stated not hidden: **Tauri has no NSPopover
 equivalent.** The Swift glance is a transient `NSPopover` anchored to the
@@ -375,14 +378,14 @@ the tray word + tray item. That matches the issue's verified note ("the
 toolbar's arbiter-stopped row is the only honest signal") with the row
 re-homed to the tray per D4.
 
-Owner question Q-a sits here: auto-reload when the origin returns.
-Recommendation: **yes, with a one-shot rule** — when the pid line
-re-appears after a known-dead state, issue exactly one `reload()` per
-transition (no timer loop, no reload storm). Reason: today's Swift shell
-requires the operator to press Relaunch/Reload. A dead-then-started
-arbiter leaves the blank canvas until then, which caused re-filed
-confusion. The one-shot reload keeps Exception-Only (the transition edge
-is the event) and cannot storm because transitions are edges.
+Owner question Q-a — LOCKED 2026-10-06: auto-reload YES, with the
+one-shot rule as designed — when the pid line re-appears after a
+known-dead state, issue exactly one `reload()` per transition (no timer
+loop, no reload storm). Reason recorded: today's Swift shell requires the
+operator to press Relaunch/Reload. A dead-then-started arbiter leaves the
+blank canvas until then, which caused re-filed confusion. The one-shot
+reload keeps Exception-Only (the transition edge is the event) and
+cannot storm because transitions are edges.
 
 ## D7 — Updater retirement
 
@@ -417,13 +420,18 @@ README desktop + menubar sections get rewritten at cutover (a stale
 control list is a convention break). Not this doc's edit — flagged here
 as required cutover work, same posture as #61 step 4's README rewrite.
 
-Owner question Q-b sits here: release/edge plumbing after the updater.
-Recommendation: **keep plain zip assets on the Forgejo release** (the
-built `.app` zipped + sha256 sidecar, with no appcast, no signing, no
-carry-forward, no marker sidecars). Reason: the "install from the
-checkout" rule needs somewhere the binary lives. The repo checkout build
-requires a full Rust/Xcode toolchain on every Mac, which the current
-fleet does not carry.
+Owner question Q-b — LOCKED 2026-10-06: NOTHING on releases. No app
+zip, no appcast, no signing — the app is built from the checkout
+everywhere, toolchain required on each machine (verified present on
+this Mac). Verified scope of the retirement: `edge.yml` publishes ONLY
+the desktop + menubar zips (its steps: gate, swiftc parse, publish —
+`.gitea/workflows/edge.yml:38,70,74`), and no TS code fetches release
+or edge artifacts, so the whole edge workflow retires with the Swift
+planes. `scripts/release.sh` sheds the desktop/menubar artifact, appcast,
+and key stages (the arbiter stays a checkout-run launchd service —
+release notes for server/client versions remain as text/tags). The
+worker's contrary recommendation (keep plain zips for toolchain-less
+machines) is overruled and recorded here for the trade-off it names.
 
 ## D8 — Migration order + tree plan
 
@@ -454,12 +462,16 @@ DECISION, ordered:
    tray lives inside the app now). The app's own autostart story is
    owner question Q-c/Q-d below. The daemon (`com.sam.idlefill.client`)
    and arbiter (`com.sam.idlefill.server`) labels are NOT touched. The
-   desktop app has no LaunchAgent today (it restores as a normal GUI
-   app), so the login-item/agent decision is net-new for the tray half.
+   app's autostart is LOCKED (Q-d): ONE LaunchAgent
+   `com.sam.idlefill.app` (RunAtLoad) installed by the app's install
+   script, replacing the menubar label. The desktop app has no
+   LaunchAgent today (it restores as a normal GUI app), so this agent is
+   net-new for the combined app.
 5. CI flips in the same commit as the deletion: `test.yml` (`:47-51`),
    `edge.yml` (`:69-70`), `release.yml` (`:72-73`) drop the
    `swiftc -parse` gates. Tauri gates arrive (D9). `edge.yml` retires
-   with the edge channel per Q-b's outcome.
+   entirely with the edge channel (Q-b LOCKED: no app artifacts
+   anywhere).
 
 ## D9 — CI + test plan
 
@@ -521,25 +533,29 @@ mentions found by grep), the daemon + arbiter LaunchAgents.
 
 ## Open questions (owner input)
 
-- **Q-a — auto-reload when the origin returns (D6).** Recommendation:
-  yes, one `reload()` per dead→live transition edge. Reason in D6.
-- **Q-b — release/edge plumbing (D7).** Keep plain zip assets (+ sha256)
-  on the Forgejo release for manual install, or drop release artifacts
-  entirely and build-from-checkout everywhere? Recommendation: keep
-  plain zips. Drop the appcast/signing/carry-forward/marker machinery.
-- **Q-c — tray double-click gesture.** Swift pinned single-click =
-  popover, double-click = open desktop (`MenuBarRouter.action`
-  `:166-170`, README-documented). In one artifact, double-click = focus
-  the window is nearly free (both events arrive,
-  `show_menu_on_left_click(false)`). Keep the two-gesture split or
-  simplify to single-click = glance only? Recommendation: keep both
-  gestures (existing muscle memory, near-zero cost).
-- **Q-d — install story for the ONE app: LaunchAgent (RunAtLoad tray) or
-  plain GUI login item?** The `com.sam.idlefill.menubar` label retires
-  either way. A LaunchAgent re-creates today's menubar autostart
-  exactly, including the install-script discipline. A login item is
-  simpler but the desktop half today has NO agent and relies on window
-  restoration. Recommendation: keep ONE LaunchAgent
-  (`com.sam.idlefill.app`, RunAtLoad) installed by the app's install
-  script, mirroring the menubar install.sh pattern and its render-before-
-  bootout test.
+ALL FOUR ANSWERED by the owner 2026-10-06 — LOCKED:
+
+- **Q-a LOCKED — auto-reload YES (D6).** One `reload()` per dead→live
+  transition edge. No timer loop, no reload storm.
+- **Q-b LOCKED — release artifacts: NOTHING (D7).** No app, no zip, no
+  appcast, no signing on Forgejo releases. The app is built from the
+  checkout everywhere. Accepted consequence, stated by the owner over
+  the worker's objection: every machine that installs the app needs the
+  Rust + Xcode toolchain (present on this Mac — cargo 1.99,
+  cargo-tauri v2, Xcode). `scripts/release.sh` + `scripts/edge-release.sh`
+  lose the desktop/menubar artifact paths entirely, and `edge.yml`
+  retires with the edge channel. The `--version` marker contract still
+  survives (the build.sh analog bakes it) — checkout builds must still
+  self-identify.
+- **Q-c LOCKED — tray gesture: SIMPLIFIED.** Single click = glance only.
+  Double-click retires as a gesture — no window-focus binding (the
+  `TrayIconEvent::DoubleClick` arm stays unused). The window opens from
+  the glance's `Open Desktop` row or from deep links. The Swift
+  two-gesture split (`MenuBarRouter.action` `:166-170`) retires — the
+  README click-routing section gets rewritten at cutover, a stale
+  gesture list is a convention break.
+- **Q-d LOCKED — autostart: ONE LaunchAgent.** `com.sam.idlefill.app`,
+  RunAtLoad, installed by the app's install script mirroring the menubar
+  `install.sh` pattern (render-before-bootout, scratch-label tests, real
+  labels untouched in tests). `com.sam.idlefill.menubar` retires at the
+  cutover step.
