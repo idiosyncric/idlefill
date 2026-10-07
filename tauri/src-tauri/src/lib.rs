@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::menu::{Menu, MenuItem};
-use tauri::tray::{TrayIcon, TrayIconBuilder, TrayIconEvent};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_deep_link::DeepLinkExt;
 
@@ -205,11 +205,39 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
         .on_tray_icon_event({
             let handle = handle.clone();
             move |tray, event| {
-                if let TrayIconEvent::Click { position, .. } = event {
+                // The anchor position rides every click event (hover
+                // events carry one too, but they never act — see
+                // tray_directive).
+                if let TrayIconEvent::Click { position, .. } = &event {
                     let shared = tray.app_handle().state::<Arc<Shared>>();
                     *shared.tray_pos.lock().unwrap() = Some((position.x, position.y));
                 }
-                toggle_glance(&handle);
+                // The gesture resolves through the pure rule, then the
+                // verdict runs. Toggle on the LEFT PRESS ONLY.
+                // macOS fires Enter/Move/Leave for every pixel of hover
+                // over the icon (tray-icon installs an NSTrackingArea
+                // with MouseMoved), and mouseDown + mouseUp each fire a
+                // Click. An unconditional toggle therefore flipped the
+                // glance on every mouse movement near the icon — the
+                // flicker the owner reported.
+                let gesture = match &event {
+                    TrayIconEvent::Click {
+                        button,
+                        button_state,
+                        ..
+                    } => match (button, button_state) {
+                        (MouseButton::Left, MouseButtonState::Down) => TrayGesture::LeftPress,
+                        (MouseButton::Left, MouseButtonState::Up) => TrayGesture::LeftRelease,
+                        _ => TrayGesture::OtherPress,
+                    },
+                    TrayIconEvent::Enter { .. }
+                    | TrayIconEvent::Move { .. }
+                    | TrayIconEvent::Leave { .. } => TrayGesture::Hover,
+                    _ => TrayGesture::OtherPress,
+                };
+                if tray_directive(gesture) == TrayDirective::ToggleGlance {
+                    toggle_glance(&handle);
+                }
             }
         })
         .build(app)?;
@@ -661,6 +689,50 @@ fn route_deep_link(app: &AppHandle, url: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// tray-gesture rule (the glance-toggle flicker fix), pure spec so the
+// cargo tests assert what ships
+// ---------------------------------------------------------------------------
+
+/// The tray event classes the rule cares about, abstracted so tests can
+/// build them (tauri's TrayIconEvent carries a non-constructible Rect /
+/// TrayIconId payload in a crate-private shape).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayGesture {
+    /// Left mouse press on the icon (Click + Left + Down).
+    LeftPress,
+    /// Left mouse release on the icon (Click + Left + Up). A real click
+    /// fires Down AND Up: toggling on both would open-then-close the
+    /// glance on one click.
+    LeftRelease,
+    /// Hover: Enter / Move / Leave. macOS fires these for every pixel of
+    /// mouse movement over the icon (tray-icon installs an NSTrackingArea
+    /// with MouseMoved). Q-c LOCKED is CLICK = glance; hover never acts.
+    Hover,
+    /// Right/middle press or anything else (the menu path).
+    OtherPress,
+}
+
+/// The native action the handler performs, decided by the pure rule.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TrayDirective {
+    /// Show/hide the glance (Q-c: single left click = glance).
+    ToggleGlance,
+    /// No native action.
+    NoAction,
+}
+
+/// The tray gesture rule as a pure function: gesture -> verdict. ONLY
+/// the left press toggles. Every other class is inert — that is the
+/// flicker fix: hover Move events used to reach the toggle, so the
+/// glance opened and closed with every mouse movement near the icon.
+pub fn tray_directive(gesture: TrayGesture) -> TrayDirective {
+    match gesture {
+        TrayGesture::LeftPress => TrayDirective::ToggleGlance,
+        _ => TrayDirective::NoAction,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // window-event rule (D1), pure spec so the cargo tests assert what ships
 // ---------------------------------------------------------------------------
 
@@ -866,6 +938,27 @@ mod tests {
         assert_eq!(
             window_directive(SETTINGS_LABEL, WindowEventKind::CloseRequested),
             WindowDirective::NoAction
+        );
+    }
+
+    // The glance-toggle flicker: ONLY the left press acts. Hover
+    // (Enter/Move/Leave) and the left release must be inert — the bug
+    // was an unconditional toggle that every hover pixel and both click
+    // halves reached.
+    #[test]
+    fn tray_left_press_is_the_only_toggle() {
+        assert_eq!(
+            tray_directive(TrayGesture::LeftPress),
+            TrayDirective::ToggleGlance
+        );
+        assert_eq!(
+            tray_directive(TrayGesture::LeftRelease),
+            TrayDirective::NoAction
+        );
+        assert_eq!(tray_directive(TrayGesture::Hover), TrayDirective::NoAction);
+        assert_eq!(
+            tray_directive(TrayGesture::OtherPress),
+            TrayDirective::NoAction
         );
     }
 
