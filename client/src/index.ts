@@ -1101,6 +1101,15 @@ export class ClientDaemon {
   private running = false;
   private activeLease: { lease_id: string; project: string; job_id: string } | null = null;
   private closed = false;
+  /**
+   * The poll loop's promise (set by start(), awaited by stop()). A tick
+   * parked at an await keeps running past closed=true; stop() must settle
+   * it before returning, or the tick can GRANT + spawn a child afterwards
+   * (the shared-queue cross-talk the lease-loop tests kept catching).
+   */
+  private loopDone: Promise<void> | null = null;
+  /** The in-flight runJob tail (executor child + usage report), awaited by stop(). */
+  private jobDone: Promise<void> | null = null;
   /** True when an executor template's script path is missing (see checkExecutorScript). */
   private executorBroken = false;
 
@@ -1198,7 +1207,7 @@ export class ClientDaemon {
     // stays as the idempotent path.)
     await this.ensureProxy();
     this.connectWs();
-    this.loop();
+    this.loopDone = this.loop();
   }
 
   async stop(): Promise<void> {
@@ -1214,6 +1223,18 @@ export class ClientDaemon {
     // are detached process groups — they would otherwise outlive the daemon).
     for (const ex of this.rebuildExecs.values()) ex.kill('SIGKILL');
     this.running = false;
+    this.stateWake = true; // wake a parked poll sleep so the loop settles fast
+    // A tick parked at an `await` (state poll, lease POST) when stop() began
+    // keeps running to its next await and used to be able to GRANT + spawn a
+    // child AFTER stop() returned: the orphaned executor then mutated queue /
+    // results files belonging to whatever ran next (lost read-modify-writes,
+    // double-counted proxy bytes), and a process exit skipped its usage
+    // report. Wait for the loop and any in-flight job to fully settle before
+    // closing the plumbing (the job tail still needs the proxy to drain).
+    await this.loopDone;
+    this.loopDone = null;
+    await this.jobDone;
+    this.jobDone = null;
     this.ws?.close();
     // Release the session gate cleanly: parked requests proceed rather than
     // dying with the daemon.
@@ -1379,8 +1400,11 @@ export class ClientDaemon {
         // so interactive traffic never wedges on a dead arbiter.
         this.gate?.onLinkDown();
       }
+      if (this.closed) return;
       // The gate can wake the loop early (new session / parked request needs
-      // fresh override state); otherwise sleep the poll period.
+      // fresh override state); otherwise sleep the poll period. stop() also
+      // flips stateWake so a parked sleep returns at once; the loop then
+      // sees closed and exits instead of starting another tick.
       const wake = this.stateWake;
       this.stateWake = false;
       await sleep(wake ? Math.min(50, this.hooks.pollMs) : this.hooks.pollMs);
@@ -1472,6 +1496,7 @@ export class ClientDaemon {
     // has forced THIS client to run anyway (force bypasses the idle verdict and
     // the reidle gate on the server too; degraded signal, busy, project pause,
     // and daily budget still block there).
+    if (this.closed) return;
     if (st.idle.degraded) return;
     const forced = me?.override?.override === 'force';
     if (!forced && (!st.idle.idle || st.idle.reidle_gated)) return;
@@ -1493,9 +1518,29 @@ export class ClientDaemon {
       estimated_seconds: jobEstimatedSeconds(job.job) ?? proj.estimated_seconds ?? 900,
     });
     if (res.status === 201 && res.body.lease_id) {
+      // stop() can land while the lease POST is in flight. Spawning a child
+      // now leaves it outside stop()'s reach: the daemon process is gone but
+      // the executor keeps mutating shared files. Release the grant instead
+      // (ok:false partial usage) and let the job retry next boot.
+      if (this.closed) {
+        this.log.info(`shutting down — releasing grant ${res.body.lease_id} without running`);
+        await this.reportUsage(res.body.lease_id!, {
+          ok: false,
+          error: 'shutting_down',
+          error_detail: 'the client stopped while the lease was being granted',
+          score: null,
+          ...this.proxyStats(),
+        });
+        return;
+      }
       this.log.info(`GRANT lease ${res.body.lease_id} for ${job.job.job_id}`);
       this.activeLease = { lease_id: res.body.lease_id!, project: proj.name, job_id: job.job.job_id };
-      void this.runJob(proj, job.job, res.body.lease_id!);
+      // runJob must never take the daemon down (D6 rule 2): the rejection is
+      // logged here instead of surfacing as an unhandledRejection or throwing
+      // through stop()'s await.
+      this.jobDone = this.runJob(proj, job.job, res.body.lease_id!).catch((err) => {
+        this.log.info(`runJob error: ${err instanceof Error ? err.message : err}`);
+      });
     } else {
       this.log.info(`lease denied: HTTP ${res.status} ${res.body.reason ?? ''}`);
     }
@@ -1867,11 +1912,18 @@ export class ClientDaemon {
         error_detail: outcome.outputTail.slice(-1000),
         ts: new Date().toISOString(),
       });
+      // Retry bookkeeping BEFORE the network report: attempts +1 / quarantine
+      // are local file writes, so the queue is in its final state the moment
+      // the result line exists. The old order put the usage `await` in the
+      // middle — a process exit in that window left the failed line recorded
+      // while the job still sat in the queue at the cap, free to run a 4th
+      // time (and it made the lease-loop retry test sample a half-applied
+      // state).
+      this.registerFailure(proj, job, error);
       // Clean failure (exit 0): the proxy saw what the job did use —
       // report it with the failure (and the child's output tail) so the
       // budget stays honest and the failure's WHY survives on the arbiter.
       await this.reportUsage(leaseId, { ok: false, error, error_detail: outcome.outputTail.slice(-1000), score: null, ...partial });
-      this.registerFailure(proj, job, error);
       this.activeLease = null;
       return;
     }
