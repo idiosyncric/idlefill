@@ -57,6 +57,37 @@ export interface SessionGateSnapshot {
   position?: number;
 }
 
+/**
+ * #67: the response-phase snapshot the register heartbeat carries as the
+ * `phase` ADD-key. What the engine is doing RIGHT NOW on this session,
+ * classified from the streamed deltas the router already pipes past:
+ * 'thinking' = reasoning deltas (`delta.reasoning_content`), 'output' =
+ * content deltas (`delta.content`), 'tools' = tool-call deltas
+ * (`delta.tool_calls`). `at` = epoch-ms of the last observed phase chunk
+ * (the surface ages/dims the state from it; the arbiter stores it
+ * verbatim). null / absent = no live stream — the body omits the block
+ * and the arbiter CLEARS any stored phase (the gate block posture).
+ */
+export interface SessionPhaseSnapshot {
+  state: 'thinking' | 'output' | 'tools';
+  at: number;
+}
+
+/**
+ * #67: an operator engine pin as the arbiter publishes it on the
+ * `/api/state` sessions[] row (the `engine_pin` ADD-key — resolved
+ * server-side like the #66 alias block: the router never recomputes a
+ * url). `engine_model` rides only when the pinned row serves the
+ * session's model under a DIFFERENT id (the alias-pair case; the same
+ * #66 D3 splice rule at forward time).
+ */
+export interface SessionPinRow {
+  server_id: string;
+  url: string;
+  engine_model?: string;
+  set_at: number;
+}
+
 /** One row of GET /apistate → sessions[] as the client sees it. */
 export interface SessionStateRow {
   token: string;
@@ -64,6 +95,8 @@ export interface SessionStateRow {
   /** The client the arbiter attributes this session to (#50 mesh, read
    *  for adoption in #54). Absent = pre-#50 arbiter or a test fixture. */
   client_name?: string;
+  /** #67: this session's operator engine pin (absent = no pin). */
+  engine_pin?: SessionPinRow | null;
 }
 
 /** The proxy's forwarder: pipe req → upstream at `path`, stream the reply. */
@@ -87,6 +120,11 @@ export interface SessionGateDeps {
      *  model + last token total) — the `history` ADD-Key on the register
      *  body. Absent for a session with no recorded traffic. */
     history?: SessionHistory,
+    /** #67: the response-phase snapshot at heartbeat time — the live
+     *  stream class (thinking/output/tools) + observation instant. null
+     *  = no live phase (the body omits the block, the arbiter CLEARS any
+     *  stored phase — the gate block posture). */
+    phase?: SessionPhaseSnapshot | null,
   ) => Promise<boolean>;
   /** #54: this client's registered name (client/config.json client_name).
    *  Arbiter session rows naming a DIFFERENT client are not adopted —
@@ -110,6 +148,13 @@ interface Held {
   req: IncomingMessage;
   res: ServerResponse;
   path: string;
+  /**
+   * The forward seam. For the proxy plane this is a fixed target (11435
+   * stays byte-for-byte, #64 D6); for the aggregate plane it is a LATE
+   * BOUND resolver (#67): the park holds it unconsumed and the release
+   * path calling it resolves the engine AT ADMISSION — a pin written
+   * while the request sat parked takes effect on this very body.
+   */
   forward: ForwardFn;
   parkedAt: number;
   capTimer?: NodeJS.Timeout;
@@ -144,6 +189,21 @@ interface Session {
   model?: string;
   /** Last token total observed in an upstream usage chunk (#45). */
   tokens?: number;
+  /**
+   * #67: the live response phase for this session — the class of the last
+   * streamed delta observed across its in-flight requests (null/absent =
+   * no live stream). Reset to null when the session's last in-flight
+   * request settles. The register heartbeat folds it into the `phase`
+   * ADD-key; surfaces age it against `at`.
+   */
+  phase?: { state: 'thinking' | 'output' | 'tools'; at: number } | null;
+  /**
+   * #67: the operator engine pin as learned from the arbiter's session
+   * rows (`engine_pin` ADD-key). Read at RELEASE time by the aggregate
+   * router's target resolver; the gate itself never reroutes around the
+   * queue — a pin moves the target, not the order.
+   */
+  pin?: SessionPinRow | null;
 
 }
 
@@ -193,6 +253,37 @@ function sniffUsageChunk(chunk: Buffer | string): number | undefined {
   if (!m) return undefined;
   const n = Number(m[1]);
   return Number.isFinite(n) && n >= 0 ? n : undefined;
+}
+
+/**
+ * #67: classify one streamed response chunk into the session's response
+ * phase — the shape the visual contract names: 'thinking' (reasoning
+ * deltas), 'output' (content deltas), 'tools' (tool-call deltas).
+ *
+ * Posture: regex over the chunk text, no JSON parse, no buffering — the
+ * same drop-don't-reject class as every other observed field. A chunk
+ * that carries no SSE `delta` row (a non-streaming JSON body, a
+ * keep-alive, the `[DONE]` row, a header row) yields NOTHING, so a phase
+ * is never invented. When one chunk carries more than one class the
+ * order is tools → thinking → output (a chunk that is genuinely a
+ * tool-call row has no content to argue with; the tie is rare in
+ * practice because engines emit one delta class per row).
+ *
+ * Honest limit, stated so no surface promises more: the classification
+ * reads BYTES, not parsed SSE frames. A chunk boundary that splits a
+ * delta row still classifies as long as one of the key substrings lands
+ * whole inside some chunk — true for every engine observed (rows are
+ * small compared to Node's read chunks). A model that emits the literal
+ * text `"tool_calls":` inside its own content could mislabel one pipe
+ * color; nothing else rides on this field.
+ */
+export function sniffPhaseChunk(chunk: Buffer | string): 'thinking' | 'output' | 'tools' | undefined {
+  const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+  if (!/"delta"\s*:/.test(text)) return undefined;
+  if (/"tool_calls"\s*:/.test(text)) return 'tools';
+  if (/"reasoning_content"\s*:/.test(text)) return 'thinking';
+  if (/"content"\s*:/.test(text)) return 'output';
+  return undefined;
 }
 
 /** #42 Slice 0: the header Hermes may carry with every provider request. */
@@ -252,6 +343,16 @@ export class SessionGate {
   }
 
   /**
+   * #67: the operator engine pin the gate currently holds for a token
+   * (null = no pin). Read by the aggregate router's release-time target
+   * resolver — the gate OWNS the learned state (it rides the poll), the
+   * router only consumes it at admission.
+   */
+  pinFor(token: string): SessionPinRow | null {
+    return this.sessions.get(token)?.pin ?? null;
+  }
+
+  /**
    * The gate-state snapshot for one token — what a heartbeat reports to the
    * arbiter. Pure read of the router's queue truth: holding a slot
    * (inflight > 0) ⇒ `active` (the parked-request count still rides as
@@ -291,6 +392,13 @@ export class SessionGate {
     // observing the piped upstream never steals bytes.
     this.recordRequest(s);
 
+    // #67: `forward` may be a LATE BOUND seam (the aggregate router
+    // resolves the engine at CALL time — a pin the operator writes
+    // between park and release moves the target at admission). It is
+    // NEVER invoked at park time: the parked body stays whole and the
+    // resolver only runs when the request actually goes out. The proxy
+    // plane passes a fixed target — byte-for-byte today's behavior.
+
     // Fail-open posture: arbiter down or gate shutting down ⇒ admit.
     if (!this.linkUp || this.released) {
       this.forwardNow(s, req, res, path, forward);
@@ -302,7 +410,7 @@ export class SessionGate {
       return;
     }
     // pause ⇒ hold that session's traffic, even with free slots (#32).
-    // The row stays queued (in place) so the unpause releases it FIFO.
+    // The row stays queued (in place) so an unpause releases it FIFO.
     if (s.override === 'pause') {
       this.enqueue(s);
       this.park(s, req, res, path, forward);
@@ -354,13 +462,20 @@ export class SessionGate {
   private async register(s: Session): Promise<void> {
     s.lastRegisterAttempt = this.now();
     try {
+      // #45: the compact history only when the session has traffic (an
+      // idle row stays exactly as it was — ADD-key posture). #67: the
+      // live response phase rides the NEXT positional slot — explicitly
+      // null (no live stream) so the arbiter CLEARS a stored phase the
+      // same way the gate block clears on the idle report. Positional
+      // args stay explicit here: a conditional spread would shift phase
+      // into history's slot (the arity the register callback declares).
+      const hist = s.ring.length || s.model || s.tokens ? sessionHistory(s, this.now()) : undefined;
       const ok = await this.deps.register(
         s.token,
         this.snapshot(s.token),
         s.session_id,
-        // #45: send the compact history only when the session has traffic
-        // (an idle row stays exactly as it was — ADD-key posture).
-        ...(s.ring.length || s.model || s.tokens ? [sessionHistory(s, this.now()) as SessionHistory] : []),
+        hist,
+        s.phase ? { state: s.phase.state, at: s.phase.at } : null,
       );
       if (ok) {
         if (!this.linkUp) {
@@ -400,6 +515,18 @@ export class SessionGate {
       if (settled) return;
       settled = true;
       s.inflight--;
+      // #67: the session has no live stream any more — its phase clears
+      // (the next heartbeat carries the no-phase report, the arbiter
+      // CLEARS the stored block). Only the last settling request writes.
+      // When a phase WAS live, the clear rides right away: the transition
+      // registers already made the surface live mid-stream, and leaving a
+      // 'tools'/'output' pipe animating for up to the 10s heartbeat window
+      // after the stream ended would render a lie. Bounded by construction
+      // (≤1 per stream, only when a phase actually stood).
+      if (s.inflight === 0 && s.phase) {
+        s.phase = null;
+        if (s.registered && this.linkUp && !this.released) void this.register(s);
+      }
       if (s.inflight === 0) this.admitLoop();
     };
     // 'close' covers clean finish, upstream error, and client abort.
@@ -433,6 +560,41 @@ export class SessionGate {
         src.once('close', detach);
       });
     }
+    // #67: the response-phase sniffer — the SAME observe-copies
+    // discipline (a listener on the piped source never steals bytes;
+    // #45 pinned the wedge the other way causes). Classifies every
+    // streamed chunk's SSE delta class: reasoning_content → 'thinking',
+    // content → 'output', tool_calls → 'tools'; each classified chunk
+    // stamps the session's live phase + observation instant. Unlike the
+    // #45 pair this listener stays for the whole stream (the phase IS
+    // the stream's live state) and detaches on end/close. An
+    // unclassifiable chunk (role row, [DONE], keep-alive) changes
+    // nothing — drop-don't-reject, never a fabricated phase.
+    res.once('pipe', (src) => {
+      const onPhase = (chunk: Buffer | string): void => {
+        const state = sniffPhaseChunk(chunk);
+        if (!state) return;
+        const transitioned = s.phase?.state !== state;
+        s.phase = { state, at: this.now() };
+        // #67: a phase TRANSITION rides the arbiter right away. The
+        // heartbeat throttle (≤1 register per 10s) is for traffic noise;
+        // a stream carries only a handful of transitions, and the flow
+        // view renders off arbiter truth — waiting up to 10s per step
+        // would freeze the surface (live probe, #67 acceptance: a 6s
+        // stream reported no phase at all between first-sight and settle).
+        // Same-state chunks just refresh the age. The settle clear below
+        // carries the matching no-phase report.
+        if (transitioned && s.registered && this.linkUp && !this.released) void this.register(s);
+      };
+      const detachPhase = (): void => {
+        src.removeListener('data', onPhase);
+        src.removeListener('end', detachPhase);
+        src.removeListener('close', detachPhase);
+      };
+      src.on('data', onPhase);
+      src.once('end', detachPhase);
+      src.once('close', detachPhase);
+    });
     forward(req, res, path);
   }
 
@@ -543,6 +705,10 @@ export class SessionGate {
       h.done = true;
       if (h.capTimer) clearTimeout(h.capTimer);
       s.holds.splice(0, 1);
+      // #67: the target resolves AT RELEASE for aggregate traffic — the
+      // held ForwardFn is late bound there, so a pin the operator wrote
+      // (or moved) while this request sat parked takes effect on THIS
+      // body, whole and unconsumed.
       this.forwardNow(s, h.req, h.res, h.path, h.forward);
     }
   }
@@ -589,13 +755,32 @@ export class SessionGate {
         // slot cap immediately — no need to wait for a slot to free.
         if (ov === 'force') this.releaseHoldsOf(s);
       }
+      // #67: learn the operator engine pin (the arbiter resolves the
+      // block; the router stores what it is told). A pin never touches
+      // the queue — it moves the forward TARGET at release, not the
+      // order. A newly-arriving pin does not release anything by itself
+      // (a pinned session still waits for its slot exactly like before;
+      // the admission then resolves to the pinned row).
+      const pin = normalizePinRow(row.engine_pin);
+      const had = s.pin?.server_id ?? null;
+      const next = pin?.server_id ?? null;
+      if (had !== next) {
+        this.log(`session ${s.token} engine pin: ${had ?? 'none'} → ${next ?? 'none'}`);
+        s.pin = pin;
+      }
     }
     // Rows the arbiter no longer reports (swept/restart): no override —
-    // the fail-open direction of last resort.
+    // the fail-open direction of last resort. Same for the pin (#67): a
+    // pin the arbiter dropped (swept row, cleared pin) must not keep
+    // resolving traffic here.
     for (const s of this.sessions.values()) {
       if (!seen.has(s.token) && s.override !== null) {
         this.log(`session ${s.token} override cleared (absent from arbiter state)`);
         s.override = null;
+      }
+      if (!seen.has(s.token) && s.pin) {
+        this.log(`session ${s.token} engine pin cleared (absent from arbiter state)`);
+        s.pin = null;
       }
     }
     this.admitLoop();
@@ -643,6 +828,29 @@ export class SessionGate {
 
 function normalizeOverride(v: unknown): SessionOverrideKind | null {
   return v === 'pause' || v === 'force' ? v : null;
+}
+
+/**
+ * #67: accept an `engine_pin` block from the arbiter's session row only
+ * in its published shape (server_id + url strings; engine_model when
+ * present a string; set_at when present a finite number). null/absent →
+ * null (no pin). Anything malformed → null too: the pin is the
+ * fail-quiet surface — an unparseable block falls back to the
+ * dispatch-chosen target, never a half-parsed reroute.
+ */
+function normalizePinRow(v: unknown): SessionPinRow | null {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
+  const p = v as { server_id?: unknown; url?: unknown; engine_model?: unknown; set_at?: unknown };
+  if (typeof p.server_id !== 'string' || p.server_id === '') return null;
+  if (typeof p.url !== 'string' || p.url === '') return null;
+  if (p.engine_model !== undefined && typeof p.engine_model !== 'string') return null;
+  if (p.set_at !== undefined && (typeof p.set_at !== 'number' || !Number.isFinite(p.set_at))) return null;
+  return {
+    server_id: p.server_id,
+    url: p.url,
+    ...(typeof p.engine_model === 'string' ? { engine_model: p.engine_model } : {}),
+    set_at: typeof p.set_at === 'number' ? p.set_at : 0,
+  };
 }
 
 function resSent(res: ServerResponse): boolean {

@@ -1658,7 +1658,7 @@ export class ClientDaemon {
         holdCapMs: this.cfg.session_hold_cap_ms ?? 120_000,
         clientName: this.cfg.client_name,
         log: (m) => this.log.info(m),
-        register: async (token, gate, sessionId, history) => {
+        register: async (token, gate, sessionId, history, phase) => {
           // #64 D5: an aggregate-derived session key (model name / header
           // id) carries the catalog-chosen row as `server_id` — idle
           // folding + preemption then land on the engine the request
@@ -1687,6 +1687,12 @@ export class ClientDaemon {
             // last streamed token total). ADD-key: absent for a session
             // with no recorded traffic; an old arbiter ignores it.
             ...(history ? { history } : {}),
+            // #67 response phase: what the engine is doing RIGHT NOW on
+            // this session (thinking/output/tools + observation instant).
+            // Verbatim like the gate block: null (no live stream) rides
+            // as the explicit CLEAR so a finished stream never stays
+            // tagged; an old arbiter ignores the extra key (back-compat).
+            ...(phase !== undefined ? { phase } : {}),
           });
           return status === 200 || status === 201;
         },

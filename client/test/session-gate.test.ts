@@ -27,7 +27,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startLlmProxy, waitProxyReady, type LlmProxy } from '../src/proxy.js';
-import { SessionGate, type SessionGateSnapshot, SessionHistory } from '../src/session-gate.js';
+import { SessionGate, sniffPhaseChunk, type SessionGateSnapshot, type SessionHistory, type SessionPhaseSnapshot } from '../src/session-gate.js';
 import { ClientDaemon } from '../src/index.js';
 import type { ClientConfig } from '../src/config.js';
 import { startFakeArbiter, type FakeArbiter } from './fake-arbiter.js';
@@ -109,12 +109,12 @@ async function waitFor(pred: () => boolean, timeoutMs = 3000, what = 'condition'
 function makeGate(opts: {
   maxActive?: number;
   holdCapMs?: number;
-  register?: (token: string, gate: SessionGateSnapshot | null, sessionId?: string, history?: SessionHistory) => Promise<boolean>;
+  register?: (token: string, gate: SessionGateSnapshot | null, sessionId?: string, history?: SessionHistory, phase?: SessionPhaseSnapshot | null) => Promise<boolean>;
   now?: () => number;
   clientName?: string;
-} = {}): { gate: SessionGate; registered: string[]; calls: { token: string; gate: SessionGateSnapshot | null; sessionId?: string; history?: SessionHistory }[] } {
+} = {}): { gate: SessionGate; registered: string[]; calls: { token: string; gate: SessionGateSnapshot | null; sessionId?: string; history?: SessionHistory; phase?: SessionPhaseSnapshot | null }[] } {
   const registered: string[] = [];
-  const calls: { token: string; gate: SessionGateSnapshot | null; sessionId?: string; history?: SessionHistory }[] = [];
+  const calls: { token: string; gate: SessionGateSnapshot | null; sessionId?: string; history?: SessionHistory; phase?: SessionPhaseSnapshot | null }[] = [];
   const gate = new SessionGate({
     maxActive: opts.maxActive ?? 1,
     holdCapMs: opts.holdCapMs ?? 30_000,
@@ -122,9 +122,9 @@ function makeGate(opts: {
     clientName: opts.clientName,
     register:
       opts.register ??
-      (async (token, gateSnapshot, sessionId, history) => {
+      (async (token, gateSnapshot, sessionId, history, phase) => {
         registered.push(token);
-        calls.push({ token, gate: gateSnapshot, sessionId, history });
+        calls.push({ token, gate: gateSnapshot, sessionId, history, phase });
         return true;
       }),
   });
@@ -367,7 +367,7 @@ test('register calls carry the gate snapshot (active at refresh, queued while pa
   // First sight registers BEFORE the request is forwarded ⇒ idle snapshot.
   const resA = postChat(proxy.base_url, '/s/tokA/v1/chat/completions');
   await waitFor(() => up.hits.length === 1, 3000, 'A forwarded');
-  assert.deepEqual(calls[0], { token: 'tokA', gate: null, sessionId: undefined, history: undefined }, 'first-sight register: no gate block, no traffic history yet');
+  assert.deepEqual(calls[0], { token: 'tokA', gate: null, sessionId: undefined, history: undefined, phase: null }, 'first-sight register: no gate block, no traffic history yet, no phase (#67: the no-phase report rides every heartbeat)');
 
   // B first-sights and parks; its register fires at first sight (before
   // the park), so it is also gate-less — the REFRESH is what reports it.
@@ -785,4 +785,233 @@ test('#45 session history on the wire: request ring + response-sniffed model/tok
   await waitFor(() => up.hits.length === 3, 3000, 'hist3 admitted');
   up.release(1);
   assert.equal((await resB).status, 200);
+});
+
+// ---------------------------------------------------------------------------
+// #67 — the response-phase sniffer on the wire + the engine-pin plane in
+// the gate (poll-learned state, release-time resolution shape, fail-quiet).
+// ---------------------------------------------------------------------------
+
+/** A hand-streamed SSE engine: frames ride out only when the test says so. */
+async function startSseEngine(): Promise<{
+  url: string;
+  started: Promise<void>;
+  send: (frame: string) => void;
+  end: () => void;
+  close: () => Promise<void>;
+}> {
+  let stream: http.ServerResponse | null = null;
+  let markStarted: () => void = () => {};
+  const started = new Promise<void>((r) => { markStarted = r; });
+  const srv = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    stream = res;
+    markStarted();
+  });
+  await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+  cleanup.push(() => new Promise<void>((r) => { srv.closeAllConnections?.(); srv.close(() => r()); }));
+  return {
+    url: `http://127.0.0.1:${(srv.address() as { port: number }).port}`,
+    started,
+    send: (frame) => { stream!.write(frame); },
+    end: () => { stream!.end(); stream = null; },
+    close: () => new Promise<void>((r) => { srv.closeAllConnections?.(); srv.close(() => r()); }),
+  };
+}
+
+test('#67 phase sniffer (unit): the delta classes the visual contract names, and nothing else becomes a phase', () => {
+  assert.equal(sniffPhaseChunk('data: {"choices":[{"delta":{"reasoning_content":"hmm"}}]}'), 'thinking');
+  assert.equal(sniffPhaseChunk('data: {"choices":[{"delta":{"content":"hello"}}]}'), 'output');
+  assert.equal(sniffPhaseChunk('data: {"choices":[{"delta":{"tool_calls":[{"index":0}]}}]}'), 'tools');
+  // A delta that carries content AND tool_calls classifies tools (the tie order).
+  assert.equal(sniffPhaseChunk('data: {"choices":[{"delta":{"content":"","tool_calls":[{}]}}]}'), 'tools');
+  // Buffers work like strings.
+  assert.equal(sniffPhaseChunk(Buffer.from('data: {"choices":[{"delta":{"content":"x"}}]}')), 'output');
+  // No delta row ⇒ no phase, ever: role row, [DONE], keep-alive, plain JSON, empty delta, empty.
+  for (const junk of [
+    'data: {"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}',
+    'data: [DONE]',
+    ': keep-alive\n\n',
+    '{"id":"chatcmpl-1","choices":[{"message":{"content":"hi"}}]}',
+    'data: {"choices":[{"delta":{}}]}',
+    '',
+  ]) {
+    assert.equal(sniffPhaseChunk(junk), undefined, `no invented phase for ${JSON.stringify(junk)}`);
+  }
+});
+
+test('#67 phase on the wire: heartbeats carry the live SSE phase and clear it at settle — the observer never steals a byte', async () => {
+  const sse = await startSseEngine();
+  const clock = { t: 91_000_000 };
+  const { gate, calls } = makeGate({ maxActive: 1, now: () => clock.t });
+  // A server whose handler runs gate.route with a seam that pipes the SSE
+  // engine into res — byte-for-byte what the proxy/aggregate forward seam
+  // does — so the gate's pipe-attached sniffer sees the frames as they
+  // flow to the client.
+  const srv = http.createServer((req, res) => {
+    const m = /^\/s\/([^/]+)/.exec(req.url ?? '');
+    const token = m?.[1] ?? 'x';
+    const path = (req.url ?? '').replace(/^\/s\/[^/]+/, '');
+    const seam = () => {
+      const u = new URL(sse.url + path);
+      const up = http.request(
+        { protocol: u.protocol, hostname: u.hostname, port: u.port, path: u.pathname, method: req.method, headers: { 'content-type': 'application/json' } },
+        (upr) => {
+          res.writeHead(upr.statusCode ?? 200, upr.headers);
+          upr.pipe(res);
+        },
+      );
+      req.pipe(up);
+    };
+    gate.route(req, res, token, path, seam);
+  });
+  await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+  cleanup.push(() => new Promise<void>((r) => { srv.closeAllConnections?.(); srv.close(() => r()); }));
+  const base = `http://127.0.0.1:${(srv.address() as { port: number }).port}`;
+
+  gate.onStatePoll([]);
+  const resP = fetch(`${base}/s/ph1/v1/chat/completions`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'm', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  await waitFor(() => calls.some((c) => c.token === 'ph1'), 3000, 'ph1 registered');
+  await sse.started; // the seam dialed the engine; frames now reach a live stream
+
+  // Unclassifiable frames change nothing; the reasoning frame stamps 'thinking'.
+  sse.send('data: {"choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n');
+  sse.send('data: {"choices":[{"index":0,"delta":{"reasoning_content":"thinking hard"}}]}\n\n');
+  await waitFor(() => {
+    clock.t += 10_001;
+    gate.heartbeat();
+    return calls.filter((c) => c.token === 'ph1').length >= 2 && calls.filter((c) => c.token === 'ph1').at(-1)!.phase?.state === 'thinking';
+  }, 3000, 'heartbeat carrying the thinking phase');
+  const hb = calls.filter((c) => c.token === 'ph1').at(-1)!;
+  assert.ok(hb.phase && typeof hb.phase.at === 'number' && hb.phase.at <= clock.t, 'the phase block carries its observation instant');
+
+  // Visible output: last write wins.
+  sse.send('data: {"choices":[{"index":0,"delta":{"content":"the answer"}}]}\n\n');
+  await waitFor(() => {
+    clock.t += 10_001;
+    gate.heartbeat();
+    return calls.filter((c) => c.token === 'ph1').length >= 3 && calls.filter((c) => c.token === 'ph1').at(-1)!.phase?.state === 'output';
+  }, 3000, 'heartbeat carrying the output phase');
+
+  // Settle: the stream ends; the next heartbeat reports the no-phase block
+  // (null — the arbiter CLEARS the stored phase on that report).
+  sse.send('data: [DONE]\n\n');
+  sse.end();
+  const r = await resP;
+  const text = await r.text();
+  assert.ok(text.includes('thinking hard') && text.includes('the answer') && text.includes('[DONE]'),
+    'every SSE byte reached the client — the sniffer copies, never consumes');
+  await waitFor(() => {
+    clock.t += 10_001;
+    gate.heartbeat();
+    return calls.filter((c) => c.token === 'ph1').length >= 4 && calls.filter((c) => c.token === 'ph1').at(-1)!.phase === null;
+  }, 3000, 'settled session reports the no-phase block');
+});
+
+/** An eager engine: answers every request immediately (echoes the marker). */
+async function startEagerEngine(marker: string): Promise<{
+  url: string;
+  hits: { path: string; body: string }[];
+  close: () => Promise<void>;
+}> {
+  const hits: { path: string; body: string }[] = [];
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      hits.push({ path: req.url ?? '', body });
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ id: 'chatcmpl-e', model: marker, choices: [{ message: { content: marker } }] }));
+    });
+  });
+  await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+  cleanup.push(() => new Promise<void>((r) => { srv.closeAllConnections?.(); srv.close(() => r()); }));
+  return {
+    url: `http://127.0.0.1:${(srv.address() as { port: number }).port}`,
+    hits,
+    close: () => new Promise<void>((r) => { srv.closeAllConnections?.(); srv.close(() => r()); }),
+  };
+}
+
+test('#67 pin: a late-bound seam + the learned pin resolve at RELEASE time (the gate half of the queued switch)', async () => {
+  // The gate contract the aggregate relies on: route() stores the seam on
+  // the PARK, onStatePoll learns the pin, and admission calls the seam —
+  // which resolves the engine AT CALL TIME. A pin arriving mid-park changes
+  // where the parked request GOES without touching queue order or re-reading
+  // the body. (The aggregate test proves the end-to-end engine landing.)
+  const engineA = await startControllableUpstream();
+  const engineB = await startEagerEngine('pinned-engine'); // answers at once: the parked request completes on B
+  cleanup.push(() => engineA.close());
+  const clock = { t: 93_000_000 };
+  const { gate } = makeGate({ maxActive: 1, now: () => clock.t });
+
+  const srv = http.createServer((req, res) => {
+    const m = /^\/s\/([^/]+)/.exec(req.url ?? '');
+    const token = m?.[1] ?? 'x';
+    const path = (req.url ?? '').replace(/^\/s\/[^/]+/, '');
+    const seam = () => {
+      const pin = gate.pinFor(token); // resolved AT CALL TIME (pinnedEntryFor shape)
+      const base = pin ? pin.url : engineA.url;
+      const u = new URL(base + path);
+      const up = http.request(
+        { protocol: u.protocol, hostname: u.hostname, port: u.port, path: u.pathname, method: req.method, headers: { 'content-type': 'application/json' } },
+        (upr) => {
+          res.writeHead(upr.statusCode ?? 200, upr.headers);
+          upr.pipe(res);
+        },
+      );
+      req.pipe(up);
+    };
+    gate.route(req, res, token, path, seam);
+  });
+  await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+  cleanup.push(() => new Promise<void>((r) => { srv.closeAllConnections?.(); srv.close(() => r()); }));
+  const base = `http://127.0.0.1:${(srv.address() as { port: number }).port}`;
+  gate.onStatePoll([]);
+  const post = (token: string) => fetch(`${base}/s/${token}/v1/chat/completions`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'switch-me' }),
+  });
+
+  // Two sessions: tokA takes the one slot (engine A, held), tokB PARKS
+  // behind the cap — a session never queues behind its own traffic.
+  const res1 = post('tokA');
+  await waitFor(() => engineA.hits.length === 1, 3000, 'tokA forwarded to A');
+  const res2 = post('tokB');
+  await waitFor(() => gate.queueDepth === 1, 2000, 'tokB parked');
+
+  // The pin lands on the parked session (the running one is fenced).
+  gate.onStatePoll([{ token: 'tokB', engine_pin: { server_id: 'srv-b', url: engineB.url, set_at: 1 } }]);
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(gate.queueDepth, 1, 'the pin alone never releases the park');
+  assert.equal(engineB.hits.length, 0, 'the pin alone never dispatches');
+
+  engineA.release(1);
+  const [r1, r2] = await Promise.all([res1, res2]);
+  assert.equal(r1.status, 200);
+  assert.equal(r2.status, 200, 'one parked request = one continuous response — no retry, no 503');
+  assert.equal(engineA.hits.length, 1, 'the running request never moved (fence)');
+  assert.equal(engineB.hits.length, 1, 'the parked request resolved the pin at release');
+  assert.equal(JSON.parse(engineB.hits[0]!.body).model, 'switch-me', 'the parked body arrived whole');
+});
+
+test('#67 pin: absent/malformed engine_pin blocks learn nothing (fail-quiet); a disappearing block clears the pin', () => {
+  const { gate } = makeGate();
+  gate.onStatePoll([
+    { token: 't1', engine_pin: { server_id: 'srv-a', url: 'http://e:1', set_at: 1 } },
+    { token: 't2', engine_pin: { server_id: '', url: 'http://e:1', set_at: 1 } },
+    { token: 't3', engine_pin: { server_id: 'srv-a', url: 8080 as never, set_at: 1 } },
+    { token: 't4', engine_pin: 'pinned' as never },
+    { token: 't5', engine_pin: { server_id: 'srv-a', url: 'http://e:1', engine_model: 'row-id', set_at: 1 } },
+  ]);
+  assert.equal(gate.pinFor('t1')?.server_id, 'srv-a');
+  assert.equal(gate.pinFor('t2'), null, 'an empty server_id never learns a pin');
+  assert.equal(gate.pinFor('t3'), null, 'a block whose url is not a string never learns a pin');
+  assert.equal(gate.pinFor('t4'), null, 'a non-object block never learns a pin');
+  assert.equal(gate.pinFor('t5')?.engine_model, 'row-id', 'the splice key rides through untouched');
+  gate.onStatePoll([{ token: 't1' }]);
+  assert.equal(gate.pinFor('t1'), null, 'the pin clears when the arbiter stops publishing it');
 });

@@ -436,3 +436,124 @@ test('#65 posture: unreachable engine through the aggregate forwarder stays a cl
   const body = (await res.json()) as { error: string };
   assert.equal(body.error, 'llm target down');
 });
+
+// ---------------------------------------------------------------------------
+// #67 — release-time target resolution: the operator engine pin.
+// The pin rides the /api/state engine_pin block into the gate; the gate
+// only LEARNS it (never releases by itself); the aggregate's forward seam
+// resolves the target at CALL time, so a parked request lands on the
+// pinned engine at admission — one client request, one response, whole
+// body — while a request already running stays on the engine it started.
+// ---------------------------------------------------------------------------
+
+test('#67 aggregate pin: a parked request resolves to the pinned engine at release (queued switch)', async () => {
+  const heldA = await startHeldEngine();
+  const engineB = await startEngine('engine-b');
+  cleanup.push(() => heldA.close());
+  cleanup.push(() => engineB.close());
+
+  const { gate } = makeGate(1); // one live request per session
+  const r = await startRouter({
+    defaultTarget: heldA.url,
+    gate,
+    catalog: [
+      { name: 'X', server_id: 'srv-a', url: heldA.url, auth_set: false },
+      { name: 'X', server_id: 'srv-b', url: engineB.url, auth_set: false },
+    ],
+  });
+
+  // Request 1 (session sA) takes the slot on row A (bare-name dispatch =
+  // first row). Request 2 (session sB) parks behind the cap — body whole,
+  // nothing answered yet. (Two SEPARATE sessions: a session already
+  // holding a slot never parks behind itself — the gate's slot rule.)
+  const resA = postChat(r.base_url, '/v1/chat/completions', 'X', { 'x-hermes-session-id': 'sA' });
+  await waitFor(() => heldA.hits.length === 1, 3000, 'first request forwarded to row A');
+  const resB = postChat(r.base_url, '/v1/chat/completions', 'X', { 'x-hermes-session-id': 'sB' });
+  await waitFor(() => gate.queueDepth === 1, 2000, 'second request parked');
+
+  // The operator pins the session while it sits parked. The block is the
+  // arbiter's RESOLVED shape (server_id + url + engine_model when the row
+  // serves the name under another id) exactly as /api/state publishes it.
+  // The pin lands on the PARKED session (sB). A pin on the RUNNING one
+  // (sA) would move nothing: the running-stream fence.
+  gate.onStatePoll([{ token: 'sB', engine_pin: { server_id: 'srv-b', url: engineB.url, set_at: 1 } }]);
+  // A pin never releases holds by itself: still parked.
+  await new Promise((res) => setTimeout(res, 50));
+  assert.equal(gate.queueDepth, 1, 'a arriving pin moves the TARGET, never the queue order');
+  assert.equal(engineB.hits.length, 0, 'the pin does not dispatch on its own');
+
+  // Admission: request 1 settles, the admit loop calls the held forward,
+  // and the seam resolves the PIN at that moment.
+  heldA.release();
+  const [ra, rb] = await Promise.all([resA, resB]);
+  assert.equal(ra.status, 200);
+  assert.equal(rb.status, 200, 'the parked request got one continuous response — no retry, no 503');
+  assert.equal(heldA.hits.length, 1, 'the running request never moved (the running-stream fence)');
+  assert.equal(engineB.hits.length, 1, 'the parked request resolved to the PINNED engine at release');
+  assert.equal(JSON.parse(engineB.hits[0]!.body).model, 'X', 'the parked body arrived whole');
+
+  // The NEXT request of the PINNED session also goes to the pinned engine
+  // (the cap is free now, so it forwards at once).
+  const resC = await postChat(r.base_url, '/v1/chat/completions', 'X', { 'x-hermes-session-id': 'sB' });
+  assert.equal(resC.status, 200);
+  assert.equal(engineB.hits.length, 2, 'the pin stands for later requests');
+  assert.equal(heldA.hits.length, 1, 'row A sees no further traffic while the pin stands');
+
+  // Clearing the pin (arbiter stops publishing the block) restores the
+  // dispatch-chosen row.
+  gate.onStatePoll([{ token: 'sB' }]);
+  const resD = postChat(r.base_url, '/v1/chat/completions', 'X', { 'x-hermes-session-id': 'sB' });
+  await waitFor(() => heldA.hits.length === 2, 3000, 'unpinned traffic returns to row A');
+  assert.equal(engineB.hits.length, 2, 'the cleared pin stops sending NEW traffic to row B');
+  heldA.release();
+  await resD;
+});
+
+test('#67 aggregate pin: a pin whose row serves the name under another id takes the splice (alias pair switch)', async () => {
+  const engineA = await startEngine('engine-a-id');
+  const engineB = await startEngine('engine-b-id');
+  cleanup.push(() => engineA.close());
+  cleanup.push(() => engineB.close());
+
+  const { gate } = makeGate(4);
+  const r = await startRouter({ defaultTarget: engineA.url, gate });
+  // The #66 alias pair arrives through updateAliases (the arbiter's
+  // winner-owned pair): two rows, each serving 'Flag' under its OWN id.
+  r.updateAliases([
+    { name: 'Flag', server_id: 'srv-a', url: engineA.url, auth_set: false, engine_model: 'engine-a-id', catalog_source: 'probed' },
+    { name: 'Flag', server_id: 'srv-b', url: engineB.url, auth_set: false, engine_model: 'engine-b-id', catalog_source: 'probed' },
+  ]);
+
+  // Pinned to row B, whose engine id is NOT the requested name: the #66
+  // splice rewrites the body model to the row's id and back on the way out.
+  gate.onStatePoll([{ token: 'Flag', engine_pin: { server_id: 'srv-b', url: engineB.url, engine_model: 'engine-b-id', set_at: 1 } }]);
+  // key = the model name (no session header): the pin matches the bare-name key.
+  const res = await postChat(r.base_url, '/v1/chat/completions', 'Flag');
+  assert.equal(res.status, 200);
+  assert.equal(engineA.hits.length, 0, 'the pin moved the target off row A');
+  assert.equal(engineB.hits.length, 1);
+  assert.equal(JSON.parse(engineB.hits[0]!.body).model, 'engine-b-id', 'the engine sees its OWN id (the #66 request-side splice)');
+  const body = (await res.json()) as { model?: string };
+  assert.equal(body.model, 'engine-b-id', 'the response relays whole — the splice is request-side only (the #66 posture)');
+});
+
+test('#67 aggregate pin: no gate pin ⇒ byte-for-byte the dispatch-chosen row (unpinned fleet unchanged)', async () => {
+  const engineA = await startEngine('a');
+  const engineB = await startEngine('b');
+  cleanup.push(() => engineA.close());
+  cleanup.push(() => engineB.close());
+  const { gate } = makeGate(4);
+  const r = await startRouter({
+    defaultTarget: engineA.url,
+    gate,
+    catalog: [
+      { name: 'Solo', server_id: 'srv-a', url: engineA.url, auth_set: false },
+      { name: 'Solo', server_id: 'srv-b', url: engineB.url, auth_set: false },
+    ],
+  });
+  gate.onStatePoll([{ token: 'Solo' }]); // no engine_pin key at all
+  const res = await postChat(r.base_url, '/v1/chat/completions', 'Solo');
+  assert.equal(res.status, 200);
+  assert.equal(engineA.hits.length, 1, 'first-row pin: the #64 rule stands when no session pin exists');
+  assert.equal(engineB.hits.length, 0);
+});

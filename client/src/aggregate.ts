@@ -396,23 +396,24 @@ export function startAggregateRouter(opts: {
   };
 
   /**
-   * The gate's forward seam for one request: chosen row (or default
-   * target). A parked request arrives here only on admission — its body
-   * was never consumed (the peek unshifted its first chunk back). The
-   * splice happens HERE, at forward time, AFTER admission: a parked body
-   * stays unconsumed until this moment (the session-gate invariant,
-   * `client/src/session-gate.ts:286`).
+   * The gate's forward seam for one request. #67 changed WHERE the entry
+   * is chosen: the returned ForwardFn resolves its entry AT CALL TIME
+   * (via `entryFor`), not when this factory runs. A parked request
+   * therefore carries no frozen target: the gate's release path calls
+   * this at admission, and an operator engine pin written while the body
+   * sat parked picks the pinned engine THEN (the body stays unconsumed —
+   * the session-gate invariant, `client/src/session-gate.ts:286`).
    *
    * #66: an ALIAS-routed entry whose engine id differs from the requested
    * name takes the scoped buffered forward (Q3 owner posture). Every other
    * route — bare catalog entry, alias whose engine id EQUALS the name, the
    * default target — keeps today's `req.pipe` posture byte-for-byte.
    */
-  const forwardFor = (
-    entry: AggregateCatalogEntry | AggregateAliasEntry | undefined,
-    requestedName?: string,
-  ): ForwardFn => (req, res, path) => {
-    if (entry) {
+  const forwardFor =
+    (entryFor: () => AggregateCatalogEntry | AggregateAliasEntry | PinEntry | undefined, requestedName?: string): ForwardFn =>
+    (req, res, path) => {
+      const entry = entryFor();
+      if (entry) {
       const base = new URL(engineBase(entry.url) + '/');
       const token = keys.get(entry.server_id);
       const auth = token !== undefined && token !== '' ? token : undefined;
@@ -425,6 +426,38 @@ export function startAggregateRouter(opts: {
       return;
     }
     forwardTo(req, res, path, target);
+    };
+
+  /**
+   * #67: an operator engine pin as the gate publishes it (the resolved
+   * `engine_pin` block on the arbiter's session row — server_id + url +
+   * engine_model when the pinned row serves the model under another id).
+   * Structurally an aggregate entry minus the alias name/source.
+   */
+  type PinEntry = { server_id: string; url: string; engine_model?: string };
+
+  /**
+   * #67: the entry choice at CALL time for one request's key+model:
+   * the session's pin when it holds one, else the catalog/alias dispatch
+   * entry. A pin pointing at the SAME row the dispatch already chose is
+   * a no-op (zero behavior change on an unpinned fleet — the resolver
+   * path stays byte-for-byte). A pin whose `engine_model` differs from
+   * the requested name takes the #66 splice: the alias-pair case, the
+   * queued-switch brief's item 3 ("the splice lives in the forward seam,
+   * and release calls forward").
+   */
+  const pinnedEntryFor = (
+    key: string,
+    model: string | undefined,
+    fallback: AggregateCatalogEntry | AggregateAliasEntry | undefined,
+  ): (() => AggregateCatalogEntry | AggregateAliasEntry | PinEntry | undefined) => {
+    const gate = opts.gate;
+    if (!gate) return () => fallback;
+    return () => {
+      const pin = gate.pinFor(key);
+      if (!pin) return fallback;
+      return { server_id: pin.server_id, url: pin.url, ...(pin.engine_model !== undefined ? { engine_model: pin.engine_model } : {}) };
+    };
   };
 
   const serveModelList = (_req: http.IncomingMessage, res: http.ServerResponse): void => {
@@ -460,16 +493,21 @@ export function startAggregateRouter(opts: {
       const entry = alias ?? (model ? catalogByName.get(model) : undefined);
       const key = headerKey ?? model;
       if (entry && key) opts.onSessionRoute?.(key, entry.server_id);
+      // #67: the forward seam resolves its entry AT CALL TIME — at
+      // dispatch for an admitted request, at ADMISSION for a parked one
+      // (releaseHoldsOf calls the held ForwardFn then). An operator pin
+      // written between park and release moves the target; the body was
+      // never consumed and rides to the new engine whole.
       if (opts.gate && key) {
         // D5: aggregate traffic is session traffic — same gate, same cap,
         // overrides by derived key, fail-open.
-        opts.gate.route(req, res, key, rawUrl, forwardFor(entry, model));
+        opts.gate.route(req, res, key, rawUrl, forwardFor(pinnedEntryFor(key, model, entry), model));
         return;
       }
       // Gate off (session_gate=false) or no identity to key on: still
       // model-routed when the catalog knows the model; unknown/absent
       // model falls to the machine's default target (today behavior).
-      forwardFor(entry, model)(req, res, rawUrl);
+      forwardFor(() => entry, model)(req, res, rawUrl);
     };
 
     if (headerKey) {
