@@ -62,7 +62,11 @@ if command -v cargo-tauri >/dev/null 2>&1; then
   # the deps but never emits the .app. Exact spike-proven invocation
   # (ISSUE69-GRILL-REPORT: `~/.cargo/bin/cargo-tauri tauri build
   # --debug` produced the bundle).
-  (cd "$SRC" && cargo-tauri tauri build "${TAURI_BUILD_ARGS[@]}")
+  # NOTE the ${arr[@]+"${arr[@]}"} form: macOS ships bash 3.2, where a
+  # bare "${arr[@]}" over an EMPTY array dies "unbound variable" under
+  # set -u (the release path, TAURI_BUILD_ARGS empty; hit live
+  # 2026-10-07 via update.sh). The guarded form expands to nothing.
+  (cd "$SRC" && cargo-tauri tauri build ${TAURI_BUILD_ARGS[@]+"${TAURI_BUILD_ARGS[@]}"})
   echo "built: $APP"
 else
   echo "built (unbundled binary): $SRC/target/$PROFILE/idlefill-app"
