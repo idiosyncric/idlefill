@@ -24,5 +24,14 @@ url = "2"
 libc = "0.2"
 ureq = { version = "2", default-features = false }
 
+# Dev-tooling plane (debug builds ONLY): tauri-pilot (Unix-socket CLI:
+# snapshot/click/fill/eval against the live webview) and the MCP bridge
+# (WebSocket bridge for the hypothesi MCP server). Gated by
+# `cfg(debug_assertions)` + the #[cfg] in lib.rs: release builds compile
+# them out entirely (zero shipped overhead).
+[target.'cfg(debug_assertions)'.dependencies]
+tauri-plugin-pilot = "0.8"
+tauri-plugin-mcp-bridge = "0.13"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

@@ -11,6 +11,12 @@ Commands
 • Verify: npm run test (node:test via tsx), npm run build,
   npx tsc --noEmit per package.
 
+• Tauri shell gates (tauri/src-tauri): cargo fmt --check (zero NEW hunks —
+  ~30 pre-existing), cargo clippy -- -D warnings, cargo test; bundle via
+  cargo-tauri tauri build (tauri/build.sh). The live dev-tool workflow
+  (tauri-pilot CLI + MCP bridge, debug builds only) lives in
+  .agents/skills/idlefill-tauri/SKILL.md.
+
 • Never commit build output (menubar/IdlefillMenubar.app) or gitignored
   config (server/config.json, client/config.json — the latter holds the
   live arbiter token).

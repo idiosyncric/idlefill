@@ -796,7 +796,7 @@ pub fn build() -> tauri::Result<()> {
         last_launchd_live: Mutex::new(None),
     });
 
-    let app = tauri::Builder::default()
+    let mut builder = tauri::Builder::default()
         // Single instance FIRST with the deep-link feature (the
         // docs-documented desktop chain the spike verified). A second
         // launch forwards its idlefill:// argv through the same route.
@@ -894,8 +894,24 @@ pub fn build() -> tauri::Result<()> {
             refresh_launchd(app.handle());
             spawn_ticks(app.handle());
             Ok(())
-        })
-        .build(tauri::generate_context!())?;
+        });
+
+    // Dev-tooling plane, debug builds ONLY (the vendor pattern from the
+    // tauri-pilot docs, plus the hypothesi MCP bridge). Release builds
+    // compile both out entirely — zero shipped overhead. The bridge
+    // MUST bind 127.0.0.1 (the plugin's default is 0.0.0.0, an open
+    // listener on the LAN — never acceptable here).
+    #[cfg(debug_assertions)]
+    {
+        builder = builder.plugin(tauri_plugin_pilot::init());
+        builder = builder.plugin(
+            tauri_plugin_mcp_bridge::Builder::new()
+                .bind_address("127.0.0.1")
+                .build(),
+        );
+    }
+
+    let app = builder.build(tauri::generate_context!())?;
 
     app.run(|app, event| {
         // Dock re-open (the desktop stays a .regular app, D1): re-show

@@ -11,6 +11,8 @@
     "allow-set-menubar",
     "allow-relaunch-arbiter-cmd",
     "allow-glance-state",
-    "allow-glance-action"
+    "allow-glance-action",
+    "pilot:default",
+    "mcp-bridge:default"
   ]
 }
