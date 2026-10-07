@@ -79,6 +79,26 @@ release builds compile them out and `tauri-pilot ping` against the INSTALLED
 
 ## Pitfalls
 
+- The debug build is a SECOND instance of the same app identity: the installed
+  release app holds the single-instance lock
+  (`/tmp/com_sam_idlefill_app_si.sock`). A debug launch while it runs
+  forwards-and-exits (exit 0, zero output). Stop the installed app first,
+  and remove the si socket if its holder died. Re-kickstart
+  `com.sam.idlefill.app` when the debug session ends.
+- Pilot `eval` on the BUNDLED views fails with the CSP refusal
+  (`'unsafe-eval' ... not an allowed source of script`) — that CSP is the
+  security posture; do not add `'unsafe-eval'` to chase it. The non-eval
+  surface (snapshot/click/fill/press/html/title/state/assert/screenshot)
+  works fine against bundled views. `eval timed out after 10s` is the
+  DIFFERENT failure: the target window is remote-origin (main).
+- Pilot's `ipc` command routes through webview eval too, so it ALSO times
+  out against the remote main window. Drive bundled views; open them via
+  the tray (real mouse click on the status item via cliclick — AXPress
+  fires the wrong gesture) or the glance's Settings row.
+- Glance element refs go stale between commands (the 5s tick re-renders the
+  rows). Run `snapshot` then the `click`/`fill` back-to-back in one command.
+- `tauri/build.sh --debug` builds the plugin-carrying bundle to
+  `target/debug/bundle/macos/Idlefill.app` through the same gates.
 - `tauri.conf.json` CSP (`default-src 'self'`) scopes the BUNDLED
   settings/glance views only — the external arbiter page is its own origin
   with its own headers; do not chase a "CSP blocks pilot" theory against

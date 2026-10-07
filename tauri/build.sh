@@ -15,7 +15,24 @@
 #   IDLEFILL_BUILD_MARKER -> baked into the binary via option_env!
 #                         (the __DESKTOP_BUILD__ analog). Default `dev`.
 #                         `idlefill --version` prints `idlefill <marker>`.
+#
+# Flags:
+#   --debug -> build the DEBUG profile. The dev-tooling plugins
+#         (tauri-plugin-pilot, tauri-plugin-mcp-bridge) are registered
+#         only under #[cfg(debug_assertions)] in lib.rs, so only this
+#         profile answers `tauri-pilot ping`. Output moves to
+#         target/debug/bundle/macos/Idlefill.app. Release stays the
+#         default; nothing here installs or launches the app.
 set -euo pipefail
+
+PROFILE=release
+TAURI_BUILD_ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --debug) PROFILE=debug; TAURI_BUILD_ARGS+=(--debug); shift ;;
+    *) echo "usage: $0 [--debug]" >&2; exit 2 ;;
+  esac
+done
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SRC="$HERE/src-tauri"
@@ -37,23 +54,23 @@ print(json.dumps({"version": sys.argv[1]}))
 PY
 )"
 
-cargo build --release --manifest-path "$SRC/Cargo.toml"
+cargo build --profile "$PROFILE" --manifest-path "$SRC/Cargo.toml"
 
-APP="$SRC/target/release/bundle/macos/Idlefill.app"
+APP="$SRC/target/$PROFILE/bundle/macos/Idlefill.app"
 if command -v cargo-tauri >/dev/null 2>&1; then
   # The tauri CLI runs the bundler; the bare `cargo build` above warms
   # the deps but never emits the .app. Exact spike-proven invocation
   # (ISSUE69-GRILL-REPORT: `~/.cargo/bin/cargo-tauri tauri build
   # --debug` produced the bundle).
-  (cd "$SRC" && cargo-tauri tauri build)
+  (cd "$SRC" && cargo-tauri tauri build "${TAURI_BUILD_ARGS[@]}")
   echo "built: $APP"
 else
-  echo "built (unbundled binary): $SRC/target/release/idlefill-app"
+  echo "built (unbundled binary): $SRC/target/$PROFILE/idlefill-app"
   echo "note: cargo install tauri-cli for the .app bundle"
 fi
 
 BIN="$APP/Contents/MacOS/idlefill-app"
-[ -x "$BIN" ] && "$BIN" --version || "$SRC/target/release/idlefill-app" --version || true
+[ -x "$BIN" ] && "$BIN" --version || "$SRC/target/$PROFILE/idlefill-app" --version || true
 
 # Post-bundle byte-verify (gate 4): the bundle's Info.plist must be a
 # valid plist carrying BOTH the idlefill URL scheme and the ATS merge.

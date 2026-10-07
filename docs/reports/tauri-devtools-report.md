@@ -59,7 +59,47 @@ ACL source of truth).
 - npm gates: not run here (no node_modules in this worktree, per dispatch);
   CI runs them on the branch push. Nothing in the JS planes changed anyway.
 
-## Live acceptance pass — what the owner needs to do
+## Live acceptance pass — PASSED on main (2026-10-07)
+
+Ran on main at daf7294. `tauri/build.sh --debug` added (the script was
+release-only; the acceptance steps need a debug bundle): builds
+`target/debug/bundle/macos/Idlefill.app` through the same marker/version/
+plist gates. Marker `debug-acceptance-daf7294`, bundle 43.61 MiB.
+
+1. DONE — `bash tauri/build.sh --debug` built the plugin-carrying bundle
+   (38 `tauri-pilot|mcp-bridge` strings in the debug binary).
+2. DONE — `tauri-pilot ping` (CLI 0.8.1): `✓ Connected. Plugin and CLI
+   both 0.8.1.` against `/tmp/tauri-pilot-com.sam.idlefill.app.sock`.
+3. DONE — bundled views: tray LeftPress opened the glance;
+   `snapshot -i --window glance` listed the action rows; `click @e2`
+   (Settings row) opened the settings window;
+   `snapshot -i --window settings` + `assert visible` passed.
+   THREE findings:
+   a. Pilot `eval` fails on the BUNDLED views too: the app CSP
+      (`default-src 'self'`, no `'unsafe-eval'`) refuses to run the
+      eval string. The skill's "without pilot:default eval times out at
+      10s" pitfall is about a DIFFERENT failure (remote/main window).
+      On a bundled view WITH the capability the error is the CSP
+      refusal. snapshot/click/fill/fill/press/html/title/state/assert all
+      work without eval.
+   b. The main window is the remote arbiter origin (no remote.urls —
+      D4-shape lock); ANY webview-backed command against it — including
+      `ipc`, which pilot routes through webview eval — times out at 10s.
+      The pilot drives bundled views only; as designed.
+   c. Glance refs go stale between commands (the 5s tick re-renders the
+      rows); snapshot + click must go back-to-back or the ref misses.
+4. DONE — `tauri-pilot ping` against the installed release app FAILS
+   exactly as documented ("No tauri-pilot socket found").
+5. DONE — stale-instance discipline: the installed app (pid 711) held the
+   single-instance lock (/tmp/com_sam_idlefill_app_si.sock); the debug
+   launch forward-and-exited until it was stopped. Launch the debug
+   build ONLY while the release app is stopped, and remove the stale si
+   socket if the holder is gone.
+
+Machine restored: debug instance killed, `com.sam.idlefill.app`
+re-kickstarted (release, running), no pilot socket on disk.
+
+## Live acceptance pass — original owner steps
 
 The pilot/MCP servers exist ONLY in debug builds. The installed
 `com.sam.idlefill.app` runs the release bundle, so:
