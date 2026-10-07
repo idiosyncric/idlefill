@@ -18,7 +18,9 @@ running shell (DOM snapshots, clicks, eval, IPC monitoring) while iterating.
 ## The bundled-view UI plane (tauri/ui, added 2026-10-07)
 
 The two bundled views (settings + glance) are React 19 + Vite + Tailwind v4 +
-shadcn-shaped components in `tauri/ui/` (root npm workspace `tauri/ui`).
+vendored shadcn components (Radix-backed: `button`, `switch`,
+`separator` in `src/components/`, all re-skinned to the DESIGN.md tokens)
+in `tauri/ui/` (root npm workspace `tauri/ui`).
 - `tauri/ui/` is the SOURCE; `tauri/settings-ui/` is the COMMITTED BUILD
   OUTPUT (frontendDist; kept committed so `bash tauri/build.sh` works with no
   npm step — the build-from-checkout rule, Q-b). After editing `tauri/ui/src`,

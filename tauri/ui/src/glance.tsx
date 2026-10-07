@@ -9,6 +9,7 @@ import { createRoot } from "react-dom/client";
 import "./styles.css";
 import "./glance.css";
 import { ipc, type GlanceState } from "@/lib/ipc";
+import { Button } from "@/components/button";
 
 createRoot(document.getElementById("root")!).render(<Glance />);
 
@@ -40,15 +41,27 @@ export default function Glance() {
           {line}
         </div>
       ))}
+      {/* Action rows ride the vendored shadcn Button (ghost, full
+          width): the popover tone is the body background, hover is
+          the card tone — the tokens replace the old .row rules. */}
       {s.relaunch && (
-        <button className="row row-warn" onClick={act("relaunch")}>
+        <Button
+          variant="ghost"
+          className="-mx-1 my-[3px] w-full justify-start text-warn"
+          onClick={act("relaunch")}
+        >
           Relaunch arbiter
-        </button>
+        </Button>
       )}
       {s.rows.map((r) => (
-        <button key={r.id} className="row" onClick={act(r.id)}>
+        <Button
+          key={r.id}
+          variant="ghost"
+          className="-mx-1 my-[3px] w-full justify-start"
+          onClick={act(r.id)}
+        >
           {r.label}
-        </button>
+        </Button>
       ))}
     </div>
   );

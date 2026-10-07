@@ -2,12 +2,16 @@
    runs:/note lines, the exception-only "arbiter stopped" + Relaunch,
    the meta line. The verbs ride the capability-gated IPC (local windows
    only). The launchd facts come from the Rust side — the view renders
-   the snapshot, it never recomputes a verdict (the harnesses' rule). */
+   the snapshot, it never recomputes a verdict (the harnesses' rule).
+   Built on the vendored shadcn components: Switch (checked =
+   installed), Separator (the row hairlines), Button (Relaunch). */
 import { useCallback, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 import { ipc, type SettingsSnapshot } from "@/lib/ipc";
 import { Button } from "@/components/button";
+import { Separator } from "@/components/separator";
+import { Switch } from "@/components/switch";
 
 createRoot(document.getElementById("root")!).render(<Settings />);
 
@@ -19,26 +23,30 @@ function stateText(loaded: boolean, runs: string | null): string {
 }
 
 function SettingsRow({
+  id,
   name,
   loaded,
   runs,
   note,
   onToggle,
 }: {
+  id: ToggleKind;
   name: string;
   loaded: boolean;
   runs: string | null;
   note: string | null;
-  onToggle: () => void;
+  onToggle: (on: boolean) => void;
 }) {
   return (
-    <div className="border-b border-border/15 py-[7px]">
+    <div className="py-[7px]">
       <div className="flex items-center gap-[10px]">
-        <span className="flex-1">{name}</span>
+        <label htmlFor={id} className="flex-1 cursor-default">
+          {name}
+        </label>
         <span className="text-dim text-[12px]">{stateText(loaded, runs)}</span>
-        <Button variant="outline" size="sm" onClick={onToggle}>
-          {loaded ? "Uninstall" : "Install"}
-        </Button>
+        {/* The snapshot is the single source of truth: checked rides
+            the Rust-side *_loaded flag, never local state. */}
+        <Switch id={id} size="sm" checked={loaded} onCheckedChange={onToggle} />
       </div>
       {note && <div className="text-warn text-[12px] pt-[2px]">{note}</div>}
     </div>
@@ -52,9 +60,8 @@ export default function Settings() {
     setSnap(await ipc.settingsState());
   }, []);
 
-  const toggle = useCallback(async (kind: ToggleKind) => {
-    const s = await ipc.settingsState();
-    setSnap(await ipc.setToggle(kind, !s[`${kind}_loaded` as const]));
+  const toggle = useCallback(async (kind: ToggleKind, on: boolean) => {
+    setSnap(await ipc.setToggle(kind, on));
   }, []);
 
   // D6: on a programmatic reload the page re-reads everything — no
@@ -72,27 +79,34 @@ export default function Settings() {
   return (
     <div className="p-[16px_18px]">
       <h2 className="text-[14px] font-semibold mb-[10px]">LaunchAgents</h2>
-      <SettingsRow
-        name="Client daemon"
-        loaded={snap.daemon_loaded}
-        runs={snap.daemon_runs}
-        note={snap.daemon_note}
-        onToggle={() => void toggle("daemon")}
-      />
-      <SettingsRow
-        name="Arbiter (this checkout's server)"
-        loaded={snap.arbiter_loaded}
-        runs={snap.arbiter_runs}
-        note={snap.arbiter_note}
-        onToggle={() => void toggle("arbiter")}
-      />
-      <SettingsRow
-        name="Legacy menubar agent"
-        loaded={snap.menubar_loaded}
-        runs={snap.menubar_runs}
-        note={snap.menubar_note}
-        onToggle={() => void toggle("menubar")}
-      />
+      <div className="flex flex-col">
+        <SettingsRow
+          id="daemon"
+          name="Client daemon"
+          loaded={snap.daemon_loaded}
+          runs={snap.daemon_runs}
+          note={snap.daemon_note}
+          onToggle={(on) => void toggle("daemon", on)}
+        />
+        <Separator />
+        <SettingsRow
+          id="arbiter"
+          name="Arbiter (this checkout's server)"
+          loaded={snap.arbiter_loaded}
+          runs={snap.arbiter_runs}
+          note={snap.arbiter_note}
+          onToggle={(on) => void toggle("arbiter", on)}
+        />
+        <Separator />
+        <SettingsRow
+          id="menubar"
+          name="Legacy menubar agent"
+          loaded={snap.menubar_loaded}
+          runs={snap.menubar_runs}
+          note={snap.menubar_note}
+          onToggle={(on) => void toggle("menubar", on)}
+        />
+      </div>
 
       <h2 className="text-[14px] font-semibold mt-[18px] mb-[10px]">Arbiter</h2>
       <div className="flex items-center gap-[10px]">
