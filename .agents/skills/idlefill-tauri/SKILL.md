@@ -11,9 +11,36 @@ platforms: [macos]
 
 ## When to Use
 
-Any work in `tauri/` (the Tauri v2 shell: `src-tauri/`, `settings-ui/`,
+Any work in `tauri/` (the Tauri v2 shell: `src-tauri/`, `ui/` + `settings-ui/`,
 build/install/acceptance scripts), or any agent that needs live eyes on the
 running shell (DOM snapshots, clicks, eval, IPC monitoring) while iterating.
+
+## The bundled-view UI plane (tauri/ui, added 2026-10-07)
+
+The two bundled views (settings + glance) are React 19 + Vite + Tailwind v4 +
+shadcn-shaped components in `tauri/ui/` (root npm workspace `tauri/ui`).
+- `tauri/ui/` is the SOURCE; `tauri/settings-ui/` is the COMMITTED BUILD
+  OUTPUT (frontendDist; kept committed so `bash tauri/build.sh` works with no
+  npm step — the build-from-checkout rule, Q-b). After editing `tauri/ui/src`,
+  run `npm run build` (root or tauri/ui) BEFORE build.sh / cargo-tauri, or the
+  bundle embeds stale views.
+- Multi-entry: `index.html` -> settings window, `glance.html` -> glance
+  (`WebviewUrl::App` names in lib.rs unchanged). `base:"./"` for the
+  tauri:// protocol. Entry files MUST call `createRoot(...).render(...)`
+  themselves — a component-only export gets tree-shaken out of the bundle
+  (the glance JS vanished once this way: #root stayed empty).
+- Theme: DESIGN.md tokens in `src/styles.css` (Tailwind v4 CSS-first `@theme`),
+  shadcn semantic vars mapped onto the Primer ramp; glance.css is entry-scoped.
+- Root `npm run build` (--workspaces) now typechecks+builds the UI in CI
+  (test.yml needed no edit); `npm test --workspaces` skips it (no test script).
+- npm 12 blocks esbuild/fsevents postinstalls: `npm install-scripts approve
+  esbuild fsevents` (approval now in root package.json `allowScripts`).
+- Live-proof recipe (works despite the no-`unsafe-eval` CSP): stop
+  `com.sam.idlefill.app` (launchctl kill TERM), rm the si socket, launch the
+  debug bundle, `cliclick dd:<tray x>,<y>` (tray pos via System Events),
+  `tauri-pilot snapshot -i --window glance`, `click @eN`, then
+  `assert visible '#root h2' --window settings`. Pilot `screenshot`/`eval`
+  fail with CSP refusal (that is the posture, not a bug).
 
 ## Prerequisites
 

@@ -8,10 +8,16 @@
     "server",
     "client",
     "adapters/career-ops",
-    "adapters/noop"
+    "adapters/noop",
+    "tauri/ui"
   ],
   "scripts": {
     "test": "npm test --workspaces --if-present",
     "build": "npm run build --workspaces --if-present"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true,
+    "esbuild@0.25.12": true,
+    "fsevents@2.3.3": true
   }
 }

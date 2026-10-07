@@ -1,0 +1,29 @@
+/* Glance-window surface rules (the fixed small window, D1): the
+   popover tone, no scroll, the action rows. Entry-scoped: only the
+   glance bundle imports this file. */
+html,
+body {
+  background: var(--popover);
+  color: var(--popover-foreground);
+  overflow: hidden;
+}
+
+.row {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  padding: 6px 8px;
+  margin: 3px -4px;
+  border-radius: var(--radius-md);
+  cursor: default;
+}
+.row:hover {
+  background: #1d1d24;
+}
+.row-warn {
+  color: var(--warn);
+}

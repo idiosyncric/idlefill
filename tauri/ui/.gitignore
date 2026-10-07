@@ -1,0 +1,7 @@
+# The build OUTPUT lives in ../settings-ui (committed — frontendDist,
+# the Q-b build-from-checkout rule). This workspace's own artifacts stay
+# out of git; the root node_modules/ and dist/ rules don't reach here
+# because tauri/ui is a nested workspace package.
+node_modules/
+dist/
+*.tsbuildinfo
