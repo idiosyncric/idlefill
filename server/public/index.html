@@ -336,6 +336,23 @@
   .frow select { background: var(--panel); color: var(--text);
     border: 1px solid var(--border); border-radius: 4px; font: inherit;
     font-size: 12px; padding: 3px 6px; }
+  /* Add-agent modal (#72): an overlay dialog (NOT the inline settings-form
+     family) — backdrop dims the page, Esc and a backdrop click close it. */
+  .modal-backdrop { position: fixed; inset: 0; z-index: 100;
+    background: rgba(1,4,9,0.65); display: flex; align-items: flex-start;
+    justify-content: center; padding: 8vh 16px 16px; }
+  .modal-backdrop[hidden] { display: none; }
+  .modal-backdrop .modal { background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; padding: 12px 14px; width: min(600px, 100%);
+    box-shadow: 0 10px 40px rgba(0,0,0,0.65); } /* the palette is near-black:
+    the dim alone barely separates the dialog — the shadow lifts it */
+  .modal h3 { margin: 0 0 8px; font-size: 11px; text-transform: uppercase;
+    letter-spacing: 1px; color: var(--dim); font-weight: 600; }
+  .modal .handoff-block { background: var(--bg); border: 1px solid var(--border);
+    border-radius: 4px; padding: 8px 10px; margin: 6px 0; font-size: 12px;
+    white-space: pre; overflow-x: auto; }
+  .modal .once-note { color: var(--warn); font-size: 11px; padding: 2px 0; }
+  .modal .plain-note { color: var(--dim); font-size: 11px; padding: 2px 0; }
   /* Queue detail page — /[project]/[worker]/queue (the same single-file
      dashboard; the script shows #queue-section and hides the panes). The
      table is client-published preview data, shown verbatim. */
@@ -617,17 +634,21 @@
     <div id="models"><div class="empty">no aliases declared</div></div>
   </section>
 
-  <!-- Agent keys (#68): idlefill's own credential for agents (a Hermes
-       profile, any OpenAI client). The agent authenticates to IDLEFILL at
-       the aggregate endpoint; idlefill authenticates to the engine with the
-       row credential. Write-only posture like every credential in this app:
-       the mint response shows the plaintext ONCE — copy it then, it never
-       appears again (the rows list labels + ids, the state file keeps only
-       the digest). Empty = the endpoint accepts any caller on this machine
+  <!-- Agent keys (#68 server plane, #72 dashboard flow): idlefill's own
+       credential for agents (a Hermes profile, any OpenAI client). CREDENTIAL
+       MAP: the header's gate-token field + hand-off pair = the CONTROL-API
+       token (writes to this arbiter at :8787); an agent key minted here = the
+       AGENT-INFERENCE credential (the agent presents it at the aggregate
+       endpoint :8800). Two different credentials — never merged.
+       The agent authenticates to IDLEFILL at the aggregate endpoint;
+       idlefill authenticates to the engine with the row credential.
+       Write-only posture like every credential in this app: the mint
+       response shows the plaintext ONCE — copy it then, it never appears
+       again (the rows list labels + ids, the state file keeps only the
+       digest). Empty = the endpoint accepts any caller on this machine
        (the zero-config posture). -->
   <section id="agents-section" data-view="resources" data-subview="agents">
     <h2>Agent keys <button id="add-agent" class="settings-toggle" type="button" title="mint an idlefill agent key for one agent (Hermes profile, OpenAI client)">+ new agent key</button></h2>
-    <div id="add-agent-form" class="settings-form"></div>
     <div id="client-keys"><div class="empty">no agent keys minted — the aggregate endpoint accepts any caller on this machine</div></div>
   </section>
 
@@ -676,6 +697,21 @@
   <div id="view-empty" class="empty" hidden></div>
 
 </main>
+
+<!-- Add-agent modal (#72): an overlay dialog, NOT the inline settings-form
+     family (the mint flow replaces the pane while it runs, so the static
+     #client-keys rows stay put underneath). One label field (required, max
+     64 — the server's bound) + a machine select fed from
+     GET /api/agent-endpoints. NO token field anywhere: the write credential
+     lives in the header gate field (the write-only posture). The mint state
+     swaps the body for the one-time hand-off block. Esc + backdrop close.
+     Hidden by the [hidden] attribute (the CSS rule above) — display:none is
+     owned by the class, so the JS only flips the attribute. -->
+<div id="add-agent-form" class="modal-backdrop" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-label="new agent key">
+    <div id="add-agent-body"></div>
+  </div>
+</div>
 
 <!-- Logs — events + leases in one bottom tray (tabs: Events / Leases). -->
 <div id="logs-tray">
@@ -1592,6 +1628,12 @@ async function refresh() {
   //     pick-list derived from THIS payload's catalog block.
   renderModelsPane(st);
 
+  // --- Agent keys (#72) — the Agents sub-view renders from the
+  //     token-gated agentKeysCache (GET /api/client-keys, 30 s authoring
+  //     cadence — never this 5 s poll). The 5 s tick only re-renders the
+  //     rows from the cache with fresh ages.
+  renderAgentsPane(st);
+
   // --- Throttled jobs (the anti-thrash backstop — exception-only: the
   //     section stays hidden while nothing is throttled, and each block
   //     carries the recovery control).
@@ -1834,8 +1876,8 @@ function renderQueueSearch() {
 // ---------------------------------------------------------------------------
 const VIEW_TABS = ["overview", "resources", "sessions", "usage"];
 const VIEW_TAB_IDS = { overview: "vtab-overview", resources: "vtab-resources", sessions: "vtab-sessions", usage: "vtab-usage" };
-const RES_TABS = ["servers", "machines", "projects", "models"];
-const RES_TAB_IDS = { servers: "rtab-servers", machines: "rtab-machines", projects: "rtab-projects", models: "rtab-models" };
+const RES_TABS = ["servers", "machines", "projects", "models", "agents"];
+const RES_TAB_IDS = { servers: "rtab-servers", machines: "rtab-machines", projects: "rtab-projects", models: "rtab-models", agents: "rtab-agents" };
 
 function currentView() {
   try {
@@ -1888,6 +1930,7 @@ function applyResTab(sub) {
     btn.setAttribute("aria-selected", on ? "true" : "false");
   }
   if (sub === "models") refreshAliases(); // the authoring read on open
+  if (sub === "agents") refreshAgents(); // #72: the rows read on open (token-gated)
   syncViewEmpty();
   try { localStorage.setItem("idlefill.resTab", sub); } catch { }
 }
@@ -1906,6 +1949,7 @@ const RES_EMPTY_MSG = {
   machines: "no mesh peers configured — this arbiter only sees its own machine",
   projects: "no projects configured on this arbiter",
   models: "no aliases declared — an alias pins one model name to exact engine inventory entries",
+  agents: "no agent keys minted — the aggregate endpoint accepts any caller on this machine",
 };
 
 // Deep links (#61 step 3 / Slice B): the desktop app's idlefill:// routes
@@ -1916,8 +1960,8 @@ const RES_EMPTY_MSG = {
 // the matching sub-tab. Non-view hashes (the queue route, anchors) change
 // nothing.
 const HASH_VIEW_RE = /^#(overview|resources|sessions|usage)$/;
-const HASH_RES_RE = /^#(projects|models)$/;
-const HASH_RES_MAP = { projects: "projects", models: "models" };
+const HASH_RES_RE = /^#(projects|models|agents)$/;
+const HASH_RES_MAP = { projects: "projects", models: "models", agents: "agents" };
 
 function syncViewEmpty() {
   const box = $("view-empty");
@@ -2943,6 +2987,7 @@ $("gate-token").addEventListener("change", () => {
   $("gate-token-hint").textContent = gateToken() ? "stored ✓" : "(not set)";
   $("gate-token").value = ""; // clear the field; the hint shows the stored state
   refreshAliases(); // #66: the Models pane's read needs the token — fill it now
+  refreshAgents(); // #72: the Agents pane's rows need the token too
 });
 
 // ---------------------------------------------------------------------------
@@ -3735,6 +3780,221 @@ function wireAliasFormDynamics(box) {
 })();
 
 // ---------------------------------------------------------------------------
+// Agent keys (#68 server plane, #72 the Add-agent flow) — the Agents
+// sub-view. CREDENTIAL MAP (the hand-off pair above is a DIFFERENT
+// credential; never merge them): the header gate-token field + hand-off
+// pair = the CONTROL-API token (this arbiter's own writes at :8787); an
+// agent key minted here = the AGENT-INFERENCE credential the agent
+// presents at the aggregate endpoint (:8800). The rows read is
+// GET /api/client-keys, the mint is POST /api/client-keys, the revoke is
+// POST /api/client-keys/revoke — all ride the shared settingsPost
+// (?token=) family, so the no-token gate posture comes free, and the
+// modal carries NO token field (the write credential stays in the header).
+//   The mint response carries the PLAINTEXT exactly once. It lives in this
+//   client's memory only while the one-time hand-off block is open: never
+//   localStorage, never the rows render (the cache holds public rows only),
+//   never a GET. The arbiter keeps only the sha256 digest, so the block
+//   says plainly that the key never comes back.
+//   Refresh posture (the Models pane's authoring cadence, NOT the 5s live
+//   poll): refreshAgents() on tab-open, on token-set, and on a 30 s timer.
+//   With no token the pane names the requirement and no agent GET/POST
+//   leaves the page.
+// ---------------------------------------------------------------------------
+const AGENT_LABEL_MAX = 64; // the server's bound (POST /api/client-keys)
+let agentKeysCache = [];      // public rows only (id/label/created_at) — no secret by construction
+let agentEndpointsCache = []; // [{client, url}] from GET /api/agent-endpoints
+let mintedOnce = null;        // the ONE plaintext — alive only while the modal shows it
+let agentModalOpen = false;
+
+// The hand-off block: the Hermes config.yaml shape (model.provider /
+// model.base_url / model.api_key under a model: key) — paste-ready.
+function agentConfigText(url, token) {
+  return "model:\n  provider: custom\n  base_url: " + url + "\n  api_key: " + token + "\n";
+}
+
+function agentKeyRow(k, st) {
+  const age = ago(((st && st.now) || Date.now()) - (k.created_at || 0));
+  return '<div class="kv"><span class="k">' + esc(k.label) +
+    ' <code>' + esc(k.id) + '</code></span>' +
+    '<span class="v">' + age + ' ' +
+    '<button class="btn destructive' + (armedKey === k.id ? " armed" : "") + '" data-key-remove="' + esc(k.id) +
+    '" type="button" title="revoke this agent key — the aggregate endpoint stops accepting it on the daemon\u0027s next pull">' +
+    (armedKey === k.id ? "confirm?" : "revoke") + "</button></span></div>";
+}
+
+function renderAgentsPane(st) {
+  if (QUEUE_PAGE) return;
+  const box = $("client-keys");
+  if (!box) return;
+  if (!gateToken()) {
+    box.innerHTML = '<div class="empty">paste the arbiter token into the header to list and revoke agent keys</div>';
+    return;
+  }
+  if (agentKeysCache.length === 0) {
+    // Honest empty state: enforcement is OFF while the set is empty (the
+    // zero-config posture #68 kept).
+    box.innerHTML = '<div class="empty">no agent keys minted — the aggregate endpoint accepts any caller on this machine</div>';
+    return;
+  }
+  box.innerHTML = agentKeysCache.map((k) => agentKeyRow(k, st)).join("");
+}
+
+// The authoring read pair: GET /api/client-keys (the rows) +
+// GET /api/agent-endpoints (the mint form's machine picks). Both token-
+// gated; a non-200 keeps the rows in hand (drop-don't-wipe, the aliases
+// pattern). No token → no request leaves the page.
+async function refreshAgents() {
+  const token = gateToken();
+  if (!token) {
+    if (LAST_ST) renderAgentsPane(LAST_ST);
+    return;
+  }
+  try {
+    const res = await fetch("/api/client-keys?token=" + encodeURIComponent(token), { cache: "no-store" });
+    if (res.ok) agentKeysCache = (await res.json()).keys || [];
+  } catch { /* the pane keeps its last good rows */ }
+  try {
+    const res = await fetch("/api/agent-endpoints?token=" + encodeURIComponent(token), { cache: "no-store" });
+    if (res.ok) agentEndpointsCache = (await res.json()).endpoints || [];
+  } catch { /* the modal re-picks from the last good list */ }
+  if (LAST_ST) renderAgentsPane(LAST_ST);
+  // Refresh the machine picks into an OPEN create-state modal only while
+  // the label is untouched — never wipe mid-type keystrokes (the
+  // settings-form stall rule), and never re-render the one-time block
+  // (the plaintext renders exactly once).
+  if (agentModalOpen && !mintedOnce && !($("ag-label")?.value)) renderAgentModal();
+}
+
+function agentModalHtml() {
+  if (mintedOnce) {
+    // The one-time hand-off block. The plaintext rides the in-memory
+    // mintedOnce only — copyText reads it, never the rendered text.
+    return '<h3>Agent key minted · ' + esc(mintedOnce.label) + '</h3>' +
+      '<div class="once-note">shown ONCE — the arbiter keeps only the digest, this key never comes back. Copy it now.</div>' +
+      '<div class="handoff-block">' + esc(agentConfigText(mintedOnce.url, mintedOnce.token)) + '</div>' +
+      '<div class="fbtns">' +
+      '<button type="button" class="primary" data-act="copy-config" data-rest="copy config">copy config</button>' +
+      '<button type="button" data-act="copy-key" data-rest="copy key">copy key</button>' +
+      '<button type="button" data-act="done" data-rest="done">done</button>' +
+      '<span class="fmsg dim"></span></div>' +
+      '<div class="plain-note">Paste it into the agent\u0027s own config (a Hermes profile\u0027s config.yaml, or any OpenAI client\u0027s base URL + API key). The agent presents this key to IDLEFILL at ' + esc(mintedOnce.url) + '; IDLEFILL authenticates to the engine with the row credential.</div>';
+  }
+  const eps = agentEndpointsCache;
+  const opts = eps.length === 0
+    ? '<option value="">— no online machine reported an aggregate port —</option>'
+    : eps.map((e, i) => '<option value="' + i + '"' + (eps.length === 1 ? " selected" : "") + '>' +
+        esc(e.client) + ' · ' + esc(e.url) + '</option>').join("");
+  return '<h3>New agent key</h3>' +
+    '<div class="frow"><label for="ag-label">label (required, max ' + AGENT_LABEL_MAX + ')</label>' +
+    '<input id="ag-label" maxlength="' + AGENT_LABEL_MAX + '" type="text" placeholder="which agent is this?"></div>' +
+    '<div class="frow"><label for="ag-machine">machine</label><select id="ag-machine">' + opts + '</select></div>' +
+    '<div class="plain-note">the URLs are loopback — honest only on the machine they name. An agent on another machine needs that machine\u0027s own dashboard to mint its key.</div>' +
+    (gateToken() ? "" : '<div class="once-note">minting is a write — paste the arbiter token into the header first.</div>') +
+    '<div class="fbtns"><button type="button" class="primary" data-act="mint">Mint key</button>' +
+    '<button type="button" data-act="cancel">Cancel</button><span class="fmsg dim"></span></div>';
+}
+
+function renderAgentModal() {
+  const body = $("add-agent-body");
+  if (body) body.innerHTML = agentModalHtml();
+}
+
+function openAgentModal() {
+  agentModalOpen = true;
+  mintedOnce = null;
+  $("add-agent-form").hidden = false;
+  renderAgentModal();
+  if (gateToken() && agentEndpointsCache.length === 0) refreshAgents(); // pick-list for the select
+  $("ag-label")?.focus();
+}
+
+function closeAgentModal() {
+  const hadMint = !!mintedOnce;
+  agentModalOpen = false;
+  mintedOnce = null; // the plaintext dies with the block
+  $("add-agent-form").hidden = true;
+  const body = $("add-agent-body");
+  if (body) body.innerHTML = "";
+  if (hadMint) refreshAgents(); // the minted row appears the moment the modal closes
+}
+
+// Two-step arm for revoke (the servers cards' remove idiom: one click arms,
+// the second revokes; the 400/404 reason lands in the header message).
+let armedKey = null;
+
+(function wireAgentsView() {
+  const btn = $("add-agent");
+  const backdrop = $("add-agent-form");
+  if (!btn || !backdrop) return;
+  btn.addEventListener("click", () => openAgentModal());
+  backdrop.addEventListener("click", async (e) => {
+    if (e.target === backdrop) { closeAgentModal(); return; } // backdrop click closes
+    const b = e.target.closest("button[data-act]");
+    if (!b) return;
+    const act = b.dataset.act;
+    if (act === "cancel" || act === "done") { closeAgentModal(); return; }
+    if (act === "copy-config") {
+      if (!mintedOnce) return;
+      copyText(agentConfigText(mintedOnce.url, mintedOnce.token)).then((ok) => flashCopied(b, ok));
+      return;
+    }
+    if (act === "copy-key") {
+      if (!mintedOnce) return;
+      copyText(mintedOnce.token).then((ok) => flashCopied(b, ok));
+      return;
+    }
+    if (act !== "mint") return;
+    const label = ($("ag-label")?.value || "").trim();
+    if (!label) { formMsg(backdrop, "label required", "err"); return; }
+    if (label.length > AGENT_LABEL_MAX) { formMsg(backdrop, "label too long (max " + AGENT_LABEL_MAX + ")", "err"); return; }
+    const idx = Number($("ag-machine")?.value);
+    const ep = Number.isInteger(idx) && idx >= 0 ? agentEndpointsCache[idx] : null;
+    if (!ep) { formMsg(backdrop, "no machine to hand over — an online worker must report an aggregate port", "err"); return; }
+    const r = await settingsPost("/api/client-keys", { label });
+    if (!r.ok) { formMsg(backdrop, "mint failed: " + r.detail, "err"); return; }
+    mintedOnce = { token: r.body.token, url: ep.url, label }; // the ONLY place the plaintext lives
+    renderAgentModal();
+  });
+  // Esc closes from anywhere while the modal is open (the flow keydown
+  // listener is container-local; the modal needs the window).
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && agentModalOpen) closeAgentModal();
+  });
+
+  const kbox = $("client-keys");
+  if (!kbox) return;
+  kbox.addEventListener("click", async (e) => {
+    const rm = e.target.closest("button[data-key-remove]");
+    if (!rm) return;
+    const id = rm.dataset.keyRemove;
+    if (armedKey !== id) {
+      armedKey = id;
+      rm.classList.add("armed");
+      rm.textContent = "confirm?";
+      setTimeout(() => {
+        if (armedKey === id) {
+          armedKey = null;
+          rm.classList.remove("armed");
+          rm.textContent = "revoke";
+        }
+      }, 4000);
+      return;
+    }
+    armedKey = null;
+    rm.disabled = true;
+    const r = await settingsPost("/api/client-keys/revoke", { id });
+    if (!r.ok) {
+      rm.disabled = false;
+      rm.textContent = "revoke";
+      flashGateMsg("revoke refused: " + r.detail, "err", true);
+      return;
+    }
+    flashGateMsg("agent key revoked", "ok");
+    refreshAgents();
+  });
+})();
+
+// ---------------------------------------------------------------------------
 // Usage (#51) — charts over the metrics retention store. Its OWN timer:
 // charts over days do not need the 5s /api/state cadence (the store's
 // pitfall list says so explicitly). Reads GET /api/metrics anonymously
@@ -3829,6 +4089,8 @@ flowToggleLabel(); // #67: the Sessions vtab's rows⟷flow toggle
 wireFlow();
 refreshAliases(); // #66: the Models view's token-gated read (the 5s state poll owns the pick-list)
 setInterval(refreshAliases, 30000); // 30 s — authoring data, not the 5s live cadence
+refreshAgents(); // #72: the Agents rows + machine picks (token-gated; no token, no request)
+setInterval(refreshAgents, 30000); // 30 s — authoring cadence, like the Models pane
 refreshUsage();
 setInterval(refreshUsage, 300000); // 5 min — its own timer, not the state poll
 </script>
