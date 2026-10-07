@@ -466,6 +466,33 @@ export interface SessionRecord {
    * surfaces render unchanged. Sanitizer posture: drop-don't-reject.
    */
   history?: { rpm: number[]; model?: string; tokens?: number; reported_at: number };
+  /**
+   * #67 response phase: what the engine is doing RIGHT NOW for this
+   * session, carried on every register heartbeat as the `phase` ADD-key.
+   * 'thinking' = reasoning deltas streaming, 'output' = content deltas,
+   * 'tools' = tool_calls deltas. `at` = epoch-ms of the last observed
+   * phase chunk (the surface dims the state when it ages past the stream).
+   * null = the router reported no live stream (the idle report CLEARS any
+   * stored phase, the gate block precedent). Absent on rows persisted
+   * before #67 and on old routers. Sanitizer posture: drop-don't-reject.
+   */
+  phase?: { state: 'thinking' | 'output' | 'tools'; at: number } | null;
+}
+
+/**
+ * #67: operator engine pin for a session — the sibling of the pause/force
+ * override plane, NOT a new kind inside it (pause/force carry a temporary
+ * 'until'; a pin is a standing routing choice). Keyed by the session's
+ * derived token, arbiter-stored, published on the session row as the
+ * `engine_pin` ADD-key, and learned by the router on the /api/state poll
+ * (D4 posture: same channel, same one-tick latency as pause/force).
+ * The pin moves where the session's traffic RESOLVES at forward time —
+ * queued and next-request traffic only; running streams never move.
+ */
+export interface SessionPin {
+  token: string;
+  server_id: string;
+  set_at: number;
 }
 
 /**
@@ -639,6 +666,8 @@ export type EventKind =
   | 'session_paused'
   | 'session_forced'
   | 'session_override_cleared'
+  | 'session_pinned'
+  | 'session_pin_cleared'
   | 'session_swept'
   | 'job_throttled'
   | 'job_unthrottled'
@@ -744,6 +773,14 @@ export interface ArbiterState {
   sessions: SessionRecord[];
   /** Operator overrides for sessions, keyed by token (same shape as client overrides). */
   session_overrides: Record<string, SessionOverride>;
+  /**
+   * #67 operator engine pins for sessions, keyed by token — the SIBLING of
+   * `session_overrides` (a pin is a standing routing choice, not a timed
+   * override). Arbiter-stored; published resolved on the session row as
+   * the `engine_pin` ADD-key; the router learns it on the /api/state poll.
+   * ADD-key: state files from before #67 carry none.
+   */
+  session_pins: Record<string, SessionPin>;
   leases: Lease[];
   /** Project name -> UTC date -> usage. */
   budgets: Record<string, Record<UtcDate, BudgetEntry>>;

@@ -2297,3 +2297,107 @@ test('#66 POST /api/aliases: the whole-entry validation matrix — 400 family, 4
     rmSync(aggDir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// #67 — the engine-pin REST plane: POST /api/sessions/:token/pin (sibling
+// of the override route), and the resolved engine_pin block /api/state +
+// /api/sessions publish for the router to learn.
+// ---------------------------------------------------------------------------
+
+test('#67 pin REST: write resolves, /api/state + /api/sessions publish the block, illegal targets are told, null clears', async () => {
+  // A row + a legal target (the declared inventory carries the session model).
+  await fetch(`${base}/api/sessions/register`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({ token: 's-pin-http', history: { rpm: [0, 0, 0, 0, 0, 0, 0, 0, 0, 1], model: 'Qwen3.8-27B' } }),
+  });
+  const srv = arbiter.upsertServerConnection({ name: 'pin-target', url: 'http://pin.local:7070', activity_path: '', models: ['Qwen3.8-27B'] });
+  assert.ok(srv.ok);
+
+  // No pin yet: no engine_pin key on the row.
+  const before = (await (await fetch(`${base}/api/state?limit=50`, { headers: auth })).json()) as {
+    sessions: { token: string; engine_pin?: unknown; phase?: unknown }[];
+  };
+  const b0 = before.sessions.find((x) => x.token === 's-pin-http')!;
+  assert.equal('engine_pin' in b0, false, 'an unpinned session carries NO engine_pin key (byte-for-byte old shape)');
+
+  // Write.
+  const w = await fetch(`${base}/api/sessions/s-pin-http/pin`, {
+    method: 'POST', headers: auth, body: JSON.stringify({ server_id: srv.server!.id }),
+  });
+  assert.equal(w.status, 200);
+  const written = (await w.json()) as { ok: boolean; pin: { server_id: string; set_at: number } };
+  assert.equal(written.ok, true);
+  assert.equal(written.pin.server_id, srv.server!.id);
+  assert.ok(typeof written.pin.set_at === 'number', 'the write response echoes the stored pin; the RESOLVED block (url) rides the reads below');
+
+  // Published on both read surfaces, resolved (url rides — the router never learns server URLs otherwise).
+  const st = (await (await fetch(`${base}/api/state?limit=50`, { headers: auth })).json()) as {
+    sessions: { token: string; engine_pin?: { server_id: string; url: string } }[];
+  };
+  assert.equal(st.sessions.find((x) => x.token === 's-pin-http')!.engine_pin!.server_id, srv.server!.id, '/api/state publishes the resolved block');
+  const list = (await (await fetch(`${base}/api/sessions`, { headers: auth })).json()) as {
+    sessions: { token: string; engine_pin?: { server_id: string } }[];
+  };
+  assert.equal(list.sessions.find((x) => x.token === 's-pin-http')!.engine_pin!.server_id, srv.server!.id, '/api/sessions too');
+
+  // Illegal target (the row does not serve the session model): 400 + reason.
+  const badRow = arbiter.upsertServerConnection({ name: 'wrong-row', url: 'http://wrong.local:7071', activity_path: '', models: ['SomeOtherModel'] });
+  assert.ok(badRow.ok);
+  const bad = await fetch(`${base}/api/sessions/s-pin-http/pin`, {
+    method: 'POST', headers: auth, body: JSON.stringify({ server_id: badRow.server!.id }),
+  });
+  assert.equal(bad.status, 400, 'a wrong write is told, not swallowed');
+  assert.equal((await bad.json()).error, 'row_lacks_model');
+  // The standing pin survives the refused write.
+  const st2 = (await (await fetch(`${base}/api/state?limit=50`, { headers: auth })).json()) as {
+    sessions: { token: string; engine_pin?: { server_id: string } }[];
+  };
+  assert.equal(st2.sessions.find((x) => x.token === 's-pin-http')!.engine_pin!.server_id, srv.server!.id, 'the refused write changed nothing');
+
+  // Unknown session: 404. Missing server_id: 400.
+  const nf = await fetch(`${base}/api/sessions/s-nobody/pin`, { method: 'POST', headers: auth, body: JSON.stringify({ server_id: srv.server!.id }) });
+  assert.equal(nf.status, 404);
+  const noBody = await fetch(`${base}/api/sessions/s-pin-http/pin`, { method: 'POST', headers: auth, body: JSON.stringify({}) });
+  assert.equal(noBody.status, 400, 'server_id must be present (null clears)');
+
+  // Clear.
+  const clr = await fetch(`${base}/api/sessions/s-pin-http/pin`, { method: 'POST', headers: auth, body: JSON.stringify({ server_id: null }) });
+  assert.equal(clr.status, 200);
+  assert.equal((await clr.json()).pin, null);
+  const st3 = (await (await fetch(`${base}/api/state?limit=50`, { headers: auth })).json()) as {
+    sessions: { token: string; engine_pin?: unknown }[];
+  };
+  assert.equal('engine_pin' in st3.sessions.find((x) => x.token === 's-pin-http')!, false, 'cleared pins stop publishing');
+});
+
+test('#67 phase over REST: the register body carries the block, the row stores it, the no-phase report clears it', async () => {
+  const reg = await fetch(`${base}/api/sessions/register`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({ token: 's-phase-http', phase: { state: 'tools', at: Date.now() } }),
+  });
+  assert.equal(reg.status, 201);
+  const created = (await reg.json()) as { session: { phase: { state: string } | null } };
+  assert.equal(created.session.phase!.state, 'tools', 'the create response carries the phase');
+
+  const st = (await (await fetch(`${base}/api/state?limit=50`, { headers: auth })).json()) as {
+    sessions: { token: string; phase?: { state: string } | null }[];
+  };
+  assert.equal(st.sessions.find((x) => x.token === 's-phase-http')!.phase!.state, 'tools', '/api/state carries it');
+
+  // Invalid block: registration still 200 (drop-don't-reject), stored value stands.
+  const bad = await fetch(`${base}/api/sessions/register`, {
+    method: 'POST', headers: auth, body: JSON.stringify({ token: 's-phase-http', phase: { state: 'vibes', at: 1 } }),
+  });
+  assert.equal(bad.status, 200);
+  const st2 = (await (await fetch(`${base}/api/state?limit=50`, { headers: auth })).json()) as {
+    sessions: { token: string; phase?: { state: string } | null }[];
+  };
+  assert.equal(st2.sessions.find((x) => x.token === 's-phase-http')!.phase!.state, 'tools', 'invalid block dropped, stored value stands');
+
+  // The no-phase report (absent key) clears the row.
+  await fetch(`${base}/api/sessions/register`, { method: 'POST', headers: auth, body: JSON.stringify({ token: 's-phase-http' }) });
+  const st3 = (await (await fetch(`${base}/api/state?limit=50`, { headers: auth })).json()) as {
+    sessions: { token: string; phase?: { state: string } | null }[];
+  };
+  assert.equal(st3.sessions.find((x) => x.token === 's-phase-http')!.phase, null, 'the absent block clears the stored phase');
+});

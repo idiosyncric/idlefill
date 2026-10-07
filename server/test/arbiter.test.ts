@@ -1521,3 +1521,137 @@ test('#66 aliasRows: per-pair source markers for the dashboard (probed / declare
     rmSync(h.dir, { recursive: true, force: true });
   }
 });
+
+
+// ---------------------------------------------------------------------------
+// #67 — response phase sanitizer + the session engine-pin plane
+// ---------------------------------------------------------------------------
+
+test('#67 sessions: phase block — stored on register, cleared on the no-phase report, invalid dropped', () => {
+  const h = makeMultiHarness();
+  const r1 = h.arbiter.registerSession('s-phase', { phase: { state: 'thinking', at: T0 }, now: T0 });
+  assert.equal(r1.ok, true);
+  assert.deepEqual(r1.session!.phase, { state: 'thinking', at: T0 });
+  // Last-write-wins.
+  const r2 = h.arbiter.registerSession('s-phase', { phase: { state: 'tools', at: T0 + 500 }, now: T0 + 1000 });
+  assert.deepEqual(r2.session!.phase, { state: 'tools', at: T0 + 500 });
+  // Invalid blocks are DROPPED (never a rejected registration); the stored value stands.
+  for (const bad of [
+    { state: 'bogus', at: T0 },
+    { state: 'output', at: -1 },
+    { state: 'output', at: 1.5 },
+    { state: 'output', at: 'x' },
+    { state: 'output' },
+    'output',
+    [1, 2],
+  ]) {
+    const r = h.arbiter.registerSession('s-phase', { phase: bad, now: T0 + 2000 });
+    assert.equal(r.ok, true, `invalid phase ${JSON.stringify(bad)} never rejects the registration`);
+    assert.deepEqual(r.session!.phase, { state: 'tools', at: T0 + 500 }, 'invalid block leaves the stored phase untouched');
+  }
+  // ABSENT is the no-phase report (the gate-block posture): the stored phase CLEARS.
+  const r3 = h.arbiter.registerSession('s-phase', { now: T0 + 3000 });
+  assert.equal(r3.session!.phase, null, 'absent phase clears to null');
+  // Re-set, then explicit null also clears.
+  h.arbiter.registerSession('s-phase', { phase: { state: 'output', at: T0 + 4000 }, now: T0 + 4000 });
+  const r4 = h.arbiter.registerSession('s-phase', { phase: null, now: T0 + 5000 });
+  assert.equal(r4.session!.phase, null);
+  // A row created WITHOUT a phase block carries phase = null (never tagged).
+  const r5 = h.arbiter.registerSession('s-plain-67', { now: T0 });
+  assert.equal(r5.session!.phase, null);
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('#67 pins: set/clear a bare-name session pin — the row must carry the model (probed, else declared)', async () => {
+  const map: Record<string, string[] | null> = {};
+  const h = makeAliasHarness(map);
+  const NOW = Date.now();
+  // A session whose sniffed model is the shared name 'X' (both rows serve it).
+  h.arbiter.registerSession('s-pin1', { now: NOW, history: { rpm: [0, 0, 0, 0, 0, 0, 0, 0, 0, 1], model: 'X' } });
+  // Row A serves X per the probe; row B does NOT (its probe lists only Y).
+  await aliasProbe(h.arbiter, { alpha: ['X'], beta: ['Y'], watched: [] }, map);
+  const good = h.arbiter.setSessionPin('s-pin1', h.idA);
+  assert.equal(good.ok, true, 'a row whose probe carries the model is a legal target');
+  assert.equal(good.pin!.server_id, h.idA);
+  const bad = h.arbiter.setSessionPin('s-pin1', h.idB);
+  assert.equal(bad.ok, false);
+  assert.equal(bad.reason, 'row_lacks_model', 'the target row must actually serve the session model');
+  // The bad write left the stored pin standing (drop-don't-reject at the write boundary: told AND no mutation).
+  assert.equal(h.arbiter.sessionPinBlock('s-pin1', 'X')!.server_id, h.idA);
+  // Probe-blocked rows fall back to the DECLARED list ONLY while the row
+  // has no last-good probe: in THIS harness beta's probe answered ['Y']
+  // earlier, so its inventory is ['Y'] and engine-b-id is refused.
+  h.arbiter.registerSession('s-pin2', { now: NOW, history: { rpm: [0, 0, 0, 0, 0, 0, 0, 0, 0, 1], model: 'engine-b-id' } });
+  const staleList = h.arbiter.setSessionPin('s-pin2', h.idB);
+  assert.equal(staleList.ok, false, 'a row with a last-good probe answers legality with THAT list, not the declared one');
+  rmSync(h.dir, { recursive: true, force: true });
+  // A never-successfully-probed row falls back to its declared inventory.
+  const h2 = makeAliasHarness({ alpha: null, beta: null, watched: null });
+  h2.arbiter.registerSession('s-pin3', { now: NOW, history: { rpm: [0, 0, 0, 0, 0, 0, 0, 0, 0, 1], model: 'engine-b-id' } });
+  const declaredOk = h2.arbiter.setSessionPin('s-pin3', h2.idB);
+  assert.equal(declaredOk.ok, true, 'a row that never answered a probe falls back to its declared inventory');
+  // Unknown session / unknown server / garbage server_id.
+  assert.equal(h2.arbiter.setSessionPin('s-nope', h2.idA).reason, 'unknown_session');
+  assert.equal(h2.arbiter.setSessionPin('s-pin3', 'srv-gone').reason, 'unknown_server');
+  assert.equal(h2.arbiter.setSessionPin('s-pin3', '').reason, 'server_id required (\u2264128 chars)');
+  // Clear.
+  const clr = h2.arbiter.setSessionPin('s-pin3', null);
+  assert.equal(clr.ok, true);
+  assert.equal(clr.pin, null);
+  assert.equal(h2.arbiter.sessionPinBlock('s-pin3', 'engine-b-id'), undefined, 'a cleared pin publishes nothing');
+  rmSync(h2.dir, { recursive: true, force: true });
+});
+
+test('#67 pins: an alias session may only pin one of the alias pair rows', async () => {
+  const map: Record<string, string[] | null> = {};
+  const h = makeAliasHarness(map);
+  const NOW = Date.now();
+  // Alias 'Flag' pairs alpha:engine-a-id + beta:engine-b-id.
+  const up = h.arbiter.putModelAlias({ alias: 'Flag', pairs: [{ server_id: h.idA, model: 'engine-a-id' }, { server_id: h.idB, model: 'engine-b-id' }] });
+  assert.equal(up.ok, true);
+  const g = h.arbiter.upsertServerConnection({ name: 'gamma', url: 'http://gamma.local:7070', activity_path: '', models: ['engine-g-id'] });
+  assert.ok(g.ok);
+  await aliasProbe(h.arbiter, { alpha: ['engine-a-id'], beta: ['engine-b-id'], watched: [] }, map);
+  h.arbiter.registerSession('s-alias', { now: NOW, history: { rpm: [0, 0, 0, 0, 0, 0, 0, 0, 0, 1], model: 'Flag' } });
+  // Both pair rows legal.
+  assert.equal(h.arbiter.setSessionPin('s-alias', h.idB).ok, true);
+  // A third row (gamma, exists, serves nothing of this alias) is NOT a pair → refused.
+  assert.equal(h.arbiter.setSessionPin('s-alias', g.server!.id).reason, 'not_an_alias_pair');
+  // Resolution: pin at beta → the beta pair's engine id rides for the splice.
+  const blk = h.arbiter.sessionPinBlock('s-alias', 'Flag')!;
+  assert.equal(blk.server_id, h.idB);
+  assert.equal(blk.engine_model, 'engine-b-id', 'the pinned row serves the alias under ITS OWN id — the splice key rides published');
+  assert.ok(blk.url.includes('beta.local'));
+  // Pin back at alpha: that row serves the alias under 'engine-a-id'.
+  h.arbiter.setSessionPin('s-alias', h.idA);
+  assert.equal(h.arbiter.sessionPinBlock('s-alias', 'Flag')!.engine_model, 'engine-a-id');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('#67 pins: a session with no sniffed model still pins by row existence; the block resolves url-only', () => {
+  const map: Record<string, string[] | null> = {};
+  const h = makeAliasHarness(map);
+  const NOW = Date.now();
+  h.arbiter.registerSession('s-nomodel', { now: NOW });
+  const res = h.arbiter.setSessionPin('s-nomodel', h.idA);
+  assert.equal(res.ok, true, 'no known model ⇒ legality cannot be proven; the row-exists check still applies');
+  const blk = h.arbiter.sessionPinBlock('s-nomodel', undefined)!;
+  assert.equal(blk.server_id, h.idA);
+  assert.equal('engine_model' in blk, false, 'no model ⇒ no splice key');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('#67 pins: sweep orphans a pin with its session row', async () => {
+  const h = makeMultiHarness();
+  const NOW = Date.now();
+  h.arbiter.registerSession('s-sweep', { now: NOW });
+  h.arbiter.setSessionPin('s-sweep', h.serverB);
+  assert.ok(h.store.state.session_pins['s-sweep']);
+  // Push the row past the stale window and tick.
+  const st = h.store.state;
+  st.sessions[0]!.last_seen = NOW - Arbiter.SESSION_STALE_MS - 1000;
+  await h.arbiter.tick(NOW + 10_000);
+  assert.equal(st.sessions.length, 0, 'the stale row swept');
+  assert.equal(st.session_pins['s-sweep'], undefined, 'the pin went with it — a standing choice never outlives its session');
+  rmSync(h.dir, { recursive: true, force: true });
+});

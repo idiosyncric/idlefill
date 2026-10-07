@@ -28,6 +28,7 @@ export function emptyState(): ArbiterState {
     overrides: {},
     sessions: [],
     session_overrides: {},
+    session_pins: {},
     throttled_jobs: {},
     results: {},
     leases: [],
@@ -79,6 +80,8 @@ export class StateStore {
         // Tolerate state files from before sessions / session overrides existed.
         sessions: Array.isArray(raw.sessions) ? raw.sessions : base.sessions,
         session_overrides: raw.session_overrides && typeof raw.session_overrides === 'object' ? raw.session_overrides : base.session_overrides,
+        // Tolerate state files from before the session engine-pin plane (#67).
+        session_pins: raw.session_pins && typeof raw.session_pins === 'object' ? raw.session_pins : base.session_pins,
         // Tolerate state files from before per-job throttling (anti-thrash)
         // existed.
         throttled_jobs: raw.throttled_jobs && typeof raw.throttled_jobs === 'object' ? raw.throttled_jobs : base.throttled_jobs,

@@ -769,6 +769,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       gate?: unknown;
       session_id?: unknown;
       history?: unknown;
+      phase?: unknown;
     };
     const token = typeof body.token === 'string' ? body.token.trim() : '';
     if (!token) return reply.code(400).send({ error: 'token required' });
@@ -787,6 +788,11 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       // + last streamed tokens). Forwarded verbatim; the sanitizer lives
       // in registerSession (drop-don't-reject, like the gate block).
       ...(body.history !== undefined ? { history: body.history } : {}),
+      // #67: the response-phase block (the router's stream truth:
+      // thinking/output/tools + observation age). Verbatim like `gate` —
+      // absent = the no-phase report (the stored phase CLEARS), and the
+      // three-verdict sanitizer lives in registerSession.
+      phase: body.phase,
     });
     if (!res.ok) return reply.code(400).send({ error: res.reason ?? 'invalid' });
     return reply.code(res.created ? 201 : 200).send({ created: res.created, session: res.session });
@@ -795,10 +801,14 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   app.get('/api/sessions', async () => {
     const now = Date.now();
     return {
-      sessions: arbiter.listSessions().map((sess) => ({
-        ...sess,
-        override: arbiter.activeSessionOverride(sess.token, now),
-      })),
+      sessions: arbiter.listSessions().map((sess) => {
+        const pin = arbiter.sessionPinBlock(sess.token, typeof sess.history?.model === 'string' ? sess.history.model : undefined);
+        return {
+          ...sess,
+          override: arbiter.activeSessionOverride(sess.token, now),
+          ...(pin ? { engine_pin: pin } : {}),
+        };
+      }),
     };
   });
 
@@ -820,6 +830,31 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     const res = arbiter.setSessionOverride(token.trim(), ov, until);
     if (!res.ok) return reply.code(404).send({ error: res.reason ?? 'unknown_session' });
     return { ok: true, override: res.override ?? null };
+  });
+
+  /**
+   * #67 operator engine pin for a session: { server_id: "<row id>" | null
+   * (clear) }. The drag/pin write path — SIBLING of the override route
+   * above (same token path shape, same operator surface, same poll-learned
+   * channel). Truth constrains the target (arbiter.setSessionPin: the row
+   * must serve the session's model per alias pairs / probed inventory);
+   * an unknown session is 404, an illegal target is 400 with the reason
+   * (the alias-write posture: a wrong write is told, not swallowed). The
+   * pin applies at RELEASE time: queued + next-request traffic moves, a
+   * running stream never does.
+   */
+  app.post('/api/sessions/:token/pin', async (req, reply) => {
+    const token = decodeURIComponent((req.params as { token: string }).token);
+    const body = (req.body ?? {}) as { server_id?: string | null };
+    if (!token.trim()) return reply.code(400).send({ error: 'session token required' });
+    const sid = body.server_id;
+    if (sid === undefined) return reply.code(400).send({ error: 'server_id required (null clears the pin)' });
+    const res = arbiter.setSessionPin(token.trim(), sid);
+    if (!res.ok) {
+      const code = res.reason === 'unknown_session' ? 404 : 400;
+      return reply.code(code).send({ error: res.reason ?? 'invalid' });
+    }
+    return { ok: true, pin: res.pin ?? null };
   });
 
   // ------------------------------------------------------------------
@@ -969,10 +1004,18 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       // dashboard and clients can see pause/force state without a second call.
       clients: s.clients.map((c) => ({ ...c, override: arbiter.activeOverride(c.client_id, now) })),
       // Interactive sessions (#32/#33) with their active operator override.
-      sessions: arbiter.listSessions().map((sess) => ({
-        ...sess,
-        override: arbiter.activeSessionOverride(sess.token, now),
-      })),
+      // #67: an active engine pin rides the row as the resolved
+      // `engine_pin` ADD-key (server_id + url + engine_model when the
+      // pinned row serves the session's model under another id + set_at) —
+      // the router learns it on this same poll, the pause/force channel.
+      sessions: arbiter.listSessions().map((sess) => {
+        const pin = arbiter.sessionPinBlock(sess.token, typeof sess.history?.model === 'string' ? sess.history.model : undefined);
+        return {
+          ...sess,
+          override: arbiter.activeSessionOverride(sess.token, now),
+          ...(pin ? { engine_pin: pin } : {}),
+        };
+      }),
       // Anti-thrash: the jobs currently throttled (persisted; newest last).
       // Empty list when nothing is throttled — the dashboard renders this
       // as the exception-only "Throttled jobs" section.

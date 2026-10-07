@@ -53,7 +53,7 @@ import type { IdleDetector } from './idle.js';
 import { activeLeaseExemptIps, defaultActivityPathFor } from './idle.js';
 import { buildCatalog, modelsProbeUrl, type CatalogEntry, type ModelsFetcher } from './catalog.js';
 import { mintInstanceId } from './mesh.js';
-import type { IdleSignal, JobResultRow, JobThrottle, ModelAlias, ModelAliasPair, SessionOverride, SessionRecord } from './types.js';
+import type { IdleSignal, JobResultRow, JobThrottle, ModelAlias, ModelAliasPair, SessionOverride, SessionPin, SessionRecord } from './types.js';
 import type { StateStore } from './state.js';
 import type { ClientOverride, Lease, ProjectAllocation, ServerConfig, ServerConnection, ServerProvider, UtcDate } from './types.js';
 import { PROVIDER_KINDS } from './types.js';
@@ -135,6 +135,31 @@ function normalizeSessionGate(v: unknown): { state: 'active' | 'queued'; waiting
       ? g.position
       : undefined;
   return { state: g.state, waiting: g.waiting, ...(position !== undefined ? { position } : {}) };
+}
+
+/**
+ * #67: validate a register heartbeat's `phase` ADD-key (the router's
+ * response-phase truth). The block follows the GATE block's posture
+ * exactly — ephemeral stream state, not accumulated history:
+ *   - a valid { state: 'thinking'|'output'|'tools', at: finite int ≥0 } → stored;
+ *   - null/absent → null: the no-live-phase report, the stored phase
+ *     CLEARS (an old router never sends the key; its rows simply stay
+ *     phase-less, exactly like the gate block);
+ *   - anything else → undefined: INVALID, the field is DROPPED (never a
+ *     rejected registration) and the stored value stands.
+ * `at` is the ROUTER's clock (the phase observation instant); the arbiter
+ * keeps it verbatim — the surface ages the state against it, never by a
+ * rewrite.
+ */
+function normalizeSessionPhase(
+  v: unknown,
+): { state: 'thinking' | 'output' | 'tools'; at: number } | null | undefined {
+  if (v === null || v === undefined) return null;
+  if (typeof v !== 'object' || Array.isArray(v)) return undefined;
+  const p = v as { state?: unknown; at?: unknown };
+  if (p.state !== 'thinking' && p.state !== 'output' && p.state !== 'tools') return undefined;
+  if (typeof p.at !== 'number' || !Number.isFinite(p.at) || !Number.isInteger(p.at) || p.at < 0) return undefined;
+  return { state: p.state, at: p.at };
 }
 
 /**
@@ -247,6 +272,16 @@ export class Arbiter {
    * pair (no cycle run yet).
    */
   private aliasPairStates = new Map<string, { server_id: string; model: string; source: 'probed' | 'declared' | 'dropped' }[]>();
+  /**
+   * #67: the per-row model inventory as of the LAST SUCCESSFUL probe of
+   * that row (row id -> names; a probe-blocked row keeps its older list,
+   * and falls back to its declared list at read). Kept ACROSS cycles per
+   * row — pins are standing choices, and a probe blip on one row must
+   * never retroactively invalidate a stored pin the way a whole-map
+   * replace would. The catalog/alias publishes stay per-tick (their
+   * drop-for-the-tick rules are deliberate; this one is not).
+   */
+  private lastProbed = new Map<string, string[]>();
   /**
    * Per-server post-revocation reidle gates: server_id -> armed-at epoch-ms.
    * Armed when a lease on that server is revoked/expired; disarmed when a
@@ -822,6 +857,11 @@ export class Arbiter {
     const before = s.sessions.length;
     s.sessions = s.sessions.filter((sess) => nowMs - sess.last_seen < Arbiter.SESSION_STALE_MS);
     if (s.sessions.length !== before) this.store.appendEvent({ kind: 'session_swept', detail: `${before - s.sessions.length} stale session row(s) swept` });
+    // #67: pins have no 'until' (a standing choice), so orphan them with
+    // their row — a swept token's pin must not outlive the session.
+    for (const tok of Object.keys(s.session_pins)) {
+      if (!s.sessions.some((sess) => sess.token === tok)) delete s.session_pins[tok];
+    }
 
     // Reidle bookkeeping (PER SERVER): any lease end on a server arms that
     // server's gate; a later poll where THAT server is fully idle — feed
@@ -909,6 +949,10 @@ export class Arbiter {
       );
     }
     this.catalogPublished = buildCatalog(rows, probed);
+    // #67: merge per-row (a row whose probe failed THIS cycle keeps its
+    // last good list — see lastProbed). The per-tick `probed` map the
+    // alias pass uses stays byte-for-byte.
+    for (const [id, names] of probed) this.lastProbed.set(id, names);
     // #66 D2: the alias pass runs in THIS cycle over the SAME probe map —
     // per-pair confirmation, winner resolution, the published block.
     this.buildAliasBlock(rows, probed);
@@ -1153,12 +1197,16 @@ export class Arbiter {
    */
   registerSession(
     token: string,
-    opts: { client_id?: string; client_name?: string; server_id?: string; last_activity?: number; gate?: unknown; session_id?: unknown; history?: unknown; now?: number },
+    opts: { client_id?: string; client_name?: string; server_id?: string; last_activity?: number; gate?: unknown; session_id?: unknown; history?: unknown; phase?: unknown; now?: number },
   ): { ok: boolean; reason?: string; created: boolean; session?: SessionRecord } {
     const t = typeof token === 'string' ? token.trim() : '';
     if (!t || t.length > 128) return { ok: false, reason: 'token required (≤128 chars)', created: false };
     const nowMs = opts.now ?? Date.now();
     const gateVerdict = normalizeSessionGate(opts.gate);
+    // #67: the response-phase block, sanitized with the same three
+    // verdicts (valid → store; explicit null → CLEAR; invalid/absent →
+    // dropped, stored value stands — an old router never sends it).
+    const phaseVerdict = normalizeSessionPhase(opts.phase);
     // #42 Slice 0: the Hermes conversation id, sanitized the token way —
     // bounded printable, and an invalid value is DROPPED (never a rejection,
     // never a clear of a stored id).
@@ -1185,6 +1233,10 @@ export class Arbiter {
       // same token are routine).
       if (sessionId) existing.session_id = sessionId;
       if (history) existing.history = history;
+      // #67 phase, three verdicts: valid ⇒ store; explicit null ⇒ CLEAR
+      // (no live stream); invalid/absent (undefined) ⇒ dropped, the stored
+      // phase stands (an old router simply never sends the key).
+      if (phaseVerdict !== undefined) existing.phase = phaseVerdict;
       this.store.save();
       return { ok: true, created: false, session: existing };
     }
@@ -1201,6 +1253,7 @@ export class Arbiter {
       ...(gateVerdict !== undefined ? { gate: gateVerdict } : {}),
       ...(sessionId ? { session_id: sessionId } : {}),
       ...(history ? { history } : {}),
+      ...(phaseVerdict !== undefined ? { phase: phaseVerdict } : {}),
     };
     s.sessions.push(session);
     this.store.appendEvent({ kind: 'session_registered', detail: `${t}${session.client_name ? ` (${session.client_name})` : ''}${session.server_id ? ` → ${session.server_id}` : ''}` });
@@ -1274,6 +1327,109 @@ export class Arbiter {
     this.store.trim();
     this.store.save();
     return { ok: true, override: o };
+  }
+
+  /**
+   * Set (replace) or clear (server_id: null) the operator engine pin for
+   * a session token — #67, the SIBLING of the pause/force override plane
+   * (same write shape, same poll-learned channel, one-tick latency —
+   * #66 D4 precedent). A pin says: resolve this session's traffic to THIS
+   * engine row at forward time (queued + next-request traffic only; a
+   * running stream never moves).
+   *
+   * Truth constrains the write (brief: "valid targets are engines that
+   * actually serve the session's model"). The session's model is the
+   * #45 `history.model` (the router sniffed it from real traffic):
+   *   - the target row must exist and be listed in the published catalog;
+   *   - when the session's model is an ALIAS, the target must be one of
+   *     that alias's surviving pair rows (drag target = "the other
+   *     pair's engine" — the same plane);
+   *   - for a bare-name model, the target row must carry the name in its
+   *     inventory (last successful probe, else the declared list);
+   *   - when the session has NO known model (no sniffed traffic yet), the
+   *     row-exists check still applies — legality cannot be proven, so
+   *     the pin rides and the ROUTER's own guard decides at release time
+   *     (drop-don't-reject: an unprovable pin is never silently honored
+   *     against an engine that lacks the model, it just falls through).
+   * A rejection is TOLD (400 family at the route), like the alias write
+   * route — operator input is not telemetry.
+   */
+  setSessionPin(
+    token: string,
+    serverId: string | null,
+  ): { ok: boolean; reason?: string; pin?: SessionPin | null } {
+    const s = this.store.state;
+    const session = s.sessions.find((x) => x.token === token);
+    if (!session) return { ok: false, reason: 'unknown_session' };
+    if (serverId === null) {
+      const had = s.session_pins[session.token];
+      delete s.session_pins[session.token];
+      if (had) {
+        this.store.appendEvent({ kind: 'session_pin_cleared', detail: `${session.token}: engine pin cleared` });
+      }
+      this.store.trim();
+      this.store.save();
+      return { ok: true, pin: null };
+    }
+    if (typeof serverId !== 'string' || !serverId || serverId.length > 128) {
+      return { ok: false, reason: 'server_id required (≤128 chars)' };
+    }
+    const row = s.servers.find((r) => r.id === serverId);
+    if (!row) return { ok: false, reason: 'unknown_server' };
+    const model = typeof session.history?.model === 'string' ? session.history.model : undefined;
+    if (model) {
+      const alias = s.model_aliases?.[model];
+      if (alias) {
+        // Alias session: legal target = one of the alias's pair rows.
+        const pairs = Array.isArray(alias.pairs) ? alias.pairs : [];
+        if (!pairs.some((p) => p && p.server_id === serverId)) {
+          return { ok: false, reason: 'not_an_alias_pair' };
+        }
+      } else {
+        // Bare-name session: the row must carry the name in its inventory
+        // (last successful probe; probe-blocked falls back to declared).
+        const inventory = this.lastProbed.get(row.id) ?? row.models ?? [];
+        if (!inventory.includes(model)) {
+          return { ok: false, reason: 'row_lacks_model' };
+        }
+      }
+    }
+    const pin: SessionPin = { token: session.token, server_id: serverId, set_at: Date.now() };
+    s.session_pins[session.token] = pin;
+    this.store.appendEvent({ kind: 'session_pinned', detail: `${session.token} → ${serverId}` });
+    this.store.trim();
+    this.store.save();
+    return { ok: true, pin };
+  }
+
+  /**
+   * #67: the engine_pin block published for one session row (resolved,
+   * like the #66 alias block — the router NEVER recomputes urls). The
+   * pin's row url + that row's engine id for the session's model ride
+   * along, because the published catalog dedupes a bare name onto ONE
+   * row: the router cannot resolve the second pair's row itself.
+   * `engine_model` is set only when the pin's row serves the session's
+   * model under a DIFFERENT id (the alias pair case — the same splice
+   * rule as #66 D3 at forward time). Absent pin or a pin whose row went
+   * missing: no key (the router falls back to the dispatch-chosen row).
+   */
+  sessionPinBlock(token: string, model: string | undefined): { server_id: string; url: string; engine_model?: string; set_at: number } | undefined {
+    const pin = this.store.state.session_pins[token];
+    if (!pin || typeof pin.server_id !== 'string' || pin.server_id === '') return undefined;
+    const row = this.store.state.servers.find((r) => r.id === pin.server_id);
+    if (!row || typeof row.url !== 'string' || row.url.trim() === '') return undefined;
+    let engineModel: string | undefined;
+    if (model) {
+      const alias = this.store.state.model_aliases?.[model];
+      const pair = alias && Array.isArray(alias.pairs) ? alias.pairs.find((p) => p && p.server_id === pin.server_id) : undefined;
+      if (pair && typeof pair.model === 'string' && pair.model !== model) engineModel = pair.model;
+    }
+    return {
+      server_id: pin.server_id,
+      url: row.url,
+      ...(engineModel !== undefined ? { engine_model: engineModel } : {}),
+      set_at: pin.set_at,
+    };
   }
 
   /** Effective idle threshold for a project (per-project override wins). */
