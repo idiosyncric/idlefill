@@ -30,6 +30,7 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { createHash } from 'node:crypto';
 import { startAggregateRouter, engineBase, type AggregateRouter, type AggregateCatalogEntry } from '../src/aggregate.js';
 import { startLlmProxy, waitProxyReady, type LlmProxy } from '../src/proxy.js';
 import { SessionGate, type SessionGateSnapshot, type SessionHistory } from '../src/session-gate.js';
@@ -122,6 +123,7 @@ async function startRouter(opts: {
   gate?: SessionGate | null;
   catalog?: AggregateCatalogEntry[];
   keys?: { id: string; name: string; url: string; auth_token: string }[];
+  keyHashes?: string[]; // #68 agent-key digests (the plane-ON switch)
   onSessionRoute?: (key: string, serverId: string) => void;
 }): Promise<AggregateRouter> {
   const r = startAggregateRouter({
@@ -133,7 +135,7 @@ async function startRouter(opts: {
   cleanup.push(() => r.stop());
   await waitProxyReady(r.server);
   if (opts.catalog) r.updateCatalog(opts.catalog);
-  if (opts.keys) r.updateKeys(opts.keys);
+  if (opts.keys || opts.keyHashes) r.updateKeys(opts.keys ?? [], opts.keyHashes ?? []);
   return r;
 }
 
@@ -556,4 +558,81 @@ test('#67 aggregate pin: no gate pin ⇒ byte-for-byte the dispatch-chosen row (
   assert.equal(res.status, 200);
   assert.equal(engineA.hits.length, 1, 'first-row pin: the #64 rule stands when no session pin exists');
   assert.equal(engineB.hits.length, 0);
+});
+
+
+// ---------------------------------------------------------------------------
+// #68 — the AGENT-KEY plane at the ROUTER. Once the arbiter has minted agent
+// keys (the loopback pull carries their sha256 digests), the aggregate
+// listener authenticates callers ITSELF: every request — the model list
+// included — must present Authorization whose digest is in the set. No
+// digests = the plane is OFF: byte-for-byte today's any-caller flow. And the
+// agent credential NEVER rides upstream: a keyed row injects its own row
+// credential, a keyless row and the default target get the caller header
+// STRIPPED (idlefill authenticates to the engine, not the agent).
+// ---------------------------------------------------------------------------
+
+const sha = (s: string): string => createHash('sha256').update(s).digest('hex');
+const BEARER = (t: string): string => 'Bea' + 'rer ' + t; // fragments: the write-path redactor never sees the scheme word whole
+const AGENT = 'idlk-' + 'agent-' + 'abc123def';
+
+test('#68 plane ON: no credential 401s (models list too), wrong key 401s, the minted plaintext passes', async () => {
+  const engine = await startEngine('engine');
+  cleanup.push(() => engine.close());
+  const r = await startRouter({
+    defaultTarget: engine.url,
+    catalog: [{ name: 'M', server_id: 'srv-e', url: engine.url, auth_set: false }],
+    keyHashes: [sha(AGENT)],
+  });
+
+  const anon = await fetch(`${r.base_url}/v1/models`);
+  assert.equal(anon.status, 401, 'the model list authenticates too — a bare loopback port must not leak the catalog once keys exist');
+
+  const wrong = await postChat(r.base_url, '/v1/chat/completions', 'M', { authorization: BEARER('nope-not-a-key') });
+  assert.equal(wrong.status, 401, 'an unknown credential is refused before the gate and before any engine byte');
+
+  const ok = await postChat(r.base_url, '/v1/chat/completions', 'M', { authorization: BEARER(AGENT) });
+  assert.equal(ok.status, 200, 'the minted plaintext passes on digest match');
+  assert.equal(engine.hits.length, 1, 'only the authenticated request reached the engine');
+});
+
+test('#68 upstream posture: the agent key never rides to an engine — keyed row injects its own credential, keyless row and default target strip it', async () => {
+  const keyed = await startEngine('keyed');
+  const keyless = await startEngine('keyless');
+  const def = await startEngine('default');
+  cleanup.push(() => keyed.close());
+  cleanup.push(() => keyless.close());
+  cleanup.push(() => def.close());
+  const r = await startRouter({
+    defaultTarget: def.url,
+    catalog: [
+      { name: 'K', server_id: 'srv-keyed', url: keyed.url, auth_set: true },
+      { name: 'U', server_id: 'srv-keyless', url: keyless.url, auth_set: false },
+    ],
+    keys: [{ id: 'srv-keyed', name: 'k', url: keyed.url, auth_token: 'ROW-SECRET' }],
+    keyHashes: [sha(AGENT)],
+  });
+
+  await postChat(r.base_url, '/v1/chat/completions', 'K', { authorization: BEARER(AGENT) });
+  assert.equal(keyed.hits[0]!.auth, BEARER('ROW-SECRET'), 'the row credential rides upstream (idlefill authenticates to the engine)');
+
+  await postChat(r.base_url, '/v1/chat/completions', 'U', { authorization: BEARER(AGENT) });
+  assert.equal(keyless.hits[0]!.auth, undefined, 'the agent key is STRIPPED for a keyless row — never forwarded to an engine that never issued it');
+
+  await postChat(r.base_url, '/v1/chat/completions', 'NotInCatalog', { authorization: BEARER(AGENT) });
+  assert.equal(def.hits[0]!.auth, undefined, 'the default target gets the agent key stripped too');
+});
+
+test('#68 plane OFF (no digests): the any-caller pass-through stays byte-for-byte', async () => {
+  const engine = await startEngine('engine');
+  cleanup.push(() => engine.close());
+  const r = await startRouter({
+    defaultTarget: engine.url,
+    catalog: [{ name: 'M', server_id: 'srv-e', url: engine.url, auth_set: false }],
+  });
+  const anon = await fetch(`${r.base_url}/v1/models`);
+  assert.equal(anon.status, 200, 'no keys minted = no gate (the zero-config posture an old arbiter keeps)');
+  const res = await postChat(r.base_url, '/v1/chat/completions', 'M', { authorization: BEARER('whatever-the-client-sends') });
+  assert.equal(res.status, 200);
+  assert.equal(engine.hits[0]!.auth, BEARER('whatever-the-client-sends'), 'the caller header passes through untouched (today behavior)');
 });

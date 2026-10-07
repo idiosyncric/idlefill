@@ -362,6 +362,15 @@ export interface ClientRecord {
    */
   proxy_port?: number;
   /**
+   * The port the client's AGGREGATE listener (#64) ACTUALLY bound,
+   * published on the register heartbeat — the agent base URL
+   * (`http://127.0.0.1:<port>/v1`) an agent config points at when it
+   * authenticates with an idlefill agent key (#68). ADD-key: stored on a
+   * valid report (integer 1..65535, else dropped), absent on old clients
+   * and on daemons running with aggregate_port=0 or a failed bind.
+   */
+  aggregate_port?: number;
+  /**
    * Code-staleness verdict computed WHERE THE FACTS LIVE (#61 step 3, A1):
    * the client compares its own boot revision against the live
    * `git rev-parse HEAD` of the checkout it runs from, and publishes the
@@ -663,6 +672,12 @@ export type EventKind =
    */
   | 'model_alias_updated'
   | 'model_alias_removed'
+  /**
+   * Agent keys (#68): an operator mint (detail carries the label, NEVER
+   * the plaintext) and a revoke (detail carries id + label).
+   */
+  | 'client_key_minted'
+  | 'client_key_revoked'
   | 'session_registered'
   | 'session_paused'
   | 'session_forced'
@@ -724,6 +739,23 @@ export interface ModelAlias {
   updated_at: number;
 }
 
+/**
+ * An idlefill-issued AGENT key (#68): the credential an agent (a Hermes
+ * profile, any OpenAI-compatible client) presents to the aggregate
+ * endpoint (:8800) so it authenticates to IDLEFILL — never to the engine.
+ * The plaintext is handed to the operator ONCE at mint (the mint response)
+ * and is NEVER stored: this row carries only the SHA-256 hex digest, the
+ * same write-only posture as a server row's auth_token (#60 B). The
+ * router pulls digests (never plaintexts) over the loopback-scoped key
+ * route and answers a caller by digesting what IT presented.
+ */
+export interface ClientKeyRow {
+  id: string; // `key-<hex8>` — the revoke handle
+  label: string; // operator naming ("accounting-agent")
+  hash: string; // sha256(plaintext) hex — never served to any read surface
+  created_at: number;
+}
+
 export interface ArbiterState {
   /** Declared inference-server connections (seeded from config on first load). */
   servers: ServerConnection[];
@@ -734,6 +766,16 @@ export interface ArbiterState {
    * construction.
    */
   model_aliases: Record<string, ModelAlias>;
+  /**
+   * Idlefill-issued AGENT keys (#68), keyed by nothing — an array like
+   * `servers`, id is the handle. ADD-key: state files from before #68
+   * carry none. The rows hold ONLY the sha256 digest of the minted
+   * plaintext (write-only posture, #60 B): the plaintext is shown once at
+   * mint and no read surface ever carries it — not /api/state, not the
+   * list route, not the router's loopback pull (which hands digests, not
+   * plaintexts).
+   */
+  client_keys: ClientKeyRow[];
   /**
    * Stable mesh instance identity (#50 D2): random hex, minted at first
    * boot and persisted. Tailnet IPs move; this id is the identity. The

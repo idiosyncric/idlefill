@@ -23,6 +23,7 @@ export function emptyState(): ArbiterState {
   return {
     servers: [],
     model_aliases: {},
+    client_keys: [],
     projects: [],
     clients: [],
     overrides: {},
@@ -97,6 +98,9 @@ export class StateStore {
         // Tolerate state files from before the model-alias plane (#66 D1)
         // existed.
         model_aliases: raw.model_aliases && typeof raw.model_aliases === 'object' ? raw.model_aliases : base.model_aliases,
+        // Tolerate state files from before the agent-key plane (#68)
+        // existed.
+        client_keys: Array.isArray(raw.client_keys) ? raw.client_keys : base.client_keys,
         // Tolerate state files from before persisted project rows existed.
         projects: Array.isArray(raw.projects) ? raw.projects : base.projects,
       };

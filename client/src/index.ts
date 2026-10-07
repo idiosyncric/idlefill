@@ -1283,6 +1283,14 @@ export class ClientDaemon {
       // ADD-key: an old arbiter ignores it; a daemon whose proxy never came
       // up reports nothing.
       ...(this.proxy ? { proxy_port: this.proxy.port } : {}),
+      // Agent-key plane (#68): the port the aggregate listener ACTUALLY
+      // bound — the agent base URL (`http://127.0.0.1:<port>/v1`) the
+      // dashboard's Add-agent flow hands an agent config. Same
+      // bound-port rule as proxy_port (cfg aggregate_port may be 0 =
+      // ephemeral). ADD-key: an old arbiter ignores it; a daemon whose
+      // aggregate listener never came up (or aggregate_port=0) reports
+      // nothing, and the Add-agent flow says so instead of guessing.
+      ...(this.aggregate ? { aggregate_port: this.aggregate.port } : {}),
       // Code-staleness verdict (#61 step 3 A1): the client is the ONLY
       // process holding both facts — the boot revision it loaded code from
       // and the live HEAD of the same checkout (it runs FROM that tree).
@@ -1688,8 +1696,13 @@ export class ClientDaemon {
   private async refreshServerKeys(): Promise<void> {
     if (!this.aggregate) return;
     try {
-      const { status, body } = await api<{ server_keys?: ServerKeyRow[] }>(this.cfg, 'GET', '/api/server-keys');
-      if (status === 200 && Array.isArray(body.server_keys)) this.aggregate.updateKeys(body.server_keys);
+      const { status, body } = await api<{ server_keys?: ServerKeyRow[]; client_key_hashes?: string[] }>(this.cfg, 'GET', '/api/server-keys');
+      if (status === 200 && Array.isArray(body.server_keys)) {
+        // #68: the agent-key digests ride the SAME pull (the route gained
+        // the `client_key_hashes` ADD-key). Absent = plane OFF: an old
+        // arbiter keeps today's any-caller posture.
+        this.aggregate.updateKeys(body.server_keys, Array.isArray(body.client_key_hashes) ? body.client_key_hashes : []);
+      }
     } catch {
       /* keep the last-known key table; the next tick retries */
     }

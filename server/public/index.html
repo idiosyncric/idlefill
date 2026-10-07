@@ -517,6 +517,7 @@
     <button id="rtab-machines" type="button" role="tab" aria-selected="false" data-subview="machines">Machines</button>
     <button id="rtab-projects" type="button" role="tab" aria-selected="false" data-subview="projects">Projects<span class="vbadge" id="badge-projects" hidden></span></button>
     <button id="rtab-models" type="button" role="tab" aria-selected="false" data-subview="models">Models</button>
+    <button id="rtab-agents" type="button" role="tab" aria-selected="false" data-subview="agents">Agents</button>
   </div>
 </div>
 
@@ -614,6 +615,20 @@
     <h2>Model aliases <button id="add-alias" class="settings-toggle" type="button" title="declare a model alias — one name pinned to exact engine inventory entries">+ add alias</button></h2>
     <div id="add-alias-form" class="settings-form"></div>
     <div id="models"><div class="empty">no aliases declared</div></div>
+  </section>
+
+  <!-- Agent keys (#68): idlefill's own credential for agents (a Hermes
+       profile, any OpenAI client). The agent authenticates to IDLEFILL at
+       the aggregate endpoint; idlefill authenticates to the engine with the
+       row credential. Write-only posture like every credential in this app:
+       the mint response shows the plaintext ONCE — copy it then, it never
+       appears again (the rows list labels + ids, the state file keeps only
+       the digest). Empty = the endpoint accepts any caller on this machine
+       (the zero-config posture). -->
+  <section id="agents-section" data-view="resources" data-subview="agents">
+    <h2>Agent keys <button id="add-agent" class="settings-toggle" type="button" title="mint an idlefill agent key for one agent (Hermes profile, OpenAI client)">+ new agent key</button></h2>
+    <div id="add-agent-form" class="settings-form"></div>
+    <div id="client-keys"><div class="empty">no agent keys minted — the aggregate endpoint accepts any caller on this machine</div></div>
   </section>
 
   <!-- Queue search — client-side filter of the per-worker PUBLISHED

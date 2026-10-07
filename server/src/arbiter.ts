@@ -48,12 +48,12 @@
  * tokens exactly once.
  */
 
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import type { IdleDetector } from './idle.js';
 import { activeLeaseExemptIps, defaultActivityPathFor } from './idle.js';
 import { buildCatalog, modelsProbeUrl, type CatalogEntry, type ModelsFetcher } from './catalog.js';
 import { mintInstanceId } from './mesh.js';
-import type { IdleSignal, JobResultRow, JobThrottle, ModelAlias, ModelAliasPair, SessionOverride, SessionPin, SessionRecord } from './types.js';
+import type { ClientKeyRow, IdleSignal, JobResultRow, JobThrottle, ModelAlias, ModelAliasPair, SessionOverride, SessionPin, SessionRecord } from './types.js';
 import type { StateStore } from './state.js';
 import type { ClientOverride, Lease, ProjectAllocation, ServerConfig, ServerConnection, ServerProvider, UtcDate } from './types.js';
 import { PROVIDER_KINDS } from './types.js';
@@ -362,7 +362,7 @@ export class Arbiter {
     observedIp: string,
     projects?: ProjectAllocation[],
     now?: number,
-    info?: { version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open'; proxy_port?: number; daemon_behind?: boolean; client_log?: string[] },
+    info?: { version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open'; proxy_port?: number; aggregate_port?: number; daemon_behind?: boolean; client_log?: string[] },
   ): { client_id: string; created: boolean } {
     const s = this.store.state;
     const seen = now ?? Date.now();
@@ -401,6 +401,14 @@ export class Arbiter {
     const proxyPort =
       typeof info?.proxy_port === 'number' && Number.isInteger(info.proxy_port) && info.proxy_port >= 1 && info.proxy_port <= 65535
         ? info.proxy_port
+        : undefined;
+    // Aggregate listener port (#68): same edge rule as proxy_port (an
+    // integer in the real-port range, else dropped). The Add-agent flow
+    // renders the agent base URL from it; absent = no listener, and the
+    // flow says so instead of guessing a port.
+    const aggregatePort =
+      typeof info?.aggregate_port === 'number' && Number.isInteger(info.aggregate_port) && info.aggregate_port >= 1 && info.aggregate_port <= 65535
+        ? info.aggregate_port
         : undefined;
     // Code-staleness verdict (#61 step 3 A1): a plain boolean, computed
     // WHERE THE FACTS LIVE (the client runs from the checkout; the arbiter
@@ -463,6 +471,8 @@ export class Arbiter {
       // row (the proxy rebind on restart is reflected within one tick);
       // absent leaves it as-is.
       if (proxyPort) existing.proxy_port = proxyPort;
+      // Aggregate port (#68): same heartbeat rule as proxy_port.
+      if (aggregatePort) existing.aggregate_port = aggregatePort;
       // Code-staleness verdict (#61 step 3 A1): present updates (true
       // stores, false clears — the restart clears the tag inside one
       // heartbeat); absent (a pre-#61-step-3 client) leaves the row exactly
@@ -496,6 +506,7 @@ export class Arbiter {
       ...(revision ? { revision } : {}),
       ...(gatePosture ? { gate_posture: gatePosture } : {}),
       ...(proxyPort ? { proxy_port: proxyPort } : {}),
+      ...(aggregatePort ? { aggregate_port: aggregatePort } : {}),
       // Same store rule as the heartbeat path: only an EXCEPTION key lands
       // on the row (daemon_behind false = no exception = no key; an empty
       // log tail = no key).
@@ -1939,6 +1950,56 @@ export class Arbiter {
     this.store.trim();
     this.store.save();
     return { ok: true, removed: id };
+  }
+
+  // ------------------------------------------------------------------
+  // Agent keys (#68): idlefill-issued credentials for aggregate callers
+  // ------------------------------------------------------------------
+
+  /**
+   * Mint an agent key. The PLAINTEXT is returned exactly once (the mint
+   * response) and stored nowhere: the row keeps only the sha256 hex
+   * digest of it. Write-only posture (#60 B) — no read surface ever
+   * carries a plaintext or a digest except the loopback-scoped pull,
+   * which hands DIGESTS (the router matches by hashing what the caller
+   * presented; even a stolen pull response cannot replay a usable key).
+   */
+  mintClientKey(label: string): { key: ClientKeyRow; token: string } {
+    const s = this.store.state;
+    const token = `idlk_${randomBytes(18).toString('hex')}`;
+    const key: ClientKeyRow = {
+      id: `key-${randomBytes(4).toString('hex')}`,
+      label,
+      hash: createHash('sha256').update(token).digest('hex'),
+      created_at: Date.now(),
+    };
+    s.client_keys.push(key);
+    this.store.appendEvent({ kind: 'client_key_minted', detail: label });
+    this.store.trim();
+    this.store.save();
+    return { key, token };
+  }
+
+  /** Public list rows (id/label/created_at) — hash stripped, like auth_token on servers. */
+  clientKeys(): { id: string; label: string; created_at: number }[] {
+    return this.store.state.client_keys.map(({ id, label, created_at }) => ({ id, label, created_at }));
+  }
+
+  /** The digests the machine's own router enforces (loopback route only). */
+  clientKeyDigests(): string[] {
+    return this.store.state.client_keys.map((k) => k.hash);
+  }
+
+  /** Revoke by id. Unknown id → 'unknown_key' (404 at the route). */
+  revokeClientKey(id: string): { ok: boolean; reason?: string; revoked?: string } {
+    const s = this.store.state;
+    const row = s.client_keys.find((k) => k.id === id);
+    if (!row) return { ok: false, reason: 'unknown_key' };
+    s.client_keys = s.client_keys.filter((k) => k.id !== id);
+    this.store.appendEvent({ kind: 'client_key_revoked', detail: `${row.id} (${row.label})` });
+    this.store.trim();
+    this.store.save();
+    return { ok: true, revoked: id };
   }
 
   /** The last probe-confirmed model list for a row (null = never probed). */

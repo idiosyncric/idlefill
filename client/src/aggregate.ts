@@ -41,6 +41,7 @@
 
 import http from 'node:http';
 import https from 'node:https';
+import { createHash } from 'node:crypto';
 import { SESSION_ID_HEADER, type ForwardFn, type SessionGate } from './session-gate.js';
 
 /** One catalog row as the arbiter publishes it (the /api/state `catalog` ADD-key). */
@@ -87,6 +88,15 @@ export interface ServerKeyRow {
   auth_token: string;
 }
 
+/**
+ * #68: the set of AGENT-key digests the arbiter minted (sha256 hex of the
+ * plaintext it handed out once). The pull carries DIGESTS only — the
+ * router never sees a usable plaintext, and a stolen pull response cannot
+ * be replayed: enforcement hashes what the CALLER presents and compares.
+ */
+export interface ClientKeyHashSet {
+  hashes: string[];
+}
 export interface AggregateRouter {
   server: http.Server;
   port: number;
@@ -95,8 +105,13 @@ export interface AggregateRouter {
   updateCatalog(entries: AggregateCatalogEntry[]): void;
   /** Replace the routing alias map (#66 D3 — from the `model_aliases` ADD-key on the SAME poll). */
   updateAliases(entries: AggregateAliasEntry[]): void;
-  /** Replace the in-memory engine-key table (from GET /api/server-keys). */
-  updateKeys(rows: ServerKeyRow[]): void;
+  /**
+   * Replace the in-memory engine-key table (from GET /api/server-keys)
+   * AND the agent-key digest set (#68, same pull — `client_key_hashes`).
+   * An omitted/empty digest set = the key plane is OFF: today's posture,
+   * any caller on this loopback listener passes.
+   */
+  updateKeys(rows: ServerKeyRow[], clientKeyHashes?: string[]): void;
   /** Current catalog size (tests + live check). */
   catalogSize(): number;
   /** Current alias size (tests + live check). */
@@ -228,9 +243,47 @@ export function startAggregateRouter(opts: {
   const aliasByName = new Map<string, AggregateAliasEntry>();
   /** In-memory engine keys (#64 D2) — never persisted, never logged. */
   let keys = new Map<string, string>();
+  /**
+   * #68: digests (sha256 hex) of the idlefill-issued AGENT keys, from
+   * the same loopback pull. Set non-empty = the plane is ON: every
+   * request to this listener — including GET /v1/models — must present
+   * `Authorization: Bearer <plaintext>` whose digest is in this set.
+   * The router never holds a plaintext: it hashes what the CALLER
+   * presents and compares digests, so a stolen pull response cannot be
+   * replayed as a credential. Empty set = plane OFF (today's posture:
+   * any caller passes).
+   */
+  let clientKeyDigests = new Set<string>();
+
+  /** The Bearer token a caller presented (null = none / not a Bearer). */
+  const bearerOf = (req: http.IncomingMessage): string | null => {
+    const h = req.headers['authorization'];
+    const v = Array.isArray(h) ? h[0] : h;
+    if (typeof v !== 'string') return null;
+    const m = /^Bearer\s+(.+)$/i.exec(v.trim());
+    return m?.[1] ?? null;
+  };
+
+  /**
+   * #68 gate: does this caller pass the agent-key check? True (pass) when
+   * the plane is OFF. Answers the 401 itself when the plane is ON and the
+   * presented digest is unknown — BEFORE the model list, the gate, and
+   * any engine byte (no engine ever sees an unauthenticated request).
+   */
+  const agentAuthOk = (req: http.IncomingMessage, res: http.ServerResponse): boolean => {
+    if (clientKeyDigests.size === 0) return true;
+    const presented = bearerOf(req);
+    if (presented !== null) {
+      const digest = createHash('sha256').update(presented).digest('hex');
+      if (clientKeyDigests.has(digest)) return true;
+    }
+    res.writeHead(401, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'unauthorized', hint: 'present an idlefill agent key: Authorization: Bearer idlk_…' }));
+    return false;
+  };
 
   /** Request headers minus the per-hop ones (identical posture for both forwards). */
-  const copyRequestHeaders = (req: http.IncomingMessage, authToken?: string): Record<string, string | string[]> => {
+  const copyRequestHeaders = (req: http.IncomingMessage, authToken?: string | null): Record<string, string | string[]> => {
     const headers: Record<string, string | string[]> = {};
     for (const [k, v] of Object.entries(req.headers)) {
       if (k === 'host') continue; // rewritten by the request
@@ -238,8 +291,14 @@ export function startAggregateRouter(opts: {
       headers[k] = v as string | string[];
     }
     // The row credential rides per request (#64 D2). No row token: the
-    // client's own headers pass through untouched (today's behavior).
+    // client's own headers pass through untouched (today's behavior) —
+    // UNLESS the #68 key plane is ON, where `null` STRIPS the caller's
+    // Authorization entirely: an idlefill agent key is IDLEFILL's
+    // credential, never the engine's, so forwarding it upstream is at
+    // best useless and at worst an "Invalid API key" 401 from the engine
+    // (the exact accounting-agent failure this plane closes).
     if (authToken) headers['authorization'] = `Bearer ${authToken}`;
+    else if (authToken === null) delete headers['authorization'];
     return headers;
   };
 
@@ -288,7 +347,7 @@ export function startAggregateRouter(opts: {
     res: http.ServerResponse,
     rawUrl: string,
     base: URL,
-    authToken: string | undefined,
+    authToken: string | null | undefined,
     fromModel: string,
     toModel: string,
   ): void => {
@@ -364,7 +423,7 @@ export function startAggregateRouter(opts: {
     res: http.ServerResponse,
     path: string,
     base: URL,
-    authToken?: string,
+    authToken?: string | null,
   ): void => {
     const headers = copyRequestHeaders(req, authToken);
     const transport = base.protocol === 'https:' ? https : http;
@@ -416,7 +475,12 @@ export function startAggregateRouter(opts: {
       if (entry) {
       const base = new URL(engineBase(entry.url) + '/');
       const token = keys.get(entry.server_id);
-      const auth = token !== undefined && token !== '' ? token : undefined;
+      // Row credential wins (#64). Keyless row + #68 plane ON: `null`
+      // strips the caller's agent key from the upstream hop (idlefill
+      // authenticates to the engine with the ROW's credential — or with
+      // none; the agent's key never leaves the machine). Keyless row +
+      // plane OFF: `undefined` = today's pass-through, byte-for-byte.
+      const auth = token !== undefined && token !== '' ? token : clientKeyDigests.size > 0 ? null : undefined;
       const engineModel = 'engine_model' in entry ? entry.engine_model : undefined;
       if (engineModel !== undefined && requestedName !== undefined && engineModel !== requestedName) {
         forwardBuffered(req, res, path, base, auth, requestedName, engineModel);
@@ -425,7 +489,11 @@ export function startAggregateRouter(opts: {
       forwardTo(req, res, path, base, auth);
       return;
     }
-    forwardTo(req, res, path, target);
+    // Default target (unknown/absent model): today's posture is the
+    // caller's headers pass through. With the #68 plane ON the caller's
+    // header is an IDLEFILL key — strip it here too, so it never rides to
+    // an engine that never issued it.
+    forwardTo(req, res, path, target, clientKeyDigests.size > 0 ? null : undefined);
     };
 
   /**
@@ -477,6 +545,11 @@ export function startAggregateRouter(opts: {
   const server = http.createServer((req, res) => {
     const rawUrl = req.url ?? '/';
     const path = rawUrl.split('?')[0] ?? rawUrl;
+
+    // #68: the agent-key check runs FIRST — before the model list, before
+    // the gate, before any body peek and before a single byte reaches an
+    // engine. Plane off (no keys minted) = byte-for-byte today's flow.
+    if (!agentAuthOk(req, res)) return;
 
     if (req.method === 'GET' && (path === '/v1/models' || path === '/models')) {
       serveModelList(req, res);
@@ -578,13 +651,19 @@ export function startAggregateRouter(opts: {
         aliases.push(e);
       }
     },
-    updateKeys(rows) {
+    updateKeys(rows, clientKeyHashes) {
       keys = new Map<string, string>();
       for (const r of rows ?? []) {
         if (r && typeof r.id === 'string' && typeof r.auth_token === 'string' && r.auth_token !== '') {
           keys.set(r.id, r.auth_token);
         }
       }
+      // #68: swap the digest set atomically with the engine keys (one
+      // pull answers both). Malformed entries drop; a non-array = empty
+      // set = plane OFF.
+      clientKeyDigests = new Set<string>(
+        Array.isArray(clientKeyHashes) ? clientKeyHashes.filter((h) => typeof h === 'string' && h !== '') : [],
+      );
     },
     catalogSize() {
       return catalog.length;

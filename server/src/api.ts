@@ -20,7 +20,7 @@ import { utcDay, type Arbiter, WATCHED_SERVER_ID } from './arbiter.js';
 import { seriesKeyOf, type MetricsBucket, type MetricsSeries, type MetricsStore } from './metrics.js';
 import { buildMeshSnapshot, type MeshFederation } from './mesh.js';
 import { isLoopbackAddress } from './catalog.js';
-import type { CycleStatusRow, ProjectAllocation, QueuePreviewRow, RebuildRunState, ServerConfig, ServerConnection } from './types.js';
+import type { ClientRecord, CycleStatusRow, ProjectAllocation, QueuePreviewRow, RebuildRunState, ServerConfig, ServerConnection } from './types.js';
 
 export interface ApiDeps {
   arbiter: Arbiter;
@@ -303,7 +303,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   // ------------------------------------------------------------------
 
   app.post('/api/clients/register', async (req, reply) => {
-    const body = (req.body ?? {}) as { name?: string; ip?: string; projects?: ProjectAllocation[]; version?: unknown; protocol?: unknown; revision?: unknown; gate_posture?: unknown; proxy_port?: unknown; daemon_behind?: unknown; client_log?: unknown };
+    const body = (req.body ?? {}) as { name?: string; ip?: string; projects?: ProjectAllocation[]; version?: unknown; protocol?: unknown; revision?: unknown; gate_posture?: unknown; proxy_port?: unknown; aggregate_port?: unknown; daemon_behind?: unknown; client_log?: unknown };
     const name = typeof body.name === 'string' ? body.name.trim() : '';
     if (!name) return reply.code(400).send({ error: 'name required' });
     const remote = (req.ip ?? '').split(':').pop() ?? 'unknown';
@@ -430,6 +430,10 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     // the key simply arrives on a later heartbeat; old clients never send
     // it at all.
     const proxy_port = typeof body.proxy_port === 'number' ? body.proxy_port : undefined;
+    // Agent-key plane (#68): the aggregate listener's bound port, same
+    // pass-through — sanitized (integer 1..65535, else dropped) in
+    // registerClient, absent on daemons without the listener.
+    const aggregate_port = typeof body.aggregate_port === 'number' ? body.aggregate_port : undefined;
     // Code-staleness verdict (#61 step 3 A1): the client computed it where
     // the facts live (boot revision vs live HEAD of the checkout it runs
     // from). A plain pass-through here — sanitized (exact boolean, else
@@ -446,8 +450,8 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       remote,
       projects,
       undefined,
-      version !== undefined || protocol !== undefined || revision !== undefined || gate_posture !== undefined || proxy_port !== undefined || daemon_behind !== undefined || client_log !== undefined
-        ? { version, protocol, revision, gate_posture, proxy_port, daemon_behind, client_log }
+      version !== undefined || protocol !== undefined || revision !== undefined || gate_posture !== undefined || proxy_port !== undefined || aggregate_port !== undefined || daemon_behind !== undefined || client_log !== undefined
+        ? { version, protocol, revision, gate_posture, proxy_port, aggregate_port, daemon_behind, client_log }
         : undefined,
     );
     return reply.code(200).send({ client_id: res.client_id, created: res.created });
@@ -691,6 +695,12 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       server_keys: s.servers
         .filter((row: ServerConnection) => row.auth_token !== undefined && row.auth_token !== '')
         .map((row: ServerConnection) => ({ id: row.id, name: row.name, url: row.url, auth_token: row.auth_token })),
+      // #68: the agent-key DIGESTS the router enforces. Digests, never
+      // plaintexts: the router answers a caller by hashing what the
+      // CALLER presented, so even a stolen pull response cannot replay a
+      // usable credential. Empty array = the key plane is off (today's
+      // posture: any caller on loopback passes).
+      client_key_hashes: arbiter.clientKeyDigests(),
     };
   });
 
@@ -737,6 +747,61 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       return reply.code(res.reason === 'unknown_server' ? 404 : 409).send({ error: res.reason ?? 'invalid' });
     }
     return { ok: true, removed: res.removed };
+  });
+
+  // ------------------------------------------------------------------
+  // Agent keys (#68): idlefill-issued credentials for aggregate callers
+  // ------------------------------------------------------------------
+
+  /**
+   * POST /api/client-keys: mint an agent key. { label } → the public row
+   * PLUS the plaintext token, ONCE, in this response. The state row keeps
+   * only the sha256 digest (#60 B write-only posture): no read surface —
+   * not GET /api/client-keys, not /api/state, not the loopback pull —
+   * ever carries a plaintext, and the pull carries only digests.
+   */
+  app.post('/api/client-keys', async (req, reply) => {
+    const body = (req.body ?? {}) as { label?: string };
+    const label = typeof body.label === 'string' ? body.label.trim() : '';
+    if (!label) return reply.code(400).send({ error: 'label required' });
+    if (label.length > 64) return reply.code(400).send({ error: 'label too long (max 64 chars)' });
+    const { key, token } = arbiter.mintClientKey(label);
+    return reply.code(201).send({ id: key.id, label: key.label, created_at: key.created_at, token });
+  });
+
+  /** GET /api/client-keys: the public rows (id/label/created_at). No hash, no plaintext. */
+  app.get('/api/client-keys', async () => {
+    return { keys: arbiter.clientKeys() };
+  });
+
+  /**
+   * GET /api/agent-endpoints (#68): the agent base URLs an Add-agent
+   * flow can hand an agent config — one per ONLINE client whose
+   * aggregate listener reported a bound port. These are loopback URLs:
+   * they are only honest on the machine they name, which is why the
+   * flow offers only THIS machine's daemon (the dashboard is served by
+   * it) and says so rather than offering a remote URL that would not
+   * resolve on the operator's box.
+   */
+  app.get('/api/agent-endpoints', async () => {
+    const now = Date.now();
+    return {
+      endpoints: arbiter['store'].state.clients
+        .filter((c: ClientRecord) => typeof c.aggregate_port === 'number' && now - c.last_seen < 90_000)
+        .map((c: ClientRecord) => ({ client: c.name, url: `http://127.0.0.1:${c.aggregate_port}/v1` })),
+    };
+  });
+
+  /** POST /api/client-keys/revoke: { id }. The router stops accepting it on its next pull. */
+  app.post('/api/client-keys/revoke', async (req, reply) => {
+    const body = (req.body ?? {}) as { id?: string };
+    const id = typeof body.id === 'string' ? body.id.trim() : '';
+    if (!id) return reply.code(400).send({ error: 'id required' });
+    const res = arbiter.revokeClientKey(id);
+    if (!res.ok) {
+      return reply.code(res.reason === 'unknown_key' ? 404 : 400).send({ error: res.reason ?? 'invalid' });
+    }
+    return { ok: true, revoked: res.revoked };
   });
 
   // ------------------------------------------------------------------

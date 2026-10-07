@@ -15,6 +15,7 @@
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -2017,6 +2018,105 @@ test('#64 GET /api/server-keys: loopback + admin token answers keyed rows; non-l
   } finally {
     rmSync(aggDir, { recursive: true, force: true });
   }
+});
+
+
+// ---------------------------------------------------------------------------
+// #68 — the AGENT-KEY plane: idlefill issues its own credential to agents so
+// they authenticate to IDLEFILL, never to the engine. Write-only posture
+// (#60 B, same as a server row's auth_token): the mint response hands the
+// plaintext ONCE; the state row keeps only the sha256 digest; NO read surface
+// (GET /api/client-keys, /api/state, the dashboard HTML) carries a plaintext
+// or a digest; the loopback key-pull hands DIGESTS (never plaintexts), so a
+// stolen pull cannot replay a usable credential.
+// ---------------------------------------------------------------------------
+
+test('#68 POST /api/client-keys mints once (plaintext in the response only); GET lists rows with no secret; the digest never leaks to a read surface', async () => {
+  const kDir = mkdtempSync(join(tmpdir(), 'idlefill-ck-'));
+  try {
+    const kCfg: ServerConfig = { ...cfg, api_tokens: [AGG_TOKEN], state_file: join(kDir, 'state.json') };
+    const kArbiter = new Arbiter(new StateStore(kCfg.state_file), kCfg, det);
+    const kApp = buildApi({ arbiter: kArbiter, cfg: kCfg, publicDir: join(__dirname, '..', 'public') });
+    await kApp.ready();
+    try {
+      // Mint: 201, the plaintext rides ONLY this response.
+      const mint = await kApp.inject({ method: 'POST', url: '/api/client-keys', remoteAddress: '127.0.0.1', headers: { authorization: `Bearer ${AGG_TOKEN}` }, body: { label: 'accounting-agent' } });
+      assert.equal(mint.statusCode, 201);
+      const m = mint.json() as { id: string; label: string; created_at: number; token: string };
+      assert.ok(m.id.startsWith('key-'), 'the id is the revoke handle');
+      assert.equal(m.label, 'accounting-agent');
+      assert.ok(m.token.startsWith('idlk_'), 'the plaintext carries the idlefill prefix');
+      const id = m.id, plain = m.token;
+
+      // A missing/blank label is a 400 (label is required naming).
+      const bad = await kApp.inject({ method: 'POST', url: '/api/client-keys', remoteAddress: '127.0.0.1', headers: { authorization: `Bearer ${AGG_TOKEN}` }, body: { label: '   ' } });
+      assert.equal(bad.statusCode, 400);
+
+      // List: the public rows only — no plaintext, no hash.
+      const list = await kApp.inject({ method: 'GET', url: '/api/client-keys', remoteAddress: '127.0.0.1', headers: { authorization: `Bearer ${AGG_TOKEN}` } });
+      assert.equal(list.statusCode, 200);
+      const rows = (list.json() as { keys: Record<string, unknown>[] }).keys;
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0]!.id, id);
+      assert.ok(!('hash' in rows[0]!), 'the digest never rides the list');
+      assert.ok(!('token' in rows[0]!), 'the plaintext never rides the list');
+      assert.ok(!list.body.includes(plain), 'the list body carries no plaintext');
+
+      // The anonymous /api/state never carries either.
+      const state = await kApp.inject({ method: 'GET', url: '/api/state?limit=1', remoteAddress: '127.0.0.1' });
+      assert.ok(!state.body.includes(plain), '/api/state carries no plaintext');
+      const digest = createHash('sha256').update(plain).digest('hex');
+      assert.ok(!state.body.includes(digest), '/api/state carries no digest either');
+
+      // The state file on disk holds the digest, never the plaintext.
+      const onDisk = JSON.stringify(kArbiter['store'].state.client_keys);
+      assert.ok(onDisk.includes(digest), 'the persisted row carries the digest');
+      assert.ok(!onDisk.includes(plain), 'the persisted row NEVER carries the plaintext');
+
+      // The loopback key-pull hands DIGESTS (ADD-key), never the plaintext.
+      const pull = await kApp.inject({ method: 'GET', url: '/api/server-keys', remoteAddress: '127.0.0.1', headers: { authorization: `Bearer ${AGG_TOKEN}` } });
+      assert.equal(pull.statusCode, 200);
+      const pb = pull.json() as { client_key_hashes: string[] };
+      assert.ok(Array.isArray(pb.client_key_hashes), 'the pull carries the digest array');
+      assert.ok(pb.client_key_hashes.includes(digest), 'the digest the router enforces is present');
+      assert.ok(!pull.body.includes(plain), 'the pull hands DIGESTS, never a plaintext');
+      const awayPull = await kApp.inject({ method: 'GET', url: '/api/server-keys', remoteAddress: '100.105.225.1', headers: { authorization: `Bearer ${AGG_TOKEN}` } });
+      assert.equal(awayPull.statusCode, 403, 'the digest pull stays loopback-only');
+
+      // Revoke: 200 then the row is gone; unknown id is 404.
+      const rev = await kApp.inject({ method: 'POST', url: '/api/client-keys/revoke', remoteAddress: '127.0.0.1', headers: { authorization: `Bearer ${AGG_TOKEN}` }, body: { id } });
+      assert.equal(rev.statusCode, 200);
+      assert.deepEqual(kArbiter.clientKeys(), [], 'the row is removed');
+      const again = await kApp.inject({ method: 'POST', url: '/api/client-keys/revoke', remoteAddress: '127.0.0.1', headers: { authorization: `Bearer ${AGG_TOKEN}` }, body: { id } });
+      assert.equal(again.statusCode, 404, 'a second revoke of the same id is unknown_key');
+    } finally {
+      await kApp.close();
+    }
+  } finally {
+    rmSync(kDir, { recursive: true, force: true });
+  }
+});
+
+test('#68 aggregate_port publishes on the register heartbeat + answers /api/agent-endpoints for an online daemon only', async () => {
+  // A daemon that reports its bound aggregate port shows up; the URL is the
+  // loopback agent base (#64 listener), the value an agent config points at.
+  await fetch(`${base}/api/clients/register`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({ name: 'agg-port-client', projects: [{ name: 'career-ops', model: 'm', estimated_seconds: 1, queue_depth: 0 }], aggregate_port: 8800 }),
+  });
+  const eps = (await (await fetch(`${base}/api/agent-endpoints`, { headers: auth })).json()) as { endpoints: { client: string; url: string }[] };
+  const hit = eps.endpoints.find((e) => e.client === 'agg-port-client');
+  assert.ok(hit, 'the online daemon with a reported port is offered');
+  assert.equal(hit!.url, 'http://127.0.0.1:8800/v1', 'the agent base is the bound aggregate port + /v1');
+
+  // A malformed port is dropped (never stored), so the client is not offered.
+  await fetch(`${base}/api/clients/register`, { method: 'POST', headers: auth, body: JSON.stringify({ name: 'agg-bad-port', aggregate_port: 'nope' }) });
+  const eps2 = (await (await fetch(`${base}/api/agent-endpoints`, { headers: auth })).json()) as { endpoints: { client: string }[] };
+  assert.ok(!eps2.endpoints.some((e) => e.client === 'agg-bad-port'), 'a malformed aggregate_port is dropped, never offered');
+
+  // The port rides the client row verbatim (ADD-key on /api/state).
+  const st = (await (await fetch(`${base}/api/state?limit=1`, { headers: auth })).json()) as { clients: { name: string; aggregate_port?: number }[] };
+  assert.equal(st.clients.find((c) => c.name === 'agg-port-client')!.aggregate_port, 8800);
 });
 
 
