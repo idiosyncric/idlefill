@@ -49,8 +49,32 @@ async function driveServer(clientDir, requests, env) {
   });
   const lines = [];
   const stderrBuf = [];
+  // Fast path: end stdin the instant every request that expects a response
+  // (has an id) has been answered, instead of a fixed 1500ms sleep per test.
+  // A notification (no id) never awaits a response, so it is excluded. The
+  // fallback below still ends stdin if an expected answer never lands, so
+  // the server's stdin 'end' handler exits the child either way.
+  const requestIds = requests.filter((r) => r && r.id !== undefined).map((r) => r.id);
+  const answered = new Set();
+  let stdinEnded = false;
+  const endStdin = () => {
+    if (!stdinEnded) {
+      stdinEnded = true;
+      child.stdin.end();
+    }
+  };
   child.stdout.on('data', (d) => {
-    for (const l of d.toString().split('\n')) if (l.trim()) lines.push(l);
+    for (const l of d.toString().split('\n')) {
+      if (!l.trim()) continue;
+      lines.push(l);
+      try {
+        const m = JSON.parse(l);
+        if (m.id !== undefined) answered.add(m.id);
+      } catch {
+        /* non-JSON line: ignore for id tracking */
+      }
+    }
+    if (requestIds.every((id) => answered.has(id))) endStdin();
   });
   child.stderr.on('data', (d) => stderrBuf.push(d.toString()));
   child.stdin.write(requests.map((r) => JSON.stringify(r) + '\n').join(''));
@@ -64,7 +88,7 @@ async function driveServer(clientDir, requests, env) {
       resolve();
     });
   });
-  setTimeout(() => child.stdin.end(), 1500);
+  setTimeout(endStdin, 3000);
   await closed;
   const byId = {};
   for (const l of lines) {

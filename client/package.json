@@ -9,7 +9,7 @@
     "start": "tsx src/index.ts",
     "dev": "tsx src/index.ts",
     "version": "tsx src/index.ts --version",
-    "test": "tsx --test test/proxy.test.ts test/aggregate.test.ts test/aliases.test.ts test/client-projects.test.ts test/session-gate.test.ts test/lease-loop.test.ts test/priority-order.test.ts test/sigint.test.ts test/group-kill.test.ts test/version-handshake.test.ts test/revision.test.ts test/adapter-registry.test.ts test/rebuild-scheduler.test.ts test/dev-cycle-worked-example.test.ts test/cycle-driver.test.ts test/cycle-publish.test.ts"
+    "test": "tsx --test --test-timeout=20000 --test-force-exit test/proxy.test.ts test/aggregate.test.ts test/aliases.test.ts test/client-projects.test.ts test/session-gate.test.ts test/lease-loop.test.ts test/priority-order.test.ts test/sigint.test.ts test/group-kill.test.ts test/version-handshake.test.ts test/revision.test.ts test/adapter-registry.test.ts test/rebuild-scheduler.test.ts test/cycle-driver.test.ts test/cycle-publish.test.ts"
   },
   "dependencies": {
     "ws": "^8.18.0"

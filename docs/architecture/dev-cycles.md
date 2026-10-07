@@ -9,8 +9,11 @@ series, no resumability, no self-improvement.
 
 This document is the GRILL, not the build. It locks the cycle state
 machine onto the primitives that already exist. The spike
-(`client/test/dev-cycle-worked-example.test.ts`) proves the mapping runs
-end-to-end on the noop adapter before any `client/src/` change is filed.
+(`client/test/dev-cycle-worked-example.test.ts`) proved the mapping runs
+end-to-end on the noop adapter before any `client/src/` change was filed.
+The spike has since retired — the shipped feature tests
+(`client/test/cycle-driver.test.ts`, `client/test/cycle-publish.test.ts`)
+supersede it.
 
 ## The rules a cycle must not break
 
