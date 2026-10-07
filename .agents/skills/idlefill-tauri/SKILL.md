@@ -114,6 +114,12 @@ release builds compile them out and `tauri-pilot ping` against the INSTALLED
   forwards-and-exits (exit 0, zero output). Stop the installed app first,
   and remove the si socket if its holder died. Re-kickstart
   `com.sam.idlefill.app` when the debug session ends.
+- Pilot `screenshot --window settings` can die with `JavaScript error:
+  [object Event]` even though snapshot/assert/html work; `html` is the
+  reliable DOM read on the bundled views (dump it, grep for data-slot
+  attrs). Tray position via System Events: coerce both coords with
+  `as string` before joining — `position & "," & position` yields a
+  spaced list that cliclick rejects.
 - Pilot `eval` on the BUNDLED views fails with the CSP refusal
   (`'unsafe-eval' ... not an allowed source of script`) — that CSP is the
   security posture; do not add `'unsafe-eval'` to chase it. The non-eval
