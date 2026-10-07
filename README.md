@@ -1193,6 +1193,29 @@ webview reads as one tabbed surface), then the sections of the active view,
 and the fixed bottom **logs** tray (Events/Leases tabs, shared
 records-to-show — a dock, not a tab: it stays reachable from every view).
 
+- **The hand-off pair** — two quiet header buttons, `copy url` and
+  `copy token`, next to the gate-token field. They put the two values an
+  agent config needs to reach this arbiter on the clipboard: `server_url`
+  and the API token. One button per value (the paste targets are two
+  different config fields, so one combined button would force the operator
+  to split the string by hand). `copy url` copies `location.origin` — the
+  origin the page is provably served from, which is also what the
+  dashboard's own fetches ride; a loopback origin only answers this
+  machine, so a remote agent needs the tailnet URL (open the page on that
+  URL, or copy it from the mesh row). `copy token` copies the token THIS
+  browser already holds (`localStorage idlefill.token`); with nothing
+  stored the label says `paste it in first` rather than putting an empty
+  value on the clipboard. **There is deliberately no server route that
+  serves the token** — every `/api/*` read is token-gated or anonymous
+  (the write-only credential posture), so a token-returning route would
+  hand the credential to any page that can read it. Clipboard mechanics
+  ride one helper (`copyText`): `navigator.clipboard` is UNDEFINED on a
+  plain-HTTP origin that is not loopback (`isSecureContext` excludes
+  `http://<tailnet-ip>:8787`), so the async API needs an
+  `execCommand("copy")` textarea fallback; a button that cannot copy says
+  `copy failed` and leaves it there — a blind `copied` over an empty
+  clipboard is the worst failure mode for a paste into an agent config.
+
 - **The view split** — every section carries a view: **Overview** =
   Inference Servers, Machines (mesh), Cycles, Throttled jobs; **Projects** =
   the Projects pane + queue search; **Sessions** = interactive traffic;

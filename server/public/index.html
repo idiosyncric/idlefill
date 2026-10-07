@@ -51,6 +51,9 @@
     width: 220px;
   }
   #gate-token-hint { color: var(--dim); font-size: 11px; }
+  /* The hand-off pair rides the header's right cluster, after the token
+     field: two quiet buttons, one per value an agent config needs. */
+  #handoff-row { display: inline-flex; align-items: center; gap: 6px; }
   main { padding: 16px 20px; display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 14px; align-items: start; }
   section {
     background: var(--panel); border: 1px solid var(--border);
@@ -483,6 +486,15 @@
     <label class="k" for="gate-token">gate token</label>
     <input id="gate-token" type="password" placeholder="arbiter API token (enables gate changes)" autocomplete="off">
     <span id="gate-token-hint"></span>
+  </span>
+  <!-- Hand-off pair: the two values an agent needs to reach this arbiter —
+       server_url and the API token. One button per value (never one button
+       for both: the paste targets are two different config fields). The
+       token is copied, never rendered; it stays the value THIS browser
+       already holds. -->
+  <span id="handoff-row">
+    <button id="copy-url" class="btn" type="button" data-rest="copy url" title="copy this arbiter's URL — what an agent's server_url points at">copy url</button>
+    <button id="copy-token" class="btn" type="button" data-rest="copy token" title="copy the arbiter API token stored in this browser — what an agent's token points at">copy token</button>
   </span>
 </header>
 
@@ -1307,10 +1319,7 @@ function wireLauncher() {
       return;
     }
     if (btn.classList.contains("copy")) {
-      navigator.clipboard?.writeText(btn.dataset.line).then(
-        () => { btn.textContent = "copied"; setTimeout(() => { btn.textContent = "copy"; }, 1200); },
-        () => { btn.textContent = "copy failed"; },
-      );
+      copyText(btn.dataset.line).then((ok) => flashCopied(btn, ok));
       return;
     }
     if (btn.classList.contains("drop")) {
@@ -2219,6 +2228,46 @@ function gateToken() {
   try { return localStorage.getItem(GATE_TOKEN_KEY) || ""; } catch { return ""; }
 }
 
+// Copy-to-clipboard with the button-label idiom (copy → copied → copy).
+// navigator.clipboard is undefined on a plain-HTTP origin that is NOT
+// loopback (the tailnet IP page, and the desktop app's External page on
+// http://<tailnet>:8787) — isSecureContext excludes those, so the async
+// API is simply missing. The textarea+execCommand fallback works on every
+// origin; it needs the click's user activation, which both call sites
+// have. Returns the promise the label flip rides.
+function copyText(text) {
+  const done = (ok) => Promise.resolve(ok);
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard.writeText(text).then(() => true, () => fallbackCopy(text));
+  }
+  return done(fallbackCopy(text));
+}
+function fallbackCopy(text) {
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "-2000px";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    return ok;
+  } catch { return false; }
+}
+// The shared label flip: a copied button says "copied" for 1.2s, a failure
+// says "copy failed" until the next click (the failure must persist — the
+// operator needs to see the copy did NOT happen before pasting it blind).
+// The resting label rides data-rest (the hand-off buttons' resting labels
+// are not "copy", and the rebuilt launcher buttons always set it).
+function flashCopied(btn, ok) {
+  const rest = btn.dataset.rest || "copy";
+  if (!ok) { btn.textContent = "copy failed"; return; }
+  btn.textContent = "copied";
+  setTimeout(() => { btn.textContent = rest; }, 1200);
+}
+
 function gateModeFor(override) {
   return override && override.override === "pause" ? "paused" : "scheduled";
 }
@@ -2879,6 +2928,39 @@ $("gate-token").addEventListener("change", () => {
   $("gate-token-hint").textContent = gateToken() ? "stored ✓" : "(not set)";
   $("gate-token").value = ""; // clear the field; the hint shows the stored state
   refreshAliases(); // #66: the Models pane's read needs the token — fill it now
+});
+
+// ---------------------------------------------------------------------------
+// Hand-off pair — the two values an agent config needs to reach this arbiter
+// (server_url + the API token), one button each so either paste target is a
+// single click.
+//   copy url    — location.origin: the origin THIS page is provably served
+//                 from (the same URL the dashboard's own fetches ride). A
+//                 loopback origin is only reachable from this machine; an
+//                 agent on another box needs the tailnet URL instead.
+//   copy token  — the token THIS browser already holds (the gate-token
+//                 field's stored value). The arbiter NEVER serves the token
+//                 over any route (every /api/* read is token-gated or
+//                 anonymous; the write-only credential posture), so there is
+//                 no fetch to add — and adding one would hand the credential
+//                 to whatever page can read it. With no token stored, the
+//                 button says what is missing instead of copying nothing.
+// ---------------------------------------------------------------------------
+$("copy-url").addEventListener("click", () => {
+  const btn = $("copy-url");
+  copyText(location.origin).then((ok) => flashCopied(btn, ok));
+});
+$("copy-token").addEventListener("click", () => {
+  const btn = $("copy-token");
+  const tok = gateToken();
+  if (!tok) {
+    // The paste target needs a real value — a silent empty clipboard is the
+    // worst outcome here (the agent config gets an empty token).
+    btn.textContent = "paste it in first";
+    setTimeout(() => { btn.textContent = btn.dataset.rest; }, 1600);
+    return;
+  }
+  copyText(tok).then((ok) => flashCopied(btn, ok));
 });
 
 // ---------------------------------------------------------------------------

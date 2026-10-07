@@ -290,6 +290,20 @@ test('dashboard carries the view-tab structure (Resources consolidation: four su
 // verified by eye; this covers the wiring the cards depend on.
 // ---------------------------------------------------------------------------
 
+test('the anonymous surfaces never carry the API token (the copy-token button reads the browser, not the server)', async () => {
+  // The header's hand-off pair copies the token THIS browser holds — there is
+  // deliberately no route that serves it. This pins that posture: the two
+  // anonymous surfaces (the dashboard document, the state poll) must not
+  // contain the configured token, so a browser that has never been handed it
+  // cannot read it out of anything the arbiter serves.
+  const token = cfg.api_tokens[0];
+  const doc = await (await fetch(`${base}/`)).text();
+  assert.ok(!doc.includes(token), 'the dashboard HTML never embeds the token');
+  assert.match(doc, /id="copy-token"/, 'the hand-off pair is on the page (the copy is client-side)');
+  const st = await (await fetch(`${base}/api/state`)).text();
+  assert.ok(!st.includes(token), 'the anonymous /api/state never carries the token');
+});
+
 test('queue detail page serves the same dashboard at /[project]/[worker]/queue', async () => {
   // The queue page is the SAME single-file dashboard (the inline script
   // switches views on location.pathname). Public read, like `/` (phase 1).

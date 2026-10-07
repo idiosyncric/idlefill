@@ -4,6 +4,8 @@ import { Input } from "@/components/ui/input";
 import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
 import { getState, apiToken, setApiToken, type StateSnapshot } from "@/lib/api";
+import { copyText } from "@/lib/clipboard";
+import { Button } from "@/components/ui/button";
 import { InferenceServers } from "@/views/InferenceServers";
 
 const VIEWS = ["overview", "resources", "sessions", "usage"] as const;
@@ -33,6 +35,22 @@ export function App() {
   const [st, setSt] = React.useState<StateSnapshot | null>(null);
   const [stErr, setStErr] = React.useState<string | null>(null);
   const [tokenDraft, setTokenDraft] = React.useState(apiToken() ?? "");
+  // Hand-off pair: "copied" / "copy failed" / "paste it in first" rides the
+  // button label for ~1.2s, then the label resets. null = resting.
+  const [urlFlash, setUrlFlash] = React.useState<string | null>(null);
+  const [tokFlash, setTokFlash] = React.useState<string | null>(null);
+
+  const flash = (set: (s: string | null) => void, msg: string) => {
+    set(msg);
+    window.setTimeout(() => set(null), 1400);
+  };
+  const doCopy = (text: string | null, missing: string, set: (s: string | null) => void) => {
+    if (!text) {
+      flash(set, missing);
+      return;
+    }
+    copyText(text).then((ok) => flash(set, ok ? "copied" : "copy failed"));
+  };
 
   // 5s poll, like the legacy dashboard (the WS push plane comes later).
   React.useEffect(() => {
@@ -94,6 +112,29 @@ export function App() {
             }}
           />
           {apiToken() && <span className="text-[11px] text-ok">stored ✓</span>}
+        </div>
+        {/* Hand-off pair: the two values an agent config needs to reach this
+            arbiter — server_url and the API token. One button per value (the
+            paste targets are two different config fields). The token is
+            copied, never rendered: it is the value THIS browser already
+            holds — the arbiter never serves it over any route. */}
+        <div className="flex items-center gap-1.5">
+          <Button
+            variant="outline"
+            size="xs"
+            title="copy this arbiter's URL — what an agent's server_url points at"
+            onClick={() => doCopy(__IDLEFILL_DEV_API__ ?? window.location.origin, "no url", setUrlFlash)}
+          >
+            {urlFlash ?? "copy url"}
+          </Button>
+          <Button
+            variant="outline"
+            size="xs"
+            title="copy the arbiter API token stored in this browser — what an agent's token points at"
+            onClick={() => doCopy(apiToken(), "paste it in first", setTokFlash)}
+          >
+            {tokFlash ?? "copy token"}
+          </Button>
         </div>
       </header>
 
