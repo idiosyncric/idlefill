@@ -745,23 +745,26 @@ pub fn build() -> tauri::Result<()> {
         // halves). Builder-level: this is the Builder's API (app.rs:2197),
         // not App's — setup has no on_window_event.
         .on_window_event(|window, event| {
-            let kind = match event {
+            // One executor for every directive: the kind and the close
+            // api resolve together, then the verdict runs BOTH halves
+            // inline. An early `return` in the CloseRequested arm is how
+            // the red X went back to being a no-op after #71 — the hide
+            // half lived in a match that arm never reached.
+            let (kind, api) = match event {
                 tauri::WindowEvent::CloseRequested { api, .. } => {
-                    if window_directive(window.label(), WindowEventKind::CloseRequested)
-                        == WindowDirective::CloseToTray
-                    {
-                        api.prevent_close();
-                    }
-                    return;
+                    (WindowEventKind::CloseRequested, Some(api))
                 }
-                tauri::WindowEvent::Focused(false) => WindowEventKind::Blurred,
-                _ => WindowEventKind::Other,
+                tauri::WindowEvent::Focused(false) => (WindowEventKind::Blurred, None),
+                _ => (WindowEventKind::Other, None),
             };
             match window_directive(window.label(), kind) {
-                WindowDirective::Dismiss => {
+                WindowDirective::CloseToTray => {
+                    if let Some(api) = api {
+                        api.prevent_close();
+                    }
                     let _ = window.hide();
                 }
-                WindowDirective::CloseToTray => {
+                WindowDirective::Dismiss => {
                     let _ = window.hide();
                 }
                 WindowDirective::NoAction => {}
