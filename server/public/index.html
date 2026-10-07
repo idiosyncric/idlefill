@@ -188,6 +188,66 @@
   .sess .sstate { font-size: 12px; font-weight: 600; white-space: nowrap; }
   .sess .gate { margin-left: 0; }
   .sess.stale { opacity: 0.55; }
+  /* #67 Sessions FLOW view — the glance surface beside the dense rows.
+     Two node columns (sessions grouped by requested model on the left,
+     inference engines on the right) joined by orthogonal rounded connectors
+     in an SVG overlay. The dashboard's own SVG + CSS speaking archify's
+     language: quiet chrome, semantic colors from design tokens, reader-
+     visible statistics on nodes and pipes. Named pipe vars (a later issue
+     makes the scheme configurable; the NAMES are the contract):
+       --pipe-base    calm idle, --pipe-queued warn/dashed,
+       --pipe-thinking green (reasoning deltas), --pipe-output blue (content
+       deltas), --pipe-tools purple (tool_calls deltas). Motion runs ON the
+       pipe ENGINE→SESSION (the stream direction); prefers-reduced-motion
+     falls back to static phase colors. */
+  #flow { position: relative; }
+  #flow .flow-cols { display: flex; gap: 120px; align-items: flex-start; }
+  #flow .flow-col { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+  #flow .flow-head { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--dim); font-weight: 600; margin-bottom: 2px; }
+  /* Model group head: the name a session group is TRYING to use (per-machine
+     truth: sessions report the name; grouping is by that name across rows;
+     counts label per machine). */
+  #flow .fgroup { font-size: 11px; color: var(--dim); margin: 6px 0 1px; overflow-wrap: anywhere; }
+  #flow .fgroup b { color: var(--text); font-weight: 600; }
+  #flow .fnode {
+    border: 1px solid var(--border); border-radius: 6px; background: var(--bg);
+    padding: 4px 8px; font-size: 12px; min-height: 28px; display: flex;
+    align-items: baseline; gap: 6px; position: relative; cursor: default;
+  }
+  #flow .fnode .fname { font-weight: 600; overflow-wrap: anywhere; }
+  #flow .fnode .fmeta { color: var(--dim); white-space: nowrap; font-size: 11px; }
+  #flow .fnode .fload { margin-left: auto; color: var(--dim); white-space: nowrap; font-size: 11px; }
+  #flow .fnode.engine { border-color: var(--border); }
+  /* Drop-target states (drag + keyboard preview). */
+  #flow .fnode.target-ok { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  #flow .fnode.target-no { opacity: 0.55; }
+  #flow .fnode.engine.pinned-node { border-color: var(--accent); }
+  #flow svg.flow-svg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
+  #flow .pipe { fill: none; stroke: var(--pipe-base, var(--border)); stroke-width: 1.6; pointer-events: stroke; }
+  #flow .pipe.queued { stroke: var(--pipe-queued, var(--warn)); stroke-dasharray: 5 4; }
+  #flow .pipe.responding { stroke-width: 2.2; }
+  #flow .pipe.thinking { stroke: var(--pipe-thinking, var(--ok)); }
+  #flow .pipe.output   { stroke: var(--pipe-output, var(--accent)); }
+  #flow .pipe.tools    { stroke: var(--pipe-tools, #bc8cff); }
+  /* Response motion: dashes travel ENGINE→SESSION. The path is authored
+     session→engine, and an INCREASING dashoffset walks the dash pattern
+     back toward the path START (the session end) — the stream direction. */
+  @media (prefers-reduced-motion: no-preference) {
+    #flow .pipe.responding { stroke-dasharray: 7 9; animation: pipeflow 1.1s linear infinite; }
+  }
+  @keyframes pipeflow { to { stroke-dashoffset: 160; } }
+  /* The pipe line itself is the keyboard affordance (focus ring rides the
+     stroke; ≥44px hit area = the invisible fat hit-path under it). */
+  #flow .pipe-hit { fill: none; stroke: transparent; stroke-width: 22; pointer-events: stroke; cursor: pointer; }
+  #flow .pipe.sel { stroke-width: 3; }
+  #flow .pipe.preview { stroke: var(--accent); stroke-dasharray: 4 4; }
+  /* The draggable engine-end handle (invisible ≥44px circle + a dot). */
+  #flow .end-dot { fill: var(--pipe-base, var(--border)); pointer-events: none; }
+  #flow .end-handle { fill: transparent; pointer-events: all; cursor: grab; }
+  #flow .end-handle:active { cursor: grabbing; }
+  #flow .pend-marker { fill: none; stroke: var(--pipe-queued, var(--warn)); stroke-width: 1.6; }
+  #flow .flow-help { color: var(--dim); font-size: 11px; margin-top: 6px; }
+  .sess-mode-toggle { margin-left: 8px; }
   /* The worker list collapses (the tray chevron's 150ms pattern, applied to
      a per-project toggle). Expanded by default; state per project in
      localStorage (idlefill.projWorkers.<name>). */
@@ -429,8 +489,12 @@
        router enforces admission; the arbiter stores + exposes — the
        dashboard only displays arbiter truth). -->
   <section id="sessions-section" data-view="sessions" style="display:none">
-    <h2>Sessions</h2>
+    <h2>Sessions <button id="sess-mode-toggle" class="unthrottle sess-mode-toggle" type="button" title="switch between the dense session rows and the #67 flow view (sessions grouped by model, connectors to the engines they route to)"></button></h2>
     <div id="sessions"></div>
+    <!-- #67 flow view: the same published payload drawn as a live surface.
+         Rows mode stays exactly as today (the dense ops view); flow is the
+         glance view. Mode persists per page (idlefill.sessMode). -->
+    <div id="flow" style="display:none"></div>
   </section>
 
   <!-- Session launcher (#43): mint a session token and hand over the exact
@@ -1304,9 +1368,22 @@ async function refresh() {
   const sessRows = st.sessions || [];
   if (sessRows.length === 0) {
     $("sessions-section").style.display = "none";
+    $("flow").style.display = "none";
+    $("flow").innerHTML = "";
   } else {
     $("sessions-section").style.display = "";
-    sessBox.innerHTML = sessRows.map((s) => sessBlock(s, st)).join("");
+    // #67: rows mode is the dense ops view (byte-for-byte today's rows);
+    // flow mode is the glance view. One paints; the other clears.
+    if (sessMode() === "flow") {
+      sessBox.innerHTML = "";
+      sessBox.style.display = "none";
+      renderFlowView(st);
+    } else {
+      $("flow").style.display = "none";
+      $("flow").innerHTML = "";
+      sessBox.style.display = "";
+      sessBox.innerHTML = sessRows.map((s) => sessBlock(s, st)).join("");
+    }
   }
 
   // --- Session launcher (#43) — exception-only: hidden until a client
@@ -2025,6 +2102,463 @@ async function setProjectPaused(name, paused) {
   } catch (err) {
     flashGateMsg("project pause failed: " + err.message, "err");
     return false;
+  }
+}
+
+
+// ---------------------------------------------------------------------------
+// #67 Sessions FLOW view — the glance surface inside the Sessions vtab.
+// Same published payload as the rows (phase, engine_pin, catalog,
+// model_aliases): sessions grouped by the model name they TRY to use on
+// the left, inference engines on the right, orthogonal rounded connectors
+// between. Pipe state: base = calm idle, warn+dashed = queued at the
+// router, animated dashes ENGINE→SESSION while the engine answers, colored
+// by the reported phase (thinking green / output blue / tools purple).
+// Drag the connector's engine end onto another node to write the pin plane
+// (POST /api/sessions/:token/pin — the arbiter constrains legality); a
+// rejected write is told + reverts on the next poll. Keyboard: click or Tab
+// to a pipe, arrows move the highlighted legal target, Enter writes, Esc
+// cancels. Reduced motion keeps static phase colors. Fail-quiet: missing
+// add-keys render base-colored pipes (the surfaces-always-render rule).
+// ---------------------------------------------------------------------------
+const FLOW_MODE_KEY = "idlefill.sessMode";
+const FLOW_PHASE_MAX_AGE_MS = 10_000; // a phase older than this is a stalled report — render idle
+
+function sessMode() {
+  try { return localStorage.getItem(FLOW_MODE_KEY) === "flow" ? "flow" : "rows"; } catch { return "rows"; }
+}
+function setSessMode(mode) {
+  try { localStorage.setItem(FLOW_MODE_KEY, mode); } catch { }
+  renderFlowView(LAST_ST);
+}
+
+// The model NAME a session group is labeled with (per-machine truth: the
+// name the session asks for, sniffed by the router; grouping is by that
+// name across rows). Absent = the watched default.
+function sessGroupName(sess) {
+  const m = sess.history && typeof sess.history.model === "string" ? sess.history.model : "";
+  return m || "(no model seen yet)";
+}
+
+// The row a session routes to: the engine_pin's server_id wins (the
+// operator's standing choice), else the heartbeat's server_id, else the
+// watched row.
+function sessTargetId(sess) {
+  if (sess.engine_pin && typeof sess.engine_pin.server_id === "string") return sess.engine_pin.server_id;
+  return sess.server_id || "srv-watched";
+}
+
+// Which pipes flow phase color: the session is answering (active + a fresh
+// phase report) — never a phase older than the heartbeat cadence.
+function sessPhaseNow(sess, st) {
+  const p = sess.phase;
+  if (!p || !p.state) return null;
+  if (!(st.now - p.at < FLOW_PHASE_MAX_AGE_MS)) return null;
+  return p.state;
+}
+
+// Legal pin targets for one session (mirrors arbiter.setSessionPin: alias
+// sessions may only pin their pair rows; a bare model must be carried by
+// the target row's probed/declared inventory; no known model = any row).
+function sessLegalTargets(sess, st) {
+  const model = sess.history && typeof sess.history.model === "string" ? sess.history.model : "";
+  const ids = new Set((st.servers || []).map((sv) => sv.id));
+  if (!model) return [...ids];
+  // Alias session: legal = the alias's pair rows (the stored rows via the
+  // token-gated cache; the public winner block as the no-token fallback).
+  const cached = (aliasesCache || []).find((a) => a.alias === model);
+  if (cached) return (cached.pairs || []).map((p) => p.server_id).filter((id) => ids.has(id));
+  const pub = (st.model_aliases || []).find((a) => a.name === model);
+  if (pub) return [pub.server_id].filter((id) => ids.has(id));
+  // Bare-name session: rows whose inventory carries the name. The deduped
+  // catalog answers for the first row; the inv fold above already covered
+  // alias pairs — for a bare name, every row that declares it anywhere.
+  const out = [];
+  for (const c of st.catalog || []) if (c.name === model && ids.has(c.server_id)) out.push(c.server_id);
+  return [...new Set(out)];
+}
+
+// Live #67 state so a re-render (and the drag gesture) survives innerHTML
+// rebuilds: the selected pipe, and the in-progress retarget.
+let flowSel = null;       // { kind: 'pipe'|'engine', id }
+let flowPending = null;   // { token, from, to } — operator intent ahead of server truth
+let flowDrag = null;      // { token, from, x, y } — mid pointer-drag
+
+function flowToggleLabel() {
+  const btn = $("sess-mode-toggle");
+  if (!btn) return;
+  btn.textContent = sessMode() === "flow" ? "rows" : "flow";
+  btn.title = sessMode() === "flow"
+    ? "switch to the dense session rows (the ops view)"
+    : "switch to the flow view (sessions grouped by model, connectors to the engines)";
+}
+
+function renderFlowView(st) {
+  const box = $("flow");
+  if (!box) return;
+  flowToggleLabel();
+  if (sessMode() !== "flow") {
+    box.style.display = "none";
+    box.innerHTML = "";
+    return;
+  }
+  const rows = st.sessions || [];
+  if (rows.length === 0) {
+    box.style.display = "none";
+    return;
+  }
+  // The arbiter's engine rows + the per-row model inventory. The catalog
+  // (#64 D4) is deduped per NAME — so a SECOND row that also serves the
+  // name would be invisible here; fold in the alias pairs (#66) so the
+  // legal target set matches arbiter.setSessionPin's truth.
+  const engines = (st.servers || []).slice().sort((a, b) => String(a.name).localeCompare(String(b.name)));
+  const inv = new Map(); // server_id -> Set(model names)
+  for (const c of st.catalog || []) {
+    if (!inv.has(c.server_id)) inv.set(c.server_id, new Set());
+    inv.get(c.server_id).add(c.name);
+  }
+  // The PUBLIC model_aliases block is winner-only (#66 D3); the full pair
+  // set rides the token-gated aliasesCache (GET /api/aliases, 30s cadence)
+  // when a token is stored. Either way legality matches the arbiter.
+  for (const a of aliasesCache || []) {
+    for (const p of a.pairs || []) {
+      if (!p || !p.server_id) continue;
+      if (!inv.has(p.server_id)) inv.set(p.server_id, new Set());
+      inv.get(p.server_id).add(a.alias);
+    }
+  }
+  const engineName = new Map(engines.map((e) => [e.id, e.name]));
+
+  // Left column: sessions grouped by the model NAME they try to use.
+  const groups = new Map();
+  for (const s of rows) {
+    const g = sessGroupName(s);
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push(s);
+  }
+  const groupNames = [...groups.keys()].sort((a, b) => a.localeCompare(b));
+
+  const sessNodes = [];
+  const leftHtml = groupNames.map((g) => {
+    const members = groups.get(g);
+    const perMachine = {};
+    for (const s of members) perMachine[s.client_name || "unknown host"] = (perMachine[s.client_name || "unknown host"] || 0) + 1;
+    const counts = Object.entries(perMachine).map(([m, n]) => m + " \u00d7" + n).join(", ");
+    const rowsHtml = members.map((s) => {
+      const shortTok = String(s.token ?? "").slice(0, 8);
+      const stale = st.now - (s.last_seen ?? 0) >= SESSION_ONLINE_MS;
+      sessNodes.push({ token: s.token, shortTok, name: shortTok + (s.client_name ? " @" + s.client_name : ""), stale, sess: s });
+      return '<div class="fnode sess-node' + (stale ? " stale" : "") + '" data-flow-node="sess:' + esc(shortTok) + '" data-token="' + esc(s.token) + '"' +
+        ' title="session ' + esc(s.token) + ' — grouped by the model name it tries to use (' + esc(g) + '); the connector shows the engine it routes to">' +
+        '<span class="dot ' + (stale ? "off" : "on") + '"></span>' +
+        '<span class="fname">' + esc(shortTok) + "</span>" +
+        (s.client_name ? '<span class="fmeta">' + esc(s.client_name) + "</span>" : "") +
+        "</div>";
+    }).join("");
+    return '<div class="fgroup" title="sessions grouped by the model name they ask for; counts per machine"><b>' + esc(g) + "</b> \u2014 " + esc(counts) + "</div>" + rowsHtml;
+  }).join("");
+
+  // Right column: engine nodes with load stats (counts read from the
+  // session rows: active = gate.state active OR inflight-looking, queued =
+  // gate.state queued — arbiter-published truth, the page never computes
+  // beyond counting).
+  const engineNodes = [];
+  const rightHtml = engines.map((e) => {
+    const load = { active: 0, queued: 0 };
+    let pinnedHere = false;
+    for (const s of rows) {
+      if (sessTargetId(s) !== e.id) continue;
+      if (s.engine_pin && s.engine_pin.server_id === e.id) pinnedHere = true;
+      const g = s.gate;
+      if (g && g.state === "queued") load.queued++;
+      else if (g && g.state === "active") load.active++;
+      else if (st.now - (s.last_activity ?? -1e15) < SESSION_ACTIVE_MS) load.active++;
+    }
+    engineNodes.push({ id: e.id, name: e.name });
+    const sig = e.signal;
+    const sigWord = !sig ? "" : sig.idle ? "idle " + (sig.idle_for_s ?? "\u2014") + "s" : "busy";
+    return '<div class="fnode engine' + (pinnedHere ? " pinned-node" : "") + '" data-flow-node="engine:' + esc(e.id) + '" title="' + esc(e.name) + " — " + (load.active + load.queued) + ' session(s) route here (' + load.active + ' active, ' + load.queued + ' queued)' + (sigWord ? " \u00b7 signal: " + sigWord : "") + '">' +
+      '<span class="dot ' + (sig && !sig.idle ? "on" : "off") + '"></span>' +
+      '<span class="fname">' + esc(e.name) + "</span>" +
+      '<span class="fload" title="sessions routing here: active / queued">' + load.active + " act \u00b7 " + load.queued + " q</span>" +
+      "</div>";
+  }).join("");
+
+  // Re-render = wipe + rebuild: the pipes ride as the LAST child (the SVG
+  // paints above the node chrome), and the DOM stays idempotent per tick.
+  box.innerHTML = "";
+  box.style.display = "";
+  box.insertAdjacentHTML("beforeend",
+    '<div class="flow-cols">' +
+    '<div class="flow-col" id="flow-left"><div class="flow-head">Sessions by model</div>' + leftHtml + "</div>" +
+    '<div class="flow-col" id="flow-right"><div class="flow-head">Inference engines</div>' + rightHtml + "</div>" +
+    "</div>" +
+    '<div class="flow-help">click a connector to select it, arrow keys + Enter to re-route (or drag its engine dot onto another node) \u00b7 Esc cancels \u00b7 the agent never learns the engine changed</div>');
+  // Keep Tab order sane: only the SELECTED pipe carries a focusable handle.
+  if (flowSel && flowSel.kind === "pipe") flowSel = sessNodes.some((n) => n.token === flowSel.id) ? flowSel : null;
+  renderFlowPipes(box, sessNodes, engineNodes, rows, st);
+  wireFlow();
+}
+
+// One orthogonal rounded path: session right-edge → engine left-edge.
+function flowPipePath(x1, y1, x2, y2, r) {
+  r = Math.max(0, Math.min(r, Math.abs(y2 - y1) / 2, Math.abs(x2 - x1) / 2));
+  if (y1 === y2) return "M" + x1 + " " + y1 + " L" + x2 + " " + y2;
+  const midX = (x1 + x2) / 2;
+  const dir = y2 > y1 ? 1 : -1;
+  return "M" + x1 + " " + y1 + " H" + (midX - r) +
+    " Q" + midX + " " + y1 + " " + midX + " " + (y1 + r * dir) +
+    " V" + (y2 - r * dir) +
+    " Q" + midX + " " + y2 + " " + (midX + r) + " " + y2 +
+    " H" + x2;
+}
+
+function renderFlowPipes(box, sessNodes, engineNodes, rows, st) {
+  // Nodes first, so their geometry is measurable.
+  const rectOf = (sel) => {
+    const el = box.querySelector(sel);
+    if (!el) return null;
+    const a = box.getBoundingClientRect();
+    const b = el.getBoundingClientRect();
+    return { x1: b.left - a.left, y1: b.top - a.top, x2: b.right - a.left, y2: b.bottom - a.top };
+  };
+  const pipes = [];
+  for (const sn of sessNodes) {
+    const s = rows.find((r) => r.token === sn.token);
+    if (!s) continue;
+    const targetId = flowPending && flowPending.token === sn.token ? flowPending.to : sessTargetId(s);
+    const queued = !!(s.gate && s.gate.state === "queued");
+    const phase = sessPhaseNow(s, st);
+    pipes.push({
+      token: sn.token, shortTok: sn.shortTok, from: sessTargetId(s), to: targetId,
+      queued, phase, stale: sn.stale,
+      pending: !!(flowPending && flowPending.token === sn.token && flowPending.to !== flowPending.from),
+    });
+  }
+  const parts = [];
+  for (const p of pipes) {
+    const sRect = rectOf('[data-flow-node="sess:' + cssEscape(p.shortTok) + '"]');
+    const eRect = rectOf('[data-flow-node="engine:' + cssEscape(p.to) + '"]');
+    if (!sRect || !eRect) continue; // engine row vanished (fail-quiet: no pipe, no crash)
+    const yMid = (sRect.y1 + sRect.y2) / 2;
+    const d = flowPipePath(sRect.x2 + 2, yMid, eRect.x1 - 2, (eRect.y1 + eRect.y2) / 2, 10);
+    // The brief's rule: a queued pipe that was JUST pinned keeps the queue
+    // color (the request has not released yet) PLUS the pending-target
+    // marker. Only a running stream with no pending move animates phase.
+    const cls = ["pipe"];
+    if (p.queued) cls.push("queued");
+    else if (p.phase) cls.push("responding", p.phase);
+    else if (p.pending) cls.push("preview");
+    if (flowSel && flowSel.kind === "pipe" && flowSel.id === p.token) cls.push("sel");
+    parts.push(
+      '<path class="pipe-hit" data-pipe-hit="' + esc(p.token) + '" d="' + d + '"></path>' +
+      '<path class="' + cls.join(" ") + '" data-pipe="' + esc(p.token) + '" d="' + d + '"><title>session ' + esc(p.shortTok) + " \u2192 engine" +
+      (p.pending ? " (pending retarget \u2014 not released yet)" : p.queued ? " \u00b7 queued at the router" : p.phase ? " \u00b7 answering: " + p.phase : "") + "</title></path>" +
+      '<circle class="end-dot" cx="' + (eRect.x1 - 2) + '" cy="' + (eRect.y1 + eRect.y2) / 2 + '" r="3"></circle>' +
+      '<circle class="end-handle" tabindex="' + (flowSel && flowSel.kind === "pipe" && flowSel.id === p.token ? "0" : "-1") + '" role="button" aria-label="session ' + esc(p.shortTok) + ' engine end — arrow keys choose a legal engine, Enter re-routes, Esc cancels" data-end-handle="' + esc(p.token) + '" cx="' + (eRect.x1 - 2) + '" cy="' + (eRect.y1 + eRect.y2) / 2 + '" r="11"></circle>'
+    );
+    // The pending-target marker (queued + freshly pinned pipe): a small
+    // dashed circle at the not-yet-released end — the queue color stands.
+    if (p.pending) {
+      parts.push('<circle class="pend-marker" cx="' + (eRect.x1 - 2) + '" cy="' + (eRect.y1 + eRect.y2) / 2 + '" r="7"></circle>');
+    }
+  }
+  const boxRect = box.getBoundingClientRect();
+  const svg = '<svg class="flow-svg" width="' + boxRect.width + '" height="' + boxRect.height + '" pointer-events="none">' + parts.join("") + "</svg>";
+  box.insertAdjacentHTML("beforeend", svg); // LAST child: pipes paint above the nodes
+}
+
+// The pin write path — SIBLING of the session override write (same
+// token-gated shape). Truth constrains the target: the arbiter answers
+// with a reason for an illegal write; the page says it, then reverts.
+async function setSessionPin(sessToken, serverId) {
+  const token = gateToken();
+  if (!token) {
+    flashGateMsg("pin needs the arbiter API token — paste it into 'gate token' in the header", "err", true);
+    const inp = $("gate-token");
+    if (inp) {
+      inp.scrollIntoView({ block: "center" });
+      inp.focus({ preventScroll: true });
+    }
+    return false;
+  }
+  try {
+    const res = await fetch("/api/sessions/" + encodeURIComponent(sessToken) + "/pin?token=" + encodeURIComponent(token), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ server_id: serverId }),
+    });
+    if (!res.ok) {
+      let detail = "HTTP " + res.status;
+      try { detail += ": " + ((await res.json()).error ?? ""); } catch { }
+      flashGateMsg("re-route refused — " + detail, "err");
+      refresh(); // server truth wins: the pipe snaps back
+      return false;
+    }
+    const j = await res.json().catch(() => ({}));
+    flashGateMsg(
+      serverId === null ? "session engine pin cleared — the dispatch-chosen row routes again"
+        : "session re-routed — the next request (and any QUEUED one) resolves on the new engine; a running stream never moves",
+      "ok",
+    );
+    flowPending = null;
+    refresh();
+    void j;
+    return true;
+  } catch (err) {
+    flashGateMsg("pin write failed: " + err.message, "err");
+    refresh();
+    return false;
+  }
+}
+
+// Keyboard retarget: Enter on a selected pipe writes flowPending; Esc
+// drops it. Arrow keys move the highlighted legal target (handled in the
+// flow container's keydown listener).
+function flowSelPipe() {
+  return flowSel && flowSel.kind === "pipe" ? flowSel.id : null;
+}
+
+function flowPreviewTargets(pipeToken, st) {
+  const sess = (st?.sessions || []).find((s) => s.token === pipeToken);
+  if (!sess) return [];
+  const legal = sessLegalTargets(sess, st);
+  return (st.servers || []).filter((e) => legal.includes(e.id)).map((e) => e.id);
+}
+
+function wireFlow() {
+  const box = $("flow");
+  if (!box || box.__flowWired) return;
+  box.__flowWired = true;
+  $("sess-mode-toggle").addEventListener("click", () => {
+    setSessMode(sessMode() === "flow" ? "rows" : "flow");
+  });
+
+  // ONE pointerdown entry: the engine-end handle starts a drag, a click
+  // along the ≥22px corridor selects the pipe, a node click selects it.
+  box.addEventListener("pointerdown", (e) => {
+    const handle = e.target.closest("[data-end-handle]");
+    if (handle) {
+      e.preventDefault();
+      flowSel = { kind: "pipe", id: handle.dataset.endHandle };
+      flowPending = null;
+      flowDrag = { token: handle.dataset.endHandle, from: "", x: e.clientX, y: e.clientY };
+      const sess = (LAST_ST?.sessions || []).find((s) => s.token === flowDrag.token);
+      if (sess) flowDrag.from = sessTargetId(sess);
+      // No setPointerCapture: the 5s rebuild replaces the handle, and the
+      // move/up tracking rides the CONTAINER (elementFromPoint decides the
+      // drop target) — capture would dead-end after a re-render.
+      renderFlowView(LAST_ST);
+      const nh = box.querySelector('[data-end-handle="' + cssEscape(handle.dataset.endHandle) + '"]');
+      if (nh) nh.focus({ preventScroll: true });
+      highlightTargets(flowDrag.token, e.clientX, e.clientY);
+      return;
+    }
+    const hit = e.target.closest("[data-pipe-hit]");
+    if (hit) {
+      const tok = hit.dataset.pipeHit;
+      flowSel = flowSel && flowSel.kind === "pipe" && flowSel.id === tok ? null : { kind: "pipe", id: tok };
+      flowPending = null;
+      renderFlowView(LAST_ST);
+      const h2 = box.querySelector('[data-end-handle="' + cssEscape(tok) + '"]');
+      if (h2 && flowSel) h2.focus({ preventScroll: true });
+      return;
+    }
+    const node = e.target.closest("[data-flow-node]");
+    if (node) {
+      flowSel = node.dataset.flowNode.startsWith("engine:")
+        ? { kind: "engine", id: node.dataset.flowNode.slice(7) }
+        : null;
+      flowPending = null;
+      renderFlowView(LAST_ST);
+    }
+  });
+  box.addEventListener("pointermove", (e) => {
+    if (!flowDrag) return;
+    flowDrag.x = e.clientX;
+    flowDrag.y = e.clientY;
+    highlightTargets(flowDrag.token, e.clientX, e.clientY);
+  });
+  box.addEventListener("pointerup", (e) => {
+    if (!flowDrag) return;
+    const under = document.elementFromPoint(e.clientX, e.clientY);
+    const node = under && under.closest ? under.closest("[data-flow-node]") : null;
+    const token = flowDrag.token;
+    clearTargetHighlights();
+    const was = flowDrag;
+    flowDrag = null;
+    if (node && node.dataset.flowNode.startsWith("engine:")) {
+      const to = node.dataset.flowNode.slice(7);
+      if (to !== was.from) setSessionPin(token, to);
+    }
+  });
+
+  // Keyboard: arrows move the highlighted legal target, Enter writes,
+  // Esc cancels. The handles are Tab-reachable, so this works without a
+  // mouse (the drag's stand-in for motor accessibility).
+  box.addEventListener("keydown", (e) => {
+    const handle = e.target.closest("[data-end-handle]");
+    if (!handle) {
+      if (e.key === "Escape" && flowSel) {
+        flowSel = null;
+        flowPending = null;
+        renderFlowView(LAST_ST);
+      }
+      return;
+    }
+    const tok = handle.dataset.endHandle;
+    if (e.key === "Escape") {
+      flowSel = null;
+      flowPending = null;
+      renderFlowView(LAST_ST);
+      return;
+    }
+    const sess = (LAST_ST?.sessions || []).find((s) => s.token === tok);
+    if (!sess) return;
+    const targets = flowPreviewTargets(tok, LAST_ST);
+    if (targets.length === 0) {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        setSessionPin(tok, null); // clear the pin (a documented keyboard write)
+      }
+      return;
+    }
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      const from = sessTargetId(sess);
+      const to = flowPending && flowPending.token === tok ? flowPending.to : targets.find((t) => t !== from);
+      if (to && to !== from) setSessionPin(tok, to);
+      return;
+    }
+    if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+      e.preventDefault();
+      const cur = flowPending && flowPending.token === tok ? targets.indexOf(flowPending.to) : -1;
+      const next = targets[(cur + (e.key === "ArrowDown" ? 1 : targets.length - 1)) % targets.length] ?? targets[0];
+      flowPending = { token: tok, from: sessTargetId(sess), to: next };
+      renderFlowView(LAST_ST);
+      const nh = box.querySelector('[data-end-handle="' + cssEscape(tok) + '"]');
+      if (nh) nh.focus({ preventScroll: true });
+    }
+  });
+}
+
+function highlightTargets(token, x, y) {
+  const st = LAST_ST;
+  if (!st) return;
+  const legal = new Set(flowPreviewTargets(token, st));
+  for (const node of document.querySelectorAll("#flow [data-flow-node]")) {
+    if (!node.dataset.flowNode.startsWith("engine:")) continue;
+    const id = node.dataset.flowNode.slice(7);
+    const r = node.getBoundingClientRect();
+    const over = x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+    node.classList.toggle("target-ok", legal.has(id) && over);
+    node.classList.toggle("target-no", !legal.has(id));
+  }
+}
+
+function clearTargetHighlights() {
+  for (const node of document.querySelectorAll("#flow [data-flow-node]")) {
+    node.classList.remove("target-ok", "target-no");
   }
 }
 
@@ -2985,6 +3519,8 @@ async function refreshUsage() {
 
 refresh();
 setInterval(refresh, 5000);
+flowToggleLabel(); // #67: the Sessions vtab's rows⟷flow toggle
+wireFlow();
 refreshAliases(); // #66: the Models view's token-gated read (the 5s state poll owns the pick-list)
 setInterval(refreshAliases, 30000); // 30 s — authoring data, not the 5s live cadence
 refreshUsage();
