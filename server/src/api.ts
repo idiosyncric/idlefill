@@ -235,6 +235,13 @@ function serverView(arbiter: Arbiter, cfg: ServerConfig, now: number) {
           })(),
         }
       : null;
+    // Model inventory: the last /v1/models probe that ANSWERED wins over
+    // the operator-declared list (the same merge the #64 catalog publishes
+    // — a failed probe never silently loses the declaration). model_source
+    // names which one the row shows; probed_at is the "last seen" for the
+    // inventory (null = the probe never answered since boot). ADD keys.
+    const probed = arbiter.probedModels(row.id);
+    const inventory = probed ?? row.models;
     // The row is echoed verbatim — so the credential (#60 B) is STRIPPED
     // here. auth_token is write-only: this view feeds GET /api/servers AND
     // the anonymous /api/state, and the dashboard renders both. A boolean
@@ -246,7 +253,9 @@ function serverView(arbiter: Arbiter, cfg: ServerConfig, now: number) {
       auth_set: auth_token !== undefined && auth_token !== '',
       watched: sig !== null,
       signal,
-      models: row.models.map((m) => ({ name: m, running: runningModels.has(m), queued: queuedByModel.get(m) ?? 0 })),
+      model_source: probed !== null ? 'probed' : 'declared',
+      probed_at: arbiter.probedAt(row.id),
+      models: inventory.map((m) => ({ name: m, running: runningModels.has(m), queued: queuedByModel.get(m) ?? 0 })),
     };
   });
 }
@@ -712,6 +721,22 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     // back through this API.
     const { auth_token, ...serverPublic } = res.server!;
     return { ok: true, created: res.created, server: { ...serverPublic, auth_set: auth_token !== undefined && auth_token !== '' } };
+  });
+
+  /**
+   * Remove a declared server connection: { id }. The arbiter refuses a
+   * row with live leases (409) and an unknown id (404) — see
+   * removeServerConnection. Token-gated like every settings write.
+   */
+  app.post('/api/servers/remove', async (req, reply) => {
+    const body = (req.body ?? {}) as { id?: string };
+    const id = typeof body.id === 'string' ? body.id.trim() : '';
+    if (!id) return reply.code(400).send({ error: 'id required' });
+    const res = arbiter.removeServerConnection(id);
+    if (!res.ok) {
+      return reply.code(res.reason === 'unknown_server' ? 404 : 409).send({ error: res.reason ?? 'invalid' });
+    }
+    return { ok: true, removed: res.removed };
   });
 
   // ------------------------------------------------------------------

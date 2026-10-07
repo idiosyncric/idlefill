@@ -383,6 +383,7 @@
   #queue-section { display: none; }
   body.queuepage #queue-section { display: block; }
   body.queuepage > main > section:not(#queue-section):not(#queue-search-section) { display: none; }
+  body.queuepage #res-subtabs { display: none; }
   /* View tabs (#61 step 2): the single page splits into Overview / Projects /
      Sessions / Usage so the desktop window reads as one tabbed surface. The
      tab group reuses the logs-tray tab styling (canvas fill, 4px radius,
@@ -393,10 +394,10 @@
      tab switch — the queuepage body-class rule owns those. No animation:
      tab switching is a display flip (DESIGN.md "Don't animate anything but
      the tray chevron"). */
-  #view-tabs { display: flex; align-items: center; gap: 10px; padding: 8px 20px 0; }
+  #view-tabs { display: flex; align-items: center; gap: 10px; row-gap: 6px; flex-wrap: wrap; padding: 8px 20px 0; }
   #view-tabs .tabs { display: flex; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
   #view-tabs .tabs button {
-    background: var(--bg); border: none; color: var(--dim);
+    background: var(--bg); border: none; color: var(--dim); white-space: nowrap;
     font: inherit; font-size: 11px; font-weight: 600; letter-spacing: 1px;
     text-transform: uppercase; padding: 3px 12px; cursor: pointer;
   }
@@ -408,6 +409,64 @@
   main section.vthide { display: none !important; }
   #view-empty { grid-column: 1 / -1; padding: 10px 2px; }
   body.queuepage #view-tabs { display: none; }
+  /* Resources sub-tabs (#): the second tab group rides the same bar and
+     shows ONLY while the Resources view is active — body.view-resources,
+     set by applyView (the same body-class idiom as body.queuepage, so no
+     inline style ever fights the exception-only sections). Sections under
+     Resources carry data-subview; the switch is the class flip (subhide),
+     never inline style, exactly like vthide. */
+  /* Specificity note: #view-tabs .tabs (below, the shared tab-group
+     styling) sets display:flex — the hide rule needs the id chain to win. */
+  #view-tabs #res-subtabs { display: none; }
+  body.view-resources #view-tabs #res-subtabs { display: flex; }
+  /* The queue route owns the main area — no sub-tab bar there either. */
+  body.queuepage.view-resources #view-tabs #res-subtabs { display: none; }
+  main section.subhide { display: none !important; }
+  /* Inference servers surface: shadcn-style card primitives (Card /
+     CardHeader / CardTitle / CardAction / CardContent / CardFooter,
+     Button variants, Badge, Separator) vendored as plain CSS over this
+     page's tokens — the dashboard stays a single hand-written file, the
+     composition matches ui.shadcn.com/docs/components/base. One card per
+     declared engine: name + state word in the header (the action cluster:
+     remove + edit), advertised models as badge chips and the metrics
+     sparklines in the content, the last-seen line in the footer. The
+     Flat-By-Default Rule holds: cards are tonal + hairline, zero shadow. */
+  .srv-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; }
+  .card { border: 1px solid var(--border); border-radius: 6px; background: var(--bg);
+    display: flex; flex-direction: column; }
+  .card-header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 8px 12px; border-bottom: 1px solid rgba(48,54,61,0.5); }
+  .card-title { font-size: 13px; font-weight: 600; }
+  .card-desc { color: var(--dim); font-size: 11px; }
+  .card-action { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
+  .card-content { padding: 8px 12px; display: flex; flex-direction: column; gap: 8px; }
+  .card-footer { padding: 6px 12px; border-top: 1px solid rgba(48,54,61,0.5);
+    color: var(--dim); font-size: 11px; display: flex; gap: 10px; flex-wrap: wrap; }
+  .card .state { font-size: 12px; font-weight: 600; white-space: nowrap; }
+  /* Button primitives (outline = the resting control, ghost = quiet row
+     action, destructive = the remove arm). Canvas-filled like every other
+     control on the page; state rides color, never lift. */
+  .btn { display: inline-flex; align-items: center; gap: 4px; font: inherit; font-size: 11px;
+    padding: 2px 8px; border-radius: 4px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text); cursor: pointer; }
+  .btn:hover { border-color: var(--dim); }
+  .btn.ghost { border-color: transparent; background: none; color: var(--dim); }
+  .btn.ghost:hover { color: var(--text); }
+  .btn.destructive { color: var(--err); border-color: rgba(248,81,73,0.4); }
+  .btn.destructive.armed { background: var(--err); color: #0d1117; border-color: var(--err); }
+  .btn:disabled { opacity: 0.55; cursor: not-allowed; }
+  /* Badge chips — the advertised model list. Exception-only color: a
+     running model rides the accent dot, everything else stays neutral. */
+  .badge { display: inline-flex; align-items: center; gap: 5px; padding: 1px 8px;
+    border-radius: 8px; border: 1px solid var(--border); font-size: 11px;
+    max-width: 100%; overflow-wrap: anywhere; }
+  .model-list { display: flex; flex-wrap: wrap; gap: 5px; }
+  /* Metric rows: label + sparkline + value (the Usage section's shape,
+     shrunk into the card). */
+  .mrow { display: flex; align-items: center; gap: 8px; font-size: 11px; }
+  .mrow .k { color: var(--dim); flex: none; min-width: 84px; }
+  .mrow svg { flex: 1 1 auto; min-width: 0; height: 22px; display: block; }
+  .mrow .v { margin-left: auto; flex: none; white-space: nowrap; }
   footer { padding: 10px 20px; color: var(--dim); font-size: 11px; border-top: 1px solid var(--border); margin-top: 10px; }
   a { color: var(--accent); text-decoration: none; }
   code { background: rgba(110,118,129,0.2); padding: 0 4px; border-radius: 3px; font-size: 12px; }
@@ -427,21 +486,25 @@
   </span>
 </header>
 
-<!-- View tabs (#61 step 2): one surface, four views. The desktop app embeds
-     this page, so it needs the tabbed structure its retired Swift tabs gave
-     it; the browser gets the same split. Overview = the machine and the
-     fleet (servers, other instances, cycles, refused work), Projects = the
-     work + its queue search, Sessions = interactive traffic, Usage = the
-     history charts. The logs stay the bottom dock (a dock, not a tab: it
-     must stay visible while any view is open). Deep links keep working —
-     the queue route hides the tab bar and owns the main area. -->
+<!-- View tabs: three surfaces — Overview (the live exception pulse: cycles,
+     refused work), Resources (the declared inventory: the machine's
+     inference engines, mesh machines, projects, model aliases — each its
+     own sub-tab), Sessions, Usage. The logs stay the bottom dock (a dock,
+     not a tab: it must stay visible while any view is open). Deep links
+     keep working — old #projects/#models hashes land on the Resources
+     sub-tab; the queue route hides the tab bar and owns the main area. -->
 <div id="view-tabs" role="tablist" aria-label="dashboard views">
   <div class="tabs">
     <button id="vtab-overview" type="button" class="active" role="tab" aria-selected="true" data-view="overview">Overview</button>
-    <button id="vtab-projects" type="button" role="tab" aria-selected="false" data-view="projects">Projects</button>
+    <button id="vtab-resources" type="button" role="tab" aria-selected="false" data-view="resources">Resources</button>
     <button id="vtab-sessions" type="button" role="tab" aria-selected="false" data-view="sessions">Sessions<span class="vbadge" id="badge-sessions" hidden></span></button>
-    <button id="vtab-models" type="button" role="tab" aria-selected="false" data-view="models">Models</button>
     <button id="vtab-usage" type="button" role="tab" aria-selected="false" data-view="usage">Usage</button>
+  </div>
+  <div class="tabs" id="res-subtabs" role="tablist" aria-label="resources sub-views">
+    <button id="rtab-servers" type="button" class="active" role="tab" aria-selected="true" data-subview="servers">Inference servers</button>
+    <button id="rtab-machines" type="button" role="tab" aria-selected="false" data-subview="machines">Machines</button>
+    <button id="rtab-projects" type="button" role="tab" aria-selected="false" data-subview="projects">Projects<span class="vbadge" id="badge-projects" hidden></span></button>
+    <button id="rtab-models" type="button" role="tab" aria-selected="false" data-subview="models">Models</button>
   </div>
 </div>
 
@@ -451,7 +514,7 @@
        jobs, budgets, workers, published stats, controls — nests under
        its project. -->
 
-  <section data-view="overview">
+  <section data-view="resources" data-subview="servers">
     <h2>Inference servers <button id="add-server" class="settings-toggle" type="button" title="add a declared inference server connection">+ add server</button></h2>
     <div id="add-server-form" class="settings-form"></div>
     <div id="servers"><div class="empty">no servers declared</div></div>
@@ -463,12 +526,12 @@
        presence, per-engine idle state, queue DEPTHS, and session/lease
        counts — never job ids, titles, URLs, or payloads. Cross-instance
        control is #39 (paired), not this strip. -->
-  <section id="mesh-section" data-view="overview" style="display:none">
+  <section id="mesh-section" data-view="resources" data-subview="machines" style="display:none">
     <h2>Machines</h2>
     <div id="mesh"></div>
   </section>
 
-  <section data-view="projects">
+  <section data-view="resources" data-subview="projects">
     <h2>Projects</h2>
     <div id="projects"><div class="empty">no projects configured</div></div>
   </section>
@@ -535,7 +598,7 @@
        router rewrites the body). Pairs are picked ONLY from probed engine
        inventories (D5 — never a fuzzy match); the arbiter never sees a
        token here (aliases carry none by construction). -->
-  <section id="models-section" data-view="models">
+  <section id="models-section" data-view="resources" data-subview="models">
     <h2>Model aliases <button id="add-alias" class="settings-toggle" type="button" title="declare a model alias — one name pinned to exact engine inventory entries">+ add alias</button></h2>
     <div id="add-alias-form" class="settings-form"></div>
     <div id="models"><div class="empty">no aliases declared</div></div>
@@ -548,7 +611,7 @@
        never this one, so a mid-type query survives a tick — only the
        results block is rebuilt. Exception-only, like the throttled
        section: hidden while the query is empty. -->
-  <section id="queue-search-section" data-view="projects" style="display:none">
+  <section id="queue-search-section" data-view="resources" data-subview="projects" style="display:none">
     <h2>Queue search
       <input id="queue-search" type="text" placeholder="filter queued jobs — job_id / company / title" spellcheck="false" autocomplete="off" title="substring match across every worker's published queue preview (first 100 queued per worker) — read-only, no API call">
     </h2>
@@ -563,7 +626,7 @@
        publishes). Exception-only: the section shows ONLY on a loopback
        page origin AND when an online client reports proxy_port. Restart
        stays native (launchd); this editor never restarts anything. -->
-  <section id="lcfg-section" data-view="projects" style="display:none">
+  <section id="lcfg-section" data-view="resources" data-subview="projects" style="display:none">
     <h2>Local client config</h2>
     <div id="lcfg"></div>
   </section>
@@ -686,101 +749,206 @@ function projGateLabelText(mode) {
 }
 
 // ---------------------------------------------------------------------------
-// Inference Servers pane — one block per declared server. The watched one
-// carries the live signal (countdown = the page's one display number, last
-// activity, the exception-only diagnostics) and its model resources; a
-// declared-but-unwatched row is inventory until the core watches it.
+// Inference servers surface (the Resources rethink): one CARD per declared
+// engine, built on the shadcn card primitives (Card / CardHeader /
+// CardTitle / CardAction / CardContent / CardFooter, Button variants,
+// Badge chips) vendored as classes over this page's tokens. The card
+// carries what an operator actually reads about an engine: its name + live
+// state word, the models it ADVERTISES (the arbiter's /v1/models probe —
+// model_source names where the list came from), a few metrics as
+// sparklines (requests/min and tokens/hour over the last 24h from the
+// metrics store, the per-model queued depth as a bar), and the footer's
+// last-seen line. Empty states everywhere: no probe answered = "models
+// unavailable · probed N ago" (or "never"), no metric points = "no
+// metrics yet". The old kv wall (now / idle for / last activity / provider
+// / declared+changed timestamps) is gone from the card; edit stays a
+// form (name, base url, provider kind, key, models fallback), remove rides
+// the header action as a two-step arm.
 // ---------------------------------------------------------------------------
-function srvBlock(s, st) {
-  let headState = "";
-  if (s.signal) {
-    const w = liveWord(s.signal, (s.models || []).some((m) => m.running));
-    headState = '<span class="state ' + w.cls + '" title="' + esc(w.note) + '">' + esc(w.label) + "</span>";
-  }
-  let signalRows = "";
-  if (s.signal) {
-    const sig = s.signal;
-    signalRows =
-      '<div class="kv"><span class="k">now</span><span class="v">' + esc(new Date(st.now).toISOString().replace("T", " ").slice(0, 19) + "Z") + "</span></div>" +
-      '<div class="kv"><span class="k">idle for</span><span class="v big ' + (sig.idle ? "ok" : "warn") + '">' + (sig.idle_for_s === null ? "unknown" : Math.floor(sig.idle_for_s / 60) + "m " + (sig.idle_for_s % 60) + "s") + "</span></div>" +
-      '<div class="kv"><span class="k">last activity</span><span class="v">' + (sig.last_activity ? ago((sig.last_activity.age_s ?? 0) * 1000) + " · " + esc(sig.last_activity.model) + " · " + esc(sig.last_activity.src) : "none seen") + "</span></div>";
-    // Exception-only diagnostics (same rules as before the rework): the log
-    // write age while the box is judged NOT idle, signal health when
-    // degraded, the re-idle gate when armed.
-    if (!sig.idle) {
-      signalRows += '<div class="kv"><span class="k">log write</span><span class="v">' + (sig.last_log_write_age_s === null ? "disabled" : ago(sig.last_log_write_age_s * 1000)) + "</span></div>";
-    }
-    if (sig.degraded) {
-      signalRows += '<div class="kv"><span class="k">signal health</span><span class="v err">DEGRADED ' + esc(sig.degraded_reason ?? "") + "</span></div>";
-    }
-    // Honest fail-closed (#62): a feed-less row with no log signal names
-    // the kind gap instead of showing an "unknown" with no explanation.
-    if (sig.no_signal_reason) {
-      signalRows += '<div class="kv"><span class="k">signal health</span><span class="v err">NO SIGNAL ' + esc(sig.no_signal_reason) + "</span></div>";
-    }
-    // Provider kind (#62): the source word — the operator can see WHY the
-    // row is judged the way it is (feed vs counters vs local files).
-    signalRows += '<div class="kv"><span class="k">provider</span><span class="v">' + esc(s.provider ?? "llama-swap") + "</span></div>";
-    if (sig.reidle_gated) {
-      signalRows += '<div class="kv"><span class="k">re-idle gate</span><span class="v warn">armed (wait for full idle)</span></div>';
-    }
-  }
-  // Per-server credential (#60 B): exception-only — the row never shows
-  // the key itself, only that one is stored (auth_set rides the stripped
-  // server view).
-  if (s.auth_set) {
-    signalRows += '<div class="kv"><span class="k">API key</span><span class="v dim">set (hidden)</span></div>';
-  }
 
-  // Model resources: one row each — running state (blue dot, signal
-  // semantics), the self-reported queued depth, and the per-job estimate
-  // when a connected worker uses this model.
-  let modelsHtml;
+const METRICS_24H = 24 * 3600000; // the card's sparkline window
+let engineMetrics = {};           // server_id -> {reqs:[], tok:[]} hour buckets
+let engineMetricsAt = 0;          // last metrics pull (page-local, 60s cadence)
+
+function srvStateWord(s) {
+  if (!s.signal) return '<span class="state dim" title="declared, but the core has no idle detector for this row">not watched</span>';
+  const w = liveWord(s.signal, (s.models || []).some((m) => m.running));
+  return '<span class="state ' + w.cls + '" title="' + esc(w.note) + '">' + esc(w.label) + '</span>';
+}
+
+function srvModelsHtml(s) {
   const models = s.models || [];
   if (models.length === 0) {
-    modelsHtml = '<div class="empty">no models declared</div>';
-  } else {
-    // Per-model estimate: the first online worker allocation that uses it.
-    const estByModel = {};
-    for (const p of st.projects || []) {
-      for (const w of p.workers || []) {
-        if (w.online && w.model && !(w.model in estByModel)) estByModel[w.model] = w.estimated_seconds;
-      }
-    }
-    modelsHtml = '<div class="models">' + models.map((m) => {
-      const est = estByModel[m.name];
-      return '<div class="worker" title="a model this server can run; jobs queue against it per project">' +
-        '<span class="dot ' + (m.running ? "run" : "off") + '" title="' + (m.running ? "a lease is running on this model" : "no lease running on this model") + '"></span>' +
-        '<span class="wname">' + esc(m.name) + "</span>" +
-        '<span class="wmeta">' + (est ? durFmt(est) + "/job" : "") + "</span>" +
-        '<span class="wqueue">' + (m.queued || 0).toLocaleString() + " queued</span>" +
-        "</div>";
-    }).join("") + "</div>";
+    // The probe never answered AND nothing was declared: say what is
+    // missing and when we last looked (the superimposed last-seen).
+    const seen = s.probed_at != null ? " · probe last answered " + ago(Date.now() - s.probed_at) : " · probe never answered";
+    return '<div class="empty">no models seen' + esc(seen.replace(/^ · /, " — ")) + '</div>';
   }
+  const chips = models.map((m) => {
+    const running = m.running ? '<span class="dot run" title="a lease is running on this model"></span>' : "";
+    return '<span class="badge" title="advertised by this engine via /v1/models">' + running + esc(m.name) + "</span>";
+  });
+  const src = s.model_source === "probed"
+    ? "advertised via /v1/models"
+    : "operator-declared (the probe never answered)";
+  return '<div class="model-list" title="' + esc(src) + '">' + chips.join("") + "</div>";
+}
 
-  const peersHtml = s.peers && s.peers.length
-    ? '<div class="note">routed behind this entry point: ' + s.peers.map(esc).join(", ") + "</div>"
-    : "";
+function srvMetricsHtml(s) {
+  const m = engineMetrics[s.id];
+  const reqs = m ? m.reqs : [];
+  const tok = m ? m.tok : [];
+  if (reqs.length === 0 && tok.length === 0) {
+    return '<div class="empty">no metrics yet — the store fills as the engine runs</div>';
+  }
+  const last = (arr) => (arr.length ? arr[arr.length - 1] : 0);
+  let out = "";
+  if (reqs.length) {
+    out += '<div class="mrow" title="requests per hour, last 24h"><span class="k">req / hr</span>' +
+      sparkline(reqs, "--accent") + '<span class="v">' + last(reqs).toLocaleString() + "</span></div>";
+  }
+  if (tok.length) {
+    out += '<div class="mrow" title="output tokens per hour, last 24h"><span class="k">tokens / hr</span>' +
+      sparkline(tok, "--accent") + '<span class="v">' + last(tok).toLocaleString() + "</span></div>";
+  }
+  return out;
+}
 
-  const body = s.signal
-    ? signalRows + modelsHtml + peersHtml
-    : '<div class="empty">declared — not watched yet</div>';
+function srvFooter(s, st) {
+  // The one time-ish line the card keeps: when the engine was last seen
+  // answering (the probe), else when the idle detector last polled it.
+  let seen = "";
+  if (s.probed_at != null) seen = "models last seen " + ago(st.now - s.probed_at);
+  else if (s.signal) seen = "watched since declared · model list unverified";
+  else seen = "never seen";
+  const url = '<code title="base url — edit to change">' + esc(s.url) + "</code>";
+  return url + "<span>" + esc(seen) + "</span>";
+}
 
-  // The declared connection (the patchable row) + the settings editor
-  // (edit = POST /api/servers by id; the form renders on open, below).
-  const connHtml =
-    '<div class="kv"><span class="k">url</span><span class="v"><code>' + esc(s.url) + "</code></span></div>" +
-    (s.activity_path ? '<div class="kv"><span class="k">activity path</span><span class="v"><code>' + esc(s.activity_path) + "</code></span></div>" : "") +
-    '<div class="kv"><span class="k">declared</span><span class="v">' + ago(s.configured_at != null ? (st.now - s.configured_at) : null) + (s.updated_at && s.updated_at !== s.configured_at ? " · changed " + ago(st.now - s.updated_at) : "") + "</span></div>" +
-    '<button class="settings-toggle collapsed" data-server="' + esc(s.id) + '" type="button" title="edit the declared connection for ' + esc(s.name) + '"><span class="chev">&#9650;</span>edit connection</button>' +
-    '<div class="settings-form" data-server-form="' + esc(s.id) + '"></div>';
-
-  return '<div class="srv">' +
-    '<div class="srv-head"><span class="name">' + esc(s.name) + "</span>" + headState + "</div>" +
-    body +
-    connHtml +
+function engineCard(s, st) {
+  return '<div class="card" data-engine="' + esc(s.id) + '">' +
+    '<div class="card-header">' +
+    '<span class="card-title">' + esc(s.name) + "</span>" + srvStateWord(s) +
+    '<span class="card-action">' +
+    '<button class="btn ghost" data-server="' + esc(s.id) + '" type="button" title="edit the base url, provider kind, key, and fallback models for ' + esc(s.name) + '">edit</button>' +
+    // The arm survives the 5s re-render: a tick between the two clicks must
+    // not reset the label while armedRemove still stands (that would make
+    // the next single click a removal).
+    '<button class="btn destructive' + (armedRemove === s.id ? " armed" : "") + '" data-remove="' + esc(s.id) + '" type="button" title="remove this server from the declared inventory">' + (armedRemove === s.id ? "confirm?" : "remove") + "</button>" +
+    "</span></div>" +
+    '<div class="card-content">' + srvModelsHtml(s) + srvMetricsHtml(s) + "</div>" +
+    '<div class="settings-form" data-server-form="' + esc(s.id) + '"></div>' +
+    '<div class="card-footer">' + srvFooter(s, st) + "</div>" +
     "</div>";
 }
+
+function renderServers(st) {
+  const sbox = $("servers");
+  if (!sbox) return;
+  if (!st.servers || st.servers.length === 0) {
+    sbox.innerHTML = '<div class="empty">no servers declared — add one above</div>';
+    return;
+  }
+  sbox.innerHTML = '<div class="srv-grid">' + st.servers.map((s) => engineCard(s, st)).join("") + "</div>";
+  // Re-open the editor the operator was mid-edit in (the 5s tick rebuilds
+  // the cards; an open form must survive it exactly like before).
+  if (openEditorId) {
+    const card = sbox.querySelector('.card[data-engine="' + cssEscape(openEditorId) + '"]');
+    const form = card && card.querySelector(".settings-form");
+    const s = (st.servers || []).find((x) => x.id === openEditorId);
+    if (form && s) {
+      form.classList.add("open");
+      form.innerHTML = serverFormHtml(s, "edit");
+      refreshColocation(form);
+    } else {
+      openEditorId = null;
+    }
+  }
+}
+
+// The editor open-state lives page-side (not localStorage): the settings
+// form is mid-edit content, it should not resurrect on a reload.
+let openEditorId = null;
+
+// Per-card engine metrics: the hour buckets the Usage section reads, scoped
+// to one server via /api/metrics' key filter (anonymous read, like every
+// other dashboard read). 60s page cadence — hour buckets do not need the
+// 5s tick. Exception-only: a store without points leaves the card's
+// metrics empty state standing.
+async function refreshEngineMetrics() {
+  const srvs = serversCache || [];
+  if (srvs.length === 0) { engineMetrics = {}; return; }
+  const now = Date.now();
+  engineMetricsAt = now;
+  const from = now - METRICS_24H;
+  try {
+    const url = (series, key) => "/api/metrics?series=" + series + "&bucket=hour&key=" + encodeURIComponent(key) + "&from=" + from + "&to=" + now;
+    const pulls = await Promise.all(srvs.map((s) =>
+      fetch(url("engine", s.id), { cache: "no-store" }).then((r) => (r.ok ? r.json() : { series: [] }))));
+    const byId = {};
+    srvs.forEach((s, i) => {
+      const eng = (pulls[i].series || []).find((x) => x.key === s.id);
+      const pts = eng ? eng.points : [];
+      byId[s.id] = {
+        reqs: pts.map((p) => p.req_total ?? 0),
+        tok: pts.map((p) => (p.engine_tokens_out ?? p.tokens_out) ?? 0),
+      };
+    });
+    engineMetrics = byId;
+  } catch {
+    /* store unreachable: the cards keep their empty state */
+  }
+}
+function engineMetricsStale() { return Date.now() - engineMetricsAt > 60000; }
+
+// Remove = a two-step arm (the Exception-Only Rule for destructive
+// actions: one click arms the button, the second removes). The arbiter
+// refuses a row with live leases (409) — the reason lands in the header
+// message, not a modal.
+let armedRemove = null;
+function wireServerActions() {
+  const box = $("servers");
+  if (!box) return;
+  box.addEventListener("click", async (e) => {
+    const rm = e.target.closest("button[data-remove]");
+    if (rm) {
+      const id = rm.dataset.remove;
+      if (armedRemove !== id) {
+        armedRemove = id;
+        rm.classList.add("armed");
+        rm.textContent = "confirm?";
+        setTimeout(() => {
+          if (armedRemove === id) {
+            armedRemove = null;
+            rm.classList.remove("armed");
+            rm.textContent = "remove";
+          }
+        }, 4000);
+        return;
+      }
+      armedRemove = null;
+      rm.disabled = true;
+      const r = await settingsPost("/api/servers/remove", { id });
+      if (!r.ok) {
+        rm.disabled = false;
+        rm.classList.remove("armed");
+        rm.textContent = "remove";
+        flashGateMsg("remove refused: " + r.detail, "err", true);
+        return;
+      }
+      flashGateMsg("server removed", "ok");
+      if (LAST_ST) renderServers(LAST_ST);
+      return;
+    }
+    const ed = e.target.closest("button[data-server]");
+    if (ed && !ed.classList.contains("settings-toggle")) {
+      const id = ed.dataset.server;
+      openEditorId = openEditorId === id ? null : id;
+      if (LAST_ST) renderServers(LAST_ST);
+    }
+  });
+}
+wireServerActions();
 
 // ---------------------------------------------------------------------------
 // Projects pane — one block per project: this project's running jobs, the
@@ -1311,12 +1479,8 @@ async function refresh() {
   // --- Inference Servers (serversCache feeds the settings editors'
   //     render-on-open closures — live data, not wire time).
   serversCache = st.servers || [];
-  const sbox = $("servers");
-  if (!st.servers || st.servers.length === 0) {
-    sbox.innerHTML = '<div class="empty">no servers declared</div>';
-  } else {
-    sbox.innerHTML = st.servers.map((s) => srvBlock(s, st)).join("");
-  }
+  renderServers(st);
+  if (engineMetricsStale()) refreshEngineMetrics().then(() => { if (LAST_ST) renderServers(LAST_ST); });
 
   // --- Mesh peers (#50) — exception-only: hidden while no peers are
   //     configured. Read-only snapshot rows; the local machine is the rest
@@ -1621,30 +1785,53 @@ function renderQueueSearch() {
   inp.addEventListener("change", renderQueueSearch);
   // #61 step 2: the search lives in the Projects view — a query typed from
   // any other view jumps to the view where its results show.
-  inp.addEventListener("focus", () => { if (!QUEUE_PAGE && currentView() !== "projects") applyView("projects"); });
+  inp.addEventListener("focus", () => {
+    if (QUEUE_PAGE) return;
+    if (currentView() !== "resources" || currentResTab() !== "projects") { applyView("resources"); applyResTab("projects"); }
+  });
 })();
 
 // (refresh is invoked at the END of the script, after all render + gate
 // helpers are defined — see the bottom.)
 // ---------------------------------------------------------------------------
-// View tabs (#61 step 2) — one page, four views. A section carries a
-// data-view attribute; exactly one view group is shown at a time. The
-// switch is a class flip (main section.vthide), never inline style: the
-// exception-only sections own their inline display (hidden while empty),
-// and the class rule carries !important so the two mechanisms never fight.
-// The choice persists (idlefill.viewTab) like the tray tab, and a link into
-// the queue route (body.queuepage) hides the bar entirely — that route owns
-// the main area.
+// View tabs — one page, four surfaces (Overview / Resources / Sessions /
+// Usage), with Resources owning a second sub-tab row (Inference servers /
+// Machines / Projects / Models). A section carries a data-view attribute;
+// exactly one view group is shown at a time, and inside Resources exactly
+// one sub-view group shows at a time. Both switches are class flips
+// (section.vthide / section.subhide), never inline style: the exception-
+// only sections own their inline display (hidden while empty), and the
+// class rules carry !important so the two mechanisms never fight. The
+// sub-tab bar itself shows only while Resources is active (body.
+// view-resources — the same body-class idiom as body.queuepage). Choices
+// persist (idlefill.viewTab / idlefill.resTab) like the tray tab, and a
+// link into the queue route (body.queuepage) hides the bar entirely —
+// that route owns the main area.
 // ---------------------------------------------------------------------------
-const VIEW_TABS = ["overview", "projects", "sessions", "models", "usage"];
-const VIEW_TAB_IDS = { overview: "vtab-overview", projects: "vtab-projects", sessions: "vtab-sessions", models: "vtab-models", usage: "vtab-usage" };
+const VIEW_TABS = ["overview", "resources", "sessions", "usage"];
+const VIEW_TAB_IDS = { overview: "vtab-overview", resources: "vtab-resources", sessions: "vtab-sessions", usage: "vtab-usage" };
+const RES_TABS = ["servers", "machines", "projects", "models"];
+const RES_TAB_IDS = { servers: "rtab-servers", machines: "rtab-machines", projects: "rtab-projects", models: "rtab-models" };
 
 function currentView() {
   try {
     const v = localStorage.getItem("idlefill.viewTab");
     if (v && VIEW_TABS.includes(v)) return v;
+    if (v === "projects" || v === "models") {
+      // the pre-Resources tabs: land on the matching sub-tab once
+      if (!localStorage.getItem("idlefill.resTab")) localStorage.setItem("idlefill.resTab", v);
+      return "resources";
+    }
   } catch { }
   return "overview";
+}
+
+function currentResTab() {
+  try {
+    const v = localStorage.getItem("idlefill.resTab");
+    if (v && RES_TABS.includes(v)) return v;
+  } catch { }
+  return "servers";
 }
 
 function applyView(view) {
@@ -1658,8 +1845,27 @@ function applyView(view) {
     btn.classList.toggle("active", on);
     btn.setAttribute("aria-selected", on ? "true" : "false");
   }
-  syncViewEmpty();
+  document.body.classList.toggle("view-resources", view === "resources");
   try { localStorage.setItem("idlefill.viewTab", view); } catch { }
+  applyResTab(currentResTab()); // reads the just-stored view — must come after
+  syncViewEmpty();
+}
+
+function applyResTab(sub) {
+  if (currentView() !== "resources") return; // subhide only bites inside Resources
+  for (const sec of document.querySelectorAll('main section[data-view="resources"]')) {
+    sec.classList.toggle("subhide", sec.dataset.subview !== sub);
+  }
+  for (const v of RES_TABS) {
+    const on = v === sub;
+    const btn = $(RES_TAB_IDS[v]);
+    if (!btn) continue;
+    btn.classList.toggle("active", on);
+    btn.setAttribute("aria-selected", on ? "true" : "false");
+  }
+  if (sub === "models") refreshAliases(); // the authoring read on open
+  syncViewEmpty();
+  try { localStorage.setItem("idlefill.resTab", sub); } catch { }
 }
 
 // The null case stays legible: when the active view's sections are all
@@ -1668,18 +1874,26 @@ function applyView(view) {
 // sections toggle their own display and the view can change underneath.
 const VIEW_EMPTY_MSG = {
   overview: "nothing on this machine yet — no servers declared",
-  projects: "no projects configured on this arbiter",
   sessions: "no interactive sessions registered — point a session at the local proxy to see it here",
-  models: "no aliases declared — an alias pins one model name to exact engine inventory entries",
   usage: "no usage recorded yet — the metrics store fills as the box runs",
+};
+const RES_EMPTY_MSG = {
+  servers: "no inference servers declared — add one below",
+  machines: "no mesh peers configured — this arbiter only sees its own machine",
+  projects: "no projects configured on this arbiter",
+  models: "no aliases declared — an alias pins one model name to exact engine inventory entries",
 };
 
 // Deep links (#61 step 3 / Slice B): the desktop app's idlefill:// routes
 // land on the live origin with #<view> appended. A hash naming a real view
 // wins over the stored tab on load ONLY — after that the stored tab (and
-// tab clicks) own the view; a hash change re-applies. Non-view hashes (the
-// queue route, anchors) change nothing.
-const HASH_VIEW_RE = /^#(overview|projects|sessions|models|usage)$/;
+// tab clicks) own the view; a hash change re-applies. The old #projects /
+// #models / #overview hashes keep working: they land on Resources with
+// the matching sub-tab. Non-view hashes (the queue route, anchors) change
+// nothing.
+const HASH_VIEW_RE = /^#(overview|resources|sessions|usage)$/;
+const HASH_RES_RE = /^#(projects|models)$/;
+const HASH_RES_MAP = { projects: "projects", models: "models" };
 
 function syncViewEmpty() {
   const box = $("view-empty");
@@ -1688,28 +1902,34 @@ function syncViewEmpty() {
   let any = false;
   for (const sec of document.querySelectorAll("main section[data-view]")) {
     if (sec.dataset.view !== view) continue;
+    if (view === "resources" && sec.classList.contains("subhide")) continue; // the sub-tab owns it
     if (sec.style.display === "none") continue; // exception-only: hidden while empty
     any = true;
     break;
   }
   box.hidden = any;
-  box.textContent = any ? "" : (VIEW_EMPTY_MSG[view] || "");
+  const msg = view === "resources" ? (RES_EMPTY_MSG[currentResTab()] || "") : (VIEW_EMPTY_MSG[view] || "");
+  box.textContent = any ? "" : msg;
 }
 
 (function wireViewTabs() {
   if (QUEUE_PAGE) return; // the queue detail route hides the bar (body.queuepage)
   const hashView = HASH_VIEW_RE.exec(location.hash);
-  if (hashView) applyView(hashView[1]); // deep link wins on load (Slice B)
+  const hashRes = HASH_RES_RE.exec(location.hash);
+  if (hashRes) { applyView("resources"); applyResTab(HASH_RES_MAP[hashRes[1]]); }
+  else if (hashView) applyView(hashView[1]); // deep link wins on load (Slice B)
   else applyView(currentView());
   window.addEventListener("hashchange", () => {
+    const r = HASH_RES_RE.exec(location.hash);
+    if (r) { applyView("resources"); applyResTab(HASH_RES_MAP[r[1]]); return; }
     const v = HASH_VIEW_RE.exec(location.hash);
     if (v) applyView(v[1]);
   });
   $("view-tabs").addEventListener("click", (e) => {
     const btn = e.target.closest("button[data-view]");
-    if (!btn) return;
-    applyView(btn.dataset.view);
-    if (btn.dataset.view === "models") refreshAliases(); // the authoring read on open
+    if (btn) { applyView(btn.dataset.view); return; }
+    const sub = e.target.closest("button[data-subview]");
+    if (sub) applyResTab(sub.dataset.subview);
   });
 })();
 
@@ -1723,14 +1943,6 @@ function updateViewBadges(st) {
   if (badge) {
     badge.textContent = heldSessions > 0 ? String(heldSessions) : "";
     badge.hidden = heldSessions === 0;
-  }
-  const projTab = $("vtab-projects");
-  if (projTab && !projTab.querySelector(".vbadge")) {
-    const b = document.createElement("span");
-    b.className = "vbadge";
-    b.id = "badge-projects";
-    b.hidden = true;
-    projTab.appendChild(b);
   }
   const pb = $("badge-projects");
   if (pb) {
@@ -2825,10 +3037,6 @@ function wireSettingsToggles(boxId, dataAttr, renderFor) {
     toggleForm(t, form, renderFor(t.dataset[key]));
   });
 }
-wireSettingsToggles("servers", "data-server", (id) => {
-  const s = serversCache.find((x) => x.id === id);
-  return s ? () => serverFormHtml(s, "edit") : null;
-});
 // Co-location warning (#62): live while the form is open — the omlx kind
 // against a remote url is a dead row, say so before the save.
 function refreshColocation(form) {
@@ -2910,6 +3118,7 @@ async function finishSettings(form, action, getState) {
     formMsg(form, r.detail, "err");
     return;
   }
+  if (form.dataset.serverForm) openEditorId = null; // a saved edit must not re-open on the 5s tick
   closeForm(form);
   flashGateMsg(st.okMsg, "ok");
   refresh();
@@ -2974,7 +3183,7 @@ $("servers").addEventListener("click", async (e) => {
   if (!btn) return;
   const form = btn.closest(".settings-form");
   if (!form || !form.dataset.serverForm) return;
-  if (btn.dataset.act === "cancel") { closeForm(form); return; }
+  if (btn.dataset.act === "cancel") { openEditorId = null; closeForm(form); return; }
   if (btn.dataset.act !== "save") return;
   const id = form.dataset.serverForm;
   const s = serversCache.find((x) => x.id === id);

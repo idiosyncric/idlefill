@@ -282,6 +282,9 @@ export class Arbiter {
    * drop-for-the-tick rules are deliberate; this one is not).
    */
   private lastProbed = new Map<string, string[]>();
+  /** When each row's /v1/models probe last answered (epoch-ms). In-memory,
+   *  like lastProbed — the dashboard's "last seen" for a row's inventory. */
+  private lastProbedAt = new Map<string, number>();
   /**
    * Per-server post-revocation reidle gates: server_id -> armed-at epoch-ms.
    * Armed when a lease on that server is revoked/expired; disarmed when a
@@ -929,6 +932,7 @@ export class Arbiter {
   async probeCatalog(): Promise<CatalogEntry[]> {
     const rows = this.store.state.servers;
     const probed = new Map<string, string[]>();
+    const nowMs = Date.now();
     if (this.modelsFetcher) {
       const fetcher = this.modelsFetcher;
       await Promise.all(
@@ -941,7 +945,10 @@ export class Arbiter {
             // the id DROPS for the tick, a pair on a probe-FAILED row
             // publishes 'declared'. buildCatalog ignores empty lists (its
             // `length > 0` gate), so the bare-name block is byte-identical.
-            if (Array.isArray(names)) probed.set(row.id, names);
+            if (Array.isArray(names)) {
+              probed.set(row.id, names);
+              this.lastProbedAt.set(row.id, nowMs);
+            }
           } catch {
             /* probe-blocked: the declared list stands (drop-don't-reject) */
           }
@@ -1908,6 +1915,40 @@ export class Arbiter {
     this.store.trim();
     this.store.save();
     return { ok: true, created: true, server };
+  }
+
+  /**
+   * Remove a declared server row (the operator's inventory control).
+   * Guard rails: unknown id → 'unknown_server'; a row with LIVE leases is
+   * refused ('leases_active') — removal never pulls an engine out from
+   * under a running job. The detector, probe memory, and reidle gate for
+   * the row are dropped with it; the events note the removal.
+   */
+  removeServerConnection(id: string): { ok: boolean; reason?: string; removed?: string } {
+    const s = this.store.state;
+    const row = s.servers.find((x) => x.id === id);
+    if (!row) return { ok: false, reason: 'unknown_server' };
+    const busy = this.activeLeases(Date.now()).some((l) => leaseServerId(l) === id);
+    if (busy) return { ok: false, reason: 'leases_active (let them finish or revoke them first)' };
+    s.servers = s.servers.filter((x) => x.id !== id);
+    this.detectors.delete(id);
+    this.lastProbed.delete(id);
+    this.lastProbedAt.delete(id);
+    this.reidleAfter.delete(id);
+    this.store.appendEvent({ kind: 'server_connection_removed', detail: `${row.name} (${row.url})` });
+    this.store.trim();
+    this.store.save();
+    return { ok: true, removed: id };
+  }
+
+  /** The last probe-confirmed model list for a row (null = never probed). */
+  probedModels(id: string): string[] | null {
+    return this.lastProbed.get(id) ?? null;
+  }
+
+  /** Epoch-ms the row's /v1/models probe last answered (null = never). */
+  probedAt(id: string): number | null {
+    return this.lastProbedAt.get(id) ?? null;
   }
 
   // ------------------------------------------------------------------

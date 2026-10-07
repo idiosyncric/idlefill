@@ -9,7 +9,8 @@
     "client",
     "adapters/career-ops",
     "adapters/noop",
-    "tauri/ui"
+    "tauri/ui",
+    "dashboard"
   ],
   "scripts": {
     "test": "npm test --workspaces --if-present",

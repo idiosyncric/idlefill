@@ -240,34 +240,55 @@ test('busy system returns 409 not_idle; unknown client 409 unknown_client', asyn
   assert.equal(((await res2.json()) as { reason: string }).reason, 'unknown_client');
 });
 
-test('dashboard HTML serves (two-pane dashboard: Inference Servers + Projects)', async () => {
+test('dashboard HTML serves (the route returns the dashboard document)', async () => {
+  // Route + document contract ONLY — never markup minutiae. Markup string
+  // tests broke on every UI redesign (the Resources consolidation, the
+  // server-card redesign) while catching no behavior; by owner decision
+  // (2026-10-07) the dashboard is verified by eye + the probes, not by
+  // string-matching its HTML.
   const res = await fetch(`${base}/`);
   assert.equal(res.status, 200);
   const html = await res.text();
   assert.match(html, /<html/);
-  assert.match(html, /idlefill/);
-  assert.match(html, /Inference Servers/);
-  assert.match(html, /Projects/);
-  assert.match(html, /api\/state/);
+  assert.match(html, /\/api\/state/);
   assert.ok((res.headers.get('content-type') ?? '').includes('text/html'));
 });
 
-test('dashboard carries the view-tab structure (#61 step 2: one surface, four views)', async () => {
+test('dashboard carries the view-tab structure (Resources consolidation: four surfaces + Resources sub-tabs)', async () => {
   const res = await fetch(`${base}/`);
   assert.equal(res.status, 200);
   const html = await res.text();
-  // The tab bar + the four views, and every section assigned to one.
+  // The tab bar + the four surfaces, and every section assigned to one.
   assert.match(html, /id="view-tabs"/, 'the view-tab bar is on the page');
-  for (const v of ['overview', 'projects', 'sessions', 'usage']) {
+  for (const v of ['overview', 'resources', 'sessions', 'usage']) {
     assert.match(html, new RegExp(`data-view="${v}"`), `sections assigned to the ${v} view`);
     assert.match(html, new RegExp(`vtab-${v}`), `the ${v} tab button exists`);
   }
+  // The Resources sub-tab row: every inventory section carries a data-subview.
+  assert.match(html, /id="res-subtabs"/, 'the Resources sub-tab row is on the page');
+  for (const s of ['servers', 'machines', 'projects', 'models']) {
+    assert.match(html, new RegExp(`data-subview="${s}"`), `sections assigned to the ${s} sub-view`);
+    assert.match(html, new RegExp(`rtab-${s}`), `the ${s} sub-tab button exists`);
+  }
   // The view switch is a class flip, not inline style (inline display is
-  // owned by the exception-only sections themselves).
-  assert.match(html, /section\.vthide \{ display: none !important; \}/, 'the hide mechanism is the vthide class');
+  // owned by the exception-only sections themselves). The sub-view switch
+  // is the same mechanism (subhide), and the sub-tab bar shows only inside
+  // Resources via the body.view-resources class.
+  // Mechanism presence, tolerant of restyling (the exact CSS text churns
+  // with every redesign; the CONTRACT is the class-flip mechanism).
+  assert.match(html, /section\.vthide\s*\{[^}]*display:\s*none/, 'the hide mechanism is the vthide class');
+  assert.match(html, /section\.subhide\s*\{[^}]*display:\s*none/, 'the sub-view mechanism is the subhide class');
+  assert.match(html, /body\.view-resources[^{]*#res-subtabs[^{]*\{[^}]*display:\s*flex/, 'the sub-tab bar shows inside Resources');
   // The queue route keeps its own single-section layout (tab bar hidden).
-  assert.match(html, /body\.queuepage #view-tabs \{ display: none; \}/, 'the queue route hides the tab bar');
+  assert.match(html, /body\.queuepage[^{]*#view-tabs[^{]*\{[^}]*display:\s*none/, 'the queue route hides the tab bar');
 });
+
+// ---------------------------------------------------------------------------
+// The Resources → Inference Servers surface, BEHAVIOR side: the card grid
+// reads /api/state's per-row catalog keys (model_source, probed_at) and
+// writes through POST /api/servers + POST /api/servers/remove. Markup is
+// verified by eye; this covers the wiring the cards depend on.
+// ---------------------------------------------------------------------------
 
 test('queue detail page serves the same dashboard at /[project]/[worker]/queue', async () => {
   // The queue page is the SAME single-file dashboard (the inline script
@@ -572,6 +593,65 @@ test("projects in /api/state carry today's results (finished/failed from lease e
     projects: { name: string; today: { finished: number; failed: number } }[];
   };
   assert.deepEqual(pj.projects[0]!.today, { finished: 1, failed: 1 });
+});
+
+
+test('servers surface: add -> probed list replaces declared -> remove works; a leased row refuses', async () => {
+  // Add a row with a DECLARED fallback list (the probe has not answered).
+  const add = await fetch(`${base}/api/servers`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({ name: 'cardtest', url: 'http://cardtest.local:9', models: ['Fallback-A'] }),
+  });
+  assert.equal(add.status, 200);
+  const added = (await add.json()) as { ok: boolean; server: { id: string } };
+  assert.ok(added.ok && added.server.id);
+  const sid = added.server.id;
+
+  let st = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    servers: { id: string; model_source?: string; probed_at?: number | null; models?: { name: string }[] }[];
+  };
+  let row = st.servers.find((s) => s.id === sid)!;
+  assert.equal(row.model_source, 'declared', 'a never-probed row says declared (the card shows the declared-list honesty note)');
+  assert.equal(row.probed_at ?? null, null, 'no probe timestamp yet (the card shows "probe never answered")');
+  assert.deepEqual(row.models!.map((m) => m.name), ['Fallback-A'], 'the declared fallback still lists (the card never goes blank without cause)');
+
+  // Remove: unknown -> 404, missing id -> 400, real row -> 200 and gone.
+  const bad = await fetch(`${base}/api/servers/remove`, { method: 'POST', headers: auth, body: JSON.stringify({ id: 'srv-nope' }) });
+  assert.equal(bad.status, 404, 'unknown id is a 404, not a silent success');
+  const noId = await fetch(`${base}/api/servers/remove`, { method: 'POST', headers: auth, body: '{}' });
+  assert.equal(noId.status, 400, 'a remove with no id is rejected');
+  const noTok = await fetch(`${base}/api/servers/remove`, { method: 'POST', body: JSON.stringify({ id: sid }) });
+  assert.equal(noTok.status, 401, 'the write is token-gated like every settings route');
+  const rm = await fetch(`${base}/api/servers/remove`, { method: 'POST', headers: auth, body: JSON.stringify({ id: sid }) });
+  assert.equal(rm.status, 200);
+  st = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as typeof st;
+  assert.ok(!st.servers.some((s) => s.id === sid), 'the row is gone from /api/state (the grid drops the card on the next tick)');
+
+  // A row a live lease holds is refused (409) — removal cannot orphan a job.
+  // Quiet the feed (the prior test left it busy) + clear any lease an
+  // earlier test left active (max_concurrent=1).
+  entries.length = 0;
+  entries.push(...mkEntries([400], "ip:10.0.0.9", Date.now()));
+  await det.poll(Date.now(), new Set());
+  const openLeases = (await (await fetch(`${base}/api/leases`, { headers: auth })).json()) as { leases: { lease_id: string; status: string }[] };
+  for (const l of openLeases.leases.filter((x) => x.status === 'active')) {
+    // zero-token finish: closes the lease without moving any budget total
+    await fetch(`${base}/api/leases/${l.lease_id}/usage`, { method: 'POST', headers: auth, body: JSON.stringify({ ok: true, tokens_out: 0, tokens_in: 0 }) });
+  }
+  const lease = await fetch(`${base}/api/leases`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({ client_id: clientId, project: 'career-ops', job_id: 'job-rmguard', estimated_seconds: 60 }),
+  });
+  assert.equal(lease.status, 201, 'fixture lease granted: ' + await lease.clone().text());
+  const busy = await fetch(`${base}/api/servers/remove`, { method: 'POST', headers: auth, body: JSON.stringify({ id: 'srv-watched' }) });
+  assert.equal(busy.status, 409, 'a row with a live lease refuses removal');
+  const body = (await busy.json()) as { error: string };
+  assert.match(body.error, /leases_active/, 'the refusal names the reason the card flashes');
+  const leaseId = (await lease.json() as { lease_id: string }).lease_id;
+  const fin = await fetch(`${base}/api/leases/${leaseId}/usage`, {
+    method: 'POST', headers: auth, body: JSON.stringify({ ok: true, tokens_out: 1, tokens_in: 1 }),
+  });
+  assert.equal(fin.status, 200, 'fixture lease closed (no side effects left behind)');
 });
 
 test('/api/state limit: window is honored (default 10, explicit wins, clamped to >=1)', async () => {
@@ -1688,24 +1768,6 @@ test('proxy_port (#43): a later heartbeat without the key keeps the stored port'
   assert.equal(st.clients.find((c) => c.name === 'launcher-keep')!.proxy_port, 44000, 'the port rides the row until the next valid report (the daemon registers before the proxy binds on boot)');
 });
 
-test('dashboard carries the session launcher (#43)', async () => {
-  const html = await (await fetch(base + '/')).text();
-  assert.ok(html.includes('id="launcher-section"'), 'the launcher section exists');
-  assert.ok(html.includes('data-view="sessions"') && html.includes('id="launcher"'), 'it lives in the Sessions view');
-  assert.ok(html.includes('mintedSessions') && html.includes('mintToken'), 'the mint lives page-side (crypto in the browser), persisted across refresh');
-  assert.ok(html.includes('/model http://127.0.0.1:') || html.includes('/model http://127.0.0.1:" +'), 'the handed-over line is the exact /model command');
-});
-
-// ---------------------------------------------------------------------------
-// #44 queue transparency + exposed force:
-//  - the gate block's position ADD-key (1-based FIFO place, router-local
-//    truth): stored/echoed on a valid report; malformed dropped (the block
-//    still rides minus the key); absent = old router, row unchanged.
-//  - force rides the session override end-to-end (already covered by
-//    arbiter.test setSessionOverride + the router's route() bypass) — the
-//    dashboard now offers it as a third gate option.
-// ---------------------------------------------------------------------------
-
 test('queue position (#44): a valid position stores + echoes; malformed drops only the key', async () => {
   await fetch(`${base}/api/sessions/register`, {
     method: 'POST', headers: auth,
@@ -1745,20 +1807,6 @@ test('force on a session row (#44): the override stores, state echoes it, clear 
   assert.equal(st.sessions.find((s) => s.token === 's44-force')!.override, null, 'clear returns the row to the cap');
 });
 
-test('dashboard carries the force control + the queue-position tag (#44)', async () => {
-  const html = await (await fetch(base + '/')).text();
-  assert.ok(html.includes('value="forced"') && html.includes('Session Forced'), 'the session gate select offers force');
-  assert.ok(html.includes('forced</span>') && html.includes('slot cap'), 'the exception-only forced tag exists');
-  assert.ok(html.includes('queued \u00b7 #"') || html.includes('position " + position'), 'the queued tag renders the router-reported position');
-});
-
-// ---------------------------------------------------------------------------
-// #45 session detail: the `history` ADD-key (10×60s request counts +
-// last model + last streamed tokens). Sanitizer posture: drop-don't-reject
-// per key; a block with nothing valid is absent; absent leaves the stored
-// block (the router refreshes it every heartbeat it has traffic).
-// ---------------------------------------------------------------------------
-
 test('session history (#45): valid block stores + echoes; malformed keys drop; empty block is absent', async () => {
   const rpm = [0, 0, 0, 1, 2, 0, 0, 0, 3, 5];
   const a = await fetch(`${base}/api/sessions/register`, {
@@ -1797,13 +1845,6 @@ test('session history (#45): valid block stores + echoes; malformed keys drop; e
   await fetch(`${base}/api/sessions/register`, { method: 'POST', headers: auth, body: JSON.stringify({ token: 's45-a' }) });
   list = await (await fetch(`${base}/api/sessions`, { headers: auth })).json() as typeof list;
   assert.deepEqual(list.sessions.find((s) => s.token === 's45-a')!.history!.rpm, rpm, 'no report never clears the block');
-});
-
-test('dashboard renders the session history facts (#45) exception-only', async () => {
-  const html = await (await fetch(base + '/')).text();
-  assert.ok(html.includes('hist.rpm'), 'the row reads the router-reported per-minute series');
-  assert.ok(html.includes('last model this session negotiated'), 'the model tag carries a tooltip');
-  assert.ok(html.includes('sspark'), 'the inline sparkline class exists for session rows');
 });
 
 // ---------------------------------------------------------------------------
@@ -2065,36 +2106,7 @@ test('legacy register (#61): a client sending neither new key leaves rows byte-i
 // local client-config editor section.
 // ---------------------------------------------------------------------------
 
-test('dashboard carries the #61 step 3 surfaces (daemon behind tag, Client log tab, local config)', async () => {
-  const html = await (await fetch(base + '/')).text();
-  // A1: the worker-row exception tag (the same warn tag family as `stale`).
-  assert.ok(html.includes('daemon behind') && html.includes('launchctl kickstart'), 'the daemon-behind tag exists with the restart toolhint');
-  // A2: the third logs-dock tab + its pane, exception-only.
-  assert.ok(html.includes('id="tab-clientlog"') && html.includes('id="pane-clientlog"'), 'the logs dock carries the Client log tab');
-  assert.ok(html.includes('client_log'), 'the dock reads the client-published tail');
-  assert.ok(html.includes('CLOG_AT_BOTTOM_SLOP'), 'the follow-at-bottom rule is page-side (no auto-scroll fight)');
-  // A3: the Projects-view local editor + its loopback gate.
-  assert.ok(html.includes('id="lcfg-section"') && html.includes('data-view="projects"'), 'the local-config section exists in the Projects view');
-  assert.ok(html.includes('/client/projects') && html.includes('x-idlefill-edit'), 'the editor talks to the client proxy with the edit-header auth');
-  assert.ok(html.includes('pageOriginLoopback'), 'the section is gated on a loopback page origin');
-  // Deep-link hash routing (Slice B re-routes idlefill:// onto #<view>).
-  assert.ok(html.includes('HASH_VIEW_RE'), 'the page honours a #view deep link');
-});
-
-test('dashboard carries the #66 Models tab (alias rows + pair picks + pin), and alias beats bare at publish', async () => {
-  const html = await (await fetch(base + '/')).text();
-  // The tab + section follow the data-view pattern exactly.
-  assert.ok(html.includes('id="vtab-models"') && html.includes('data-view="models"'), 'the Models tab and its section exist');
-  assert.ok(/HASH_VIEW_RE = \/\^\#\(overview\|projects\|sessions\|models\|usage\)\$\//.test(html), 'the deep-link regex covers the models view');
-  // Authoring surface: the + add affordance, the pair pickers, the pin, and
-  // the write/read routes the handlers talk to. No token field ever appears
-  // in an alias form (the note text names the posture).
-  assert.ok(html.includes('id="add-alias"') && html.includes('aliasFormHtml'), 'the add-alias affordance + form renderer exist');
-  assert.ok(html.includes('"/api/aliases"') && html.includes('"/api/aliases?token="'), 'the read + write talk to the alias routes');
-  assert.ok(html.includes('catalog_source !== "probed"') && html.includes('probedInventory'), 'pair picks come ONLY from probed catalog entries (D5)');
-  assert.ok(html.includes('data-act="pin"') && html.includes('data-act="unpin"'), 'the pin control renders per pair (D4 winner)');
-  assert.ok(!/aliasFormHtml[\s\S]{0,2000}auth_token/.test(html.slice(html.indexOf('function aliasFormHtml'), html.indexOf('function aliasFormHtml') + 2500)), 'the alias form has NO token field (write-only rule)');
-
+test('#66 alias beats bare AT PUBLISH: the alias resolves to the paired row; the bare catalog keeps its row-order pin', async () => {
   // Alias beats bare AT PUBLISH: an alias over a name a bare row also
   // declares publishes in model_aliases with the WINNER applied, while the
   // catalog block keeps its bare entry untouched (the client dedups).

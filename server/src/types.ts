@@ -655,6 +655,7 @@ export type EventKind =
   | 'client_override_cleared'
   | 'project_settings_updated'
   | 'server_connection_added'
+  | 'server_connection_removed'
   | 'server_connection_updated'
   /**
    * Model aliases (#66 D4): an operator alias write (upsert / re-pin) and
