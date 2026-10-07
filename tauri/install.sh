@@ -70,6 +70,33 @@ bootout() {
   fi
 }
 
+bootstrap() {
+  # CHECKED bootstrap with the launchd teardown race handled. launchd's
+  # bootout is async: `launchctl print` keeps reporting the label while it
+  # drains, and a bootstrap fired in that window fails with 5
+  # (Input/output error) — observed live: the unchecked bootstrap failed,
+  # install.sh still printed "reinstalled" and exited 0, and the label
+  # ended up GONE. So: wait for the drain (print starts failing), bootstrap,
+  # retry on rc!=0 until it takes, and NEVER claim success unchecked.
+  local i rc
+  for i in 1 2 3 4 5 6 7 8; do
+    is_loaded || break
+    sleep 0.5
+  done
+  rc=0
+  launchctl bootstrap "gui/$UID_NUM" "$PLIST" 2>/dev/null || rc=$?
+  for i in 1 2 3 4 5; do
+    [ "$rc" -eq 0 ] && break
+    sleep 1
+    rc=0
+    launchctl bootstrap "gui/$UID_NUM" "$PLIST" 2>/dev/null || rc=$?
+  done
+  if [ "$rc" -ne 0 ]; then
+    echo "error: bootstrap failed (rc $rc) — gui/$UID_NUM/$LABEL left unloaded (the rendered plist stays at $PLIST)" >&2
+    return 1
+  fi
+}
+
 render_plist() {
   # Render the TEMPLATE with this checkout's values (the menubar
   # install.sh string-substitution discipline, no regex):
@@ -152,7 +179,7 @@ if is_loaded; then
     echo "==> gui/$UID_NUM/$LABEL is loaded — --reinstall: render + bootout + bootstrap"
     render_plist
     bootout
-    launchctl bootstrap "gui/$UID_NUM" "$PLIST"
+    bootstrap
     echo "reinstalled: $PLIST → gui/$UID_NUM/$LABEL"
   else
     echo "gui/$UID_NUM/$LABEL is already loaded — nothing to do (clean no-op; no files written)."
@@ -168,7 +195,7 @@ if is_loaded; then
 fi
 
 render_plist
-launchctl bootstrap "gui/$UID_NUM" "$PLIST"
+bootstrap
 echo "installed: $PLIST → gui/$UID_NUM/$LABEL"
 if [ -z "$PROG" ] && [ ! -f "$DEFAULT_BIN" ]; then
   echo "NOTE: the bundle binary was missing at install time — the agent will"
