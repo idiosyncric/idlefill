@@ -72,8 +72,8 @@ echo "==> restarting com.sam.idlefill.app"
 # line is unchecked: launchd's bootout teardown is async, so a bootstrap
 # fired immediately after sometimes fails with "Bootstrap failed: 5:
 # Input/output error" while install.sh still exits 0. Always verify the
-# label afterwards; when launchd refused, the render already landed and the
-# label is booted-out — retry the bootstrap alone until it takes.
+# label afterwards; when launchd refused, the render already landed and
+# the label is booted-out — retry the bootstrap alone until it takes.
 LABEL="com.sam.idlefill.app"
 # Run the agent from the /Applications copy (install.sh honours
 # IDLEFILL_APP_PROG as ProgramArguments). The plist's WorkingDirectory and
@@ -81,19 +81,23 @@ LABEL="com.sam.idlefill.app"
 PROG_BIN="$DEST_APP/Contents/MacOS/idlefill-app"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 IDLEFILL_APP_PROG="$PROG_BIN" bash tauri/install.sh --reinstall || true
-# Settle on the PROCESS, not on launchctl print: after a bootout, print keeps
-# answering success while the label drains, so a print-based check passes at
-# the instant the label is actually doomed (observed live: the app ended up
-# gone after a "successful" run). The new binary path is unique, so a process
-# carrying it IS the proof the update is live. While nothing carries it, the
-# label is either still draining or launchd refused the bootstrap — a
-# bootstrap onto a draining label errors harmlessly, onto a drained one takes.
+# Settle on launchd's job PID, NOT on the process path. After the rename
+# swap the old process and the new binary share the SAME path, so a
+# path-based pgrep passes the instant the swap lands even when the new
+# process is gone (the app's single-instance plugin exits a second
+# instance at the existing lock — observed live 2026-10-08: update.sh
+# reported "updated" while the old binary kept serving). launchd's
+# "pid = <N>" line is the identity only the NEW process carries. While
+# nothing new is running, the label is either still draining or launchd
+# refused the bootstrap — a bootstrap onto a draining label errors
+# harmlessly, onto a drained one takes.
 ok=0
-for _ in 1 2 3 4 5 6 7 8; do
-  if pgrep -f "$PROG_BIN" >/dev/null 2>&1; then ok=1; break; fi
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  jobpid="$(launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | awk '/^\tpid = /{print $3; exit}')"
+  if [ -n "$jobpid" ] && kill -0 "$jobpid" 2>/dev/null; then ok=1; break; fi
   launchctl bootstrap "gui/$(id -u)" "$PLIST" >/dev/null 2>&1 || true
   sleep 2
 done
-[ "$ok" -eq 1 ] || { echo "error: no process running $PROG_BIN — check $PLIST and logs/app.launchd.err.log" >&2; exit 1; }
+[ "$ok" -eq 1 ] || { echo "error: the label's job is not running the new binary — check $PLIST and logs/app.launchd.err.log" >&2; exit 1; }
 
 echo "updated: idlefill $MARKER"
