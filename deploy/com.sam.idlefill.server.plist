@@ -18,7 +18,7 @@
   KeepAlive SuccessfulExit=false restarts the arbiter on crash; leases
   survive via state.json (a lease active at boot expires at its TTL).
   Label is deliberately distinct from com.sam.idlefill.client (the daemon
-  stays one process) and from com.sam.idlefill.menubar.
+  stays one process).
 
   Install via deploy/install-server-agent.sh (renders + byte-verifies this
   template; do not copy it by hand).

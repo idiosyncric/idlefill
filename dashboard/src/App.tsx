@@ -39,9 +39,7 @@ import { applyTheme } from "@/lib/theme";
 
 // The sidebar nav (shadcn sidebar-16 shape). Every parent item is itself a
 // view: picking "Resources" lands on its Overview. The chevron beside it
-// toggles the sub-tab list — a sub-tab shows that sub-view directly. The
-// id set is a contract (see nav.ts): nav.test.ts pins it against the
-// retired legacy dashboard's view set.
+// toggles the sub-tab list — a sub-tab shows that sub-view directly.
 const NAV: NavItem[] = [
   { id: "overview", title: "Overview", icon: LayoutDashboard },
   {

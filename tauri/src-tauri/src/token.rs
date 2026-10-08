@@ -7,9 +7,9 @@
 //! other form. The wrapper type redacts Debug so a stray {token:?} in a
 //! future log line cannot leak the value.
 
-/// The page's gate key (the page's own contract, GATE_TOKEN_KEY in
-/// server/public/index.html). If the page renames it, this constant and
-/// the live eyeball are the two places to change (sessions-test (i)).
+/// The page's gate key (the page's own contract: the TOKEN_KEY read site
+/// in dashboard/src/lib/api.ts). If the page renames it, this constant and
+/// the live eyeball are the two places to change.
 pub const GATE_TOKEN_KEY: &str = "idlefill.token";
 
 /// A token value that never Debug-prints itself (write-only discipline).

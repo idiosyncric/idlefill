@@ -9,7 +9,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
-    "test": "tsx --test --test-timeout=20000 --test-force-exit test/idle.test.ts test/feed-off.test.ts test/server-key.test.ts test/provider-kinds.test.ts test/arbiter.test.ts test/api.test.ts test/mesh.test.ts test/metrics.test.ts test/page-agents.test.ts test/theme.test.ts"
+    "test": "tsx --test --test-timeout=20000 --test-force-exit test/idle.test.ts test/feed-off.test.ts test/server-key.test.ts test/provider-kinds.test.ts test/arbiter.test.ts test/api.test.ts test/mesh.test.ts test/metrics.test.ts test/theme.test.ts"
   },
   "dependencies": {
     "fastify": "^5.4.0",

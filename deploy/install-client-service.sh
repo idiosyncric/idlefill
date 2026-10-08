@@ -64,9 +64,9 @@ git -C "$REPO" rev-parse HEAD >/dev/null 2>&1 || fail "$REPO is not a git checko
 
 # Refuse a running non-systemd client from THIS repo: two daemons under one
 # name fight over leases and flood registration heartbeats.
-LIVE_PIDS="$(node "$REPO/scripts/idlefill-menubar.mjs" pids 2>/dev/null || true)"
+LIVE_PIDS="$(node "$REPO/scripts/idlefill-daemon.mjs" pids 2>/dev/null || true)"
 if [ -n "$LIVE_PIDS" ]; then
-  fail "a client daemon for this repo is already running outside systemd (pids: $(echo $LIVE_PIDS | tr '\n' ' ')). Stop it first: node scripts/idlefill-menubar.mjs stop"
+  fail "a client daemon for this repo is already running outside systemd (pids: $(echo $LIVE_PIDS | tr '\n' ' ')). Stop it first: node scripts/idlefill-daemon.mjs stop"
 fi
 
 # ---- render + byte-verify (never edit the template) -----------------------

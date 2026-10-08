@@ -396,7 +396,9 @@ Changes (the build wave, after this grill):
   winner rule, the alias POST handler.
 - `server/src/api.ts`: `model_aliases` published on `/api/state` beside
   `catalog` and one admin-token alias write route.
-- `server/public/index.html`: the Models authoring view (D5 shape).
+- `dashboard/src/views/Models.tsx`: the Models authoring view (D5 shape;
+  the legacy `server/public/index.html` that carried it retired with the
+  dashboard cutover, 2026-10-08).
 - `client/src/aggregate.ts`: the alias map beside `catalogByName`, the
   merged `/v1/models`, the first-chunk splice + length rule.
 - Suite: pair confirm/drop, alias-beats-bare, winner fall-through, poll

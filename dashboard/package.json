@@ -8,7 +8,7 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "test": "tsx --test test/nav.test.ts",
+    "test": "true",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

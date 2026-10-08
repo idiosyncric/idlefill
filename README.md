@@ -127,13 +127,14 @@ node scripts/build-careerops-queue.mjs
 
 ```
 server/     arbiter (Docker image) — idle detection, lease state machine,
-            Fastify API, WS events, static dashboard
+            Fastify API, WS events, static dashboard (serves the committed
+            React build from dashboard/dist)
 client/     Mac daemon — register, lease loop, loopback proxy, executor
             supervision, usage reporting, crash-safe queue handling
 adapters/   per-project executors (career-ops: queue builder + JD evaluator
             + the idlefill MCP server, idlefill-mcp.mjs)
 scripts/    thin CLI wrappers (build-careerops-queue.mjs, the control
-            CLIs: idlefill-control.mjs arbiter-side, idlefill-menubar.mjs
+            CLIs: idlefill-control.mjs arbiter-side, idlefill-daemon.mjs
             daemon-side — platform-portable, systemd-aware on Linux)
 deploy/     launchd templates (com.sam.idlefill.client.plist,
             com.sam.idlefill.server.plist) + systemd/ + install-client-service.sh
@@ -217,7 +218,7 @@ when it cannot run sudo itself).
 
 Lifecycle on Linux belongs to systemd: `systemctl --user
 start|stop|restart|status idlefill-client`, logs via `journalctl --user -u
-idlefill-client`. `scripts/idlefill-menubar.mjs` is the portable
+idlefill-client`. `scripts/idlefill-daemon.mjs` is the portable
 daemon-side control (status/start/stop/logs/diagnose/pids) — on Linux it
 shows the unit's state and refuses a raw SIGINT while the unit is active
 (a signal death reads as a crash and `Restart=on-failure` relaunches).
@@ -270,8 +271,8 @@ even with free slots; `force` bypasses the slot cap for that session.
 
 **Gate-state visibility.** The register heartbeat also carries what the
 router's queue knows about the session, so the arbiter's session rows — and
-every sessions surface: the page's Sessions view (the desktop app hosts
-that page), and the menubar panel's exception one-liners — can show "queued
+the Sessions views that read them (the dashboard's Sessions view, which the
+desktop app hosts; the app's glance sessions block) — can show "queued
 behind another session · N waiting" instead of just "registered". The body
 gains an optional `gate` block; a session that neither holds a slot nor
 parks anything sends NO block, and the arbiter then CLEARS any stored gate

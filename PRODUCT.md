@@ -75,16 +75,16 @@ Current (phase 1, live on urza):
   active) and `force` (bypass idle verdict + reidle gate only), with optional
   `until` expiry swept each tick; idempotent re-registration by name keeps
   overrides sticking across daemon restarts.
-- Dashboard panels: Clients (rows + gate comboboxes + override badges),
-  Projects (workers, budget, plain-words schedule), Leases, fixed Logs bottom
-  tray (Events/Leases, shared records-to-show).
+- Dashboard views (the React workspace, `dashboard/src`): Overview,
+  Resources (servers, machines, projects, models, agents), Sessions, Usage,
+  and the Settings theme editor.
 - Auth: Bearer token (header or `token` query param); one bad token on an
   otherwise-anonymous route is a 401.
 
 Constraints: Node 22, TypeScript strict, npm workspaces monorepo, Fastify
-(server), no framework lock-in beyond Fastify; dashboard is hand-written
-static HTML+CSS+JS in `server/public/index.html` (outside tsc coverage —
-inline script must be checked separately). urza is amd64; Mac is arm64 — the
+(server). The dashboard is the React workspace (`dashboard/`): it builds to
+the committed `dashboard/dist/` output that the arbiter serves, so the
+dashboard code is inside the workspace tsc gate. urza is amd64; Mac is arm64 — the
 shipping image is built natively on urza, never on the Mac. Secrets live in
 gitignored config files; tokens never appear in commands, commits, or UI
 copy.
@@ -102,7 +102,8 @@ copy.
 
 - `README.md` — architecture, the self-traffic trap, auth model, operator
   overrides, projects/workers view, phase status.
-- Live dashboard implementation: `server/public/index.html` (hand-written).
+- Live dashboard implementation: `dashboard/src` (React workspace; the
+  arbiter serves the committed build in `dashboard/dist/`).
 - Test suites (server + client), `npm run test` / `npx tsc --noEmit` gate.
 - A deployed, working instance on urza (dashboard at the tailnet IP:8787).
 - Absences future work must not fabricate: no customers, no public launch,

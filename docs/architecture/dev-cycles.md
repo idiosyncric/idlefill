@@ -435,8 +435,8 @@ Verified against the shipped MCP module
   own job, and the row's `verdicts` map is private to the row. The
   spike's third phase asserts both.
 
-The dashboard cycle strip is BUILT (`server/public/index.html` renders a
-per-worker Cycles section; `docs/reports/ISSUE53-CYCLE-STRIP-REPORT.md`
+The dashboard cycle strip is BUILT (`dashboard/src/views/Overview.tsx`
+renders the per-worker Cycle strip; `docs/reports/ISSUE53-CYCLE-STRIP-REPORT.md`
 records the build + live verification). The shape rule it shipped with:
 cycle rows ride the client-published register heartbeat as a `cycles`
 key — one entry per cycle row (this section's locked rule; the

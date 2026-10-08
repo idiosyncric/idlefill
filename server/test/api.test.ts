@@ -1938,7 +1938,7 @@ test('#64 /api/state catalog ADD-key: shape + auth_set, and no token anywhere (a
     });
     aggArbiter.upsertServerConnection({ name: 'omlx', url: 'http://omlx.local:8000', models: ['MlxDeclared'], activity_path: '', auth_token: 'sekret-omlx-token' });
     await aggArbiter.probeCatalog();
-    const aggApp = buildApi({ arbiter: aggArbiter, cfg: aggCfg, publicDir: join(__dirname, '..', 'public') });
+    const aggApp = buildApi({ arbiter: aggArbiter, cfg: aggCfg, publicDir: join(__dirname, 'fixtures', 'dashboard') });
     await aggApp.ready();
     try {
       for (const inject of [
@@ -1976,7 +1976,7 @@ test('#64 GET /api/server-keys: loopback + admin token answers keyed rows; non-l
     const aggArbiter = new Arbiter(new StateStore(aggCfg.state_file), aggCfg, det);
     aggArbiter.upsertServerConnection({ name: 'omlx', url: 'http://omlx.local:8000', models: [], activity_path: '', auth_token: 'sekret-omlx-token' });
     aggArbiter.upsertServerConnection({ name: 'lmstudio', url: 'http://lms.local:1234', models: [], activity_path: '' });
-    const aggApp = buildApi({ arbiter: aggArbiter, cfg: aggCfg, publicDir: join(__dirname, '..', 'public') });
+    const aggApp = buildApi({ arbiter: aggArbiter, cfg: aggCfg, publicDir: join(__dirname, 'fixtures', 'dashboard') });
     await aggApp.ready();
     try {
       const ok = await aggApp.inject({ method: 'GET', url: '/api/server-keys', remoteAddress: '127.0.0.1', headers: { authorization: `Bearer ${AGG_TOKEN}` } });
@@ -2025,7 +2025,7 @@ test('#68 POST /api/client-keys mints once (plaintext in the response only); GET
   try {
     const kCfg: ServerConfig = { ...cfg, api_tokens: [AGG_TOKEN], state_file: join(kDir, 'state.json') };
     const kArbiter = new Arbiter(new StateStore(kCfg.state_file), kCfg, det);
-    const kApp = buildApi({ arbiter: kArbiter, cfg: kCfg, publicDir: join(__dirname, '..', 'public') });
+    const kApp = buildApi({ arbiter: kArbiter, cfg: kCfg, publicDir: join(__dirname, 'fixtures', 'dashboard') });
     await kApp.ready();
     try {
       // Mint: 201, the plaintext rides ONLY this response.
@@ -2226,7 +2226,7 @@ test('#66 alias beats bare AT PUBLISH: the alias resolves to the paired row; the
     // otherwise pin the bare name to `watched`.
     aggArbiter.putModelAlias({ alias: 'Shared-Name', pairs: [{ server_id: omlx.server!.id, model: 'Shared-Name' }] });
     await aggArbiter.probeCatalog();
-    const aggApp = buildApi({ arbiter: aggArbiter, cfg: aggCfg, publicDir: join(__dirname, '..', 'public') });
+    const aggApp = buildApi({ arbiter: aggArbiter, cfg: aggCfg, publicDir: join(__dirname, 'fixtures', 'dashboard') });
     await aggApp.ready();
     try {
       const res = await aggApp.inject({ method: 'GET', url: '/api/state' });
@@ -2268,7 +2268,7 @@ test('#66 /api/state model_aliases ADD-key: present beside an untouched catalog 
     const put = aggArbiter.putModelAlias({ alias: 'Flagship', pairs: [{ server_id: up.server!.id, model: 'MlxDeclared' }] });
     assert.ok(put.ok, JSON.stringify(put));
     await aggArbiter.probeCatalog();
-    const aggApp = buildApi({ arbiter: aggArbiter, cfg: aggCfg, publicDir: join(__dirname, '..', 'public') });
+    const aggApp = buildApi({ arbiter: aggArbiter, cfg: aggCfg, publicDir: join(__dirname, 'fixtures', 'dashboard') });
     await aggApp.ready();
     try {
       for (const inject of [
@@ -2312,7 +2312,7 @@ test('#66 GET /api/aliases: the authoring read is token-gated (never the anonymo
     });
     const up = aggArbiter.upsertServerConnection({ name: 'omlx', url: 'http://omlx.local:8000', models: ['MlxDeclared'], activity_path: '', auth_token: 'sekret-omlx-token' });
     aggArbiter.putModelAlias({ alias: 'Flagship', pairs: [{ server_id: up.server!.id, model: 'MlxDeclared' }], pin: up.server!.id });
-    const aggApp = buildApi({ arbiter: aggArbiter, cfg: aggCfg, publicDir: join(__dirname, '..', 'public') });
+    const aggApp = buildApi({ arbiter: aggArbiter, cfg: aggCfg, publicDir: join(__dirname, 'fixtures', 'dashboard') });
     await aggApp.ready();
     try {
       const anon = await aggApp.inject({ method: 'GET', url: '/api/aliases' });
@@ -2343,7 +2343,7 @@ test('#66 POST /api/aliases: the whole-entry validation matrix — 400 family, 4
     const up = aggArbiter.upsertServerConnection({ name: 'omlx', url: 'http://omlx.local:8000', models: ['MlxDeclared'], activity_path: '' });
     const other = aggArbiter.upsertServerConnection({ name: 'alpha', url: 'http://alpha.local:9090', models: ['engine-a-id'], activity_path: '' });
     assert.ok(up.ok && other.ok);
-    const aggApp = buildApi({ arbiter: aggArbiter, cfg: aggCfg, publicDir: join(__dirname, '..', 'public') });
+    const aggApp = buildApi({ arbiter: aggArbiter, cfg: aggCfg, publicDir: join(__dirname, 'fixtures', 'dashboard') });
     await aggApp.ready();
     const H = { authorization: `Bearer ${AGG_TOKEN}`, 'content-type': 'application/json' };
     try {

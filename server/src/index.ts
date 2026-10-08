@@ -27,16 +27,15 @@ const entryDir = dirname(fileURLToPath(import.meta.url));
  * Candidate order:
  *   1. <repo>/dashboard/dist — the dev/tsx layout (entryDir = server/src),
  *      built by `npm run build` (the test.yml gate builds every workspace);
- *   2. ../public — the legacy single-file page (server/public), kept only as
- *      the fail-safe when the React build has not been run.
- * The container layout (/app/dist/index.js + /app/dashboard/dist) resolves
- * candidate 1 the same way relative to its own entryDir.
+ *   2. ../dashboard/dist — the container layout (/app/dist → /app/dashboard/dist).
+ * The candidate that ships the page must exist in the build context
+ * (scripts/deploy-server.sh stages it); a missing build is a deploy gate
+ * failure, not a runtime fallback.
  */
 function dashboardDir(from: string): string {
   const candidates = [
     join(from, '..', '..', 'dashboard', 'dist'), // server/src → repo/dashboard/dist
     join(from, '..', 'dashboard', 'dist'), // /app/dist → /app/dashboard/dist
-    join(from, '..', 'public'), // legacy fallback
   ];
   for (const c of candidates) {
     if (existsSync(join(c, 'index.html'))) return c;

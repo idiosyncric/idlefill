@@ -2,8 +2,8 @@
 //! (IdlefillDesktop.swift:1063-1072). The scheme must be `idlefill`.
 //! `state` -> overview; sessions/projects/usage map to themselves;
 //! anything else (open, dashboard, logs, unknown, empty) -> None = the
-//! page's default view (the page owns hash reading: HASH_VIEW_RE,
-//! server/public/index.html:1571, untouched).
+//! page's default view (the page owns hash reading: the location.hash
+//! read site in dashboard/src/App.tsx).
 
 /// The URL's view hash for the live origin, or None for the default.
 pub fn hash_view(url: &str) -> Option<String> {

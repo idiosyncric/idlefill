@@ -205,7 +205,7 @@ D3), so every machine charts itself today.
 ## D8 — Dashboard chart surface (PROPOSED)
 
 Minimal for a single operator: one new section ("Usage"), exception-only
-like the other sections of `server/public/index.html`.
+like the other views of `dashboard/src/`.
 
 - Per engine: requests per hour (last 7 days), idle hours per day, lease
   tokens per day.
@@ -258,7 +258,7 @@ Changes (the implementation wave):
    per hour boundary.
 3. One route in `server/src/api.ts` — `GET /api/metrics`.
 4. Two config knobs in `server/src/config.ts` — raw window, retention.
-5. One dashboard section in `server/public/index.html`.
+5. One dashboard view in `dashboard/src` (built into `dashboard/dist/`).
 6. #45's register heartbeat gains one compact block. The arbiter appends it.
 
 Untouched:

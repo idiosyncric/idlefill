@@ -1,11 +1,10 @@
 /**
  * Fastify routes for the arbiter.
  *
- * Auth: every API route requires a token from config `api_tokens` via
  * Auth: every API route requires one of the configured tokens, presented either as the Bearer
  * credential in the Authorization header or as a `token` query parameter.
- * the same way. The dashboard page itself is unauthenticated in phase 1
- * (documented in README); `/api/state` is a read-only endpoint that is
+ * The dashboard page itself is unauthenticated (documented in README);
+ * `/api/state` is a read-only endpoint that is
  * public ONLY when the request carries no token at all — if a token is
  * present and wrong, it is rejected (401). This matches the spec's
  * "dashboard itself is unauthenticated read-only state" while keeping the
@@ -814,13 +813,20 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
    * flow offers only THIS machine's daemon (the dashboard is served by
    * it) and says so rather than offering a remote URL that would not
    * resolve on the operator's box.
+   *
+   * Each endpoint also names the DEFAULT model (`model`): the highest-priority
+   * alias the machine advertises (the first published alias), else the first
+   * bare catalog entry, else null (the machine's default target). The mint
+   * hand-off bakes this name into the agent's config.yaml so a pasted block
+   * works out of the box.
    */
   app.get('/api/agent-endpoints', async () => {
     const now = Date.now();
+    const defaultModel = arbiter.modelAliases()[0]?.name ?? arbiter.catalog()[0]?.name ?? null;
     return {
       endpoints: arbiter['store'].state.clients
         .filter((c: ClientRecord) => typeof c.aggregate_port === 'number' && now - c.last_seen < 90_000)
-        .map((c: ClientRecord) => ({ client: c.name, url: `http://127.0.0.1:${c.aggregate_port}/v1` })),
+        .map((c: ClientRecord) => ({ client: c.name, url: `http://127.0.0.1:${c.aggregate_port}/v1`, model: defaultModel })),
     };
   });
 
@@ -853,23 +859,30 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
 
   /**
    * POST /api/aliases: the alias write route (the drag's write path is the
-   * same). Body: { alias, pairs?, pin?, delete? } — upsert with alias +
+   * same). Body: { alias, pairs?, pin?, delete?, order? } — upsert with alias +
    * pairs (optional pin), re-pin with alias + pin on an existing alias,
-   * removal with { alias, delete: true }. WHOLE-ENTRY validation answers
-   * 400 with the reason (D1/D2 posture: a wrong entry is told, not
-   * swallowed); a delete of an unknown alias is 404. Every write appends
-   * an event (the server_connection_updated pattern) so the Sessions view
-   * and the logs dock see the change. The response echoes the STORED
-   * entry — pairs carry no secret (D1: aliases are secret-free by
-   * construction), so there is nothing to strip.
+   * removal with { alias, delete: true }, or a PRIORITY re-arrangement with
+   * { order: [name, …] } (the stored keys are re-inserted in that order;
+   * first = the default model). WHOLE-ENTRY validation answers 400 with the
+   * reason (D1/D2 posture: a wrong entry is told, not swallowed); a delete of
+   * an unknown alias is 404. Every write appends an event (the
+   * server_connection_updated pattern) so the Sessions view and the logs dock
+   * see the change. The response echoes the STORED entry — pairs carry no
+   * secret (D1: aliases are secret-free by construction), so nothing strips.
    */
   app.post('/api/aliases', async (req, reply) => {
-    const body = (req.body ?? {}) as { alias?: unknown; pairs?: unknown; pin?: unknown; delete?: unknown };
+    const body = (req.body ?? {}) as { alias?: unknown; pairs?: unknown; pin?: unknown; delete?: unknown; order?: unknown };
     const res = arbiter.putModelAlias(body);
     if (!res.ok) {
       return reply.code(res.reason === 'unknown_alias' ? 404 : 400).send({ error: res.reason ?? 'invalid' });
     }
-    return { ok: true, created: res.created === true, deleted: res.deleted === true, ...(res.alias ? { alias: res.alias } : {}) };
+    return {
+      ok: true,
+      created: res.created === true,
+      deleted: res.deleted === true,
+      reordered: res.reordered === true,
+      ...(res.alias ? { alias: res.alias } : {}),
+    };
   });
 
   // ------------------------------------------------------------------
@@ -1174,7 +1187,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   });
 
   // ------------------------------------------------------------------
-  // Dashboard (static, public read in phase 1)
+  // Dashboard (static; the README documents the public read)
   // ------------------------------------------------------------------
 
   const sendShell = (reply: FastifyReply) => {
