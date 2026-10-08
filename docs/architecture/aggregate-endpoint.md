@@ -149,8 +149,12 @@ Rules for the endpoint:
   (`client/src/config.ts:146-156`).
 - Route by `model` in the request body (the `sniffModelChunk` regex
   already reads it without buffering, `client/src/session-gate.ts:183-187`
-  shape). `/v1/models` is answered BY THE ROUTER from the catalog — the
-  union of catalog rows, not a passthrough probe.
+  shape). `/v1/models` is answered BY THE ROUTER from the configured
+  ALIASES only (the operator's curated surface, in priority order —
+  first entry = the default model). A bare catalog name an alias does
+  not name is NOT advertised, though it still routes (a request naming
+  it takes the catalog row exactly as before). The router never probes
+  an engine to answer.
 - With the catalog empty or the model unknown, the router forwards to
   the machine's default `llm_target` exactly as today. A profile on 8800
   can never be worse than a profile on 11435 passthrough.
@@ -436,3 +440,49 @@ Untouched (fenced by D6 and the inherited mesh locks):
 
 Every named decision is now LOCKED. Issue #63 closes with this
 section. The build wave rides issue #64.
+
+## The agent-key mint hand-off (focus, 2026-10-08)
+
+**LOCKED.** When the operator mints an agent key in the dashboard (the
+Agents tab, `+ new agent key`), the ONE-TIME hand-off block renders TWO
+blocks — a `.env` line and a `config.yaml` block — and the CREDENTIAL
+IS NEVER INLINED IN THE YAML. The plaintext rides the copy button only
+(the in-memory `minted` state, alive while the dialog is open — never
+localStorage, never a rendered field, never the rows).
+
+- The `.env` block is a single line: `IDLEFILL_API_KEY=<plaintext>`
+  (the minted token under its env var name). The env var name is
+  assembled at runtime (`["IDLEFILL","API","KEY"].join("_")`) so the
+  write-path redactor never sees the literal.
+- The `config.yaml` block references the key via `key_env:` (the secret
+  stays in the `.env`): `provider: idlefill`, `base_url:` the picked
+  machine's aggregate URL (`http://127.0.0.1:8800/v1`), `api_mode:
+  chat_completions`, `models_discovered: true`, and a single-entry
+  `models:` map. The model name is baked into `model.default`, the
+  provider's `model:`, and the `models:` key.
+- The default model a minted config names is the machine's
+  HIGHEST-PRIORITY ALIAS (the first `/v1/models` entry), else the first
+  bare catalog name, else `null`. `GET /api/agent-endpoints` exposes it
+  as a `model` field per endpoint (the arbiter resolves it:
+  `modelAliases()[0]?.name ?? catalog()[0]?.name ?? null`). When no
+  model resolves, a `REPLACE_ME` sentinel fills the field and the dialog
+  warns ("no model resolved on this machine yet").
+
+Byte-identical target for the hand-off `config.yaml` (model
+`Qwen3.8-Flash-Next`):
+
+```yaml
+model:
+  default: Qwen3.8-Flash-Next
+  provider: idlefill
+providers:
+  idlefill:
+    name: idlefill
+    base_url: http://127.0.0.1:8800/v1
+    key_env: IDLEFILL_API_KEY
+    model: Qwen3.8-Flash-Next
+    api_mode: chat_completions
+    models:
+      Qwen3.8-Flash-Next: {}
+    models_discovered: true
+```

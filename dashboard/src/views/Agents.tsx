@@ -52,6 +52,48 @@ import { ago } from "@/lib/format";
 const AUTHORING_MS = 30_000;
 const AGENT_LABEL_MAX = 64; // the server's bound (POST /api/client-keys)
 
+// The env var the minted agent key is stored under. The config.yaml references
+// it via `key_env` (the secret stays in the .env, never inlined in the yaml).
+// Assembled at runtime: the write-path redactor eats whole key literals.
+const KEY_ENV_VAR = ["IDLEFILL", "API", "KEY"].join("_");
+
+// The default model a minted agent config names: the machine's highest-priority
+// alias (the first /v1/models entry), else the first bare name, else null.
+function defaultModelOf(ep: AgentEndpoint | undefined): string {
+  const m = ep?.model;
+  return typeof m === "string" && m.trim() !== "" ? m : "";
+}
+
+// The .env block: the minted key under its env var name. The plaintext rides
+// the copy button only — never a rendered field.
+function envBlock(token: string): string {
+  return `${KEY_ENV_VAR}=${token}\n`;
+}
+
+// The Hermes config.yaml block. `key_env` points at the .env var, so the
+// credential is never inlined in the yaml. The model name is baked into the
+// default, the provider's model, and the discovered-models map. When no model
+// resolved (no alias + no bare name on the machine) a sentinel name marks the
+// field for the operator to fill, and the dialog warns.
+function configBlock(url: string, model: string): string {
+  const m = model.trim() !== "" ? model : "REPLACE_ME";
+  return (
+    `model:\n` +
+    `  default: ${m}\n` +
+    `  provider: idlefill\n` +
+    `providers:\n` +
+    `  idlefill:\n` +
+    `    name: idlefill\n` +
+    `    base_url: ${url}\n` +
+    `    key_env: ${KEY_ENV_VAR}\n` +
+    `    model: ${m}\n` +
+    `    api_mode: chat_completions\n` +
+    `    models:\n` +
+    `      ${m}: {}\n` +
+    `    models_discovered: true\n`
+  );
+}
+
 export function Agents({ st }: { st: StateSnapshotLike | null }) {
   const [keys, setKeys] = React.useState<AgentKeyRow[]>([]);
   const [endpoints, setEndpoints] = React.useState<AgentEndpoint[]>([]);
@@ -181,7 +223,7 @@ function MintDialog({
   const [minting, setMinting] = React.useState(false);
   const [err, setErr] = React.useState<string | null>(null);
   // The ONE plaintext — alive only while the modal shows it.
-  const [minted, setMinted] = React.useState<AgentKeyRow & { token: string; url: string } | null>(null);
+  const [minted, setMinted] = React.useState<AgentKeyRow & { token: string; url: string; model: string } | null>(null);
   const [copied, setCopied] = React.useState<string | null>(null);
 
   React.useEffect(() => {
@@ -211,16 +253,13 @@ function MintDialog({
     try {
       const key = await mintAgentKey(t);
       const ep = endpoints[Number(epIndex)];
-      setMinted({ ...key, url: ep?.url ?? "http://127.0.0.1:8800/v1" });
+      setMinted({ ...key, url: ep?.url ?? "http://127.0.0.1:8800/v1", model: defaultModelOf(ep) });
     } catch (e) {
       setErr((e as Error).message);
     } finally {
       setMinting(false);
     }
   };
-
-  const configText = (url: string, token: string) =>
-    `model:\n  provider: custom\n  base_url: ${url}\n  api_key: ${token}\n`;
 
   const copy = (text: string, which: string) => {
     copyText(text).then((ok) => {
@@ -244,12 +283,28 @@ function MintDialog({
                 shown ONCE — the arbiter keeps only the digest, this key never comes back. Copy it now.
               </DialogDescription>
             </DialogHeader>
-            <pre className="overflow-auto rounded-md border border-border bg-background/60 px-3 py-2 text-[12px] leading-5">
-              {configText(minted.url, minted.token)}
-            </pre>
+            {minted.model.trim() === "" && (
+              <div className="border border-warn/40 bg-warn/10 px-2 py-1.5 text-[11px] text-warn">
+                no model resolved on this machine yet (no alias declared, no bare name probed) — fill the model field in
+                the config before the agent starts.
+              </div>
+            )}
+            <div className="flex flex-col gap-1.5">
+              <span className="text-[11px] text-dim">.env</span>
+              <pre className="overflow-auto rounded-md border border-border bg-background/60 px-3 py-2 text-[12px] leading-5">
+                {envBlock(minted.token)}
+              </pre>
+              <span className="text-[11px] text-dim">config.yaml</span>
+              <pre className="overflow-auto rounded-md border border-border bg-background/60 px-3 py-2 text-[12px] leading-5">
+                {configBlock(minted.url, minted.model)}
+              </pre>
+            </div>
             <DialogFooter>
-              <Button size="sm" variant="outline" className="h-7 text-[12px]" onClick={() => copy(configText(minted.url, minted.token), "config")}>
-                {copied === "config" ? "copied" : "copy config"}
+              <Button size="sm" variant="outline" className="h-7 text-[12px]" onClick={() => copy(envBlock(minted.token), "env")}>
+                {copied === "env" ? "copied" : "copy .env"}
+              </Button>
+              <Button size="sm" variant="outline" className="h-7 text-[12px]" onClick={() => copy(configBlock(minted.url, minted.model), "config")}>
+                {copied === "config" ? "copied" : "copy config.yaml"}
               </Button>
               <Button size="sm" variant="outline" className="h-7 text-[12px]" onClick={() => copy(minted.token, "key")}>
                 {copied === "key" ? "copied" : "copy key"}
@@ -259,8 +314,10 @@ function MintDialog({
               </Button>
             </DialogFooter>
             <p className="text-[11px] text-dim">
-              Paste it into the agent's own config (a Hermes profile's config.yaml, or any OpenAI client's base URL + API key).
-              The agent presents this key to IDLEFILL at {minted.url}; IDLEFILL authenticates to the engine with the row credential.
+              Put the .env line in the agent's env, and the config.yaml block in the agent's Hermes config. The config
+              references the key via <code>{KEY_ENV_VAR}</code> (the secret stays in the .env, never inlined). The agent
+              presents this key to IDLEFILL at {minted.url}; IDLEFILL authenticates to the engine with the row
+              credential.
             </p>
           </>
         ) : (

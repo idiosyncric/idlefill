@@ -672,6 +672,7 @@ export type EventKind =
    */
   | 'model_alias_updated'
   | 'model_alias_removed'
+  | 'model_alias_reordered'
   /**
    * Agent keys (#68): an operator mint (detail carries the label, NEVER
    * the plaintext) and a revoke (detail carries id + label).

@@ -8,8 +8,9 @@
  * exact shape the daemon's /api/state poll feeds it.
  *
  * Covers:
- *   - /v1/models: alias winners FIRST, a bare name an alias shadows
- *     appears ONCE (D3 dedup — one string, one row)
+ *   - /v1/models: advertises ONLY the configured aliases, in their PRIORITY
+ *     order (the publish block order) — a shadowed name appears once, a
+ *     non-aliased bare name is absent (the operator's curated surface)
  *   - routing: the alias name reaches the WINNER row's engine with that
  *     row's Authorization header; the alias BEATS a bare catalog entry of
  *     the same name (D2 precedence); onSessionRoute reports the WINNER
@@ -186,7 +187,7 @@ test('spliceModelName: only the model value changes, quotes intact, no-match lea
   assert.equal(spliceModelName(body, ALIAS_NAME, ALIAS_NAME), body);
 });
 
-test('#66 /v1/models: alias winners FIRST, a shadowed bare name appears ONCE (D3 dedup)', async () => {
+test('#66 /v1/models: advertises ONLY the aliases (in priority order) — a shadowed name appears once, a non-aliased bare name is absent', async () => {
   const def = await startEcho('default');
   cleanup.push(() => def.close());
   const r = await startRouter({
@@ -203,11 +204,31 @@ test('#66 /v1/models: alias winners FIRST, a shadowed bare name appears ONCE (D3
   assert.equal(res.status, 200);
   const list = (await res.json()) as { object: string; data: { id: string; owned_by: string }[] };
   const ids = list.data.map((d) => d.id);
-  assert.equal(ids.filter((i) => i === ALIAS_NAME).length, 1, 'one string appears once');
-  assert.equal(list.data[0]!.id, ALIAS_NAME, 'alias winners come first');
+  assert.deepEqual(ids, [ALIAS_NAME], 'only the alias is advertised — the shadowed bare entry AND the non-aliased BareOther are both absent');
+  assert.equal(list.data[0]!.id, ALIAS_NAME, 'the alias is the first advertised name');
   assert.equal(list.data[0]!.owned_by, 'srv-win', 'owned_by = the winner row, not the shadowed bare row');
-  assert.ok(ids.includes('BareOther'), 'unaliased bare names still publish (additive)');
   assert.equal(def.hits.length, 0, 'the router still never probes an engine for /v1/models');
+});
+
+test('#66 /v1/models: the alias list order is the PRIORITY order (first alias first)', async () => {
+  const def = await startEcho('default');
+  cleanup.push(() => def.close());
+  // Two aliases; the operator's priority puts B before A (A was created first,
+  // but the publish block — the operator's reordered view — leads with B).
+  const r = await startRouter({
+    defaultTarget: def.url,
+    catalog: [
+      { name: 'AliasA', server_id: 'srv-a', url: 'http://127.0.0.1:5', auth_set: true, catalog_source: 'probed' },
+      { name: 'AliasB', server_id: 'srv-b', url: 'http://127.0.0.1:6', auth_set: true, catalog_source: 'probed' },
+    ],
+    aliases: [
+      { name: 'AliasB', server_id: 'srv-b', url: 'http://127.0.0.1:6', auth_set: true, engine_model: 'engine-b', catalog_source: 'probed' },
+      { name: 'AliasA', server_id: 'srv-a', url: 'http://127.0.0.1:5', auth_set: true, engine_model: 'engine-a', catalog_source: 'probed' },
+    ],
+  });
+  const res = await fetch(`${r.base_url}/v1/models`);
+  const list = (await res.json()) as { data: { id: string }[] };
+  assert.deepEqual(list.data.map((d) => d.id), ['AliasB', 'AliasA'], 'the advertised order is the publish block order, not the creation order');
 });
 
 test('#66 routing: the alias name reaches the WINNER engine with the row Authorization; the alias beats a bare entry of the same name', async () => {

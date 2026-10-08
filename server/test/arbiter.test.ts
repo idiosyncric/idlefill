@@ -1480,6 +1480,46 @@ test('#66 winner rule (D4): stored pin wins; absent pin / pin row gone / pin pai
   }
 });
 
+test('#66 priority reorder: { order } re-inserts the stored keys (rows untouched); an unchanged order is a no-op; a bad list is refused', () => {
+  const map: Record<string, string[] | null> = {};
+  const h = makeAliasHarness(map);
+  try {
+    const put = (alias: string) =>
+      h.arbiter.putModelAlias({ alias, pairs: [{ server_id: h.idA, model: 'engine-a-id' }] });
+    assert.ok(put('A').ok && put('B').ok && put('C').ok, 'seed three aliases');
+    const keys = () => Object.keys(h.store.state.model_aliases);
+    assert.deepEqual(keys(), ['A', 'B', 'C'], 'stored insertion order = the priority (A on top)');
+
+    // Reorder C to the top: the stored keys are re-inserted, the ROWS (pairs)
+    // are untouched, and the publish pass follows the new order.
+    const moved = h.arbiter.putModelAlias({ order: ['C', 'A', 'B'] });
+    assert.equal(moved.ok, true, JSON.stringify(moved));
+    assert.equal(moved.reordered, true, 'a real move reports reordered');
+    assert.deepEqual(keys(), ['C', 'A', 'B'], 'the stored keys are re-inserted in the new order');
+    assert.equal(h.store.state.model_aliases['A']?.pairs.length, 1, 'the A row is untouched by the reorder');
+    assert.equal(h.store.state.model_aliases['C']?.pairs.length, 1, 'the C row is untouched by the reorder');
+    assert.deepEqual(
+      h.arbiter.aliasRows().map((r) => r.alias),
+      ['C', 'A', 'B'],
+      'the authoring read (and the publish order) follow the new priority',
+    );
+
+    // An unchanged order is a no-op (no event, no save churn).
+    const same = h.arbiter.putModelAlias({ order: ['C', 'A', 'B'] });
+    assert.equal(same.ok, true);
+    assert.equal(same.reordered, false, 'an unchanged order is a no-op');
+
+    // Bad lists are refused whole (told, not swallowed) — the order is unchanged.
+    assert.equal(h.arbiter.putModelAlias({ order: ['C', 'A', 'B', 'Z'] }).ok, false, 'a stray name is refused');
+    assert.equal(h.arbiter.putModelAlias({ order: ['C', 'A'] }).ok, false, 'a missing name is refused');
+    assert.equal(h.arbiter.putModelAlias({ order: ['C', 'C', 'B'] }).ok, false, 'a duplicated name is refused');
+    assert.equal(h.arbiter.putModelAlias({ order: ['C', 5, 'B'] }).ok, false, 'a non-string entry is refused');
+    assert.deepEqual(keys(), ['C', 'A', 'B'], 'a refused reorder leaves the order unchanged');
+  } finally {
+    rmSync(h.dir, { recursive: true, force: true });
+  }
+});
+
 test("#66 publish-path sanitizers are drop-don't-reject: a hostile stored key publishes nothing but never throws", async () => {
   const map: Record<string, string[] | null> = {};
   const h = makeAliasHarness(map);

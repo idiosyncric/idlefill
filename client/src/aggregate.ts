@@ -4,8 +4,9 @@
  * SAME process, in front of the SAME SessionGate instance.
  *
  * Every Hermes profile points at `http://127.0.0.1:8800/v1`. This listener:
- *   - answers GET /v1/models from the arbiter-published catalog union
- *     (deduped bare names — NEVER a passthrough probe of one engine);
+ *   - answers GET /v1/models with the CONFIGURED ALIASES only, in their
+ *     priority order (the operator's curated surface — bare engine names an
+ *     alias does not name are NOT advertised, though they still route);
  *   - routes chat-completions by the body's `model` to the catalog row's
  *     engine, adding that row's Authorization header from the router's
  *     IN-MEMORY key table (pull-scoped loopback route #64 D2 — tokens
@@ -540,15 +541,16 @@ export function startAggregateRouter(opts: {
   };
 
   const serveModelList = (_req: http.IncomingMessage, res: http.ServerResponse): void => {
-    // The router answers from the catalog union — NEVER a passthrough
-    // probe (D1). Bare names, first-row pin already applied upstream.
-    // #66 D3 dedup: alias winners come FIRST, and a bare entry whose name
-    // an alias shadows is skipped — one string still appears ONCE.
+    // The operator's ask (2026-10-08): /v1/models advertises ONLY the
+    // configured aliases, in their priority order (the publish block's order,
+    // first = the default model). A bare engine name an alias does not name
+    // is NOT advertised — it still routes (a request naming it takes the
+    // catalog row exactly as before); the list is the operator's curated
+    // surface, not the raw catalog union. With no alias the list is empty:
+    // the machine advertises nothing (a chat request still routes by name,
+    // and the unknown-model fallback stands). The router still NEVER probes
+    // an engine to answer (D1).
     const data = aliases.map((a) => ({ id: a.name, object: 'model', owned_by: a.server_id }));
-    for (const e of catalog) {
-      if (aliasByName.has(e.name)) continue; // the alias owns this name
-      data.push({ id: e.name, object: 'model', owned_by: e.server_id });
-    }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ object: 'list', data }));
   };

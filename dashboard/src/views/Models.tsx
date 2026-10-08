@@ -1,5 +1,6 @@
 import * as React from "react";
 import { toast } from "sonner";
+import { ArrowUp, ArrowDown } from "lucide-react";
 import {
   Card,
   CardHeader,
@@ -81,6 +82,42 @@ export function Models({ st }: { st: StateSnapshot | null }) {
     }
   }, []);
 
+  // Priority re-arrangement. The stored key order IS the priority: it is the
+  // order /v1/models advertises (first = the default model) and the default
+  // model a minted agent config names. A move rewrites the whole order as
+  // { order: [name, …] } (first = highest priority). The list the pane holds
+  // is already in priority order (the server returns stored insertion order).
+  const reorder = React.useCallback(
+    async (names: string[]) => {
+      if (!apiToken()) {
+        toast.error("needs the arbiter API token — paste it in the header first");
+        return;
+      }
+      const current = aliases.map((a) => a.alias);
+      if (names.length !== current.length || names.every((n, i) => current[i] === n)) return; // no-op
+      try {
+        await putAlias({ order: names });
+        toast.success("priority updated");
+        void refresh();
+      } catch (e) {
+        toast.error(`reorder refused: ${(e as Error).message}`);
+      }
+    },
+    [aliases, refresh],
+  );
+
+  // Swap one card with its neighbor (the up/down arrows).
+  const move = React.useCallback(
+    (index: number, dir: -1 | 1) => {
+      const j = index + dir;
+      if (j < 0 || j >= aliases.length) return;
+      const names = aliases.map((a) => a.alias);
+      [names[index], names[j]] = [names[j]!, names[index]!];
+      void reorder(names);
+    },
+    [aliases, reorder],
+  );
+
   React.useEffect(() => {
     void refresh();
     const id = setInterval(() => void refresh(), AUTHORING_MS);
@@ -126,19 +163,28 @@ export function Models({ st }: { st: StateSnapshot | null }) {
           </CardContent>
         </Card>
       ) : (
-        <div className="grid gap-2.5 [grid-template-columns:repeat(auto-fit,minmax(340px,1fr))]">
-          {aliases.map((a) => (
-            <AliasCard
-              key={a.alias}
-              a={a}
-              srvName={srvName}
-              now={st?.now ?? Date.now()}
-              onEdit={() => {
-                if (apiToken()) setEditName(a.alias);
-              }}
-            />
-          ))}
-        </div>
+        <>
+          <p className="mb-2 text-[11px] text-dim">
+            cards are listed in PRIORITY order — top = highest priority. The top alias is the machine’s default model
+            (the name /v1/models leads with, and the name a minted agent config names). Re-order with the arrows.
+          </p>
+          <div className="grid gap-2.5 [grid-template-columns:repeat(auto-fit,minmax(340px,1fr))]">
+            {aliases.map((a, i) => (
+              <AliasCard
+                key={a.alias}
+                a={a}
+                index={i}
+                total={aliases.length}
+                onMove={(dir) => move(i, dir)}
+                srvName={srvName}
+                now={st?.now ?? Date.now()}
+                onEdit={() => {
+                  if (apiToken()) setEditName(a.alias);
+                }}
+              />
+            ))}
+          </div>
+        </>
       )}
 
       <AliasFormDialog
@@ -182,11 +228,17 @@ const SOURCE_MARK: Record<string, string> = {
 
 function AliasCard({
   a,
+  index,
+  total,
+  onMove,
   srvName,
   now,
   onEdit,
 }: {
   a: AliasRow;
+  index: number;
+  total: number;
+  onMove: (dir: -1 | 1) => void;
   srvName: (id: string) => string;
   now: number;
   onEdit: () => void;
@@ -194,6 +246,7 @@ function AliasCard({
   const winnerId = a.pinned_server_id ?? a.pairs[0]?.server_id ?? "";
   const winnerPair = a.pairs.find((p) => p.server_id === winnerId) ?? a.pairs[0];
   const winnerIsPin = a.pinned_server_id !== undefined;
+  const isDefault = index === 0 && total > 0;
 
   const pin = async (server_id: string | null) => {
     if (!apiToken()) {
@@ -229,7 +282,41 @@ function AliasCard({
   return (
     <Card className="gap-0 py-0 shadow-none">
       <CardHeader className="flex-row items-center gap-2 px-3 py-2 pb-0">
+        <span className="flex items-center gap-1.5">
+          <span className="flex items-center gap-0.5" title="re-order the priority (top = highest)">
+            <Button
+              size="xs"
+              variant="ghost"
+              className="h-6 w-6 p-0 text-[11px] text-dim"
+              disabled={index === 0}
+              onClick={() => onMove(-1)}
+              title="raise the priority (move up toward the default)"
+              aria-label="raise priority"
+            >
+              <ArrowUp className="size-3.5" />
+            </Button>
+            <Button
+              size="xs"
+              variant="ghost"
+              className="h-6 w-6 p-0 text-[11px] text-dim"
+              disabled={index === total - 1}
+              onClick={() => onMove(1)}
+              title="lower the priority (move down)"
+              aria-label="lower priority"
+            >
+              <ArrowDown className="size-3.5" />
+            </Button>
+          </span>
+          <span className="w-4 text-[11px] tabular-nums text-dim" title={`priority ${index + 1} of ${total}`}>
+            {index + 1}.
+          </span>
+        </span>
         <CardTitle className="font-mono text-[13px] font-semibold">{a.alias}</CardTitle>
+        {isDefault && (
+          <Badge variant="outline" className="shrink-0 rounded-pill border-accent/50 px-1.5 py-0 text-[10px] font-normal text-accent" title="the top alias — the machine’s default model (first in /v1/models, named by a minted agent config)">
+            default
+          </Badge>
+        )}
         <CardAction className="gap-1.5">
           <Button size="xs" variant="ghost" className="h-6 px-2 text-[11px]" onClick={onEdit}>
             edit
@@ -342,6 +429,11 @@ function AliasFormDialog({
   const [pin, setPin] = React.useState("");
   const [saving, setSaving] = React.useState(false);
   const [err, setErr] = React.useState<string | null>(null);
+  // The insert position for a NEW alias (an index 0..existing.length into the
+  // priority list; length = append at the bottom). Ignored on edit (the name
+  // is the identity; re-order from the card arrows). Default = append at the
+  // bottom (no silent demotion of the current default).
+  const [position, setPosition] = React.useState("0");
 
   React.useEffect(() => {
     if (!open) return;
@@ -349,7 +441,9 @@ function AliasFormDialog({
     setPairs(alias ? alias.pairs.map((p) => ({ server_id: p.server_id, model: p.model })) : [{ server_id: "", model: "" }]);
     setPin(alias?.pinned_server_id ?? "");
     setErr(null);
+    setPosition(String(existing.length)); // append at the bottom by default
   }, [open, alias]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
 
   // The probed inventory for a row (the pick-list), plus any stored value
   // the probe never confirmed (it round-trips verbatim, marked).
@@ -429,6 +523,15 @@ function AliasFormDialog({
     }
     try {
       await putAlias(body);
+      // A NEW alias: place it at the chosen insert position. The create
+      // appended it at the BOTTOM (stored insertion order), so only a
+      // position above the last index is a real move; re-order to land it.
+      if (!editing) {
+        const others = existing.map((x) => x.alias);
+        const pos = Math.max(0, Math.min(parseInt(position, 10) || 0, others.length));
+        const order = [...others.slice(0, pos), aliasName, ...others.slice(pos)];
+        if (pos < others.length) await putAlias({ order });
+      }
       onSaved();
       onOpenChange(false);
     } catch (e) {
@@ -456,10 +559,43 @@ function AliasFormDialog({
               <code>{alias!.alias}</code>
             </div>
           ) : (
-            <label className="flex flex-col gap-1">
-              <span className="text-dim">alias name (≤128 printable chars)</span>
-              <Input className="h-7 text-[12px]" value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Qwen3.Flagship" maxLength={128} />
-            </label>
+            <>
+              <label className="flex flex-col gap-1">
+                <span className="text-dim">alias name (≤128 printable chars)</span>
+                <Input className="h-7 text-[12px]" value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Qwen3.Flagship" maxLength={128} />
+              </label>
+              <label className="flex items-center gap-2">
+                <span className="text-dim">insert position (priority)</span>
+                <Select value={position} onValueChange={setPosition}>
+                  <SelectTrigger size="sm" className="h-7 w-[200px] text-[12px]">
+                    <SelectValue placeholder="— position —" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {existing.length === 0 ? (
+                      <SelectItem value="0" className="text-[12px]">
+                        the only alias (top)
+                      </SelectItem>
+                    ) : (
+                      <>
+                        <SelectItem value="0" className="text-[12px]">
+                          1 · top — becomes the default
+                        </SelectItem>
+                        {existing.map((x, i) =>
+                          i < existing.length - 1 ? (
+                            <SelectItem key={x.alias} value={String(i + 1)} className="text-[12px]">
+                              {i + 2} · after {x.alias}
+                            </SelectItem>
+                          ) : null,
+                        )}
+                        <SelectItem value={String(existing.length)} className="text-[12px]">
+                          {existing.length + 1} · bottom (after {existing[existing.length - 1]!.alias})
+                        </SelectItem>
+                      </>
+                    )}
+                  </SelectContent>
+                </Select>
+              </label>
+            </>
           )}
 
           <div className="flex flex-col gap-1.5">

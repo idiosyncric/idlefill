@@ -186,12 +186,15 @@ Publication shape. `GET /api/state` gains the ADD-key
 ```
 
 The existing `catalog` entries are untouched (`server/src/catalog.ts:23-34`).
-The router answers `GET /v1/models` from the merge: alias winners first
-(as `{id: alias, object: 'model', owned_by: server_id}` — the
-`serveModelList` shape, `client/src/aggregate.ts:229-239`), then bare
-entries whose name no alias shadows. Old routers ignore the new key —
-back-compat by ADD rule. Dedup: an alias name shadows a bare name, so
-one string still appears ONCE in `hermes model`.
+The router answers `GET /v1/models` from the ALIASES only (the operator's
+curated surface, in priority order — first entry = the default model):
+`{id: alias, object: 'model', owned_by: server_id}` — the
+`serveModelList` shape, `client/src/aggregate.ts`. A bare catalog entry
+whose name no alias names is NOT advertised, though it still routes
+(a request naming it takes the catalog row exactly as before). With no
+alias configured the list is EMPTY. Old routers ignore the new key —
+back-compat by ADD rule. An alias name shadows a bare name, so one
+string still appears ONCE in `hermes model`.
 
 The rewrite. A routed alias whose `engine_model` differs from the
 requested name must ship the ENGINE's id in the body. Today nothing
@@ -292,6 +295,37 @@ The runtime re-pin write path, one sentence each:
   profile config names only the alias, and the register heartbeat's
   `server_id` flips to the new row on the next heartbeat — idle folding
   and preemption follow the new engine honestly.
+
+The runtime PRIORITY re-arrangement write path (the Models tab's re-order
+arrows / insert-position picker), one sentence each — a NEW write shape on
+the same POST route, no new channel:
+
+- The stored object-key INSERTION order of `state.model_aliases` IS the
+  priority (first key = highest = the default model the mint hand-off names,
+  the first `/v1/models` entry, the publish pass's first-survivor fallback).
+  Re-arranging is a rewrite of that key order — the rows are untouched.
+- Dashboard POSTs `{ order: [name, …] }` to the same `POST /api/aliases`
+  admin route (no `alias`/`pairs`/`pin` in the body); the arbiter
+  `putModelAlias({ order })` → `reorderAliases` re-inserts the stored keys.
+- All-or-nothing: the list must name every stored alias EXACTLY once. A
+  gap, a dupe, a stray name, or a non-string entry is refused whole (a 400,
+  told not swallowed) and the order is unchanged. An unchanged order is a
+  no-op (no event, no save churn). A new alias appends at the BOTTOM by
+  default (insert position = `existing.length`) — no silent demotion of the
+  current default.
+- The arbiter appends a `model_alias_reordered` event (the
+  `model_alias_updated` pattern) and saves; the router learns the new order
+  on the NEXT `/api/state` poll (same pull posture as the pin — the
+  `model_aliases` block re-publishes in the new key order). The agent never
+  learns; the gate key is the alias name (stable).
+
+Rejected: a numeric `rank` column (the object-key insertion order is already
+the priority — a rank is redundant state to keep in sync, and a missing rank
+has no honest default). A per-move delta (move alias X to position N) (the
+whole-list `{ order }` is atomic and self-describing; a delta needs a
+conflict rule the operator has to read). A separate reorder endpoint (the
+existing `POST /api/aliases` admin route + body already carries the shape —
+one route, one token gate).
 
 Rejected: least-loaded selection (the arbiter's load signals are per-
 server idle verdicts, not per-model queues — it cannot rank engines for

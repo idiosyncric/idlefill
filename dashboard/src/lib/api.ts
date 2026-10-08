@@ -255,6 +255,8 @@ export type AgentKeyRow = {
 export type AgentEndpoint = {
   client: string;
   url: string;
+  /** The default model the mint hand-off bakes into the config (the highest-priority alias, else the first bare name, else null). */
+  model?: string | null;
 };
 
 export type MeshPeerServer = {
@@ -524,8 +526,16 @@ export async function setSessionPin(token: string, server_id: string | null) {
   }));
 }
 
-// Alias upsert: { alias, pairs?, pin?, delete? }.
-export async function putAlias(body: { alias: string; pairs?: { server_id: string; model: string }[]; pin?: string | null; delete?: boolean }) {
+// Alias upsert: { alias, pairs?, pin?, delete? } — or a PRIORITY re-arrangement
+// { order: [name, …] } (the stored keys are re-inserted in that order; first =
+// the default model). For a re-arrangement `alias` is absent.
+export async function putAlias(body: {
+  alias?: string;
+  pairs?: { server_id: string; model: string }[];
+  pin?: string | null;
+  delete?: boolean;
+  order?: string[];
+}) {
   return json(await fetch(`/api/aliases${qsToken()}`, {
     method: "POST",
     headers: { "content-type": "application/json" },

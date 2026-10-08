@@ -9,8 +9,10 @@
  * the exact shape the daemon's poll loop feeds them.
  *
  * Covers:
- *   - GET /v1/models answers the catalog UNION (deduped), never a
- *     passthrough probe (the probe engine is never hit for it)
+ *   - GET /v1/models advertises ONLY the configured aliases — with none an
+ *     EMPTY list (the bare catalog is not advertised), never a passthrough
+ *     probe (the probe engine is never hit for it); a non-aliased bare name
+ *     still ROUTES to its catalog row
  *   - chat-completions route by the body's `model` to the catalog row's
  *     engine, WITH that row's Authorization header from the in-memory key
  *     table
@@ -186,22 +188,36 @@ test('engineBase: operator-pasted /v1 bases normalize to the origin', () => {
   assert.equal(engineBase('https://strata.example/v1'), 'https://strata.example');
 });
 
-test('GET /v1/models answers the deduped catalog union — never a passthrough probe', async () => {
+test('GET /v1/models advertises ONLY the aliases (the curated surface) — with none, an empty list; the bare names still route and are never probed', async () => {
   const def = await startEngine('default');
+  const row = await startEngine('row-engine');
   cleanup.push(() => def.close());
-  const r = await startRouter({ defaultTarget: def.url, catalog: CATALOG });
+  cleanup.push(() => row.close());
+  // No aliases here: the operator's curated surface advertises ONLY the
+  // configured aliases, so the list is EMPTY even though bare catalog names
+  // exist (pointed at a live row engine so the routing half is real). The
+  // router still never probes an engine to answer (D1), and a bare name
+  // still ROUTES (a request naming it takes the catalog row).
+  const r = await startRouter({ defaultTarget: def.url, catalog: CATALOG.map((e) => ({ ...e, url: row.url })) });
   assert.equal(r.catalogSize(), 2, 'the router de-dups a bare name even if the payload repeats it');
 
   const res = await fetch(`${r.base_url}/v1/models`);
   assert.equal(res.status, 200);
-  const list = (await res.json()) as { object: string; data: { id: string; owned_by: string }[] };
+  const list = (await res.json()) as { object: string; data: { id: string }[] };
   assert.equal(list.object, 'list');
-  const ids = list.data.map((d) => d.id);
-  assert.deepEqual([...new Set(ids)].length, ids.length, 'bare names deduped');
-  assert.ok(ids.includes('MlxModel') && ids.includes('Shared'));
-  const shared = list.data.find((d) => d.id === 'Shared')!;
-  assert.equal(shared.owned_by, 'srv-omlx', 'first row owns the collision (arbiter-pinned order stands)');
-  assert.equal(def.hits.length, 0, 'the router NEVER probes an engine to answer /v1/models (D1)');
+  assert.equal(list.data.length, 0, 'no aliases configured → the list advertises nothing (only aliases are advertised)');
+  assert.equal(def.hits.length, 0, 'the router NEVER probes the default engine to answer /v1/models (D1)');
+  assert.equal(row.hits.length, 0, 'the router NEVER probes a row engine to answer /v1/models (D1)');
+
+  // The bare name is not advertised, but it still routes (fall-through stands).
+  const chat = await fetch(`${r.base_url}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'MlxModel', messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  assert.equal(chat.status, 200, 'a bare catalog name still routes (not advertised, but routable)');
+  assert.equal(row.hits.length, 1, 'the bare request reached the row engine (no probe of /v1/models, real routing only)');
+  assert.equal(def.hits.length, 0, 'a cataloged model never falls back to the default target');
 });
 
 test('chat-completions route by model to the catalog row, adding the row Authorization from the key table', async () => {

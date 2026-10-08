@@ -1130,16 +1130,27 @@ export class Arbiter {
    * An alias whose stored pin no longer matches a surviving pair is legal
    * — publish falls through to the first surviving pair (D4).
    */
-  putModelAlias(input: { alias?: unknown; pairs?: unknown; pin?: unknown; delete?: unknown }): {
+  putModelAlias(input: { alias?: unknown; pairs?: unknown; pin?: unknown; delete?: unknown; order?: unknown }): {
     ok: boolean;
     reason?: string;
     created?: boolean;
     deleted?: boolean;
+    reordered?: boolean;
     alias?: ModelAlias;
   } {
     const s = this.store.state;
     const key = typeof input.alias === 'string' ? input.alias.trim() : '';
-    if (!ALIAS_NAME_RE.test(key)) return { ok: false, reason: 'alias name must be printable and at most 128 chars' };
+    // An ABSENT name is legal (the pure re-arrangement write needs no alias);
+    // a PRESENT name is validated as always.
+    if (key !== '' && !ALIAS_NAME_RE.test(key)) return { ok: false, reason: 'alias name must be printable and at most 128 chars' };
+
+    // Priority re-arrangement (no alias write in the same call): rewrite the
+    // stored keys in the given order. The object-key insertion order is the
+    // priority the publish pass and the /v1/models advertisement follow
+    // (first = the default model).
+    if (Array.isArray(input.order) && input.pairs === undefined && input.pin === undefined && input.delete !== true) {
+      return this.reorderAliases(input.order);
+    }
 
     if (input.delete === true) {
       if (!s.model_aliases[key]) return { ok: false, reason: 'unknown_alias' };
@@ -1205,6 +1216,41 @@ export class Arbiter {
     this.store.trim();
     this.store.save();
     return { ok: true, created: false, alias: existing };
+  }
+
+  /**
+   * Priority re-arrangement (the Models tab's re-order write). The stored
+   * keys are re-inserted in the given order — the object-key insertion order
+   * IS the priority (first = the default model the mint hand-off offers, the
+   * order /v1/models advertises, the publish pass's first-survivor fallback).
+   *
+   * Rules: every listed name must be a STORED alias (an unknown name is a 400,
+   * told not swallowed). The union of the list and the stored set must agree —
+   * every stored alias appears exactly once in the list. A list with gaps,
+   * dupes, or stray names is refused whole (no partial reorder).
+   */
+  private reorderAliases(order: unknown[]): { ok: boolean; reason?: string; reordered?: boolean } {
+    const s = this.store.state;
+    const names = order.map((x) => (typeof x === 'string' ? x.trim() : ''));
+    if (names.some((n) => n === '' || !ALIAS_NAME_RE.test(n))) {
+      return { ok: false, reason: 'order must be a list of stored alias names (printable, at most 128 chars)' };
+    }
+    if (new Set(names).size !== names.length) return { ok: false, reason: 'order names must be unique' };
+    const stored = Object.keys(s.model_aliases ?? {});
+    if (stored.length === 0) return { ok: false, reason: 'no aliases to reorder' };
+    if (names.length !== stored.length) return { ok: false, reason: 'order must name every stored alias exactly once' };
+    for (const n of names) if (!s.model_aliases[n]) return { ok: false, reason: `order names an unknown alias: ${n}` };
+    // An unchanged order is a no-op (no event, no save churn).
+    if (names.every((n, i) => stored[i] === n)) return { ok: true, reordered: false };
+    // Rebuild the object in the new order (the rows are untouched; only the
+    // key insertion order — the priority — changes).
+    const reordered: Record<string, ModelAlias> = {};
+    for (const n of names) reordered[n] = s.model_aliases[n]!;
+    s.model_aliases = reordered;
+    this.store.appendEvent({ kind: 'model_alias_reordered', detail: names.join(' → ') });
+    this.store.trim();
+    this.store.save();
+    return { ok: true, reordered: true };
   }
 
   // ------------------------------------------------------------------
