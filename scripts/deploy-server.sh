@@ -110,9 +110,12 @@ npm test
 (cd client && npx tsc --noEmit)
 echo "==> gate clean"
 
-# --- ship committed server/ and build natively on urza (amd64) -------------
+# --- ship committed server/ (+ the dashboard build) and build on urza ------
+# The dashboard is served BY the arbiter (cutover 2026-10-08): its committed
+# built output (dashboard/dist) is staged INTO the server/ docker context,
+# so the Dockerfile's COPY dashboard/dist/ finds it there.
 echo "==> building image natively on urza"
-git archive --format=tar HEAD server > "$WORK/server.tar"
+git archive --format=tar HEAD server dashboard/dist > "$WORK/server.tar"
 ssh "$URZA" "mkdir -p '$REMOTE_HOME'"
 ssh "$URZA" "cat > '$REMOTE_HOME/server-src-$SHA.tar'" < "$WORK/server.tar"
 ssh "$URZA" "bash -s" "$REMOTE_HOME" "$TAG" "$SHA" <<'REMOTE'
@@ -121,6 +124,11 @@ REMOTE_HOME="$1"; TAG="$2"; SHA="$3"
 build="$REMOTE_HOME/build-$SHA"
 rm -rf "$build" && mkdir -p "$build"
 tar -xf "$REMOTE_HOME/server-src-$SHA.tar" -C "$build"
+# git archive wrote server/ + dashboard/dist/ side by side; the docker
+# context is server/, so move the dashboard inside it.
+[ -f "$build/dashboard/dist/index.html" ] || { echo "dashboard/dist missing from the archive — rebuild + commit it" >&2; exit 1; }
+mkdir -p "$build/server/dashboard"
+mv "$build/dashboard" "$build/server/dashboard"
 docker build -q -t "$TAG" "$build/server"
 rm -rf "$build" "$REMOTE_HOME/server-src-$SHA.tar"
 echo "built $TAG"

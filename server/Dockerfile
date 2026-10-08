@@ -17,6 +17,11 @@ WORKDIR /app
 COPY package.json ./
 RUN npm install --omit=dev --no-audit --no-fund
 COPY --from=build /app/dist ./dist
+# The served dashboard: the React workspace's committed built output
+# (cutover 2026-10-08). server/src/index.ts dashboardDir() resolves
+# /app/dashboard/dist from the entry dir; ../public (the retired legacy
+# page) stays as the fail-safe if the dist is ever missing.
+COPY dashboard/dist/ ./dashboard/dist/
 COPY public/ ./public/
 
 # Non-root runtime user. State lives in /data (compose mounts a volume there

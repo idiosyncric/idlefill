@@ -18,6 +18,7 @@ import {
 } from "@/components/ui/sidebar";
 import { NavMain, type NavItem } from "@/components/nav-main";
 import { SiteHeader } from "@/components/site-header";
+import { NAV_IDS, RES_SUBTABS, type ResTab } from "@/nav";
 import { Input } from "@/components/ui/input";
 import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
@@ -28,16 +29,9 @@ import { InferenceServers } from "@/views/InferenceServers";
 
 // The sidebar nav (shadcn sidebar-16 shape). Every parent item is itself a
 // view: picking "Resources" lands on its Overview. The chevron beside it
-// toggles the sub-tab list — a sub-tab shows that sub-view directly.
-type ResTab = "overview" | "servers" | "machines" | "projects" | "models";
-const RES_SUBTABS: { id: ResTab; title: string }[] = [
-  { id: "overview", title: "Overview" },
-  { id: "servers", title: "Inference servers" },
-  { id: "machines", title: "Machines" },
-  { id: "projects", title: "Projects" },
-  { id: "models", title: "Models" },
-];
-
+// toggles the sub-tab list — a sub-tab shows that sub-view directly. The
+// id set is a contract (see nav.ts): nav.test.ts pins it against the
+// retired legacy dashboard's view set.
 const NAV: NavItem[] = [
   { id: "overview", title: "Overview", icon: LayoutDashboard },
   {
@@ -54,7 +48,7 @@ const VIEW_KEY = "idlefill.viewTab";
 const RES_KEY = "idlefill.resTab";
 const SUB_OPEN_KEY = "idlefill.navSubOpen";
 
-const VIEW_IDS = NAV.map((n) => n.id);
+const VIEW_IDS: readonly string[] = NAV_IDS;
 
 function readView(): string {
   const hash = location.hash.replace(/^#/, "");
@@ -237,13 +231,13 @@ export function App() {
           {view === "resources" && resTab === "overview" && (
             <ResourceOverview st={st} onPickTab={pickResTab} />
           )}
-          {(view === "resources" && (resTab === "machines" || resTab === "projects" || resTab === "models") ||
+          {(view === "resources" && (resTab === "machines" || resTab === "projects" || resTab === "models" || resTab === "agents") ||
             view === "sessions" ||
             view === "usage" ||
             view === "overview") && (
             <div className="text-dim text-[12px] py-10 text-center">
-              the {view === "resources" ? resTab : view} view still lives in the legacy dashboard
-              (localhost:8787) — the React app starts with Resources → Inference servers.
+              the {view === "resources" ? resTab : view} view is still being ported to this
+              dashboard (the cutover retired the legacy page) — tracked by the nav contract in src/nav.ts.
             </div>
           )}
         </main>

@@ -13,8 +13,9 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs';
+import { join, resolve, extname } from 'node:path';
 import os from 'node:os';
-import fastify, { type FastifyInstance } from 'fastify';
+import fastify, { type FastifyInstance, type FastifyReply } from 'fastify';
 import { WebSocketServer } from 'ws';
 import { utcDay, type Arbiter, WATCHED_SERVER_ID } from './arbiter.js';
 import { seriesKeyOf, type MetricsBucket, type MetricsSeries, type MetricsStore } from './metrics.js';
@@ -1140,20 +1141,34 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   // Dashboard (static, public read in phase 1)
   // ------------------------------------------------------------------
 
-  app.get('/', async (_req, reply) => {
-    const file = `${publicDir}/index.html`;
-    if (!existsSync(file)) return reply.code(500).send('dashboard missing (public/index.html)');
+  const sendShell = (reply: FastifyReply) => {
+    const file = join(publicDir, 'index.html');
+    if (!existsSync(file)) return reply.code(500).send(`dashboard missing (${publicDir}/index.html)`);
     return reply.type('text/html; charset=utf-8').send(readFileSync(file, 'utf-8'));
-  });
+  };
 
-  // Queue detail page — /[project]/[worker]/queue. The SAME single-file
-  // dashboard: the inline script switches on location.pathname and renders
-  // this worker's published queue preview (the arbiter never reads queue
-  // files; the data rides on /api/state). Public read, like `/` (phase 1).
-  app.get('/:project/:worker/queue', async (_req, reply) => {
-    const file = `${publicDir}/index.html`;
-    if (!existsSync(file)) return reply.code(500).send('dashboard missing (public/index.html)');
-    return reply.type('text/html; charset=utf-8').send(readFileSync(file, 'utf-8'));
+  app.get('/', (_req, reply) => sendShell(reply));
+
+  // Queue detail link — /[project]/[worker]/queue. The React dashboard
+  // (cutover 2026-10-08) serves the SPA shell here so old deep links keep
+  // resolving; the queue VIEW itself is not ported to React yet (tracked
+  // as a follow-up — the queue data still rides /api/state).
+  app.get('/:project/:worker/queue', (_req, reply) => sendShell(reply));
+
+  // Built SPA assets — /assets/<hashed file>. The Vite build emits hashed
+  // filenames (immutable), so a year of max-age is safe. Traversal-guarded:
+  // the resolved path must stay inside publicDir/assets.
+  app.get('/assets/*', (req, reply) => {
+    const rel = (req.params as { '*': string })['*'];
+    const assetsDir = resolve(publicDir, 'assets');
+    const file = resolve(assetsDir, rel);
+    if (!file.startsWith(assetsDir + '/') || !existsSync(file)) {
+      return reply.code(404).send('asset not found');
+    }
+    const type =
+      { '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.woff2': 'font/woff2' }[extname(file)] ??
+      'application/octet-stream';
+    return reply.header('cache-control', 'public, max-age=31536000, immutable').type(type).send(readFileSync(file));
   });
 
   return app;

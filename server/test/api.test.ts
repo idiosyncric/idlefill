@@ -87,7 +87,7 @@ before(async () => {
     idle_seconds: cfg.idle_seconds,
   });
   arbiter = new Arbiter(store, cfg, det);
-  app = buildApi({ arbiter, cfg, publicDir: join(__dirname, '..', 'public') });
+  app = buildApi({ arbiter, cfg, publicDir: join(__dirname, 'fixtures', 'dashboard') });
   attachWebSocket(app, arbiter, cfg);
 
   await app.listen({ port: 0, host: '127.0.0.1' });
@@ -241,47 +241,35 @@ test('busy system returns 409 not_idle; unknown client 409 unknown_client', asyn
   assert.equal(((await res2.json()) as { reason: string }).reason, 'unknown_client');
 });
 
-test('dashboard HTML serves (the route returns the dashboard document)', async () => {
-  // Route + document contract ONLY — never markup minutiae. Markup string
-  // tests broke on every UI redesign (the Resources consolidation, the
-  // server-card redesign) while catching no behavior; by owner decision
-  // (2026-10-07) the dashboard is verified by eye + the probes, not by
-  // string-matching its HTML.
+test('dashboard HTML serves (the route returns the SPA shell document)', async () => {
+  // Route + document contract ONLY — never markup minutiae (owner decision
+  // 2026-10-07: the dashboard is verified by eye + the probes). Cutover
+  // 2026-10-08: the served document is the React workspace's built shell
+  // (dashboard/dist); the fixture mirrors its shape — a module script that
+  // pulls its bundle from /assets.
   const res = await fetch(`${base}/`);
   assert.equal(res.status, 200);
   const html = await res.text();
   assert.match(html, /<html/);
-  assert.match(html, /\/api\/state/);
+  assert.match(html, /<div id="root">/, 'the SPA mount point is on the page');
+  assert.match(html, /<script type="module"[^>]*src="\/assets\//, 'the page boots from a module bundle under /assets');
   assert.ok((res.headers.get('content-type') ?? '').includes('text/html'));
 });
 
-test('dashboard carries the view-tab structure (Resources consolidation: four surfaces + Resources sub-tabs)', async () => {
-  const res = await fetch(`${base}/`);
-  assert.equal(res.status, 200);
-  const html = await res.text();
-  // The tab bar + the four surfaces, and every section assigned to one.
-  assert.match(html, /id="view-tabs"/, 'the view-tab bar is on the page');
-  for (const v of ['overview', 'resources', 'sessions', 'usage']) {
-    assert.match(html, new RegExp(`data-view="${v}"`), `sections assigned to the ${v} view`);
-    assert.match(html, new RegExp(`vtab-${v}`), `the ${v} tab button exists`);
-  }
-  // The Resources sub-tab row: every inventory section carries a data-subview.
-  assert.match(html, /id="res-subtabs"/, 'the Resources sub-tab row is on the page');
-  for (const s of ['servers', 'machines', 'projects', 'models']) {
-    assert.match(html, new RegExp(`data-subview="${s}"`), `sections assigned to the ${s} sub-view`);
-    assert.match(html, new RegExp(`rtab-${s}`), `the ${s} sub-tab button exists`);
-  }
-  // The view switch is a class flip, not inline style (inline display is
-  // owned by the exception-only sections themselves). The sub-view switch
-  // is the same mechanism (subhide), and the sub-tab bar shows only inside
-  // Resources via the body.view-resources class.
-  // Mechanism presence, tolerant of restyling (the exact CSS text churns
-  // with every redesign; the CONTRACT is the class-flip mechanism).
-  assert.match(html, /section\.vthide\s*\{[^}]*display:\s*none/, 'the hide mechanism is the vthide class');
-  assert.match(html, /section\.subhide\s*\{[^}]*display:\s*none/, 'the sub-view mechanism is the subhide class');
-  assert.match(html, /body\.view-resources[^{]*#res-subtabs[^{]*\{[^}]*display:\s*flex/, 'the sub-tab bar shows inside Resources');
-  // The queue route keeps its own single-section layout (tab bar hidden).
-  assert.match(html, /body\.queuepage[^{]*#view-tabs[^{]*\{[^}]*display:\s*none/, 'the queue route hides the tab bar');
+test('built SPA assets serve typed + immutable, and stay inside the assets dir', async () => {
+  const res = await fetch(`${base}/assets/probe-Ckw9t.js`);
+  assert.equal(res.status, 200, 'the hashed bundle the shell references is served');
+  assert.ok((res.headers.get('content-type') ?? '').includes('javascript'), 'typed as javascript');
+  assert.match(res.headers.get('cache-control') ?? '', /immutable/, 'hashed filenames are cache-immutable');
+
+  const miss = await fetch(`${base}/assets/absent-Dead0000.js`);
+  assert.equal(miss.status, 404, 'a missing asset is a 404, not the shell');
+
+  // Traversal guard: the wildcard must never read outside publicDir/assets.
+  const traversal = await fetch(`${base}/assets/..%2F..%2Fsrc%2Findex.ts`);
+  assert.ok(traversal.status === 404 || traversal.status === 400, 'no escape from the assets dir');
+  const body = await traversal.text();
+  assert.ok(!body.includes('Fastify routes for the arbiter'), 'server source never leaks through the asset route');
 });
 
 // ---------------------------------------------------------------------------
@@ -300,20 +288,21 @@ test('the anonymous surfaces never carry the API token (the copy-token button re
   const token = cfg.api_tokens[0];
   const doc = await (await fetch(`${base}/`)).text();
   assert.ok(!doc.includes(token), 'the dashboard HTML never embeds the token');
-  assert.match(doc, /id="copy-token"/, 'the hand-off pair is on the page (the copy is client-side)');
+  const asset = await (await fetch(`${base}/assets/probe-Ckw9t.js`)).text();
+  assert.ok(!asset.includes(token), 'served bundles never embed the token');
   const st = await (await fetch(`${base}/api/state`)).text();
   assert.ok(!st.includes(token), 'the anonymous /api/state never carries the token');
 });
 
-test('queue detail page serves the same dashboard at /[project]/[worker]/queue', async () => {
-  // The queue page is the SAME single-file dashboard (the inline script
-  // switches views on location.pathname). Public read, like `/` (phase 1).
+test('queue detail route serves the SPA shell at /[project]/[worker]/queue', async () => {
+  // Cutover 2026-10-08: old queue deep links resolve to the SPA shell (the
+  // queue VIEW is not ported to React yet — the link keeps working, the
+  // React app shows its in-progress placeholder). Public read, like `/`.
   for (const path of ['/career-ops/mac-sam/queue', '/career-ops/any-worker/queue']) {
     const res = await fetch(`${base}${path}`);
     assert.equal(res.status, 200, `${path} → 200`);
     const html = await res.text();
-    assert.match(html, /queue-section/, 'queue section present');
-    assert.match(html, /api\/state/);
+    assert.match(html, /<div id="root">/, 'the SPA shell resolves the deep link');
     assert.ok((res.headers.get('content-type') ?? '').includes('text/html'));
   }
   // A non-queue two-segment path is NOT the dashboard (falls to 404).

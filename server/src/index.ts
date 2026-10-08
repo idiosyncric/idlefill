@@ -4,6 +4,7 @@
  * Run: node dist/index.js (container) or `npm run dev` (tsx).
  */
 
+import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildApi, attachWebSocket } from './api.js';
@@ -19,6 +20,29 @@ import { StateStore } from './state.js';
 import type { ActivityEntry, EngineCounters, RequestsSource, ServerConnection, ServerProvider } from './types.js';
 
 const entryDir = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * The dashboard document directory (dashboard cutover, 2026-10-08): the
+ * React workspace's BUILT output (dashboard/dist) is the served dashboard.
+ * Candidate order:
+ *   1. <repo>/dashboard/dist — the dev/tsx layout (entryDir = server/src),
+ *      built by `npm run build` (the test.yml gate builds every workspace);
+ *   2. ../public — the legacy single-file page (server/public), kept only as
+ *      the fail-safe when the React build has not been run.
+ * The container layout (/app/dist/index.js + /app/dashboard/dist) resolves
+ * candidate 1 the same way relative to its own entryDir.
+ */
+function dashboardDir(from: string): string {
+  const candidates = [
+    join(from, '..', '..', 'dashboard', 'dist'), // server/src → repo/dashboard/dist
+    join(from, '..', 'dashboard', 'dist'), // /app/dist → /app/dashboard/dist
+    join(from, '..', 'public'), // legacy fallback
+  ];
+  for (const c of candidates) {
+    if (existsSync(join(c, 'index.html'))) return c;
+  }
+  return candidates[candidates.length - 1]!;
+}
 
 async function main(): Promise<void> {
   const cfg = loadConfig(entryDir);
@@ -129,7 +153,7 @@ async function main(): Promise<void> {
   }
   store.save();
 
-  const app = buildApi({ arbiter: apiArbiter, cfg, publicDir: join(entryDir, '..', 'public'), mesh, metrics });
+  const app = buildApi({ arbiter: apiArbiter, cfg, publicDir: dashboardDir(entryDir), mesh, metrics });
   const wss = attachWebSocket(app, arbiter, cfg);
   const broadcast = (app as unknown as Record<string, unknown>).broadcastWs as (obj: unknown) => void;
 
