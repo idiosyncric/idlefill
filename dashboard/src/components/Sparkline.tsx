@@ -6,10 +6,14 @@ export function Sparkline({
   values,
   className,
   title,
+  stroke = "var(--accent)",
 }: {
   values: number[];
   className?: string;
   title?: string;
+  /** The polyline color (a CSS color or var). The legacy rows colored each
+   *  series by kind: requests accent, tokens warn, idle share ok. */
+  stroke?: string;
 }) {
   if (values.length === 0) return null;
   const w = 120;
@@ -27,7 +31,7 @@ export function Sparkline({
       aria-hidden="true"
     >
       <title>{title}</title>
-      <polyline points={pts} fill="none" stroke="var(--accent)" strokeWidth="1" vectorEffect="non-scaling-stroke" />
+      <polyline points={pts} fill="none" stroke={stroke} strokeWidth="1" vectorEffect="non-scaling-stroke" />
     </svg>
   );
 }

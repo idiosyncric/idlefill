@@ -26,6 +26,13 @@ import { getState, apiToken, setApiToken, type StateSnapshot } from "@/lib/api";
 import { copyText } from "@/lib/clipboard";
 import { Button } from "@/components/ui/button";
 import { InferenceServers } from "@/views/InferenceServers";
+import { Overview } from "@/views/Overview";
+import { Sessions } from "@/views/Sessions";
+import { Machines } from "@/views/Machines";
+import { Projects } from "@/views/Projects";
+import { Models } from "@/views/Models";
+import { Agents } from "@/views/Agents";
+import { Usage } from "@/views/Usage";
 
 // The sidebar nav (shadcn sidebar-16 shape). Every parent item is itself a
 // view: picking "Resources" lands on its Overview. The chevron beside it
@@ -53,9 +60,10 @@ const VIEW_IDS: readonly string[] = NAV_IDS;
 function readView(): string {
   const hash = location.hash.replace(/^#/, "");
   const stored = localStorage.getItem(VIEW_KEY);
-  // Legacy deep links: #projects/#models were top-level tabs before the
-  // Resources rethink; they now live as Resources sub-tabs.
-  if (hash === "projects" || hash === "models") {
+  // Deep links to a Resources sub-tab: #projects/#models were top-level
+  // tabs before the Resources rethink; every sub-tab id lands on
+  // Resources now (overview stays the top-level view — same id).
+  if (hash !== "overview" && RES_SUBTABS.some((t) => t.id === hash)) {
     localStorage.setItem(RES_KEY, hash);
     return "resources";
   }
@@ -227,19 +235,17 @@ export function App() {
               state unreachable: {stErr} — the arbiter is down or the token was rejected.
             </div>
           )}
+          {view === "overview" && <Overview st={st} />}
+          {view === "sessions" && <Sessions st={st} />}
+          {view === "usage" && <Usage />}
           {view === "resources" && resTab === "servers" && <InferenceServers st={st} />}
           {view === "resources" && resTab === "overview" && (
             <ResourceOverview st={st} onPickTab={pickResTab} />
           )}
-          {(view === "resources" && (resTab === "machines" || resTab === "projects" || resTab === "models" || resTab === "agents") ||
-            view === "sessions" ||
-            view === "usage" ||
-            view === "overview") && (
-            <div className="text-dim text-[12px] py-10 text-center">
-              the {view === "resources" ? resTab : view} view is still being ported to this
-              dashboard (the cutover retired the legacy page) — tracked by the nav contract in src/nav.ts.
-            </div>
-          )}
+          {view === "resources" && resTab === "machines" && <Machines st={st} />}
+          {view === "resources" && resTab === "projects" && <Projects st={st} />}
+          {view === "resources" && resTab === "models" && <Models st={st} />}
+          {view === "resources" && resTab === "agents" && <Agents st={st} />}
         </main>
         <Toaster position="top-center" richColors={false} closeButton={false} />
       </SidebarInset>
