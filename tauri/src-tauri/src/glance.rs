@@ -117,10 +117,17 @@ pub struct SessionRow {
 /// else an 8-char token prefix + the ellipsis. Healthy sessions render
 /// NO one-liner (Exception-Only).
 pub fn project_sessions(payload: &Value, now_ms: f64) -> Vec<SessionRow> {
-    let rows = payload.get("sessions").and_then(Value::as_array).cloned().unwrap_or_default();
+    let rows = payload
+        .get("sessions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     rows.iter()
         .filter_map(|s| {
-            let tok = s.get("token").and_then(Value::as_str).filter(|t| !t.is_empty())?;
+            let tok = s
+                .get("token")
+                .and_then(Value::as_str)
+                .filter(|t| !t.is_empty())?;
             let last_seen = s.get("last_seen").and_then(Value::as_f64).unwrap_or(0.0);
             let stale = now_ms - last_seen > 90_000.0;
             let ov = s
@@ -138,14 +145,19 @@ pub fn project_sessions(payload: &Value, now_ms: f64) -> Vec<SessionRow> {
                 .filter(|n| !n.is_empty())
                 .map(|n| n.to_string());
             let gate = s.get("gate");
-            let queued = gate.and_then(|g| g.get("state")).and_then(Value::as_str) == Some("queued");
+            let queued =
+                gate.and_then(|g| g.get("state")).and_then(Value::as_str) == Some("queued");
             let waiting = gate
                 .and_then(|g| g.get("waiting"))
                 .and_then(Value::as_f64)
                 .map(|w| w as usize)
                 .unwrap_or(0);
             let who = name.clone().unwrap_or_else(|| {
-                let end = tok.char_indices().nth(8).map(|(i, _)| i).unwrap_or(tok.len());
+                let end = tok
+                    .char_indices()
+                    .nth(8)
+                    .map(|(i, _)| i)
+                    .unwrap_or(tok.len());
                 format!("{}…", &tok[..end])
             });
             let mut words: Vec<String> = Vec::new();
@@ -189,10 +201,22 @@ pub fn sessions_count_line(rows: &[SessionRow]) -> Option<String> {
     if rows.is_empty() {
         return None;
     }
-    let paused = rows.iter().filter(|r| r.override_label == Some("pause")).count();
-    let forced = rows.iter().filter(|r| r.override_label == Some("force")).count();
-    let stale = rows.iter().filter(|r| r.override_label.is_none() && r.stale).count();
-    let active = rows.iter().filter(|r| r.override_label.is_none() && !r.stale).count();
+    let paused = rows
+        .iter()
+        .filter(|r| r.override_label == Some("pause"))
+        .count();
+    let forced = rows
+        .iter()
+        .filter(|r| r.override_label == Some("force"))
+        .count();
+    let stale = rows
+        .iter()
+        .filter(|r| r.override_label.is_none() && r.stale)
+        .count();
+    let active = rows
+        .iter()
+        .filter(|r| r.override_label.is_none() && !r.stale)
+        .count();
     let mut parts: Vec<String> = Vec::new();
     if active > 0 {
         parts.push(format!("{active} active"));
@@ -221,16 +245,17 @@ pub fn state_word(payload: &Value) -> Conn {
         return Conn::Unreachable;
     }
     let idle = payload.get("idle").cloned().unwrap_or(Value::Null);
-    let degraded = idle.get("degraded").and_then(Value::as_bool).unwrap_or(false);
+    let degraded = idle
+        .get("degraded")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let idle_flag = idle.get("idle").and_then(Value::as_bool).unwrap_or(false);
     let active = payload
         .get("active_leases")
         .and_then(Value::as_array)
         .map(|rows| {
             rows.iter()
-                .filter(|l| {
-                    l.get("status").and_then(Value::as_str).unwrap_or("active") == "active"
-                })
+                .filter(|l| l.get("status").and_then(Value::as_str).unwrap_or("active") == "active")
                 .count()
         })
         .unwrap_or(0);
@@ -249,9 +274,16 @@ pub fn state_word(payload: &Value) -> Conn {
 /// name-matched client row's last_seen inside 90s; no name match falls
 /// back to the freshest row (the old heuristic, only ever a fallback).
 pub fn daemon_running(payload: &Value, client_name: Option<&str>, now_ms: f64) -> bool {
-    let clients = payload.get("clients").and_then(Value::as_array).cloned().unwrap_or_default();
+    let clients = payload
+        .get("clients")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let me_last_seen: f64 = match client_name {
-        Some(cn) => match clients.iter().find(|c| c.get("name").and_then(Value::as_str) == Some(cn)) {
+        Some(cn) => match clients
+            .iter()
+            .find(|c| c.get("name").and_then(Value::as_str) == Some(cn))
+        {
             Some(c) => c.get("last_seen").and_then(Value::as_f64).unwrap_or(0.0),
             None => clients
                 .iter()
@@ -307,9 +339,15 @@ mod tests {
 
     #[test]
     fn status_row_in_window_is_the_state_word() {
-        assert_eq!(glance_status_row(Conn::Working, true, "/c.json"), "running idle tasks");
+        assert_eq!(
+            glance_status_row(Conn::Working, true, "/c.json"),
+            "running idle tasks"
+        );
         assert_eq!(glance_status_row(Conn::Idle, true, "/c.json"), "idle");
-        assert_eq!(glance_status_row(Conn::Degraded, true, "/c.json"), "degraded");
+        assert_eq!(
+            glance_status_row(Conn::Degraded, true, "/c.json"),
+            "degraded"
+        );
     }
 
     // panelActionRows minus the update row (panel-test.sh check family 1).
@@ -329,7 +367,10 @@ mod tests {
             "Restart",
             "Update Code",
         ] {
-            assert!(!labels.iter().any(|l| l.starts_with(retired)), "{retired} must not render");
+            assert!(
+                !labels.iter().any(|l| l.starts_with(retired)),
+                "{retired} must not render"
+            );
         }
     }
 
@@ -360,7 +401,10 @@ mod tests {
         ]});
         let rows = project_sessions(&p, now);
         assert_eq!(rows.len(), 3);
-        assert_eq!(sessions_count_line(&rows).as_deref(), Some("2 active, 1 paused"));
+        assert_eq!(
+            sessions_count_line(&rows).as_deref(),
+            Some("2 active, 1 paused")
+        );
         // Exception-Only: the two healthy rows render NO one-liner.
         assert_eq!(rows[0].exception_line, None);
         assert_eq!(rows[1].exception_line, None);
@@ -390,7 +434,10 @@ mod tests {
             "override": {"override": "pause"}
         }]});
         let rows = project_sessions(&p, now);
-        assert_eq!(rows[0].exception_line.as_deref(), Some("mac · paused · stale"));
+        assert_eq!(
+            rows[0].exception_line.as_deref(),
+            Some("mac · paused · stale")
+        );
     }
 
     #[test]
@@ -405,7 +452,10 @@ mod tests {
         // when the token is shorter than 8 chars (sessions-test.sh pins
         // the 8-char form: "xyzw9876… · stale").
         assert_eq!(rows[0].exception_line.as_deref(), Some("t1… · queued"));
-        assert_eq!(rows[1].exception_line.as_deref(), Some("t2… · queued · 3 waiting"));
+        assert_eq!(
+            rows[1].exception_line.as_deref(),
+            Some("t2… · queued · 3 waiting")
+        );
         assert_eq!(rows[1].waiting_count, 3);
     }
 
@@ -432,7 +482,9 @@ mod tests {
     fn state_word_switch_order() {
         let c = json!({"clients": [{"name": "mac"}]});
         assert_eq!(
-            state_word(&json!({"clients": c["clients"], "idle": {"degraded": true}, "active_leases": []})),
+            state_word(
+                &json!({"clients": c["clients"], "idle": {"degraded": true}, "active_leases": []})
+            ),
             Conn::Degraded
         );
         assert_eq!(
@@ -441,11 +493,15 @@ mod tests {
             Conn::Working
         );
         assert_eq!(
-            state_word(&json!({"clients": c["clients"], "idle": {"idle": true}, "active_leases": []})),
+            state_word(
+                &json!({"clients": c["clients"], "idle": {"idle": true}, "active_leases": []})
+            ),
             Conn::Idle
         );
         assert_eq!(
-            state_word(&json!({"clients": c["clients"], "idle": {"idle": false}, "active_leases": []})),
+            state_word(
+                &json!({"clients": c["clients"], "idle": {"idle": false}, "active_leases": []})
+            ),
             Conn::Busy
         );
     }

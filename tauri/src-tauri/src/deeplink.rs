@@ -32,8 +32,14 @@ mod tests {
 
     #[test]
     fn direct_views() {
-        assert_eq!(hash_view("idlefill://sessions").as_deref(), Some("sessions"));
-        assert_eq!(hash_view("idlefill://projects").as_deref(), Some("projects"));
+        assert_eq!(
+            hash_view("idlefill://sessions").as_deref(),
+            Some("sessions")
+        );
+        assert_eq!(
+            hash_view("idlefill://projects").as_deref(),
+            Some("projects")
+        );
         assert_eq!(hash_view("idlefill://usage").as_deref(), Some("usage"));
     }
 

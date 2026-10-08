@@ -103,16 +103,20 @@ impl Shared {
     }
 
     fn arbiter_label(&self) -> String {
-        self.hook
-            .label(lifecycle::ARBITER_LABEL, "IDLEFILL_TAURI_TEST_LABEL_ARBITER")
+        self.hook.label(
+            lifecycle::ARBITER_LABEL,
+            "IDLEFILL_TAURI_TEST_LABEL_ARBITER",
+        )
     }
     fn daemon_label(&self) -> String {
         self.hook
             .label(lifecycle::DAEMON_LABEL, "IDLEFILL_TAURI_TEST_LABEL_DAEMON")
     }
     fn menubar_label(&self) -> String {
-        self.hook
-            .label(lifecycle::MENUBAR_LABEL, "IDLEFILL_TAURI_TEST_LABEL_MENUBAR")
+        self.hook.label(
+            lifecycle::MENUBAR_LABEL,
+            "IDLEFILL_TAURI_TEST_LABEL_MENUBAR",
+        )
     }
 }
 
@@ -176,8 +180,7 @@ fn tray_menu(app: &AppHandle, with_relaunch: bool) -> tauri::Result<Menu<tauri::
     if with_relaunch {
         // D6 exception-only item: rendered ONLY in the loaded-but-exited
         // state (the desktop's strip row :2047-2055 re-homed to the tray).
-        let relaunch =
-            MenuItem::with_id(app, "relaunch", "Relaunch arbiter", true, None::<&str>)?;
+        let relaunch = MenuItem::with_id(app, "relaunch", "Relaunch arbiter", true, None::<&str>)?;
         Menu::with_items(app, &[&open, &relaunch, &settings, &quit])
     } else {
         Menu::with_items(app, &[&open, &settings, &quit])
@@ -266,15 +269,11 @@ fn show_settings(app: &AppHandle) {
         let _ = w.set_focus();
         return;
     }
-    let _ = WebviewWindowBuilder::new(
-        app,
-        SETTINGS_LABEL,
-        WebviewUrl::App("index.html".into()),
-    )
-    .title("idlefill settings")
-    .inner_size(600.0, 520.0)
-    .resizable(true)
-    .build();
+    let _ = WebviewWindowBuilder::new(app, SETTINGS_LABEL, WebviewUrl::App("index.html".into()))
+        .title("idlefill settings")
+        .inner_size(600.0, 520.0)
+        .resizable(true)
+        .build();
 }
 
 /// D6 exception fix (relaunchArbiter :1555-1563): kickstart WITHOUT -k,
@@ -309,19 +308,15 @@ fn toggle_glance(app: &AppHandle) {
         let _ = w.show();
         let _ = w.set_focus();
     } else {
-        let _ = WebviewWindowBuilder::new(
-            app,
-            GLANCE_LABEL,
-            WebviewUrl::App("glance.html".into()),
-        )
-        .title("idlefill")
-        .decorations(false)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .resizable(false)
-        .shadow(true)
-        .inner_size(280.0, 220.0)
-        .build();
+        let _ = WebviewWindowBuilder::new(app, GLANCE_LABEL, WebviewUrl::App("glance.html".into()))
+            .title("idlefill")
+            .decorations(false)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .resizable(false)
+            .shadow(true)
+            .inner_size(280.0, 220.0)
+            .build();
     }
     if let Some(w) = app.get_webview_window(GLANCE_LABEL) {
         if let Some((x, y)) = *shared.tray_pos.lock().unwrap() {
@@ -859,12 +854,15 @@ pub fn build() -> tauri::Result<()> {
             // D4-shape), Open Desktop, Settings, Quit.
             let handle = app.handle().clone();
             let open = MenuItem::with_id(&handle, "open", "Open Desktop", true, None::<&str>)?;
-            let settings =
-                MenuItem::with_id(&handle, "settings", "Settings", true, None::<&str>)?;
-            let reload =
-                MenuItem::with_id(&handle, "reload", "Reload", true, Some("CmdOrCtrl+R"))?;
-            let quit =
-                MenuItem::with_id(&handle, "quitapp", "Quit idlefill", true, Some("CmdOrCtrl+Q"))?;
+            let settings = MenuItem::with_id(&handle, "settings", "Settings", true, None::<&str>)?;
+            let reload = MenuItem::with_id(&handle, "reload", "Reload", true, Some("CmdOrCtrl+R"))?;
+            let quit = MenuItem::with_id(
+                &handle,
+                "quitapp",
+                "Quit idlefill",
+                true,
+                Some("CmdOrCtrl+Q"),
+            )?;
             let app_menu = Menu::with_items(&handle, &[&open, &settings, &reload, &quit])?;
             app.set_menu(app_menu)?;
             handle.on_menu_event(move |app, event| match event.id().as_ref() {

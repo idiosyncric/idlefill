@@ -34,7 +34,9 @@ impl TestHook {
     pub fn label(&self, real: &str, env_key: &str) -> String {
         match &self.dir {
             None => real.to_string(),
-            Some(_) => std::env::var(env_key).unwrap_or_else(|_| "com.sam.idlefill.app-test".into()),
+            Some(_) => {
+                std::env::var(env_key).unwrap_or_else(|_| "com.sam.idlefill.app-test".into())
+            }
         }
     }
 
@@ -207,7 +209,11 @@ pub fn arbiter_plist_xml(label: &str, repo: &Path) -> String {
     let log_dir = cwd.clone();
     plist_render(
         label,
-        &[PathBuf::from("/opt/homebrew/bin/npx"), PathBuf::from("tsx"), entry],
+        &[
+            PathBuf::from("/opt/homebrew/bin/npx"),
+            PathBuf::from("tsx"),
+            entry,
+        ],
         &cwd,
         &log_dir,
         true,
@@ -292,12 +298,19 @@ pub fn install_label(plist_path: &Path, plist_xml: &str) -> Option<String> {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Err(e) = std::fs::write(plist_path, plist_xml) {
-        return Some(format!("install failed: could not write {}: {e}", plist_path.display()));
+        return Some(format!(
+            "install failed: could not write {}: {e}",
+            plist_path.display()
+        ));
     }
     let uid = unsafe { libc::getuid() };
     let (st, out) = run_cmd(
         "/bin/launchctl",
-        &["bootstrap", &format!("gui/{uid}"), &plist_path.display().to_string()],
+        &[
+            "bootstrap",
+            &format!("gui/{uid}"),
+            &plist_path.display().to_string(),
+        ],
     );
     if st == 0 {
         return None;
@@ -314,7 +327,10 @@ pub fn install_label(plist_path: &Path, plist_xml: &str) -> Option<String> {
 /// are clean no-ops (:1346-1353).
 pub fn bootout_label(label: &str) -> Option<String> {
     let uid = unsafe { libc::getuid() };
-    let (st, out) = run_cmd("/bin/launchctl", &["bootout", &format!("gui/{uid}/{label}")]);
+    let (st, out) = run_cmd(
+        "/bin/launchctl",
+        &["bootout", &format!("gui/{uid}/{label}")],
+    );
     if st == 0 {
         return None;
     }
@@ -329,7 +345,10 @@ pub fn bootout_label(label: &str) -> Option<String> {
 /// -k — it starts the exited-but-loaded job and is a no-op while running.
 pub fn kickstart(label: &str) -> Option<String> {
     let uid = unsafe { libc::getuid() };
-    let (st, out) = run_cmd("/bin/launchctl", &["kickstart", &format!("gui/{uid}/{label}")]);
+    let (st, out) = run_cmd(
+        "/bin/launchctl",
+        &["kickstart", &format!("gui/{uid}/{label}")],
+    );
     if st == 0 {
         None
     } else {
@@ -344,12 +363,7 @@ pub fn kickstart(label: &str) -> Option<String> {
 pub fn foreign_port_owner(port: u16, label: &str) -> Option<u32> {
     let (st, out) = run_cmd(
         "/usr/sbin/lsof",
-        &[
-            "-nP",
-            &format!("-iTCP:{port}"),
-            "-sTCP:LISTEN",
-            "-t",
-        ],
+        &["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"],
     );
     if st != 0 || out.is_empty() {
         return None;
@@ -447,7 +461,8 @@ job state = exited
 
     #[test]
     fn first_argument_reads_the_arguments_block() {
-        let dump = "arguments = {\n\t\t/opt/homebrew/bin/npx => /opt/homebrew/bin/npx\n\t\ttsx\n\t}\n";
+        let dump =
+            "arguments = {\n\t\t/opt/homebrew/bin/npx => /opt/homebrew/bin/npx\n\t\ttsx\n\t}\n";
         assert_eq!(
             first_argument(dump).as_deref(),
             Some("/opt/homebrew/bin/npx => /opt/homebrew/bin/npx")
