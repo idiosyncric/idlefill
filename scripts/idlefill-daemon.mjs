@@ -1,20 +1,21 @@
 #!/usr/bin/env node
 /**
- * idlefill menubar CLI — control + troubleshoot the client daemon, from a
- * terminal while developing it.
+ * idlefill daemon CLI — control + troubleshoot the client daemon, from a
+ * terminal while developing it. (Renamed from idlefill-menubar.mjs: the
+ * Swift menubar it named retired with the #69 cutover.)
  *
- *   node scripts/idlefill-menubar.mjs status      what the daemon sees: paths,
- *                                                 daemon pid, arbiter view
- *   node scripts/idlefill-menubar.mjs start       launch the daemon (same
- *                                                 command the Settings toggle runs)
- *   node scripts/idlefill-menubar.mjs stop        SIGINT the daemon (clean
- *                                                 shutdown, crash-safe)
- *   node scripts/idlefill-menubar.mjs restart     stop, then start
- *   node scripts/idlefill-menubar.mjs logs [--lines N]
- *                                                 tail client/logs/client.log
- *   node scripts/idlefill-menubar.mjs diagnose    status + tsx/node checks +
- *                                                 log tail + online/stale
- *                                                 interpretation
+ *   node scripts/idlefill-daemon.mjs status      what the daemon sees: paths,
+ *                                                daemon pid, arbiter view
+ *   node scripts/idlefill-daemon.mjs start       launch the daemon (same
+ *                                                command the Settings toggle runs)
+ *   node scripts/idlefill-daemon.mjs stop        SIGINT the daemon (clean
+ *                                                shutdown, crash-safe)
+ *   node scripts/idlefill-daemon.mjs restart     stop, then start
+ *   node scripts/idlefill-daemon.mjs logs [--lines N]
+ *                                                tail client/logs/client.log
+ *   node scripts/idlefill-daemon.mjs diagnose    status + tsx/node checks +
+ *                                                log tail + online/stale
+ *                                                interpretation
  *
  * start/stop use the SAME daemon identity rule the Tauri shell uses: a
  * `node` process whose command line carries this repo's path AND the client
