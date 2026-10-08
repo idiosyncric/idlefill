@@ -386,16 +386,9 @@ export class SessionGate {
     // #42 Slice 0: Hermes may carry its REAL conversation id on every
     // provider request. Capture it per request — the row's identity display
     // updates from live traffic, headerless clients leave it untouched.
+    // touch() counts the request into the ring (before the register fire)
+    // and does the first-sight bookkeeping.
     const s = this.touch(token, cleanSessionId(req.headers[SESSION_ID_HEADER]));
-    // #45 session detail: count the request the moment the router sees it
-    // (forwarded OR parked — a parked request is still a request). The
-    // body is NEVER touched here: a parked request must keep its body
-    // unconsumed for the forward on admission (a req 'data' listener
-    // drains it and wedges the park — found by the (c)/(e) gate tests).
-    // Model + usage sniff from the upstream RESPONSE instead (below): the
-    // engine echoes the model it served in the response body, and
-    // observing the piped upstream never steals bytes.
-    this.recordRequest(s);
 
     // #67: `forward` may be a LATE BOUND seam (the aggregate router
     // resolves the engine at CALL time — a pin the operator writes
@@ -452,6 +445,15 @@ export class SessionGate {
     // a later headerless request never clears it (last-known-wins, the same
     // posture as the client-published display fields).
     if (sessionId) s.session_id = sessionId;
+    // #45: count the request the moment the router sees it (forwarded OR
+    // parked — a parked request is still a request), BEFORE the register
+    // fire below: the first-sight register then reports this request's
+    // real instant (#76), not an empty ring. One entry per request
+    // (capped; in-memory, restart starts empty). The request body is
+    // NEVER touched here: a parked request must keep its body unconsumed
+    // for the forward on admission (a req 'data' listener drains it and
+    // wedges the park — found by the (c)/(e) gate tests).
+    this.recordRequest(s);
     const target = s;
     if (this.now() - target.lastRegisterAttempt >= this.heartbeatMs) {
       void this.register(target);

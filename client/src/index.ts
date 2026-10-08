@@ -1735,9 +1735,14 @@ export class ClientDaemon {
             // Date.now() pinned every arbiter row to "now": the max-keep
             // rule at the arbiter never rewinds, idle folding stayed
             // defeated, and grants were blocked for dead sessions).
-            // Ring-less rows (the router has not seen the token yet)
-            // report the tick time — the pre-#76 posture for those.
-            last_activity: lastActivity ?? Date.now(),
+            // ADD-key posture (like session_id/history): ABSENT when the
+            // ring is empty — the arbiter then KEEPS its stored value.
+            // This matters on the re-adoption path: after a daemon restart
+            // every previously-known session is re-learned from /api/state
+            // with an empty local ring; a Date.now() fallback would
+            // re-inflate each row to "now" every 10s (the same bug). Omit
+            // ⇒ the stored real time stands and ages out on its own.
+            ...(typeof lastActivity === 'number' ? { last_activity: lastActivity } : {}),
             // Gate-state visibility: the router's queue truth for this
             // session at heartbeat time. null (idle) ⇒ NO gate block — the
             // arbiter then CLEARS any stored gate for the token. An old

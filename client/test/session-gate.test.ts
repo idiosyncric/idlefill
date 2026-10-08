@@ -364,10 +364,12 @@ test('register calls carry the gate snapshot (active at refresh, queued while pa
   const { proxy, up } = await harness({ gate });
   gate.onStatePoll([]);
 
-  // First sight registers BEFORE the request is forwarded ⇒ idle snapshot.
+  // First sight registers AFTER touch() counted the request into the ring
+  // (the #76 ordering) ⇒ the first register carries the request's REAL
+  // instant. No gate block (idle snapshot), no phase yet.
   const resA = postChat(proxy.base_url, '/s/tokA/v1/chat/completions');
   await waitFor(() => up.hits.length === 1, 3000, 'A forwarded');
-  assert.deepEqual(calls[0], { token: 'tokA', gate: null, sessionId: undefined, history: undefined, phase: null, lastActivity: undefined }, 'first-sight register: no gate block, no traffic history yet, no phase (#67: the no-phase report rides every heartbeat), no observed request time yet (#76: the ring fills after this register)');
+  assert.deepEqual(calls[0], { token: 'tokA', gate: null, sessionId: undefined, history: { rpm: [0, 0, 0, 0, 0, 0, 0, 0, 0, 1] }, phase: null, lastActivity: 2_000_000 }, 'first-sight register: no gate block, no phase (#67), the request already counted (#45 history) with its real instant (#76: the ring fills before the register fires)');
 
   // B first-sights and parks; its register fires at first sight (before
   // the park), so it is also gate-less — the REFRESH is what reports it.
@@ -793,21 +795,21 @@ test('#76 last_activity on the wire: the newest REQUEST time, never the heartbea
   const { proxy, up } = await harness({ gate });
   gate.onStatePoll([]); // arbiter reachable
 
-  // Request at t=200s. The first register fires inside the request path —
-  // before recordRequest pushes the ring entry. The daemon maps that
-  // ring-less report to its own clock (index.ts: lastActivity ?? Date.now()),
-  // the pre-#76 posture for a token the router has not seen yet.
+  // Request at t=200s. touch() counts the request into the ring BEFORE the
+  // first-sight register fires (#76 ordering), so the first register already
+  // carries the real request instant — a NEW session defeats idle folding
+  // from its very first heartbeat, not 10s later.
   const resP = postChat(proxy.base_url, '/s/lact1/v1/chat/completions');
   await waitFor(() => up.hits.length === 1, 3000, 'hit forwarded');
   up.release(1);
   assert.equal((await resP).status, 200);
   await waitFor(() => calls.some((c) => c.token === 'lact1'), 3000, 'first register');
   const first = calls.filter((c) => c.token === 'lact1').at(0)!;
-  assert.equal(first.lastActivity, undefined, 'ring-less first sight reports no observed request time');
+  assert.equal(first.lastActivity, 200_000_000, 'first-sight register reports the triggering request instant');
 
-  // The ring now holds the request instant. The HEARTBEAT (a 10s tick, no
-  // traffic) must report THAT time — not the tick's own clock. The old
-  // Date.now() stamp + the arbiter's max-keep pinned every row to "now".
+  // The HEARTBEAT (a 10s tick, no new traffic) must report THAT same
+  // request time — not the tick's own clock. The old Date.now() stamp + the
+  // arbiter's max-keep pinned every row to "now".
   clock.t += 10_001;
   gate.heartbeat();
   await waitFor(() => calls.filter((c) => c.token === 'lact1').length >= 2, 3000, 'heartbeat register');
@@ -827,13 +829,16 @@ test('#76 last_activity on the wire: the newest REQUEST time, never the heartbea
   assert.equal(hb2.lastActivity, 200_010_001, 'the newer request instant wins');
 
   // A poll-adopted token (the arbiter reports a row the router never saw —
-  // no local ring) reports undefined on its first heartbeat. The caller
-  // falls back to its own clock — the pre-#76 posture for that row.
+  // no local ring, e.g. after a daemon restart) reports undefined on its
+  // heartbeat. The daemon OMITS last_activity (ADD-key posture): the
+  // arbiter keeps its stored value — the row ages out on its own instead of
+  // being re-pinned to "now" every 10s (a Date.now() fallback would be the
+  // same bug via the re-adoption path).
   gate.onStatePoll([{ token: 'lact2' }]);
   gate.heartbeat();
   await waitFor(() => calls.some((c) => c.token === 'lact2'), 3000, 'adopted session heartbeat');
   const adopted = calls.filter((c) => c.token === 'lact2').at(-1)!;
-  assert.equal(adopted.lastActivity, undefined, 'no local ring ⇒ undefined (the caller clock stands)');
+  assert.equal(adopted.lastActivity, undefined, 'no local ring ⇒ undefined (last_activity omitted, the stored time stands)');
 });
 
 // ---------------------------------------------------------------------------
