@@ -17,7 +17,8 @@ Commands
   (tauri-pilot CLI + MCP bridge, debug builds only) lives in
   .agents/skills/idlefill-tauri/SKILL.md.
 
-• Never commit build output (menubar/IdlefillMenubar.app) or gitignored
+• Never commit build output (the compiled Tauri bundle is gitignored under
+  tauri/src-tauri/target/) or gitignored
   config (server/config.json, client/config.json — the latter holds the
   live arbiter token).
 

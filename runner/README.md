@@ -1,7 +1,7 @@
 # Actions runner (Forgejo Runner, this Mac)
 
 idlefill's CI/CD runs on a **Forgejo Runner** daemon on urza (the Mac that
-also hosts the repo's main checkout, the daemon, and the menubar). One
+also hosts the repo's main checkout, the daemon, and the Tauri app). One
 runner home per repo lives under `~/Software/ci-cd/` so every runner is in
 the same place — this one is `~/Software/ci-cd/idlefill-runner/`.
 
@@ -14,7 +14,6 @@ the same place — this one is `~/Software/ci-cd/idlefill-runner/`.
 | Runner config (uuid + **registration token**) | `~/Software/ci-cd/idlefill-runner/config.yaml`, 0600 | secret; the repo is **public** |
 | Runner state file (`runner`), `runner.log` | same host dir | runner's own bookkeeping |
 | launchd agent (`com.sam.idlefill.actrunner`) | `~/Library/LaunchAgents/` | keeps the daemon alive across reboots |
-| Signing key (`~/.config/idlefill/sparkle-ed-key.b64`) | host, outside repo | Ed25519 seed; release.sh signs with it |
 
 ## Setup (one-time, per runner home)
 
@@ -50,8 +49,9 @@ job steps as **plain processes** on the Mac instead of spinning a container
 host must therefore have the toolchain the workflows use in `PATH`:
 
 - node ≥ 20 (workflows pin 22 via `actions/setup-node`) + npm
-- python3 (release.sh + appcast signing glue)
-- swiftc (Xcode CLT — desktop source parse gate)
+- python3 (release.sh + drop-auto-release.sh glue)
+- the Rust toolchain: cargo + the tauri CLI (the shell's cargo gates —
+  issue #69 D9 replaced the retired `swiftc -parse` gate)
 
 `actions/checkout` + `actions/setup-node` resolve from
 `https://data.forgejo.org`, so the host needs outbound HTTPS to it (and to

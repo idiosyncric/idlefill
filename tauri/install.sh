@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Install / update the idlefill app's own LaunchAgent (Q-d LOCKED: ONE
-# agent, com.sam.idlefill.app, RunAtLoad). Issue #70 deliverable 6: this
-# mirrors menubar/install.sh's discipline exactly. NOT run against the
-# real label in wave 1 — the live machine keeps the Swift planes; the
-# real-label install is the owner-gated cutover step.
+# agent, com.sam.idlefill.app, RunAtLoad). Issue #70 deliverable 6; the
+# render-before-bootout discipline ported from the (now retired) Swift
+# menubar installer. The real-label install ran at the #69 cutover; this
+# script is also the idempotent day-2 updater.
 #
 #   tauri/install.sh              idempotent install (already loaded -> no-op)
 #   tauri/install.sh --reinstall  render + bootout + bootstrap
 #   tauri/install.sh --uninstall  bootout only (the plist file stays)
 #
-# Discipline (the menubar/install.sh rules, ported):
+# Discipline (the fail-closed rules, ported):
 #   a. derive the repo root from this script's location (tauri/ -> ..)
 #   b. render <plistdir>/<label>.plist from the committed TEMPLATE
 #      (tauri/IdlefillApp.plist), substituting this checkout's repo root,
@@ -98,8 +98,8 @@ bootstrap() {
 }
 
 render_plist() {
-  # Render the TEMPLATE with this checkout's values (the menubar
-  # install.sh string-substitution discipline, no regex):
+  # Render the TEMPLATE with this checkout's values (string-substitution
+  # discipline, no regex):
   #   1. the executable   -> the configured program (default: this
   #      checkout's bundle binary; MUST happen before the repo rewrite)
   #   2. the repo prefix  -> this checkout's repo root
@@ -137,9 +137,9 @@ render_plist() {
       print line
     }
   ' "$TEMPLATE" > "$TMPPLIST"
-  # Byte-verify (the menubar install.sh rule): assert the RENDERED values
-  # — the template literal IS correct when this checkout is the main
-  # checkout, so a "no template path" grep would false-fire there.
+  # Byte-verify: assert the RENDERED values — the template literal IS
+  # correct when this checkout is the main checkout, so a "no template
+  # path" grep would false-fire there.
   if [ "$REPO" = "/Users/sam/Software/idlefill" ]; then
     EXPECTED_BIN="${PROG%% *}"
     [ -n "$PROG" ] || EXPECTED_BIN="$DEFAULT_BIN"

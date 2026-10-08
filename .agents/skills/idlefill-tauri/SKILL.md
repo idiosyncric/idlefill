@@ -88,7 +88,10 @@ release builds compile them out and `tauri-pilot ping` against the INSTALLED
 
 ## Fences (D8 / Q-b)
 
-- Nothing in `desktop/` or `menubar/` changes.
+- The two Swift shell trees retired with the #69 cutover (2026-10-08):
+  `desktop/` and `menubar/` no longer exist. `tauri/` is the only shell
+  plane; nothing outside it (server/, client/, adapters/, the deploy
+  scripts) is touched by shell work.
 - Production launchd labels (`com.sam.idlefill.server`, `.client`, and the
   live `com.sam.idlefill.app` unless the owner directs an install/update)
   are never kickstarted by tests — scratch labels only

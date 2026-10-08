@@ -373,661 +373,191 @@ releases parked requests cleanly too.
 5. Kill the arbiter (`launchctl`/docker as applicable) and send messages
    in both sessions: both must keep working (fail-open).
 
-## The menu bar app (macOS)
+## The desktop app (macOS — the one Tauri shell)
 
-`menubar/IdlefillMenubar.swift` is an AppKit `NSStatusItem` + `NSPopover`
-companion (macOS 14+, built with plain `swiftc` — no Xcode project; the
-SwiftUI `MenuBarExtra` exposes no click count, so the status item is built
-by hand and the panel view is hosted in a popover unchanged). Issue #61
-step 4 demoted it from a control surface to a **glance + open window**:
-the glance answers "is the box healthy, and is an update waiting?"
-without opening anything, and one row opens the one window (the desktop
-app hosting the arbiter-served page). It is a second *view* of the same
-daemon, not a different daemon: liveness is read from the arbiter (the
-client row's `last_seen`, within the arbiter's 90s window), so the daemon
-can be started from anywhere — an Orca tab, launchd, the control CLI
-below — and the arbiter stays the ground truth. The panel shows the
-state word (the arbiter's global verdict for the box), this machine's
-status row (the name-matched client row's liveness posture — or the
-missing/rejected-token fact), the checkout revision row with the
-exception-only `daemon behind` tag, and the exception-only sessions
-block (the count line only while sessions exist; one-liners for
-paused / forced / queued / stale only), plus Open Desktop (the ONE nav
-row — its right half carries the exception-only update indicator) ·
-Install Update <v> (exception-only).
+`tauri/` is the ONE Mac shell (issue #69 cutover, decision doc
+`docs/architecture/tauri-cutover.md`): a Tauri v2 app, built from this
+checkout, that is both the window and the menu-bar companion. The two
+Swift trees that preceded it — `desktop/` (the windowed app) and
+`menubar/` (the status-item app) — retired WITH their harnesses at the
+cutover; this section replaces their two former sections.
 
-- **Click routing:** a *single click* toggles the popover (the panel —
-  today's behavior, exactly). A *double click* opens the **desktop app**
-  (`idlefill://open` — since #61 step 3 the page's default view),
-  falling back to `open /Applications/Idlefill.app` if the URL-scheme
-  open is not handled. "Installed" = `/Applications/Idlefill.app` exists
-  (the standard install target of `desktop/update.sh`).
-- **Retired by the demotion (#61 step 4)** — each now lives in the one
-  window (the page's four views + the desktop app's Settings disclosure,
-  #61 step 3): the machine × project **scope pickers** (the page is the
-  place to look at any machine); the per-scope **stats rows** — queue
-  depth, today's finished/failed, tokens out with the project cap, the
-  running leases as rows, the queue peek (the page's four views); the
-  exception-only **scope controls** — project pause gate, grant knobs,
-  worker pause/force override (the page owns every write); the
-  **Start/Stop/Restart** rows (the Settings disclosure hosts the launchd
-  toggles; the control CLI below covers the rest). The `Open Dashboard`
-  and `Show Logs` rows retire too: step 3 re-points every `idlefill://`
-  deep link onto the page's default view anyway, and the logs dock is
-  not a hashable view — a second nav row could only land where
-  `Open Desktop` already lands. `menubar/scope-test.sh` retired WITH
-  the picker it pinned (the repo rule: harnesses retire with the code
-  they pin).
-- **Open Desktop row:** the always-on nav row that performs the
-  *double-click action* — `idlefill://open` (the desktop app; since
-  step 3 the page's default view), falling back to
-  `open /Applications/Idlefill.app` when the URL-scheme open is not
-  handled. The row and the double-click routing call the SAME shared
-  helper (`MenuBarAppState.openDesktopApp`), so they cannot drift. Its
-  right half carries the exception-only update indicator: when an update
-  is available the tag shows the `updateAvailable` value **verbatim** (a
-  release number `1`, a legacy `0.0.2`, an edge marker
-  `edge-main-a9787a7`) in the panel's tag color; when none is available
-  the row is label-only — no tag, no "current" mark (the Exception-Only
-  rule). The `Update Code` and `Quit` rows are gone (issue #27): the
-  Update Code *machinery* (`UpdatePlan`, `updateCode()`, the revision
-  log, `uc-update-test.sh`) stays fully intact and tested — only the
-  panel door was removed. The app's exit path is the CLI
-  (`node scripts/idlefill-menubar.mjs app stop`) or launchd
-  (`launchctl bootout gui/$(id -u)/com.sam.idlefill.menubar`). The row
-  set, the exception-only tag, and the glance's status row are pure
-  (`AppModel.panelActionRows` / `desktopRowTag` / `glanceStatusRow` —
-  the view renders that spec) and are proven headlessly by
-  `menubar/panel-test.sh` (the same harness pattern as
-  `menubar/uc-test.sh`).
+- **Shape (D1):** one `WebviewWindow` on the arbiter's **live origin**
+  (the `server_url` from `client/config.json`, loaded at runtime as
+  `WebviewUrl::External` — never a bundled copy of the page, the #61
+  rule) plus ONE status item. A **single click** on the status item
+  toggles the **glance** (a small borderless window anchored under the
+  tray icon: the state word, this machine's row, the revision row, the
+  exception-only sessions block, and the action rows); the tray menu
+  carries **Open Desktop**, **Settings**, and **Quit**. The double-click
+  gesture and the update row retired (Q-c). The glance dismisses on
+  focus loss.
+- **Token injection (D3):** the gate token is read at runtime from the
+  gitignored `client/config.json` and rides `initialization_script`
+  (document-start) into the page's own `idlefill.token` key — write-only
+  everywhere, never baked, never printed. The page's own token box stays
+  functional for browser users.
+- **Lifecycle parity (D4):** the Settings window re-hosts what the arbiter
+  can never know — the **daemon / app / arbiter** launchd toggles read
+  from real `launchctl print` state on a 5s tick (the `com.sam.idlefill.app`
+  toggle manages the shell's OWN LaunchAgent; the daemon and arbiter
+  labels are the same services the former desktop app managed), the runs:
+  lines, the repo path, and the exception-only **stopped** marker +
+  one-button **Relaunch** for a loaded-but-exited arbiter (the e737411
+  semantics: liveness = the `pid =` line, `launchctl kickstart` without
+  `-k`). The update-channel block retired (Q-b).
+- **Deep links (D5):** `idlefill://` is owned by this app (LaunchServices
+  re-registered at the cutover; verified live by an `idlefill://open`
+  round-trip that spawned no second process — single-instance). Every
+  host routes the one window onto the page's default view or `#<view>`
+  via the ported pure `hashView` map (state→#overview, sessions→#sessions,
+  projects→#projects, usage→#usage), unit-tested on the Rust side.
+- **Blank-origin behavior (D6):** wry exposes no page-load *Failed*
+  event, so the signal is the missing page-load Finished event plus the
+  arbiter pid-line liveness check — the same trio the Swift shell used.
+  The exception-only Relaunch parity stands; per the owner call (Q-a),
+  the window auto-reloads ONCE per dead→live transition edge when the
+  arbiter comes back.
+- **Build:** `bash tauri/build.sh` → `tauri/src-tauri/target/release/`
+  `bundle/macOS/Idlefill.app` (no signing identity, no notarization, no
+  install step in the build — Q-b). The `IDLEFILL_VERSION` env sets the
+  bundle version (semver, default 1.0.0); the `IDLEFILL_BUILD_MARKER`
+  env bakes the build marker the `--version` argv prints (default `dev`;
+  `update.sh` passes the commit's short sha). The tray icon is generated
+  at build time (`make-tray-icon.py`), not a checked-in binary blob. The
+  script byte-verifies the bundle's Info.plist (URL scheme + ATS merge)
+  with the raw-only `plutil` forms — a mutating `plutil` form corrupts
+  the plist it checks (the 2026-10-06 incident; the gate guards itself).
+- **Install / autostart (Q-d):** ONE LaunchAgent,
+  `com.sam.idlefill.app` (RunAtLoad), installed by `bash tauri/install.sh`
+  (idempotent; `--reinstall` renders the committed
+  `tauri/IdlefillApp.plist` template to a temp file + byte-verifies
+  BEFORE any bootout — a render refusal never leaves the loaded agent
+  down; `--uninstall` is bootout only). The shell's exit path is
+  `launchctl bootout gui/$(id -u)/com.sam.idlefill.app` or the tray menu's
+  Quit. The retired `com.sam.idlefill.menubar` label is gone from this
+  machine (booted out at the cutover, plist removed, in the same step as
+  the install — never a zero-tray window, never two trays).
+- **Update:** there is no update plane — an update is a rebuild from the
+  checkout (`./update.sh`; see the Releases & CI section below for the
+  build-identity rules).
+- **The bundled views** (settings + glance) are React in `tauri/ui/`;
+  `tauri/settings-ui/` is the committed build output (the frontendDist —
+  `bash tauri/build.sh` needs no npm step, the build-from-checkout rule).
+  Rebuild `tauri/ui` before a commit that touches its `src/`.
 
-- **Build:** `menubar/build.sh` → `menubar/IdlefillMenubar.app`, a real
-  bundle: `Contents/MacOS/IdlefillMenubar` + `Contents/Info.plist`
-  (bundle id `com.sam.idlefill.menubar`, `LSUIElement` — a status-bar app,
-  no dock icon). `CFBundleShortVersionString` is the root `package.json`
-  version (read with `node` at build time, overridable via
-  `IDLEFILL_VERSION`), injected into the binary through the
-  `__MENUBAR_VERSION__` placeholder — so the binary answers
-  `IdlefillMenubar --version` with the release it was built from. The
-  bundle is ad-hoc `codesign`ed as the last step (the desktop's
-  `build.sh` is the pattern). The compiled bundle is gitignored.
-- **Install:** `menubar/install.sh` scripts `launchctl bootstrap` for the
-  LaunchAgent (`com.sam.idlefill.menubar`) — idempotent: an already-loaded
-  label is a clean no-op (no re-bootstrap, no writes), `--reinstall` takes
-  the render + bootout + bootstrap cycle, `--uninstall` is bootout only. It renders
-  the live plist from the committed template
-  (`menubar/IdlefillMenubar.plist`) with this checkout's repo root in
-  every path and creates the log dir. The menu bar survives
-  logout/login (the agent is `RunAtLoad` + `KeepAlive`). **`--reinstall` renders FIRST
-  (fail closed, issue #23):** the render + byte-verify happen BEFORE the
-  bootout, and the render lands via a temp file that only replaces the
-  live plist once verified — a render refusal (bad template, missing
-  template) exits with the previously-loaded agent still running. The
-  already-loaded no-op also *reports* drift: when the live agent runs a
-  different binary than this checkout's built bundle, the note says so
-  and points at `--reinstall`. It touches only
-  the menubar label, never the daemon's.
-- **Update check:** on launch and every `update_check_minutes` (see the
-  config note below; default 360 = 6h) the app checks its update
-  channel **anonymously** (the repo is public — the arbiter token is
-  never sent to Forgejo). **Releases channel (the default):** it GETs the
-  Forgejo releases list, picks the newest release — a release number
-  (`v1`, `v2`, …; the pre-numbering semver tags `v0.0.1`/`v0.0.2` are still
-  understood and sort below any number) — and
-  compares it against its own baked version. Strictly newer → an
-  exception-only `Install Update <version>` row appears in the panel
-  (hidden while no update is available). **Back-switch rule:** a build
-  whose baked version is NOT numeric (an edge marker, a dev build) can
-  never compare numerically, so the check offers the newest release
-  unconditionally — such a machine can always get back to the releases
-  channel. **Branch channel (opt-in):** set `update_channel` to a branch
-  name in `client/config.json` (absent = releases). The check then GETs
-  the branch's TIP via the git refs API (`GET
-  …/git/refs/heads/<branch>`, anonymous) and compares its edge marker
-  (`edge-<branch>-<sha7>`) against the baked marker — an update is
-  available whenever the two differ (no ordering on branch builds: a
-  newer push is a different marker, and the difference IS the update).
-  **Development pin (opt-in within the branch channel):** set `update_pin`
-  to a commit SHA (7–40 hex chars — a full 40-hex sha pins the same build
-  as its own prefix) in `client/config.json`: the check then targets
-  `edge-<branch>-<sha7(pin)>` — the PINNED commit's edge build — instead
-  of the branch's tip. Its availability is the pinned edge release's
-  EXISTENCE (`GET …/api/v1/repos/sam/idlefill/releases/tags/<marker>`,
-  anonymous — the per-commit tag `edge.yml` pushes on every branch push,
-  or `scripts/edge-release.sh <marker> <sha>` on demand for an
-  unpublished commit): pinned marker == the baked marker → up to date;
-  a different pinned marker that exists → the `Install Update
-  <marker>` row (the same sha256-verified install as the tip's offer);
-  a pinned marker with no published release → the check says nothing
-  (fail quiet — publish the build, the next tick offers). Malformed or
-  empty `update_pin` = absent: tip-following resumes.
-  A tip for a branch that does not exist (a typo'd name) says so in the
-  note; the row then reads `Install Update edge-<branch>-<sha7>` and the
-  install downloads the marker-named `IdlefillMenubar-<marker>.app.zip`
-  release asset **and its `.sha256` sidecar**. Either way the install
-  verifies the hash before touching anything (a mismatch or missing
-  sidecar refuses and keeps the current bundle), swaps
-  `menubar/IdlefillMenubar.app` in place, and then takes the loaded
-  LaunchAgent over (issue #23 — the same machinery as Update Code):
-  already on the bundle → `launchctl kickstart -k`; stale inside this
-  repo → render + bootout + bootstrap re-point; outside this repo →
-  never touched. The note reports the outcome (`relaunched` / `agent
-  not loaded: run menubar/install.sh` / `agent NOT re-pointed: …`), and
-  a successful take-over is VERIFIED via `launchctl print` before the
-  note claims it. OFFLINE-TOLERANT: with the network down
-  the check says nothing and fails quiet — no dialog, no error row; the
-  next cadence tick retries. The edge builds it can install are
-  published per push to a tracked branch by `edge.yml` (below); the pure
-  decision logic is proven headlessly by `menubar/edge-test.sh` (the same
-  harness pattern as `menubar/uc-test.sh`).
-  **Cadence (configurable):** `update_check_minutes` in
-  `client/config.json` sets the interval in minutes (default **360** =
-  6h; clamped to a minimum of **5** — a lower value is clamped up and
-  the clamp is logged once at launch to `logs/idlefill-menubar.log`,
-  never shown in the panel). Absent/empty/invalid = the default. Parsed
-  once at launch like every other config key — a relaunch picks up a
-  new value.
-- **Update Code:** *(no panel row since issue #27 — the row was removed;
-  the machinery below stays fully intact and is still proven headlessly
-  by `menubar/uc-update-test.sh`.)* Fast-forwards this checkout to
-  `origin/main` and
-  reinstalls/rebuilds/restarts only what changed. Pre-flight gates, in
-  order — a refusal at any gate writes nothing (no merge, no install, no
-  signal to the daemon): (a) the tree must be clean
-  (`git status --porcelain`, timeout-bounded) — a dirty tree refuses with
-  `commit or stash first`; (b) `git fetch origin main` must succeed — a
-  failed fetch refuses; (c) `HEAD` must be an ancestor of `origin/main`
-  (`git merge-base --is-ancestor`) — a diverged local branch refuses.
-  `git pull` is never run: the only write is `git merge --ff-only
-  origin/main`, after all three gates. If `HEAD == origin/main` the
-  update is a no-op (`already up to date`), no install/rebuild/restart.
-  The daemon is stopped **first** (the same `SIGINT`-the-whole-pair path
-  as Stop), so it never runs against a mid-merge tree or a torn-down
-  `node_modules`; `npm ci` runs **only** when `package-lock.json` differs
-  between the two revisions (`git diff --quiet old new --
-  `package-lock.json`), never while the daemon runs. Then the menu bar
-  bundle is rebuilt (`menubar/build.sh`), and the loaded LaunchAgent is
-  **taken over** (issue #23 — a stale agent is a repair STEP, never just
-  a note): if the label is loaded and its `ProgramArguments.0` equals
-  this checkout's built bundle executable, `launchctl kickstart -k`
-  relaunches it on the new code; if the label is loaded but runs a
-  DIFFERENT path **inside this repo** (a stale pre-bundle-era path), the
-  agent is RE-POINTED — the committed plist template is rendered (to a
-  temp file, byte-verified, before any bootout) and the label goes
-  through bootout + bootstrap onto the rebuilt bundle. A label whose
-  executable lives OUTSIDE this repo belongs to another checkout and is
-  never killed or re-pointed (the note then says the menu bar was
-  rebuilt; relaunch it). After a kick or a re-point the app VERIFIES
-  `launchctl print` shows the bundle executable — a mismatch is surfaced
-  as a failure, not a success. The note before the take-over says
-  `restarting menu bar with new code`. Each
-  completed update appends one line to `logs/idlefill-menubar.log`
-  (`<oldsha> → <newsha> <ISO ts> daemon-pid=<pid|none>
-  lock-changed=<yes|no>`, rotated at 1 MiB keeping the last 512 KiB —
-  never deleted, never truncated to empty) and the panel's `revision`
-  row shows the deployed `git rev-parse --short HEAD`. The decision core
-  (`UpdatePlan`) is pure and is proven headlessly by
-  `menubar/uc-update-test.sh` against scratch repos (the same harness
-  pattern as `menubar/uc-test.sh`).
-- **Config:** the client config is parsed **once** at launch
-  (`ClientConfig`: `token` + `server_url` + `client_name` +
-  `update_channel` + `update_pin` + `update_check_minutes`). The
-  `client_name` key selects **this machine's** row in the payload (its
-  `last_seen` drives the glance's liveness posture and the
-  `daemon behind` comparison) — registration is idempotent by name, so
-  the name, not the `client_id`, survives daemon restarts. Values come
-  from the published state payload, never recomputed: the header state
-  word is the arbiter's GLOBAL verdict for the box. The pre-demotion
-  machine × project **scope** machinery (`ScopeView`'s picker state, the
-  per-scope aggregates, the exception-only control writes through
-  `POST /api/projects/:name`, `/settings`, and
-  `/api/clients/:ref/override`) retired in #61 step 4 — the page owns
-  every control and every per-machine view. The pure `ScopeView`
-  projection itself stays as the glance's read site (`sessions-test.sh`
-  and `staleness-test.sh` pin it against canned payloads).
-- **Repo discovery:** the binary ships at `<repo>/menubar/`, so it resolves
-  the repo from its own location (one level up), honoring
-  `IDLEFILL_CONFIG_FILE` when set. The token is read at runtime from the
-  gitignored `client/config.json` — never baked in.
-- **The daemon control paths** (`start()` runs the repo's
-  `node_modules/.bin/tsx` on `client/src/index.ts` with the client dir as
-  cwd and a real `PATH`; `stop()` sends `SIGINT` to the whole tsx pair —
-  clean, crash-safe) stay in the app for the update machinery
-  (`updateCode()`'s stop/start steps, proven by `uc-update-test.sh`),
-  but the panel no longer exposes them (the Settings disclosure hosts
-  the launchd toggles). A GUI-launched app inherits only
-  `/usr/bin:/bin`, where `node` does not live — the tsx shim resolves
-  node via `#!/usr/bin/env node`.
+## Updating (build from a checkout)
 
-**The control CLI** — `scripts/idlefill-menubar.mjs` — drives and
-troubleshoots the app and the daemon from a terminal while developing
-either. Same repo discovery and the same daemon-identity rule the app
-uses: a `node` process whose command line carries this repo's path AND the
-client entry (`src/` or `dist/` `index.ts`). (A bare `pgrep -f src/index.ts`
-matches any shell that merely quotes the path — do not use it.)
+There is no update plane. The Sparkle feed, the appcast, the ed25519
+signing, the branch (edge) channel, and every self-update row and check
+retired with the Swift shells at the #69 cutover (Q-b LOCKED,
+2026-10-06). The app is built from a checkout on every machine that runs
+it; the Rust toolchain (cargo + the tauri CLI) and the Node toolchain are
+required on that machine — both present on this one.
 
-```
-node scripts/idlefill-menubar.mjs status              repo/config/tsx/daemon/app + arbiter view
-node scripts/idlefill-menubar.mjs start               launch the daemon (same command the app's Start runs)
-node scripts/idlefill-menubar.mjs stop                SIGINT the daemon (clean, crash-safe)
-node scripts/idlefill-menubar.mjs restart             stop, then start
-node scripts/idlefill-menubar.mjs logs [--lines N]    tail client/logs/client.log
-node scripts/idlefill-menubar.mjs diagnose            status + tsx/node checks + log tail + interpretation
-node scripts/idlefill-menubar.mjs app start|stop|status   control the menubar binary itself
-```
+An update is `./update.sh` — one command, fail-closed at every step:
 
-`diagnose` is the troubleshooting entry point: it checks config, tsx, and
-node, then cross-references the local daemon process against the arbiter's
-`online` view and tells you which of "daemon is up but not heartbeating" /
-"arbiter says online but no local process" / "nothing running, arbiter down"
-you're in. The arbiter token is read at runtime from the gitignored client
-config and never printed.
-
-## The desktop app (macOS)
-
-`desktop/IdlefillDesktop.swift` is a windowed companion (macOS 14+, built
-with plain `swiftc` into a real `.app` bundle — no Xcode project). Since
-issue #61 step 3 it is ONE surface: the window hosts the arbiter's own
-page (a `WKWebView` on the live origin) under a slim native toolbar that
-carries only what the page can never own — the launchd lifecycle
-toggles, the repo path, and the update channel. The five legacy Swift
-tabs (State / Sessions / Logs / Projects / Settings-as-a-tab) retired
-with their parity gaps built INTO the page: the `daemon behind` code-
-staleness tag, the client log tail (the logs dock's Client log tab), and
-the local project-config editor all live on the arbiter-served page now.
-Like the menu bar app it is a *view* of the daemon, not a second one, so
-the daemon can be started from anywhere — launchd, an Orca tab, the menu
-bar — and the arbiter stays the ground truth.
-
-- **Build:** `desktop/build.sh` → `desktop/Idlefill.app` (ad-hoc signed).
-  It assembles the bundle (`Contents/MacOS/Idlefill` + `Info.plist`,
-  `LSUIElement false` — it has a window), registers the `idlefill://` URL
-  scheme (`CFBundleURLTypes`), draws the dock icon at runtime (the
-  open-ring logo, no `.icns`), links the vendored **Sparkle** framework into
-  `Contents/Frameworks`, writes the Sparkle keys into `Info.plist`
-  (`SUFeedURL`, `SUPublicEDKey`, `SUEnableInstallerLauncherService`), and
-  `codesign --force -s -` signs it so Gatekeeper-on-local is happy. The
-  version is `IDLEFILL_VERSION` (default `0.0.1`). Run it with
-  `open desktop/Idlefill.app`.
-  Install to Applications with `cp -R desktop/Idlefill.app /Applications/`,
-  or just run **`desktop/update.sh`** — one command to update an installed
-  copy: rebuilds, quits the running app (clean SIGTERM — the app holds no
-  leases; the daemon is a separate process), replaces the bundle in
-  `/Applications` (or a target dir passed as the first argument), and
-  relaunches.
-- **URL scheme `idlefill://` (#61 step 3: every host re-points the ONE
-  surface).** The window is the hosted page, so a deep link reloads the
-  live origin with the page view's `#<view>` appended where a page view
-  exists: `state` → `#overview`, `sessions` → `#sessions`, `projects` →
-  `#projects`, `usage` → `#usage`; `""`, `open`, `dashboard`, `logs`, or
-  any unknown host → the page's default view (the logs DOCK is a dock,
-  not a hashable view — the page reads the hash itself via
-  `HASH_VIEW_RE`). A URL that *launches* the app opens on the requested
-  view; a URL delivered to a *running* app activates it, brings the
-  window forward, and re-points the webview (extra restored windows are
-  closed — the link targets one window). Parsing is the pure
-  `AppModel.hashView(for:)`. This is how the menu bar's double-click and
-  its one `Open Desktop` row (#61 step 4 demotion) hand off to the
-  desktop app.
-- **The ONE surface (issue #61 step 1 + 3) — the app hosts the web page.**
-  The window IS a `WKWebView` (system WebKit, zero new dependencies)
-  loading the arbiter's **live origin** — `server_url` from
-  `client/config.json` + `/`, never a hardcoded host and never a bundled
-  copy of `server/public/index.html` (a copied page re-creates the drift
-  bug inside the bundle; the arbiter serves its own version-matched page).
-  The gate token from `client/config.json` is injected via a `WKUserScript`
-  at `.documentStart` — before the page's inline script runs — into the
-  page's own `localStorage` key (`idlefill.token`, the same key the header
-  token box writes), so every write works with **zero pasting**; the token
-  rides as a JSON-quoted literal (no breakout), a nil token injects
-  nothing, and the page's own token box stays functional for browser
-  users (the injection is additive — no page or server contract change).
-  The webview instance lives on the model, so the settings disclosure and
-  a deep link re-host the same live page instead of tearing it down; the
-  slim native toolbar above it names the origin + token state, carries the
-  exception-only **arbiter stopped** marker + one-button **Relaunch**, and
-  holds **Reload** (a rotated token takes effect on the next reload) and
-  the **settings** disclosure. ATS: the bundle's existing
-  `NSAllowsArbitraryLoads` exception covers the plain-HTTP loopback load
-  (proven by the live run).
-- **The retired Swift tabs (#61 step 3) — parity moved INTO the page.**
-  The native tab strip and the four data panels are gone. Each gap the
-  panels owned is now a page feature, so nothing regressed:
-  - **State** → the page's Overview/Projects views (state word, queue
-    depth, today's finished/failed, the running lease) — plus the
-    exception-only **daemon behind** code-staleness tag (#49's marker,
-    now computed by the client and published on the register heartbeat as
-    `daemon_behind`, so the arbiter and page can show it; toolhint names
-    the fix — restart the daemon via the native toolbar / `launchctl
-    kickstart`).
-  - **Sessions** → the page's Sessions view (pause/resume/force, FIFO
-    queue position, the session launcher, model/tokens). The desktop's
-    `SessionsView.project` / `overrideRequest` pure helpers and
-    `desktop/sessions-test.sh` retired WITH the panel (the page is the
-    interaction surface now).
-  - **Logs** → the logs dock's third tab, **Client log**: the client
-    publishes its in-memory log tail (last ~120 lines, each capped ~300
-    chars, oldest first) on the register heartbeat as `client_log`, ONLY
-    to a loopback arbiter — log payloads never cross the mesh. The dock
-    renders newest at the bottom and follows only when already at the
-    bottom (the same rule the Swift LogViewer used).
-  - **Projects** → the page's local project-config editor: on the
-    Projects view, when the page origin is loopback AND a client row
-    reports `proxy_port`, the page edits that client's
-    `client/config.json` `projects[]` entries through the client's own
-    loopback proxy (`GET`/`PUT /client/projects`, guarded by Host +
-    Origin + the `X-Idlefill-Edit` token the webview already injects). A
-    `PUT` validates every entry the way launch-time config parsing does
-    (whole-body 400 on any invalid entry, never a partial write),
-    preserves every other config key (the token included) and the file's
-    `0600` mode, writes tmp-then-rename, and answers
-    `{restart_required:true}` — the restart stays a native/launchd
-    action. This replaces the panel's Save + Restart affordance and
-    `desktop/staleness-test.sh` retired with the desktop's copy of the
-    staleness rule (the client publishes the verdict now).
-  - **Settings** → the same machinery, re-hosted in the slim native
-    toolbar's disclosure (below): the launchd toggles, the repo-path
-    field, and the update channel. These CANNOT move to the page — the
-    arbiter cannot know about launchd — so they stay native.
-- **launchd management model (opt-in).** Three toggles — **daemon**,
-  **menu bar**, and **arbiter** — each manage a LaunchAgent in the user's
-  `gui/<uid>` domain (no root, no system domain). **ON** writes the agent's
-  plist and runs `launchctl bootstrap gui/<uid>`; **OFF** runs `launchctl
-  bootout`. The
-  daemon plist points the repo's `node_modules/.bin/tsx` at
-  `client/src/index.ts` (working dir `client/`, `KeepAlive SuccessfulExit=false`,
-  `ThrottleInterval 30`, a real `PATH`); the menu-bar plist points at
-  `<repo>/menubar/IdlefillMenubar.app/Contents/MacOS/IdlefillMenubar`
-  (building the bundle first via `menubar/build.sh` if it is missing).
-  The **arbiter** toggle (issue #60 Slice A — the Mac-local fused instance
-  the **Dashboard** tab loads) renders the same values
-  `deploy/install-server-agent.sh` substitutes into its template: `npx tsx`
-  on `server/src/index.ts` (working dir `server/`, `NODE_ENV production`,
-  logs under `server/logs/`). It refuses rather than starting a second
-  arbiter: it will not bootstrap over a foreign process already serving the
-  arbiter's port (a hand-run `npm run dev`), and it declines when this
-  checkout's `server_url` names a remote host with no local
-  `server/config.json` (a local agent would shadow the real one).
-  **The plist carries no
-  token** — the daemon reads `client/config.json` itself at startup. The
-  toggles reflect **real launchctl state** (`launchctl print gui/<uid>/<label>`
-  exit 0 = loaded), re-checked every 5s, so a failed bootstrap shows an
-  error note and leaves the toggle OFF rather than a stale "on".
-- **Loaded is not live (the blank-dashboard fix).** A loaded service can sit
-  EXITED: a clean exit (SIGTERM → exit 0) under `KeepAlive SuccessfulExit=false`
-  does NOT relaunch, and `launchctl print` still exits 0 — so a plain
-  loaded-check reads healthy while the process is gone. For the arbiter that
-  means a **blank Dashboard tab** (the webview loads an unreachable origin and
-  paints the canvas fill over WebKit's error page). The arbiter row therefore
-  reads liveness from the print dump's `pid =` line, not from exit 0: it shows
-  an exception-only **stopped** marker ("loaded but not running — the
-  dashboard origin is down") with a one-button **Relaunch**
-  (`launchctl kickstart`, no `-k`: it starts an exited job and is a no-op while
-  running — proven live against scratch labels). The same marker + Relaunch
-  appear inline on the **Dashboard** tab's strip, where the blank page shows,
-  so the fix does not require opening Settings. Headless coverage:
-  `desktop/arbiter-test.sh` (the pure `pidLine` parse + the pure remote-refusal
-  rule + the shipped `setArbiter`/`relaunchArbiter` path end-to-end against a
-  scratch label via the `IDLEFILL_DESKTOP_TEST` hook, with a before/after
-  `launchctl print` of the real labels as the production-untouched proof).
-- **Settings drift marker (issue #23).** Each toggle row also shows what
-  its agent ACTUALLY runs — the `ProgramArguments.0` of the LOADED
-  `launchctl print` view (not the on-disk plist, which may not be what
-  launchd loaded). The menu-bar row carries an exception-only **stale**
-  marker when that path differs from this checkout's built bundle
-  executable (`menubar/IdlefillMenubar.app/Contents/MacOS/IdlefillMenubar`):
-  a stale agent becomes visible instead of masquerading as healthy. No
-  mark when healthy (the Exception-Only rule). The marker clears on the
-  next 5s poll after any successful re-point — Update Code, Install
-  Update, or `menubar/install.sh --reinstall` all re-point the agent at
-  the built bundle. Headless coverage: the `desktop/edge-test.sh`
-  `--drift` run (scratch labels via the `IDLEFILL_DESKTOP_TEST` hook —
-  marker ON on drift, agent path shown, marker CLEARS after a
-  bootout+bootstrap re-point).
-- **Repo path resolution:** defaults to `~/Software/idlefill`, overridable
-  by the `IDLEFILL_REPO_PATH` env var or the Settings field (persisted to
-  `~/Library/Application Support/Idlefill/config.json`). All plist paths,
-  the log path, and the token source derive from it. The token is read at
-  runtime from the gitignored `client/config.json` — never baked into the
-  plist, the bundle, or the binary.
-
-## Updating (two channels: releases + branch)
-
-The desktop app self-updates via [Sparkle](desktop/vendor/sparkle/SPARKLE.md)
-against a **private update feed**: the appcast and update zips live as
-**assets on a Forgejo release** (`git.samwarth.com/sam/idlefill`), not in
-the repo tree. The repo is public but **ingress is LAN-restricted**, so the
-feed is only reachable from inside the network — that is what makes it
-private in practice (Sparkle does a plain HTTPS GET, no auth). This is the
-**releases channel** — the default. The **branch channel** (below) is the
-second, opt-in channel: it tracks a git branch's latest published edge
-build instead of the numbered feed.
-
-**Feed URL** (in `Info.plist` `SUFeedURL` and the app's `kSparkleFeedURL`):
-
-```
-https://git.samwarth.com/sam/idlefill/releases/download/latest/appcast.xml
-```
-
-Gitea's release-download route is `/releases/download/{vTag}/{fileName}` —
-there is **no** `/releases/latest/download/` route (that GitHub form 404s on
-Gitea even once the repo is public), so the feed uses the `latest`
-pseudo-tag in the `{vTag}` slot. `latest` resolves to the newest release,
-which carries the **whole current feed**: `appcast.xml` + every zip it
-references. The enclosures in the appcast point at the same
-`/releases/download/latest/` prefix.
-
-**Signing.** Each update is signed with **ed25519 (EdDSA)**: the enclosure
-carries a `sparkle:edSignature` (a 64-byte ed25519 signature over the zip),
-and the bundle's `Info.plist` carries the matching **`SUPublicEDKey`**
-(base64 of the 32-byte public key) that Sparkle verifies against. The
-private seed lives at `~/.config/idlefill/sparkle-ed-key.b64` (mode `0600`,
-base64 of 32 bytes). `scripts/release.sh` derives the public key from it;
-if the file is missing it generates one and prints the public key to bake
-into the build.
-
-**Releasing** — `scripts/release.sh` runs the whole pipeline:
-
-1. build the app (`IDLEFILL_VERSION=<release number>`, with the `SUPublicEDKey`);
-2. zip the bundle (`Idlefill <n>.zip`);
-3. `generate_appcast` with `--maximum-deltas 0` (zips only, no `.delta`)
-   against a **persistent staging dir** (`~/idlefill-release-staging`) so
-   the feed carries the full history — old zips are carried forward;
-4. parse the feed and collect every referenced enclosure;
-5. **publish** to Forgejo: delete any existing release named
-   `Release #<n>`, create release `Release #<n>` tagged `v<n>`, and
-   attach `appcast.xml` + every referenced zip (idempotent re-runs);
-6. **verify the live feed** (authed GET): it parses as XML, the newest
-   `sparkle:version` is `<n>`, every zip enclosure GETs `200` with a
-   zip-ish `Content-Type`, and the ed25519 signature is present.
+1. refuse a checkout with uncommitted tracked changes;
+2. fast-forward `main` (`--no-pull` skips the pull and rebuilds the
+   current commit — e.g. a pinned checkout);
+3. `tauri/build.sh` with `IDLEFILL_BUILD_MARKER=<short sha>` so the
+   bundle proves its own origin;
+4. stage the bundle into `/Applications/Idlefill.app` (a rename swap —
+   an rsync/cp over a running app's binary fails with ETXTBSY, a rename
+   never does; the staged copy must pass `--version` before it lands);
+5. `tauri/install.sh --reinstall` re-pointed at the `/Applications`
+   copy, and settle on the PROCESS: the label is verified live only when
+   a process running the NEW binary path exists (launchd's bootout is
+   async — a `launchctl print` check at the drain window reads a doomed
+   label as loaded, so the process is the proof).
 
 ```bash
-IDLEFILL_VERSION=2 FORGEJO_TOKEN=<forgejo token> scripts/release.sh
-# FORGEJO_TOKEN is read at runtime from the gitignored credential — it is
-# never written into the feed or the repo.
+./update.sh              # pull + rebuild + reinstall
+./update.sh --no-pull    # rebuild THIS checkout, reinstall
 ```
 
-**In-app.** The Settings tab has a **Check for Updates…** button and a
-status line. The `SPUStandardUpdaterController` is created **lazily — on
-the first tap**, never at launch — so headless builds and tests never start
-an updater. Status reports: checking, up-to-date, update found / downloaded
-/ installed, or a fetch/parse failure (the feed is only reachable from the
-LAN, so an off-network machine reports a fetch failure, not "up to date").
-
-### The branch channel (edge builds)
-
-The second, opt-in channel (issue #26): instead of the numbered feed, the
-app tracks the TIP of a git branch and can install the edge build that was
-published for it.
-
-**Settings.** The Settings tab carries the channel option: an
-**update channel** picker (`releases` — the default, the Sparkle flow
-above — or `branch`) and, while `branch` is selected, a **branch** field
-(default `main`). Both persist in `~/Library/Application Support/Idlefill/
-config.json` alongside `repo_path`, with the exact same read-modify-write
-save (pretty JSON, every other key preserved). A channel value that is not
-one of the two known names falls back to `releases` — a hand-edited config
-never points the check at a third channel.
-
-**The check.** On `branch`, **Check for Updates…** GETs the branch's tip
-via the git refs API (`GET …/api/v1/repos/sam/idlefill/git/refs/heads/
-<branch>`, **anonymous** — the repo is public; the arbiter token is never
-sent). The tip's **edge marker** is `edge-<branch>-<sha7>` (the branch's
-name + the pushed commit's first 7 hex chars — one string, three uses: the
-edge release's tag, its name's tail, and the artifact-zip name part). An
-update is available ⇔ the baked marker differs from the tip's marker —
-no ordering on branch builds: a newer push is a different marker, and the
-difference IS the update. The status line names the tip marker; the
-Settings row then gains an **install edge build** confirm control.
-Confirmation re-fetches the tip (the check may be stale), downloads
-`Idlefill <marker>.zip` **and its `.sha256` sidecar** from the edge
-release, verifies the hash BEFORE any swap (a mismatch, missing or
-malformed sidecar refuses and keeps the current bundle, and the status
-line says so), then swaps the installed bundle with the `desktop/update.sh`
-sequence — unzip, quit the running app cleanly (SIGTERM; the quit matches
-the TARGET bundle, never a bare name match), replace, relaunch — driven
-from a detached helper so the app can replace itself. A 404 (the branch
-does not exist — a typo'd name) is distinct from the offline silence: the
-status line says `branch <name> not found`. Offline-tolerant throughout:
-a dead network or an unparseable body sets nothing new (the previous
-status is restored) and the next check retries.
-
-**The development pin (pin the branch channel to a commit).** While
-`branch` is selected, the Settings row also carries a **pin** field: a
-commit SHA (7–40 hex chars; a full 40-hex sha pins the same build as its
-own 7-char prefix), persisted alongside the branch in the app config
-(empty/malformed = absent, cleared on save — the read drops a malformed
-value rather than trusting it). With a valid pin, **Check for
-Updates…** skips the refs fetch entirely — a pin cannot move, the marker
-`edge-<branch>-<sha7(pin)>` IS the identity — and probes the pinned edge
-release's existence instead (`GET …/api/v1/repos/sam/idlefill/
-releases/tags/<marker>`, anonymous): a genuine 2xx offers the pinned
-build (the status line says `pinned build <marker> — confirm to
-install`; the **install edge build** control installs it — no re-fetch at
-confirm time, the same sha256-verified download + swap), a genuine 404
-is operator-actionable — `pin <marker> not published — publish it:
-scripts/edge-release.sh <marker> <sha>` — and any other outcome (the
-network is down) restores the previous status. A pin equal to this
-build's own marker reports `up to date (<marker>)`. The menubar's
-equivalent is `update_pin` in `client/config.json` (the automatic check —
-every `update_check_minutes`, default 6h — takes the pin path and fails
-quiet on a missing/unpublished
-pin — no status line there to carry the publish hint; the desktop's
-Settings shows it).
-
-**Where the edge builds come from.** `edge.yml` publishes one per push to
-a tracked branch (see below): `scripts/edge-release.sh` builds BOTH
-artifacts with the marker (`IDLEFILL_VERSION=<marker>` for the menubar;
-`IDLEFILL_DESKTOP_BUILD=<marker>` for the desktop), zips them as
-`IdlefillMenubar-<marker>.app.zip` / `Idlefill <marker>.zip`, and
-publishes them on a Forgejo release tagged `<marker>` — carrying the live
-numbered feed forward (the edge release is the newest, so `latest` serves
-it; without the carry-forward the numbered appcast would 404 for every
-Sparkle machine). The edge zips never enter the appcast and edge builds
-never carry the Sparkle key — the numbered pipeline is the only signer.
-
-**Build identity.** `desktop/build.sh` bakes a build marker into the
-binary the same way `menubar/build.sh` bakes its version: `Idlefill
---version` prints it (release builds print the numeric release number; an
-edge build prints its marker, so an installed build proves its own
-origin). An un-substituted build (an ad-hoc `swiftc` on the source)
-reports the default `1.0` — never the literal placeholder.
-`CFBundleVersion` stays the numeric release number either way: Sparkle
-compares `CFBundleVersion`, never the marker. The pure decision logic is
-proven headlessly by `desktop/edge-test.sh` (real source minus `@main` +
-a driver, `env -i`, against a local stub of the refs API + a scratch
-bundle — the same harness pattern as `menubar/edge-test.sh`).
+**Build identity.** The marker contract survives the pipeline's death:
+`idlefill-app --version` prints `idlefill <marker>` — the commit's short
+sha on an `update.sh` build, `dev` on a bare `tauri/build.sh`. The
+running app's revision is also visible on the page (the arbiter
+echoes the registration) and on the glance's revision row, so an
+installed build proves its own origin.
 
 ## Releases & CI (Gitea Actions)
 
 The repo runs Forgejo Actions on a **local runner** (urza, arm64 macOS —
-`com.sam.idlefill.actrunner` via launchd, like the daemon and menubar). It
-has the Xcode CLT, node, and python3 the pipeline needs. Tradeoff: cutting a
-release requires that Mac to be on — the same constraint as the manual
-`scripts/release.sh` path. Setup + day-2 ops for the runner live in
-[`runner/`](runner/README.md) (token-free templates; the live config with
-its registration secret stays on the host at
-`~/Software/ci-cd/idlefill-runner/`, never committed — this repo is public).
+`com.sam.idlefill.actrunner` via launchd, like the daemon). It carries
+the node, python3, AND Rust toolchains (cargo + the tauri CLI) the
+pipeline needs. Tradeoff: cutting a release requires that Mac to be on.
+Setup + day-2 ops for the runner live in [`runner/`](runner/README.md)
+(token-free templates; the live config with its registration secret stays
+on the host at `~/Software/ci-cd/idlefill-runner/`, never committed — this
+repo is public).
 
-Three workflows in `.gitea/workflows/`:
+Two workflows in `.gitea/workflows/` (the third, `edge.yml`, retired with
+the edge channel at the #69 cutover — Q-b: it published only the Swift
+app zips):
 
-- **`test.yml`** — every push + PR to `main`: full suite (server + client +
-  adapter tests, `tsc --noEmit` both packages, `npm run build`, `node --check`
-  on the MCP server, `swiftc -parse` on the desktop and menubar sources).
-  Tests only — never publishes.
-- **`release.yml`** — on a `v*` tag on `main` (or manual re-run): the same
-  full suite runs **first, as a hard gate** — any failing step stops the job
-  and nothing is published. Only a fully green gate reaches the publish step:
-  `scripts/release.sh` (build desktop + menubar → zip + sha256 sidecar →
-  sign appcast → Forgejo publish → live feed verify).
-- **`edge.yml`** — on a push to a tracked branch (today: `main`; the branch
-  list is a one-line variable at the top of the file): the same full suite
-  runs **first, as a hard gate** (the same step list as `release.yml` — the
-  edge builds are never signed, so there is no signing-key pre-flight). Only
-  a fully green gate reaches the publish step: `scripts/edge-release.sh`
-  (build BOTH apps with the edge marker → zip + sha256 sidecar → carry the
-  live numbered feed forward → Forgejo release on tag `edge-<branch>-<sha7>`
-  → live verify). See **The branch channel (edge builds)** above for what
-  this publishes and who consumes it.
+- **`test.yml`** — every push + PR to `main`: full suite (server + client
+  + adapter tests, `tsc --noEmit` both packages, `npm run build`,
+  `node --check` on the MCP server) plus the Tauri shell gates (issue
+  #69 D9, replacing the retired `swiftc -parse` gates):
+  `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, and a
+  debug `cargo build` as the bundle-plumbing smoke. Tests only — never
+  publishes.
+- **`release.yml`** — on a `v<N>` tag on `main` (or manual re-run): the
+  same full suite runs **first, as a hard gate** — any failing step stops
+  the job and nothing is published. Only a fully green gate reaches the
+  publish step: the tag's release NOTES (no artifacts — Q-b).
 
-**Why tag-triggered, not merge-triggered:** a release ships the Mac
-artifacts (the desktop `.app` Sparkle feed + the menubar `.app` zip and
-sha256 sidecar) — the arbiter, daemon, and MCP server run from each
-machine's local checkout and are not distributed. Publishing on every
-merge would push a possibly-broken build to every user's machine on every
-push, even when nothing changed. Tagging `v<number>` (the release number) on
-`main` is the deliberate "this version is a release" bump.
+**Why tag-triggered, not merge-triggered:** the arbiter, daemon, and MCP
+server run from each machine's local checkout, and the shell is built
+from a checkout too — nothing is distributed from the tag. The tag is the
+deliberate "this version is a release" bump: it stamps the release number
+that the daemons and arbiter carry in their registration (see below), and
+it publishes the notes that say how to get that build.
 
 ### Versions & releases
 
 Releases are **numbered** — release #1, #2, #3, … — not semver. The release
-number is the version: the root `package.json` holds the next release number,
-the tag is `v<number>`, and the Forgejo release is named `Release #<number>`.
-(The pre-numbering releases `v0.0.1`/`v0.0.2` are the one-off semver
-exceptions; they stay in the signed feed and every consumer keeps
-understanding them — they sort below any release number, so an installed
-`0.0.2` app picks up release #1 as an update.)
+number is the version: the root `package.json` holds the current release
+number, the tag is `v<number>`, and the Forgejo release is named
+`Release #<number>` (notes only since the #69 cutover — the pre-numbering
+releases `v0.0.1`/`v0.0.2` and the artifact releases before the cutover
+are the historical record).
 
-The root `package.json` is the single version source: the release tag
-`v<number>` is cut from it, and the release artifacts are stamped with it —
-the desktop feed's `sparkle:version` and the menubar bundle's
-`CFBundleShortVersionString` + baked `--version` string (the menubar's
-`build.sh` reads the root version with `node` by default;
-`scripts/release.sh` takes `IDLEFILL_VERSION` = the release number). The
-daemon resolves it the same way at runtime — its registration carries
-`version` + `protocol` (the version handshake), echoed on `/api/state`
-per worker row and shown on the dashboard's per-worker row when present.
-The registration also carries `revision` (issue #49): the git commit the
-daemon's RUNNING process loaded its code from (`git rev-parse HEAD`, once
-at startup; a full SHA, sanitized like `version`). The version handshake
-cannot see a daemon that predates its own working tree — the release
-number only bumps on a tag, and launchd relaunches only on crash — so the
-surfaces compare `revision` against their own checkout HEAD and show an
-exception-only `daemon behind` marker (menubar panel + desktop STATE tab);
-the daemon's boot revision clears it within one heartbeat of a restart.
-The arbiter only stores + echoes it: the comparison is client-side, since
-the arbiter has no view of any client's repo tree. A non-git checkout
-reports nothing and renders exactly as before.
+The root `package.json` is the single version source for the daemon: its
+registration carries `version` + `protocol` (the version handshake),
+echoed on `/api/state` per worker row and shown on the dashboard's
+per-worker row when present. The registration also carries `revision`
+(issue #49): the git commit the daemon's RUNNING process loaded its code
+from (`git rev-parse HEAD`, once at startup). The version handshake cannot
+see a daemon that predates its own working tree — the release number only
+bumps on a tag, and launchd relaunches only on crash — so the surfaces
+compare `revision` against their own checkout HEAD and show an
+exception-only `daemon behind` marker; the daemon's boot revision clears
+it within one heartbeat of a restart. The arbiter only stores + echoes
+it: the comparison is client-side, since the arbiter has no view of any
+client's repo tree. A non-git checkout reports nothing and renders
+exactly as before.
+
 ```bash
 node client/src/index.ts --version    # the daemon prints its version (exit 0)
-menubar/IdlefillMenubar.app/Contents/MacOS/IdlefillMenubar --version
+idlefill-app --version                # the shell prints idlefill <marker>
 ```
-The daemon does not self-update — it reports its version and the
-operator sees which revision each worker speaks; the menu bar is the
-self-updating artifact (update check + sha256-verified install, above).
 
-To cut a release: bump the root `package.json` version to the next release
-number, commit, and tag (the tag is the version with a `v`):
+The daemon does not self-update — it reports its version and the operator
+sees which revision each worker speaks. To cut a release: the root
+`package.json` already carries the number (it bumps when a release is
+cut), commit the bump, and tag (the tag is the version with a `v`):
 
 ```bash
-# bump root package.json to the next number (e.g. "2"), commit, then:
-git tag v2 main && git push origin v2     # runs release.yml; gate then publish
+git tag v2 main && git push origin v2     # runs release.yml; gate then notes
 ```
 
 The runner injects `FORGEJO_TOKEN` (write:releases on this repo) into the
-publish step; the ed25519 signing key stays at
-`~/.config/idlefill/sparkle-ed-key.b64` on the runner host (never in the
-repo, never a CI secret).
+publish step. The shell's build identity is the marker, not the release
+number (see Updating above).
 
 ## Auth model
 

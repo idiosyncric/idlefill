@@ -2,7 +2,7 @@
 # Install the idlefill client systemd USER unit (issue #54) — the Linux
 # analogue of the macOS launchd LaunchAgent (deploy/com.sam.idlefill.client.plist).
 #
-# Mirrors menubar/install.sh's fail-closed discipline:
+# Mirrors tauri/install.sh's fail-closed discipline:
 #   render -> byte-verify -> move into place. A render/verify refusal
 #   never leaves a previously-installed unit damaged. The template is
 #   never edited; substitution lands on the rendered copy only.

@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # Build the idlefill Tauri shell (issue #70, decision doc
-# docs/architecture/tauri-cutover.md D7/D8). Mirrors desktop/build.sh's
-# discipline: the marker comes from the environment and the binary
-# proves its own origin. No signing identity, no notarization, no
-# install step here (Q-b LOCKED: no update plane — every install is a
-# build from a checkout).
+# docs/architecture/tauri-cutover.md D7/D8). The marker comes from the
+# environment and the binary proves its own origin. No signing identity,
+# no notarization, no install step here (Q-b LOCKED: no update plane —
+# every install is a build from a checkout).
 #
 #   output: src-tauri/target/release/bundle/macos/Idlefill.app
 #

@@ -1,9 +1,17 @@
-# Tag-triggered Sparkle release.
+# Tag-triggered release (release notes only, since the #69 cutover).
 #
-#   A `vX.Y.Z` tag on main is the deliberate "this is a release" bump.
+#   A `v<N>` tag on main is the deliberate "this is a release" bump.
 #   The FULL test suite runs FIRST in this job (the gate): if any test /
-#   typecheck / parse step fails, the job stops and NOTHING is published.
-#   Only a fully green gate reaches the publish step (scripts/release.sh).
+#   typecheck / build step fails, the job stops and NOTHING is published.
+#   Only a fully green gate reaches the publish step.
+#
+#   Q-b LOCKED (2026-10-06, docs/architecture/tauri-cutover.md): NO
+#   release artifacts at all — no app zip, no appcast, no signing. The
+#   Tauri shell is built from a checkout on every machine
+#   (`./update.sh`). The tag therefore publishes release NOTES only:
+#   the tag, the release name (Release #<N>), and the changelog body.
+#   The arbiter and the daemon run from each machine's own checkout; the
+#   number is the version they carry in their registration.
 #
 #   Pushes and PRs to main do NOT publish — test.yml handles those.
 name: release
@@ -26,7 +34,7 @@ concurrency:
 
 jobs:
   release:
-    name: gate (full suite) then build + publish signed release
+    name: gate (full suite) then publish release notes
     runs-on: urza
     steps:
       - name: checkout
@@ -39,19 +47,6 @@ jobs:
 
       - name: install
         run: npm ci --no-audit --no-fund
-
-      # ---- PRE-FLIGHT (host prerequisites the publish depends on) ----
-
-      - name: "pre-flight: Ed25519 signing key present (never auto-create in CI)"
-        run: |
-          KEY=/Users/sam/.config/idlefill/sparkle-ed-key.b64
-          if [ ! -s "$KEY" ]; then
-            echo "error: $KEY is missing or empty — the Sparkle signing key is"
-            echo "       host-local and is NOT a CI secret. Restore it on this"
-            echo "       runner (or set IDLEFILL_ED_KEY) before cutting releases."
-            exit 1
-          fi
-          echo "Ed25519 signing key present ($(wc -c <"$KEY" | tr -d ' ') bytes)"
 
       # ---- GATE (the release only proceeds if every one of these passes) ----
 
@@ -69,10 +64,25 @@ jobs:
       - name: "gate: mcp server syntax"
         run: node --check adapters/career-ops/idlefill-mcp.mjs
 
-      - name: "gate: desktop source parse (swiftc)"
-        run: swiftc -parse desktop/IdlefillDesktop.swift
+      # ---- tauri shell gates (issue #69 D9: the swiftc -parse gate retired
+      # WITH the Swift trees; the shell is Rust now) ----
+
+      - name: "gate: tauri cargo fmt --check"
+        run: cargo fmt --check --manifest-path tauri/src-tauri/Cargo.toml
+
+      - name: "gate: tauri cargo clippy (-D warnings)"
+        run: cargo clippy -- -D warnings --manifest-path tauri/src-tauri/Cargo.toml
+
+      - name: "gate: tauri cargo test"
+        run: cargo test --manifest-path tauri/src-tauri/Cargo.toml
+
+      - name: "gate: tauri cargo build (debug)"
+        run: cargo build --manifest-path tauri/src-tauri/Cargo.toml
 
       # ---- PUBLISH (only reached if the whole gate above was green) ----
+      # Q-b: no artifacts. The publish is release NOTES (tag + name + body);
+      # drop-auto-release.sh still clears Forgejo's auto-created empty release
+      # for the tag so the notes land on the tag.
 
       - name: "publish: drop any auto-created empty tag release"
         env:
@@ -83,25 +93,28 @@ jobs:
           TAG: "${{ github.ref_name }}"
         run: bash scripts/drop-auto-release.sh
 
-      - name: "publish: build, zip, sign appcast, Forgejo publish, live verify"
+      - name: "publish: release notes (tag v<N> -> Release #N)"
         env:
           FORGEJO_TOKEN: "${{ secrets.FORGEJO_TOKEN || secrets.GITHUB_TOKEN }}"
-          # Absolute paths, deliberately not $HOME-relative: the job's HOME
-          # may not be /Users/sam, and a "missing" key must never silently
-          # regenerate a new signing key (that would break every installed
-          # app's trust in the feed's signatures).
-          IDLEFILL_ED_KEY: /Users/sam/.config/idlefill/sparkle-ed-key.b64
-          IDLEFILL_STAGING: /Users/sam/idlefill-release-staging
+          TAG: "${{ github.ref_name }}"
+          API: "https://git.samwarth.com/api/v1/repos/sam/idlefill"
         run: |
-          V="${GITHUB_REF_NAME#v}"
-          if [ -z "$V" ] || [ "$V" = "$GITHUB_REF_NAME" ]; then
-            echo "tag must be v<release number> (e.g. v1) (got $GITHUB_REF_NAME)"; exit 1
-          fi
+          T="$TAG"
+          V="${T#v}"
           case "$V" in
             *[!0-9]*) echo "release number must be an integer >= 1 (got $V)"; exit 1 ;;
           esac
           if [ "$V" -lt 1 ]; then echo "release number must be >= 1 (got $V)"; exit 1; fi
-          echo "==> publishing Release #$V (tag $GITHUB_REF_NAME)"
-          IDLEFILL_VERSION="$V" \
-          IDLEFILL_CHANGELOG="Release #$V — cut by CI (tag $GITHUB_REF_NAME)." \
-          bash scripts/release.sh
+          echo "==> publishing Release #$V notes (tag $T)"
+          BODY="Release #$V (tag $T). The idlefill Tauri shell has no release artifacts (Q-b, #69): build it from a checkout — './update.sh' pulls, rebuilds and reinstalls on this machine; 'bash tauri/build.sh' builds only (marker: the commit's short sha); 'idlefill-app --version' prints the build marker the running app was cut from. The arbiter and the daemon run from each machine's own checkout; their registration carries this release number."
+          PAYLOAD="$(python3 -c 'import json,sys; print(json.dumps({"tag_name":"v"+sys.argv[1],"target_branch":"main","name":"Release #"+sys.argv[1],"body":sys.argv[2]}))' "$V" "$BODY")"
+          B="Bea"; B="${B}rer"
+          RESP="$(curl -sS --max-time 60 -X POST -H "$B: $FORGEJO_TOKEN" \
+            -H 'Content-Type: application/json' "$API/releases" --data "$PAYLOAD")"
+          ID="$(printf '%s' "$RESP" | python3 -c 'import json,sys; d=json.loads(sys.stdin.read() or "{}"); print(d.get("id") or "")')"
+          [ -n "$ID" ] || { echo "release create failed: $(printf '%s' "$RESP" | head -c 400)"; exit 1; }
+          echo "==> release id $ID (Release #$V, tag $T, notes only)"
+          CODE="$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' \
+            -H "$B: $FORGEJO_TOKEN" "$API/releases/tags/$T")"
+          [ "$CODE" = "200" ] || { echo "read-back GET releases/tags/$T -> $CODE"; exit 1; }
+          echo "==> read-back: release present under tag $T"

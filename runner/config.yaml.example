@@ -49,5 +49,5 @@ server:
 
 container:
   # Jobs run as plain processes on this Mac (no Docker) — they need
-  # swiftc + node + npm + python3, all present in sam's PATH.
+  # cargo (the Rust toolchain) + node + npm + python3, all in sam's PATH.
   options: ""

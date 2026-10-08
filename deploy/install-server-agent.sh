@@ -6,7 +6,7 @@
 #   deploy/install-server-agent.sh --reinstall  bootout + bootstrap (take a fresh plist)
 #   deploy/install-server-agent.sh --uninstall  bootout only (the plist file stays)
 #
-# Plain bash, no deps. Same shape as menubar/install.sh (the pattern this
+# Plain bash, no deps. Same fail-closed shape as tauri/install.sh (which it
 # follows): render the committed TEMPLATE to a temp file + byte-verify
 # BEFORE any bootout, so a render refusal never leaves a loaded agent down.
 #

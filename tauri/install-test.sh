@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Headless test for tauri/install.sh (issue #70 deliverable 6). Ports the
-# menubar/install-test.sh check families to the app label: the
+# Headless test for tauri/install.sh (issue #70 deliverable 6). The
+# render-before-bootout check families on the app label: the
 # --reinstall cycle is RENDER-BEFORE-BOOTOUT (fail closed — a render
 # refusal must NEVER leave the previously-loaded agent unloaded), and a
 # clean --reinstall completes end-to-end leaving the agent loaded.
 #
 # ALL launchd work uses a SCRATCH label + scratch plist dir via the
 # install.sh overrides (IDLEFILL_APP_LABEL/_PLIST_DIR/_PROG/_LOG_DIR).
-# The REAL labels (com.sam.idlefill.app is not installed in wave 1; the
-# live com.sam.idlefill.menubar / com.sam.idlefill.client /
-# com.sam.idlefill.server labels) are NEVER touched; the run ends with a
-# production-untouched proof.
+# The REAL labels (com.sam.idlefill.app — installed at the #69 cutover —
+# plus the live com.sam.idlefill.client / com.sam.idlefill.server labels)
+# are NEVER touched; the run ends with a production-untouched +
+# cutover-state proof.
 set -uo pipefail
 T="$(mktemp -d /tmp/tauri-install-test.XXXXXX)"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -27,6 +27,10 @@ check() {
 is_loaded() { launchctl print "gui/$UID_NUM/$LABEL" >/dev/null 2>&1; }
 runs_of() { # the LOADED service's ProgramArguments.0
   launchctl print "gui/$UID_NUM/$LABEL" 2>/dev/null \
+    | awk '/arguments = \{/{f=1;next} f && /^[[:space:]]*}/{exit} f && NF {gsub(/^[ \t]+|[ \t]+$/,""); print; exit}'
+}
+runs_of_app() { # the REAL (cutover-installed) app label's ProgramArguments.0
+  launchctl print "gui/$UID_NUM/com.sam.idlefill.app" 2>/dev/null \
     | awk '/arguments = \{/{f=1;next} f && /^[[:space:]]*}/{exit} f && NF {gsub(/^[ \t]+|[ \t]+$/,""); print; exit}'
 }
 plist_bin() { plutil -extract ProgramArguments.0 raw "$1" 2>/dev/null || true; }
@@ -94,19 +98,26 @@ rc=0; bash "$T/copy/install.sh" --reinstall > "$T/reinstall-notpl.log" 2>&1 || r
 check "missing-template: --reinstall exits non-zero" test "$rc" -ne 0
 check "missing-template: agent STILL LOADED" is_loaded
 
-# ---- (6) the REAL labels untouched proof: the live agent labels still
-# ---- print and the menubar one still runs the main-checkout bundle.
-check "production: com.sam.idlefill.menubar still prints (untouched)" \
-  launchctl print "gui/$UID_NUM/com.sam.idlefill.menubar"
-launchctl print "gui/$UID_NUM/com.sam.idlefill.menubar" > "$T/real-mb.txt" 2>&1 || true
-check "production: the real menubar label still runs the main-checkout bundle" \
-  grep -q '/Users/sam/Software/idlefill/menubar/IdlefillMenubar.app/Contents/MacOS/IdlefillMenubar' "$T/real-mb.txt"
+# ---- (6) the REAL labels untouched + cutover-state proof: the live agent
+# ---- labels still print; the retired menubar label is GONE (booted out +
+# ---- plist removed at the #69 cutover); and if the cutover installed the
+# ---- app (the /Applications bundle), the real app label is live.
+check "production: the retired com.sam.idlefill.menubar label is gone" \
+  test "$(launchctl print "gui/$UID_NUM/com.sam.idlefill.menubar" >/dev/null 2>&1; echo $?)" -ne 0
 check "production: com.sam.idlefill.client still prints (untouched)" \
   launchctl print "gui/$UID_NUM/com.sam.idlefill.client"
 check "production: com.sam.idlefill.server still prints (untouched)" \
   launchctl print "gui/$UID_NUM/com.sam.idlefill.server"
-check "production: the real app label was NEVER installed (wave-1 fence)" \
-  test "$(launchctl print "gui/$UID_NUM/com.sam.idlefill.app" >/dev/null 2>&1; echo $?)" -ne 0
+APP_BIN="/Applications/Idlefill.app/Contents/MacOS/idlefill-app"
+if [ -x "$APP_BIN" ]; then
+  # The cutover ran on this machine: the ONE app's label is live.
+  check "cutover: com.sam.idlefill.app label is live" \
+    launchctl print "gui/$UID_NUM/com.sam.idlefill.app"
+  check "cutover: the app label runs the /Applications bundle" \
+    test "$(runs_of_app)" = "$APP_BIN"
+else
+  echo "NOTE: /Applications/Idlefill.app not present — skipping the app-label checks (cutover not run here)"
+fi
 
 # ---- cleanup: boot out the scratch label (the trap repeats it — idempotent)
 launchctl bootout "gui/$UID_NUM/$LABEL" 2>/dev/null || true

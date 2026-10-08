@@ -16,7 +16,7 @@ on:
 
 jobs:
   test:
-    name: "full suite (server + client + adapter + types + desktop)"
+    name: "full suite (server + client + adapter + types + tauri shell)"
     runs-on: urza
     steps:
       - name: checkout
@@ -44,8 +44,19 @@ jobs:
       - name: mcp server syntax
         run: node --check adapters/career-ops/idlefill-mcp.mjs
 
-      - name: desktop source parse (swiftc)
-        run: swiftc -parse desktop/IdlefillDesktop.swift
+      # ---- tauri shell gates (issue #69 D9: the swiftc -parse gates retired
+      # WITH the Swift trees; the shell is Rust now) ----
+      # The runner (urza, this Mac) carries the Rust toolchain; the label is
+      # the same urza:host as every other job.
 
-      - name: menubar source parse (swiftc)
-        run: swiftc -parse menubar/IdlefillMenubar.swift
+      - name: "tauri: cargo fmt --check"
+        run: cargo fmt --check --manifest-path tauri/src-tauri/Cargo.toml
+
+      - name: "tauri: cargo clippy (-D warnings)"
+        run: cargo clippy -- -D warnings --manifest-path tauri/src-tauri/Cargo.toml
+
+      - name: "tauri: cargo test"
+        run: cargo test --manifest-path tauri/src-tauri/Cargo.toml
+
+      - name: "tauri: cargo build (debug — the bundle-plumbing smoke)"
+        run: cargo build --manifest-path tauri/src-tauri/Cargo.toml
