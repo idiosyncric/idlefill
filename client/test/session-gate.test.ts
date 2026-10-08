@@ -109,12 +109,12 @@ async function waitFor(pred: () => boolean, timeoutMs = 3000, what = 'condition'
 function makeGate(opts: {
   maxActive?: number;
   holdCapMs?: number;
-  register?: (token: string, gate: SessionGateSnapshot | null, sessionId?: string, history?: SessionHistory, phase?: SessionPhaseSnapshot | null) => Promise<boolean>;
+  register?: (token: string, gate: SessionGateSnapshot | null, sessionId?: string, history?: SessionHistory, phase?: SessionPhaseSnapshot | null, lastActivity?: number) => Promise<boolean>;
   now?: () => number;
   clientName?: string;
-} = {}): { gate: SessionGate; registered: string[]; calls: { token: string; gate: SessionGateSnapshot | null; sessionId?: string; history?: SessionHistory; phase?: SessionPhaseSnapshot | null }[] } {
+} = {}): { gate: SessionGate; registered: string[]; calls: { token: string; gate: SessionGateSnapshot | null; sessionId?: string; history?: SessionHistory; phase?: SessionPhaseSnapshot | null; lastActivity?: number }[] } {
   const registered: string[] = [];
-  const calls: { token: string; gate: SessionGateSnapshot | null; sessionId?: string; history?: SessionHistory; phase?: SessionPhaseSnapshot | null }[] = [];
+  const calls: { token: string; gate: SessionGateSnapshot | null; sessionId?: string; history?: SessionHistory; phase?: SessionPhaseSnapshot | null; lastActivity?: number }[] = [];
   const gate = new SessionGate({
     maxActive: opts.maxActive ?? 1,
     holdCapMs: opts.holdCapMs ?? 30_000,
@@ -122,9 +122,9 @@ function makeGate(opts: {
     clientName: opts.clientName,
     register:
       opts.register ??
-      (async (token, gateSnapshot, sessionId, history, phase) => {
+      (async (token, gateSnapshot, sessionId, history, phase, lastActivity) => {
         registered.push(token);
-        calls.push({ token, gate: gateSnapshot, sessionId, history, phase });
+        calls.push({ token, gate: gateSnapshot, sessionId, history, phase, lastActivity });
         return true;
       }),
   });
@@ -367,7 +367,7 @@ test('register calls carry the gate snapshot (active at refresh, queued while pa
   // First sight registers BEFORE the request is forwarded ⇒ idle snapshot.
   const resA = postChat(proxy.base_url, '/s/tokA/v1/chat/completions');
   await waitFor(() => up.hits.length === 1, 3000, 'A forwarded');
-  assert.deepEqual(calls[0], { token: 'tokA', gate: null, sessionId: undefined, history: undefined, phase: null }, 'first-sight register: no gate block, no traffic history yet, no phase (#67: the no-phase report rides every heartbeat)');
+  assert.deepEqual(calls[0], { token: 'tokA', gate: null, sessionId: undefined, history: undefined, phase: null, lastActivity: undefined }, 'first-sight register: no gate block, no traffic history yet, no phase (#67: the no-phase report rides every heartbeat), no observed request time yet (#76: the ring fills after this register)');
 
   // B first-sights and parks; its register fires at first sight (before
   // the park), so it is also gate-less — the REFRESH is what reports it.
@@ -785,6 +785,55 @@ test('#45 session history on the wire: request ring + response-sniffed model/tok
   await waitFor(() => up.hits.length === 3, 3000, 'hist3 admitted');
   up.release(1);
   assert.equal((await resB).status, 200);
+});
+
+test('#76 last_activity on the wire: the newest REQUEST time, never the heartbeat tick (the inflation fix)', async () => {
+  const clock = { t: 200_000_000 };
+  const { gate, calls } = makeGate({ maxActive: 1, now: () => clock.t });
+  const { proxy, up } = await harness({ gate });
+  gate.onStatePoll([]); // arbiter reachable
+
+  // Request at t=200s. The first register fires inside the request path —
+  // before recordRequest pushes the ring entry. The daemon maps that
+  // ring-less report to its own clock (index.ts: lastActivity ?? Date.now()),
+  // the pre-#76 posture for a token the router has not seen yet.
+  const resP = postChat(proxy.base_url, '/s/lact1/v1/chat/completions');
+  await waitFor(() => up.hits.length === 1, 3000, 'hit forwarded');
+  up.release(1);
+  assert.equal((await resP).status, 200);
+  await waitFor(() => calls.some((c) => c.token === 'lact1'), 3000, 'first register');
+  const first = calls.filter((c) => c.token === 'lact1').at(0)!;
+  assert.equal(first.lastActivity, undefined, 'ring-less first sight reports no observed request time');
+
+  // The ring now holds the request instant. The HEARTBEAT (a 10s tick, no
+  // traffic) must report THAT time — not the tick's own clock. The old
+  // Date.now() stamp + the arbiter's max-keep pinned every row to "now".
+  clock.t += 10_001;
+  gate.heartbeat();
+  await waitFor(() => calls.filter((c) => c.token === 'lact1').length >= 2, 3000, 'heartbeat register');
+  const hb = calls.filter((c) => c.token === 'lact1').at(-1)!;
+  assert.equal(hb.lastActivity, 200_000_000, 'the heartbeat reports the request instant (the ring entry)');
+  assert.notEqual(hb.lastActivity, clock.t, 'never the tick time (the old inflation)');
+
+  // A newer request updates the ring → the next heartbeat reports it.
+  const resP2 = postChat(proxy.base_url, '/s/lact1/v1/chat/completions');
+  await waitFor(() => up.hits.length === 2, 3000, 'second hit forwarded');
+  up.release(1);
+  assert.equal((await resP2).status, 200);
+  clock.t += 10_001;
+  gate.heartbeat();
+  await waitFor(() => calls.filter((c) => c.token === 'lact1').length >= 3, 3000, 'heartbeat register 2');
+  const hb2 = calls.filter((c) => c.token === 'lact1').at(-1)!;
+  assert.equal(hb2.lastActivity, 200_010_001, 'the newer request instant wins');
+
+  // A poll-adopted token (the arbiter reports a row the router never saw —
+  // no local ring) reports undefined on its first heartbeat. The caller
+  // falls back to its own clock — the pre-#76 posture for that row.
+  gate.onStatePoll([{ token: 'lact2' }]);
+  gate.heartbeat();
+  await waitFor(() => calls.some((c) => c.token === 'lact2'), 3000, 'adopted session heartbeat');
+  const adopted = calls.filter((c) => c.token === 'lact2').at(-1)!;
+  assert.equal(adopted.lastActivity, undefined, 'no local ring ⇒ undefined (the caller clock stands)');
 });
 
 // ---------------------------------------------------------------------------

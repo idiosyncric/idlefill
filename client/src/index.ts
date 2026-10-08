@@ -1716,7 +1716,7 @@ export class ClientDaemon {
         holdCapMs: this.cfg.session_hold_cap_ms ?? 120_000,
         clientName: this.cfg.client_name,
         log: (m) => this.log.info(m),
-        register: async (token, gate, sessionId, history, phase) => {
+        register: async (token, gate, sessionId, history, phase, lastActivity) => {
           // #64 D5: an aggregate-derived session key (model name / header
           // id) carries the catalog-chosen row as `server_id` — idle
           // folding + preemption then land on the engine the request
@@ -1729,7 +1729,15 @@ export class ClientDaemon {
             ...(this.clientId ? { client_id: this.clientId } : {}),
             client_name: this.cfg.client_name,
             ...(aggregateServerId ? { server_id: aggregateServerId } : {}),
-            last_activity: Date.now(),
+            // #76: the NEWEST REQUEST the router saw on this session (the
+            // ring's last entry) — a 10s liveness tick is not a request, so
+            // the heartbeat never stamps its own tick (the old
+            // Date.now() pinned every arbiter row to "now": the max-keep
+            // rule at the arbiter never rewinds, idle folding stayed
+            // defeated, and grants were blocked for dead sessions).
+            // Ring-less rows (the router has not seen the token yet)
+            // report the tick time — the pre-#76 posture for those.
+            last_activity: lastActivity ?? Date.now(),
             // Gate-state visibility: the router's queue truth for this
             // session at heartbeat time. null (idle) ⇒ NO gate block — the
             // arbiter then CLEARS any stored gate for the token. An old

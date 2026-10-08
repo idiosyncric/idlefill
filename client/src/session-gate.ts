@@ -125,6 +125,11 @@ export interface SessionGateDeps {
      *  = no live phase (the body omits the block, the arbiter CLEARS any
      *  stored phase — the gate block posture). */
     phase?: SessionPhaseSnapshot | null,
+    /** The newest request time the router observed on this session (epoch-ms,
+     *  the register body's `last_activity`). undefined = the session has no
+     *  recorded traffic — the caller reports its own clock instead of the
+     *  heartbeat tick (the inflation a 10s tick caused on the arbiter rows). */
+    lastActivity?: number,
   ) => Promise<boolean>;
   /** #54: this client's registered name (client/config.json client_name).
    *  Arbiter session rows naming a DIFFERENT client are not adopted —
@@ -470,12 +475,21 @@ export class SessionGate {
       // args stay explicit here: a conditional spread would shift phase
       // into history's slot (the arity the register callback declares).
       const hist = s.ring.length || s.model || s.tokens ? sessionHistory(s, this.now()) : undefined;
+      // #76: `last_activity` is the NEWEST REQUEST the router observed on
+      // this session (the ring's last entry — a 10s liveness tick is not a
+      // request, so the heartbeat must never report its own tick time; the
+      // arbiter keeps the max and a tick-stamp pinned every row to "now").
+      // A session the router has not seen yet (poll-adopted, no local ring)
+      // reports undefined: the caller falls back to its own clock, exactly
+      // the pre-#76 posture for rows without observed traffic.
+      const lastActivity = s.ring.length ? s.ring.at(-1) : undefined;
       const ok = await this.deps.register(
         s.token,
         this.snapshot(s.token),
         s.session_id,
         hist,
         s.phase ? { state: s.phase.state, at: s.phase.at } : null,
+        lastActivity,
       );
       if (ok) {
         if (!this.linkUp) {

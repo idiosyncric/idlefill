@@ -78,6 +78,9 @@ export function startFakeArbiter(): Promise<FakeArbiter> {
     sessionRegisters: [] as Record<string, unknown>[],
     sessionTokens: new Set<string>(),
     sessionGates: new Map<string, { state: string; waiting: number } | null>(),
+    /** #76: the NEWEST reported request time per token — the real arbiter's
+     *  max-keep rule (registerSession keeps the max, never rewinds). */
+    sessionLastActivity: new Map<string, number>(),
     sessionOverrides: new Map<string, { override: string; until: number | null }>(),
     clients: new Set<WebSocket>(),
   };
@@ -117,6 +120,11 @@ export function startFakeArbiter(): Promise<FakeArbiter> {
         // gate-state: store the block verbatim; an absent field is the
         // idle report → clear (the real arbiter's clear-on-absent rule).
         state.sessionGates.set(token, (j.gate as { state: string; waiting: number } | undefined) ?? null);
+        // #76: the register body's last_activity, the real arbiter's
+        // max-keep rule (a heartbeat never rewinds a newer stored value).
+        if (typeof j.last_activity === 'number' && Number.isFinite(j.last_activity)) {
+          state.sessionLastActivity.set(token, Math.max(state.sessionLastActivity.get(token) ?? 0, j.last_activity));
+        }
         return send(created ? 201 : 200, { created, session: { token } });
       }
       const sov = url.pathname.match(/^\/api\/sessions\/([^/]+)\/override$/);
@@ -142,6 +150,9 @@ export function startFakeArbiter(): Promise<FakeArbiter> {
           clients: [{ client_id: 'c-test', name: 'test-client', ip: '100.94.165.102', override: state.override }],
           sessions: [...state.sessionTokens].map((token) => ({
             token,
+            // #76: the newest reported request time (max-keep, like the real
+            // arbiter row) — the client's onStatePoll learns activity from it.
+            ...(state.sessionLastActivity.has(token) ? { last_activity: state.sessionLastActivity.get(token) } : {}),
             override: state.sessionOverrides.get(token) ?? null,
             // gate-state: the stored block rides the row verbatim, like
             // the real arbiter's /api/state spread.
