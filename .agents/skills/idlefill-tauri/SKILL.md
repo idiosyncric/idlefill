@@ -61,8 +61,12 @@ in `tauri/ui/` (root npm workspace `tauri/ui`).
   count hunks before (`git stash`) and after your change, not zero absolute.
 - `cargo clippy -- -D warnings` — clean pin.
 - `cargo test` — green pin.
-- Bundle via `cargo-tauri tauri build`; a bare `cargo build` emits no `.app`.
-  `tauri/build.sh` handles both (marker + version env discipline).
+- Bundle via `cargo-tauri tauri build`; a bare `cargo build` emits no `.app`
+  — and do NOT run one "to warm the deps" first: the CLI's build context
+  differs, so the warm-up compiles the whole dep tree the CLI then
+  compiles AGAIN (~70s of pure waste, measured 2026-10-08; the pre-warm
+  was dropped from `tauri/build.sh` in e1b7b26). `tauri/build.sh` is the
+  only entry (marker + version env discipline).
 
 ## Dev-tool usage (debug builds only)
 
