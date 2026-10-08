@@ -52,15 +52,15 @@ import json, sys
 print(json.dumps({"version": sys.argv[1]}))
 PY
 )"
-
-cargo build --profile "$PROFILE" --manifest-path "$SRC/Cargo.toml"
-
+# The tauri CLI is the sole build entry (ISSUE69-GRILL-REPORT: the spike
+# proved `cargo-tauri tauri build` emits the bundle). A bare `cargo build`
+# BEFORE it was once a "warm the deps" step — measured 2026-10-08, it is
+# pure cost: its build context differs from the CLI's, so it compiles ~24
+# crates the CLI never reuses and then the CLI compiles them AGAIN (~100s
+# warm total). With only the CLI step, a warm update recompiles just the
+# app crate (the marker change forces it) and bundles: ~30s.
 APP="$SRC/target/$PROFILE/bundle/macos/Idlefill.app"
 if command -v cargo-tauri >/dev/null 2>&1; then
-  # The tauri CLI runs the bundler; the bare `cargo build` above warms
-  # the deps but never emits the .app. Exact spike-proven invocation
-  # (ISSUE69-GRILL-REPORT: `~/.cargo/bin/cargo-tauri tauri build
-  # --debug` produced the bundle).
   # NOTE the ${arr[@]+"${arr[@]}"} form: macOS ships bash 3.2, where a
   # bare "${arr[@]}" over an EMPTY array dies "unbound variable" under
   # set -u (the release path, TAURI_BUILD_ARGS empty; hit live
@@ -68,6 +68,10 @@ if command -v cargo-tauri >/dev/null 2>&1; then
   (cd "$SRC" && cargo-tauri tauri build ${TAURI_BUILD_ARGS[@]+"${TAURI_BUILD_ARGS[@]}"})
   echo "built: $APP"
 else
+  # The CLI is the only bundler; without it the best a build can do is
+  # the unbundled binary (the .app bundle is what the install paths
+  # need, so this is a degraded result, not an equivalent one).
+  cargo build --profile "$PROFILE" --manifest-path "$SRC/Cargo.toml"
   echo "built (unbundled binary): $SRC/target/$PROFILE/idlefill-app"
   echo "note: cargo install tauri-cli for the .app bundle"
 fi
