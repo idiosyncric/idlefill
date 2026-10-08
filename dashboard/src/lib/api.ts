@@ -76,6 +76,24 @@ export function setApiToken(token: string | null) {
   else localStorage.removeItem(TOKEN_KEY);
 }
 
+// Dev-only seeding. `npm run dev` reads the INSTALLED client's config
+// (server_url + arbiter token) and exposes it on the dev server at
+// /__idlefill-dev-config — same origin, so no CORS, no pasting. The installed
+// config is the source of truth in dev, so a changed token replaces the
+// stored one. Production builds (the arbiter serves dist/) bake
+// __IDLEFILL_DEV_API__ = null and never call this.
+export async function seedFromDevConfig(): Promise<void> {
+  if (__IDLEFILL_DEV_API__ === null) return;
+  try {
+    const res = await fetch("/__idlefill-dev-config", { cache: "no-store" });
+    if (!res.ok) return;
+    const cfg = (await res.json()) as { token?: string | null };
+    if (cfg.token && cfg.token !== apiToken()) setApiToken(cfg.token);
+  } catch {
+    /* dev bridge missing — the header field still works */
+  }
+}
+
 function qsToken(): string {
   const t = apiToken();
   return t ? `?token=${encodeURIComponent(t)}` : "";
