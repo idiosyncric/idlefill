@@ -130,9 +130,10 @@ not silently revoke the other.
 ## D5 — Human login: the seam, not the feature (PROPOSED)
 
 The operator asked for a "login/connection service". Today the human
-surface is: anonymous dashboard read + a pasted arbiter token + traefik
-basic-auth. A fleet service is the natural home for a real operator
-login, and it is the SaaS lever: `instance` gains one column,
+surface is: anonymous dashboard read + a pasted arbiter token (tailnet-only
+reach, no published port — the retired compose plane's IP/basic-auth
+middleware never shipped). A fleet service is the natural home for a real
+operator login, and it is the SaaS lever: `instance` gains one column,
 `fleet_id`, defaulting to `home`. That single column is the whole
 multi-tenant seam.
 

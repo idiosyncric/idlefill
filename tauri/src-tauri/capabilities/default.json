@@ -8,7 +8,6 @@
     "allow-settings-state",
     "allow-set-arbiter",
     "allow-set-daemon",
-    "allow-set-menubar",
     "allow-relaunch-arbiter-cmd",
     "allow-glance-state",
     "allow-glance-action",

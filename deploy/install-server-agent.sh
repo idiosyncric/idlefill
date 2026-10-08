@@ -23,8 +23,7 @@
 #   e. otherwise: bootstrap gui/<uid> <plist>
 #
 # Guardrails:
-#   - touches ONLY the server label — never com.sam.idlefill.client or
-#     com.sam.idlefill.menubar.
+#   - touches ONLY the server label — never com.sam.idlefill.client.
 #   - refuses to bootstrap when the arbiter PORT is already served by a
 #     foreign process (a hand-run `npm run dev` arbiter would silently
 #     shadow the agent): a plain `GET http://127.0.0.1:<port>/api/state`

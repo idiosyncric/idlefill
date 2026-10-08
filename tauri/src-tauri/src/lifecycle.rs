@@ -9,9 +9,6 @@ use std::process::Command;
 
 pub const DAEMON_LABEL: &str = "com.sam.idlefill.client";
 pub const ARBITER_LABEL: &str = "com.sam.idlefill.server";
-/// Retires at the cutover (D8 step 4). Kept so the Settings parity holds
-/// until then; the app's own autostart label arrives with install.sh (Q-d).
-pub const MENUBAR_LABEL: &str = "com.sam.idlefill.menubar";
 
 /// Launchd test-hook shape (the desktop's IDLEFILL_DESKTOP_TEST pattern).
 /// When `dir` is set, labels come from the per-label env vars and plists
@@ -220,19 +217,11 @@ pub fn arbiter_plist_xml(label: &str, repo: &Path) -> String {
     )
 }
 
-/// The menubar plist (menubarPlistXML, :1576+): this checkout's built
-/// menubar bundle executable, logs under <repo>/logs.
-pub fn menubar_plist_xml(label: &str, repo: &Path) -> String {
-    let bin = repo.join("menubar/IdlefillMenubar.app/Contents/MacOS/IdlefillMenubar");
-    let log_dir = repo.join("logs");
-    plist_render(label, &[bin], repo, &log_dir, false)
-}
-
-/// Shared renderer for the three lifecycle plists. The shape is the
+/// Shared renderer for the lifecycle plists. The shape is the
 /// desktop's exact template (KeepAlive SuccessfulExit=false +
 /// ThrottleInterval 30 + EnvironmentVariables PATH + RunAtLoad). The
 /// arbiter template additionally carries NODE_ENV production
-/// (arbiterPlistXML); the daemon and menubar templates do not.
+/// (arbiterPlistXML); the daemon template does not.
 fn plist_render(
     label: &str,
     program: &[PathBuf],

@@ -17,7 +17,6 @@ fn main() {
             "settings_state",
             "set_arbiter",
             "set_daemon",
-            "set_menubar",
             "relaunch_arbiter_cmd",
             "glance_state",
             "glance_action",

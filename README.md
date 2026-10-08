@@ -47,8 +47,8 @@ Architecture below.
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | Monorepo, server (Docker), client daemon, career-ops adapter, tests | **Done** — see `npm test`, Docker build |
-| 1.5 | Arbiter deployed to **urza** (2026-09-25) | **Done** — `idlefill-server:amd64`, host network, `~/idlefill/data`, token in `~/idlefill/config.json` (0600). Dashboard: `http://100.105.225.1:8787` (unauthenticated — phase-2 middleware gates it). Image built natively on urza: `docker build -t idlefill-server:amd64 server/` (urza is amd64; the Mac's arm64 image won't run there) |
-| 2 | urza hardening (compose + traefik route + IP/auth middleware), launchd client, NInfer log ro-mount | **Untested** — artifacts in `deploy/` are clearly marked; nothing there has been exercised by a real deployment |
+| 1.5 | Arbiter deployed to **urza** (2026-09-25) | **Done** — the live path is `scripts/deploy-server.sh` (gate, native amd64 build on urza, host-network container swap, tailnet healthcheck, auto-rollback). Image tag = the commit sha. State + config live under urza's `~/idlefill/` (0700/0600). Dashboard: `http://100.105.225.1:8787` |
+| 2 | urza hardening (compose + traefik route + IP/auth middleware), launchd client, NInfer log ro-mount | **Superseded (retired 2026-10-08)** — the compose + traefik plane never ran (urza is host-networked via the script above; `/mnt/docker/idlefill` never existed). The launchd client IS live (`tauri/install.sh` renders `tauri/IdlefillApp.plist`; the daemon/arbiter plists render from the Rust lifecycle plane) and the Linux client service is exercised (issue #54) |
 
 ## Architecture
 
@@ -60,16 +60,16 @@ Architecture below.
                         │   ├── activity feed /api/metrics/activity  │
                         │   └── NInfer req-*.jsonl (throughput log)  │
                         │           │                                │
-                        │           ▼ ro-mount (phase 2)             │
+                        │           ▼                                │
                         │  ┌──────────────────────────┐              │
-                        │  │ idlefill (arbiter) :8787 │              │
-                        │  │  IdleDetector + Arbiter  │◀── traefik   │
+                        │  │ idlefill (arbiter) :8787 │  host net    │
+                        │  │  IdleDetector + Arbiter  │ (tailnet IP) │
                         │  └────────────┬─────────────┘              │
                         └───────────────┼────────────────────────────┘
-                                        │ t3-proxy network
+                                        │ tailnet (Mac client registers here)
                           register / poll / WS (token auth)
                                         │
-                 Mac (this repo, phase 1 local / launchd phase 2)
+                 Mac (this repo, dev or launchd-installed)
                  ┌────────────────────────────────────────────────┐
                  │ idlefill client                                 │
                  │  └─ loopback proxy 127.0.0.1:11435 ──────────┐  │
@@ -106,7 +106,8 @@ docker run --rm --name idlefill-dev \
   -e IDLEFILL_CONFIG="$(cat config.json)" \
   -e IDLEFILL_STATE=./state.json \
   -p 8787:8787 idlefill-server:dev
-# (phase 1 dev: -p is for convenience; phase 2 publishes nothing — traefik fronts it)
+# (dev: -p is for convenience; the urza container is host-networked and
+#  publishes nothing — scripts/deploy-server.sh is the live deploy path)
 
 # 1b. Or run the server directly on the Mac (no Docker):
 #   cd server && npx tsx src/index.ts   (reads ./config.json)
@@ -134,9 +135,11 @@ adapters/   per-project executors (career-ops: queue builder + JD evaluator
 scripts/    thin CLI wrappers (build-careerops-queue.mjs, the control
             CLIs: idlefill-control.mjs arbiter-side, idlefill-menubar.mjs
             daemon-side — platform-portable, systemd-aware on Linux)
-deploy/     PHASE 2, UNTESTED: compose.yaml, traefik/idlefill.yml, deploy.sh,
-            com.sam.idlefill.client.plist; systemd/ + install-client-service.sh
-            = the Linux client service (issue #54 — exercised, see below)
+deploy/     launchd templates (com.sam.idlefill.client.plist,
+            com.sam.idlefill.server.plist) + systemd/ + install-client-service.sh
+            = the Linux client service (issue #54 — exercised, see below).
+            The compose + traefik hardening plane is RETIRED (2026-10-08):
+            urza is host-networked and the live deploy is scripts/deploy-server.sh.
 docs/       reports/ — per-issue build reports (historical record; see
             docs/reports/README.md). New issue reports land there, never at
             the repo root.
@@ -565,9 +568,9 @@ number (see Updating above).
 - Every API call and the WS connection must present one of the configured tokens (Bearer
 - credential header or `token` query parameter).
 - Exception (documented, LAN/tailnet-only): the dashboard page (`/`) and
-  `GET /api/state` are unauthenticated **read-only** in phase 1. If a request
-  to `/api/state` *does* carry a token, a bad one is rejected (401). Phase 2
-  adds traefik's `middleware-local-ip-range` in front.
+  `GET /api/state` are unauthenticated **read-only** (the dashboard poll). If a request
+  to `/api/state` *does* carry a token, a bad one is rejected (401). Access is
+  tailnet/LAN-only by deployment choice (host network, no published port).
 
 ## Operator overrides (pause / force clients)
 

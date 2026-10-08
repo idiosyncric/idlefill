@@ -15,7 +15,7 @@ import { Switch } from "@/components/switch";
 
 createRoot(document.getElementById("root")!).render(<Settings />);
 
-type ToggleKind = "daemon" | "arbiter" | "menubar";
+type ToggleKind = "daemon" | "arbiter";
 
 function stateText(loaded: boolean, runs: string | null): string {
   if (!loaded) return "not installed";
@@ -96,15 +96,6 @@ export default function Settings() {
           runs={snap.arbiter_runs}
           note={snap.arbiter_note}
           onToggle={(on) => void toggle("arbiter", on)}
-        />
-        <Separator />
-        <SettingsRow
-          id="menubar"
-          name="Legacy menubar agent"
-          loaded={snap.menubar_loaded}
-          runs={snap.menubar_runs}
-          note={snap.menubar_note}
-          onToggle={(on) => void toggle("menubar", on)}
         />
       </div>
 

@@ -43,11 +43,11 @@ truthfully copy a scheduler that is correct about its own traffic.
 
 - Homelab topology: the arbiter runs on urza (Docker, host networking) next to
   the LLM gateway (llama-swap) whose activity feed it watches; client daemons
-  run on Macs over the tailnet. Phase 2 (launchd client, traefik route,
-  compose hardening) is written but untested.
-- Access posture: LAN/tailnet-only. Phase 1: dashboard page and `GET
+  run on Macs over the tailnet. The compose + traefik hardening plane is
+  RETIRED (2026-10-08): urza is host-networked via scripts/deploy-server.sh.
+- Access posture: LAN/tailnet-only. Dashboard page and `GET
   /api/state` are unauthenticated read-only; all writes are Bearer-token
-  authed. Phase 2 adds IP middleware in front.
+  authed. Reach is tailnet/LAN-only by deployment choice (no published port).
 - Operator controls the system from the dashboard (header state word + engine
   gate combobox, per-client gates, gate token field) and from the CLI
   (`scripts/idlefill-control.mjs`). No other user-facing surfaces exist.

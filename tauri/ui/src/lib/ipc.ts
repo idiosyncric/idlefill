@@ -7,14 +7,11 @@ export type SettingsSnapshot = {
   daemon_loaded: boolean;
   arbiter_loaded: boolean;
   arbiter_running: boolean;
-  menubar_loaded: boolean;
   arbiter_stopped: boolean;
   daemon_runs: string | null;
   arbiter_runs: string | null;
-  menubar_runs: string | null;
   daemon_note: string | null;
   arbiter_note: string | null;
-  menubar_note: string | null;
   repo: string;
   config_path: string;
   marker: string;
@@ -36,7 +33,7 @@ export type GlanceState = {
    block — the arbiter page has NO IPC reach, the D4-shape lock). */
 export const ipc = {
   settingsState: () => invoke<SettingsSnapshot>("settings_state"),
-  setToggle: (kind: "arbiter" | "daemon" | "menubar", on: boolean) =>
+  setToggle: (kind: "arbiter" | "daemon", on: boolean) =>
     invoke<SettingsSnapshot>(`set_${kind}`, { on }),
   relaunchArbiter: () => invoke<SettingsSnapshot>("relaunch_arbiter_cmd"),
   glanceState: () => invoke<GlanceState>("glance_state"),

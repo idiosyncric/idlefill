@@ -42,13 +42,10 @@ struct LaunchdState {
     daemon_loaded: bool,
     arbiter_loaded: bool,
     arbiter_running: bool,
-    menubar_loaded: bool,
     daemon_runs: Option<String>,
     arbiter_runs: Option<String>,
-    menubar_runs: Option<String>,
     arbiter_note: Option<String>,
     daemon_note: Option<String>,
-    menubar_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -111,12 +108,6 @@ impl Shared {
     fn daemon_label(&self) -> String {
         self.hook
             .label(lifecycle::DAEMON_LABEL, "IDLEFILL_TAURI_TEST_LABEL_DAEMON")
-    }
-    fn menubar_label(&self) -> String {
-        self.hook.label(
-            lifecycle::MENUBAR_LABEL,
-            "IDLEFILL_TAURI_TEST_LABEL_MENUBAR",
-        )
     }
 }
 
@@ -337,14 +328,11 @@ fn refresh_launchd(app: &AppHandle) {
     let shared = app.state::<Arc<Shared>>().inner().clone();
     let d = lifecycle::launchctl_print(&shared.daemon_label());
     let a = lifecycle::launchctl_print(&shared.arbiter_label());
-    let m = lifecycle::launchctl_print(&shared.menubar_label());
     let mut st = shared.launchd.lock().unwrap();
     st.daemon_loaded = d.is_some();
     st.arbiter_loaded = a.is_some();
-    st.menubar_loaded = m.is_some();
     st.daemon_runs = d.as_deref().and_then(lifecycle::first_argument);
     st.arbiter_runs = a.as_deref().and_then(lifecycle::first_argument);
-    st.menubar_runs = m.as_deref().and_then(lifecycle::first_argument);
     // loaded != live: the pid line decides (e737411).
     st.arbiter_running = a.as_deref().and_then(lifecycle::pid_line).is_some();
     // Acceptance proof channel (gate 5): one log line per arbiter
@@ -481,14 +469,11 @@ struct SettingsSnapshot {
     daemon_loaded: bool,
     arbiter_loaded: bool,
     arbiter_running: bool,
-    menubar_loaded: bool,
     arbiter_stopped: bool,
     daemon_runs: Option<String>,
     arbiter_runs: Option<String>,
-    menubar_runs: Option<String>,
     daemon_note: Option<String>,
     arbiter_note: Option<String>,
-    menubar_note: Option<String>,
     repo: String,
     config_path: String,
     marker: &'static str,
@@ -501,14 +486,11 @@ fn snapshot(app: &AppHandle) -> SettingsSnapshot {
         daemon_loaded: l.daemon_loaded,
         arbiter_loaded: l.arbiter_loaded,
         arbiter_running: l.arbiter_running,
-        menubar_loaded: l.menubar_loaded,
         arbiter_stopped: glance::relaunch_row_present(l.arbiter_loaded, l.arbiter_running),
         daemon_runs: l.daemon_runs.clone(),
         arbiter_runs: l.arbiter_runs.clone(),
-        menubar_runs: l.menubar_runs.clone(),
         daemon_note: l.daemon_note.clone(),
         arbiter_note: l.arbiter_note.clone(),
-        menubar_note: l.menubar_note.clone(),
         repo: shared.repo.display().to_string(),
         config_path: shared.config_path_display(),
         marker: build_marker(),
@@ -580,26 +562,6 @@ fn set_daemon(app: AppHandle, on: bool) -> SettingsSnapshot {
         shared.launchd.lock().unwrap().daemon_note = lifecycle::install_label(&path, &xml);
     } else {
         shared.launchd.lock().unwrap().daemon_note = lifecycle::bootout_label(&label);
-    }
-    refresh_launchd(&app);
-    snapshot(&app)
-}
-
-#[tauri::command]
-fn set_menubar(app: AppHandle, on: bool) -> SettingsSnapshot {
-    let shared = app.state::<Arc<Shared>>().inner().clone();
-    let label = shared.menubar_label();
-    shared.launchd.lock().unwrap().menubar_note = None;
-    if on {
-        let xml = if shared.hook.dir.is_some() {
-            lifecycle::test_plist_xml(&label)
-        } else {
-            lifecycle::menubar_plist_xml(&label, &shared.repo)
-        };
-        let path = shared.hook.plist_dir().join(format!("{label}.plist"));
-        shared.launchd.lock().unwrap().menubar_note = lifecycle::install_label(&path, &xml);
-    } else {
-        shared.launchd.lock().unwrap().menubar_note = lifecycle::bootout_label(&label);
     }
     refresh_launchd(&app);
     snapshot(&app)
@@ -841,7 +803,6 @@ pub fn build() -> tauri::Result<()> {
             settings_state,
             set_arbiter,
             set_daemon,
-            set_menubar,
             relaunch_arbiter_cmd,
             glance_state,
             glance_action

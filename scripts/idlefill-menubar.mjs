@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 /**
- * idlefill menubar CLI — control + troubleshoot the menu bar app and the
- * client daemon it launches, from a terminal while developing either.
+ * idlefill menubar CLI — control + troubleshoot the client daemon, from a
+ * terminal while developing it.
  *
- *   node scripts/idlefill-menubar.mjs status      what the app sees: paths,
+ *   node scripts/idlefill-menubar.mjs status      what the daemon sees: paths,
  *                                                 daemon pid, arbiter view
  *   node scripts/idlefill-menubar.mjs start       launch the daemon (same
- *                                                 command the app's Start runs)
+ *                                                 command the Settings toggle runs)
  *   node scripts/idlefill-menubar.mjs stop        SIGINT the daemon (clean
  *                                                 shutdown, crash-safe)
  *   node scripts/idlefill-menubar.mjs restart     stop, then start
@@ -15,20 +15,15 @@
  *   node scripts/idlefill-menubar.mjs diagnose    status + tsx/node checks +
  *                                                 log tail + online/stale
  *                                                 interpretation
- *   node scripts/idlefill-menubar.mjs app start|stop|status
- *                                                 control the IdlefillMenubar
- *                                                 binary itself (it is not
- *                                                 installed as a launchd job)
  *
- * start/stop use the SAME daemon identity rule the menu bar app uses: a
+ * start/stop use the SAME daemon identity rule the Tauri shell uses: a
  * `node` process whose command line carries this repo's path AND the client
  * entry (src/ or dist/ index.ts). A bare `pgrep -f src/index.ts` matches any
  * shell that merely quotes the path — do not use it.
  *
  * Linux (issue #54): the daemon-side commands (status/start/stop/restart/
  * logs/diagnose/pids) are platform-portable — `ps` adapts to procps and the
- * arbiter view is the same. The `app` subcommand (the Swift binary) and the
- * launchd agent are macOS-only; on Linux the daemon's supervisor is systemd
+ * arbiter view is the same. On Linux the daemon's supervisor is systemd
  * (deploy/install-client-service.sh) and status/diagnose show the unit's
  * state and route stop/restart to `systemctl --user` when it is active.
  *
@@ -67,7 +62,6 @@ const repo = findRepo();
 const clientDir = join(repo, 'client');
 const tsxBin = join(repo, 'node_modules', '.bin', 'tsx');
 const entry = join(clientDir, 'src', 'index.ts');
-const appBin = join(repo, 'menubar', 'IdlefillMenubar');
 
 // The daemon anchors its log to the ENTRY dir (client/src in dev, client/dist
 // after a build) → <client>/<entry>/logs/client.log.
@@ -121,19 +115,6 @@ function daemonPids() {
   return pids;
 }
 
-/** The menu bar binary (by executable basename, exact). */
-function appPid() {
-  for (const line of psRows()) {
-    const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
-    if (!m) continue;
-    const argv0 = (m[3] ?? '').split(/\s+/)[0] ?? '';
-    if (argv0 === appBin || (argv0.endsWith('/IdlefillMenubar') && argv0.startsWith(repo))) {
-      return Number(m[1]);
-    }
-  }
-  return null;
-}
-
 // ---- config / arbiter ------------------------------------------------------
 
 function clientConfig() {
@@ -183,7 +164,6 @@ function mark(ok) { return ok ? y('ok  ') : r('FAIL'); }
 
 async function printStatus(quiet) {
   const pids = daemonPids();
-  const app = isLinux() ? null : appPid();
   const unit = systemdUnit();
   const cfg = clientConfig();
   const tsxOk = existsSync(tsxBin);
@@ -197,7 +177,6 @@ async function printStatus(quiet) {
       console.log(`unit     ${unit ? `${UNIT} ${unit.ActiveState}/${unit.SubState} pid=${unit.ExecMainPID ?? '?'} ${unit.EnableState ?? ''}` : a('no systemd user unit — deploy/install-client-service.sh')}`);
     }
     console.log(`daemon   ${pids.length ? 'pid ' + pids.join(', ') + (pids.length > 1 ? ' (tsx CLI + daemon — expected pair)' : '') : 'not running'}`);
-    if (!isLinux()) console.log(`app      ${app ? 'pid ' + app : 'not running'}  (${appBin})`);
     if (!st.reachable) {
       console.log(`arbiter  ${r('unreachable')} (${cfg.server_url ?? 'no server_url in config'})`);
     } else {
@@ -223,7 +202,7 @@ async function printStatus(quiet) {
       }
     }
   }
-  return { pids, app, cfg, tsxOk, st, unit };
+  return { pids, cfg, tsxOk, st, unit };
 }
 
 function logTail(n) {
@@ -281,31 +260,12 @@ async function cmdStop() {
 
 function cmdApp(args) {
   const sub = args[0] ?? 'status';
-  if (sub === 'status') {
-    const pid = appPid();
-    console.log(`IdlefillMenubar ${pid ? 'running (pid ' + pid + ')' : 'not running'} — ${appBin}`);
-    return pid ? 0 : 1;
-  }
-  if (sub === 'start') {
-    if (appPid()) { console.log('app already running'); return 0; }
-    if (!existsSync(appBin)) { console.log(r(`app binary missing: ${appBin} — run menubar/build.sh`)); return 1; }
-    const child = spawn(appBin, [], { detached: true, stdio: 'ignore', env: process.env });
-    child.unref();
-    console.log(`app launched (pid ${child.pid})`);
-    return 0;
-  }
-  if (sub === 'stop') {
-    const pid = appPid();
-    if (!pid) { console.log('app not running'); return 1; }
-    process.kill(pid, 'SIGTERM');
-    console.log(`SIGTERM → ${pid}`);
-    return 0;
-  }
-  return 2;
+  console.log(r('the app subcommand retired with the Swift menubar (issue #69 close-out) — the Tauri shell is the app now'));
+  return 1;
 }
 
 async function cmdDiagnose() {
-  const { pids, app, cfg, tsxOk, st, unit } = await printStatus(true);
+  const { pids, cfg, tsxOk, st, unit } = await printStatus(true);
   console.log('');
   console.log(`config   ${mark(cfg.present)} ${cfg.present ? `server_url=${cfg.server_url}` : join(clientDir, 'config.json')}`);
   console.log(`tsx      ${mark(tsxOk)} ${tsxBin}`);
@@ -315,7 +275,6 @@ async function cmdDiagnose() {
     console.log(`unit     ${mark(!!unit)} ${unit ? `${UNIT} ${unit.ActiveState}/${unit.SubState} ${unit.EnableState ?? ''}` : 'no systemd user unit (deploy/install-client-service.sh)'}`);
   }
   console.log(`daemon   ${mark(pids.length >= 1)} ${pids.length ? 'pid ' + pids.join(', ') + (pids.length > 1 ? ' (tsx CLI + daemon — expected pair)' : '') : 'not running'}`);
-  if (!isLinux()) console.log(`app      ${mark(!!app)} ${app ? 'pid ' + app : 'not running'}`);
   console.log(`arbiter  ${mark(st.reachable)} ${st.reachable ? (st.me ? `me=${st.me.name} online=${st.me.online}` : 'no client rows') : `unreachable${st.status ? ` (HTTP ${st.status})` : ''}`}`);
 
   if (pids.length && st.reachable && st.me && !st.me.online) {
