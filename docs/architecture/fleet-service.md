@@ -160,7 +160,9 @@ real query needs.
   already lives there). Route `fleet.samwarth.com` behind
   `middleware-local-ip-range` like the other private routes.
 - Own compose file under `/mnt/docker/fleetlink/`, state on a named
-  volume, same house conventions as `deploy/compose.yaml`.
+  volume, same house conventions the urza compose files share: no
+  published ports (traefik fronts the container via docker labels),
+  attaches to the `t3-proxy` network.
 - Dependency-free Node (fastify at most), matching the repo's posture.
 
 ## What changes in idlefill when this lands
