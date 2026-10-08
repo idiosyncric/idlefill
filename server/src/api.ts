@@ -892,7 +892,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     const now = Date.now();
     return {
       sessions: arbiter.listSessions().map((sess) => {
-        const pin = arbiter.sessionPinBlock(sess.token, typeof sess.history?.model === 'string' ? sess.history.model : undefined);
+        const pin = arbiter.sessionPinBlock(sess.token, typeof sess.history?.model === 'string' ? sess.history.model : undefined, sess.server_id);
         return {
           ...sess,
           override: arbiter.activeSessionOverride(sess.token, now),
@@ -1099,7 +1099,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       // pinned row serves the session's model under another id + set_at) —
       // the router learns it on this same poll, the pause/force channel.
       sessions: arbiter.listSessions().map((sess) => {
-        const pin = arbiter.sessionPinBlock(sess.token, typeof sess.history?.model === 'string' ? sess.history.model : undefined);
+        const pin = arbiter.sessionPinBlock(sess.token, typeof sess.history?.model === 'string' ? sess.history.model : undefined, sess.server_id);
         return {
           ...sess,
           override: arbiter.activeSessionOverride(sess.token, now),

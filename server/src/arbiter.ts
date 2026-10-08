@@ -1348,6 +1348,36 @@ export class Arbiter {
   }
 
   /**
+   * #67 acceptance fix: WHICH alias a session's model belongs to. The
+   * router sniffs `history.model` from the RESPONSE — for an alias
+   * session that is the winner pair's ENGINE id, never the alias name
+   * (docs/architecture/model-aliases.md: the sniff seam sees the
+   * resolved engine model). A name-only lookup therefore never finds the
+   * alias for real alias traffic, and the pin legality fell to the bare
+   * branch and refused the legal cross-pair switch. Resolution order:
+   *   1. the name itself IS an alias (name-shape session; the fixture
+   *      path + engines that echo the REQUESTED model);
+   *   2. an alias carrying the exact pair (session's current row,
+   *      sniffed engine id) — the precise live shape. A pair match
+   *      WITHOUT the row constraint is never consulted: a bare-name
+   *      session that happens to share an id with some alias pair must
+   *      keep the bare inventory rule, not alias legality.
+   */
+  private aliasForSessionModel(model: string, sessionServerId?: string): ModelAlias | undefined {
+    const aliases = this.store.state.model_aliases;
+    if (!aliases) return undefined;
+    const byName = aliases[model];
+    if (byName) return byName;
+    if (sessionServerId) {
+      for (const a of Object.values(aliases)) {
+        const pairs = Array.isArray(a.pairs) ? a.pairs : [];
+        if (pairs.some((p) => p && p.server_id === sessionServerId && p.model === model)) return a;
+      }
+    }
+    return undefined;
+  }
+
+  /**
    * Set (replace) or clear (server_id: null) the operator engine pin for
    * a session token — #67, the SIBLING of the pause/force override plane
    * (same write shape, same poll-learned channel, one-tick latency —
@@ -1396,7 +1426,7 @@ export class Arbiter {
     if (!row) return { ok: false, reason: 'unknown_server' };
     const model = typeof session.history?.model === 'string' ? session.history.model : undefined;
     if (model) {
-      const alias = s.model_aliases?.[model];
+      const alias = this.aliasForSessionModel(model, session.server_id);
       if (alias) {
         // Alias session: legal target = one of the alias's pair rows.
         const pairs = Array.isArray(alias.pairs) ? alias.pairs : [];
@@ -1431,14 +1461,14 @@ export class Arbiter {
    * rule as #66 D3 at forward time). Absent pin or a pin whose row went
    * missing: no key (the router falls back to the dispatch-chosen row).
    */
-  sessionPinBlock(token: string, model: string | undefined): { server_id: string; url: string; engine_model?: string; set_at: number } | undefined {
+  sessionPinBlock(token: string, model: string | undefined, sessionServerId?: string): { server_id: string; url: string; engine_model?: string; set_at: number } | undefined {
     const pin = this.store.state.session_pins[token];
     if (!pin || typeof pin.server_id !== 'string' || pin.server_id === '') return undefined;
     const row = this.store.state.servers.find((r) => r.id === pin.server_id);
     if (!row || typeof row.url !== 'string' || row.url.trim() === '') return undefined;
     let engineModel: string | undefined;
     if (model) {
-      const alias = this.store.state.model_aliases?.[model];
+      const alias = this.aliasForSessionModel(model, sessionServerId);
       const pair = alias && Array.isArray(alias.pairs) ? alias.pairs.find((p) => p && p.server_id === pin.server_id) : undefined;
       if (pair && typeof pair.model === 'string' && pair.model !== model) engineModel = pair.model;
     }

@@ -1628,6 +1628,38 @@ test('#67 pins: an alias session may only pin one of the alias pair rows', async
   rmSync(h.dir, { recursive: true, force: true });
 });
 
+test('#67 pins: an alias session with the LIVE sniff shape (engine id, not the alias name) resolves through its pair', async () => {
+  // The acceptance catch: the router sniffs history.model from the
+  // RESPONSE, so a real alias session carries the WINNER PAIR'S ENGINE
+  // id. A name-only alias lookup never fires for live traffic; the
+  // resolver must identify the alias by the exact (row, engine id) pair.
+  const map: Record<string, string[] | null> = {};
+  const h = makeAliasHarness(map);
+  const NOW = Date.now();
+  const up = h.arbiter.putModelAlias({ alias: 'Flag', pairs: [{ server_id: h.idA, model: 'engine-a-id' }, { server_id: h.idB, model: 'engine-b-id' }] });
+  assert.equal(up.ok, true);
+  const g = h.arbiter.upsertServerConnection({ name: 'gamma', url: 'http://gamma.local:7070', activity_path: '', models: ['engine-g-id'] });
+  assert.ok(g.ok);
+  await aliasProbe(h.arbiter, { alpha: ['engine-a-id'], beta: ['engine-b-id'], watched: [] }, map);
+  // Session rides beta (the winner) under the engine id beta echoes:
+  h.arbiter.registerSession('s-live', { now: NOW, server_id: h.idB, history: { rpm: [0, 0, 0, 0, 0, 0, 0, 0, 0, 1], model: 'engine-b-id' } });
+  // The flagship scenario: drag the alias session to the OTHER pair row.
+  const cross = h.arbiter.setSessionPin('s-live', h.idA);
+  assert.equal(cross.ok, true, 'the other pair row is legal for an engine-id alias session');
+  const blk = h.arbiter.sessionPinBlock('s-live', 'engine-b-id', h.idB)!;
+  assert.equal(blk.server_id, h.idA);
+  assert.equal(blk.engine_model, 'engine-a-id', 'the pinned row serves the pair under ITS OWN id — the splice key rides published');
+  // A non-pair row is still refused for the same session.
+  assert.equal(h.arbiter.setSessionPin('s-live', g.server!.id).reason, 'not_an_alias_pair');
+  // A BARE session that shares an id with an alias pair keeps the bare
+  // inventory rule (no row constraint ⇒ no alias legality): with the
+  // session on an unrelated row, the pair match does not fire.
+  h.arbiter.registerSession('s-bare', { now: NOW, server_id: g.server!.id, history: { rpm: [0, 0, 0, 0, 0, 0, 0, 0, 0, 1], model: 'engine-b-id' } });
+  assert.equal(h.arbiter.setSessionPin('s-bare', h.idA).reason, 'row_lacks_model', 'a bare session on a foreign row keeps the bare rule');
+  assert.equal(h.arbiter.setSessionPin('s-bare', h.idB).ok, true, 'beta serves engine-b-id per its probe');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
 test('#67 pins: a session with no sniffed model still pins by row existence; the block resolves url-only', () => {
   const map: Record<string, string[] | null> = {};
   const h = makeAliasHarness(map);

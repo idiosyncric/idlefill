@@ -764,7 +764,13 @@ export class SessionGate {
       const pin = normalizePinRow(row.engine_pin);
       const had = s.pin?.server_id ?? null;
       const next = pin?.server_id ?? null;
-      if (had !== next) {
+      // #67 acceptance fix: the splice key rides SEPARATELY from the
+      // row. The block resolved while the session had no sniffed model
+      // carries url-only; the completed block (same row, now naming the
+      // row's OWN engine id) must still replace it — a server_id-only
+      // comparison strands the incomplete pin and the alias request
+      // reaches the pinned engine un-spliced (live: 404 model_not_found).
+      if (had !== next || s.pin?.engine_model !== pin?.engine_model) {
         this.log(`session ${s.token} engine pin: ${had ?? 'none'} → ${next ?? 'none'}`);
         s.pin = pin;
       }

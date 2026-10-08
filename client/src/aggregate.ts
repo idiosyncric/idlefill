@@ -524,6 +524,17 @@ export function startAggregateRouter(opts: {
     return () => {
       const pin = gate.pinFor(key);
       if (!pin) return fallback;
+      // #67 acceptance guard (drop-don't-reject, the documented posture
+      // for an unprovable pin): an ALIAS-named request needs the pinned
+      // row's OWN engine id for the splice. A block without
+      // `engine_model` cannot name it — the session's model was not
+      // sniffed yet when the arbiter resolved the block (first
+      // heartbeats carry no history.model). Honoring such a pin blindly
+      // forwards the alias name to an engine that does not serve it
+      // (live: 404 model_not_found at the pinned row). Fall through to
+      // the alias entry; the block re-publishes complete once the model
+      // is known and the pin then lands exactly as written.
+      if (model && aliasByName.has(model) && !('engine_model' in pin)) return fallback;
       return { server_id: pin.server_id, url: pin.url, ...(pin.engine_model !== undefined ? { engine_model: pin.engine_model } : {}) };
     };
   };

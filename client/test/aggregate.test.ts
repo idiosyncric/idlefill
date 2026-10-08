@@ -539,6 +539,43 @@ test('#67 aggregate pin: a pin whose row serves the name under another id takes 
   assert.equal(body.model, 'engine-b-id', 'the response relays whole — the splice is request-side only (the #66 posture)');
 });
 
+test('#67 aggregate pin: an alias-named request with a block that lacks engine_model falls through (no un-spliced 404)', async () => {
+  // The live acceptance catch: the arbiter resolves the block the
+  // heartbeat that FIRST carries the session — and the first register
+  // sends no history.model (the ring/model ride a later beat). An
+  // alias-keyed session therefore can learn a pin WITHOUT the splice
+  // key. Honoring it would forward the alias name itself — the pinned
+  // row 404s model_not_found. Drop-don't-reject: the alias entry keeps
+  // the route; the completed block (next poll after the model rides)
+  // then lands exactly as written.
+  const engineA = await startEngine('engine-a-id');
+  const engineB = await startEngine('engine-b-id');
+  cleanup.push(() => engineA.close());
+  cleanup.push(() => engineB.close());
+
+  const { gate } = makeGate(4);
+  const r = await startRouter({ defaultTarget: engineA.url, gate });
+  r.updateAliases([
+    { name: 'Flag', server_id: 'srv-a', url: engineA.url, auth_set: false, engine_model: 'engine-a-id', catalog_source: 'probed' },
+    { name: 'Flag', server_id: 'srv-b', url: engineB.url, auth_set: false, engine_model: 'engine-b-id', catalog_source: 'probed' },
+  ]);
+
+  // Incomplete block: no engine_model (the model-not-yet-sniffed shape).
+  gate.onStatePoll([{ token: 'sess-1', engine_pin: { server_id: 'srv-b', url: engineB.url, set_at: 1 } }]);
+  const resIncomplete = await postChat(r.base_url, '/v1/chat/completions', 'Flag', { 'x-hermes-session-id': 'sess-1' });
+  assert.equal(resIncomplete.status, 200, 'the alias route stands — never an un-spliced alias name at row B');
+  assert.equal(engineB.hits.length, 0, 'the unprovable pin is not honored');
+  assert.equal(engineA.hits.length, 1, 'the alias winner (first row) answers');
+  assert.equal(JSON.parse(engineA.hits[0]!.body).model, 'engine-a-id', 'the #66 splice applied on the fallback route');
+
+  // The completed block arrives (the model rode a later heartbeat).
+  gate.onStatePoll([{ token: 'sess-1', engine_pin: { server_id: 'srv-b', url: engineB.url, engine_model: 'engine-b-id', set_at: 2 } }]);
+  const resComplete = await postChat(r.base_url, '/v1/chat/completions', 'Flag', { 'x-hermes-session-id': 'sess-1' });
+  assert.equal(resComplete.status, 200);
+  assert.equal(engineB.hits.length, 1, 'the completed block lands the pin');
+  assert.equal(JSON.parse(engineB.hits[0]!.body).model, 'engine-b-id', 'row B sees its OWN id — the splice key rode');
+});
+
 test('#67 aggregate pin: no gate pin ⇒ byte-for-byte the dispatch-chosen row (unpinned fleet unchanged)', async () => {
   const engineA = await startEngine('a');
   const engineB = await startEngine('b');

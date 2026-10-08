@@ -2486,10 +2486,19 @@ function sessLegalTargets(sess, st) {
   if (!model) return [...ids];
   // Alias session: legal = the alias's pair rows (the stored rows via the
   // token-gated cache; the public winner block as the no-token fallback).
+  // #67 acceptance fix: the model here is the RESPONSE-sniffed id (the
+  // winner pair's engine id), not the alias name, so a name-only lookup
+  // misses real alias traffic. Mirror the arbiter's resolver: name first,
+  // then the alias carrying the exact (session row, engine id) pair.
   const cached = (aliasesCache || []).find((a) => a.alias === model);
   if (cached) return (cached.pairs || []).map((p) => p.server_id).filter((id) => ids.has(id));
   const pub = (st.model_aliases || []).find((a) => a.name === model);
   if (pub) return [pub.server_id].filter((id) => ids.has(id));
+  if (sess.server_id) {
+    const byPair = (aliasesCache || []).find((a) =>
+      (a.pairs || []).some((p) => p && p.server_id === sess.server_id && p.model === model));
+    if (byPair) return (byPair.pairs || []).map((p) => p.server_id).filter((id) => ids.has(id));
+  }
   // Bare-name session: rows whose inventory carries the name. The deduped
   // catalog answers for the first row; the inv fold above already covered
   // alias pairs — for a bare name, every row that declares it anywhere.
@@ -2853,7 +2862,12 @@ function wireFlow() {
     if (e.key === "ArrowUp" || e.key === "ArrowDown") {
       e.preventDefault();
       const cur = flowPending && flowPending.token === tok ? targets.indexOf(flowPending.to) : -1;
-      const next = targets[(cur + (e.key === "ArrowDown" ? 1 : targets.length - 1)) % targets.length] ?? targets[0];
+      // First press from an unpreviewed pipe lands on a DIFFERENT legal
+      // engine (same rule as Enter's default) — arrowing onto the current
+      // row would show no preview and write nothing on Enter.
+      const next = cur < 0
+        ? (targets.find((t) => t !== sessTargetId(sess)) ?? targets[0])
+        : targets[(cur + (e.key === "ArrowDown" ? 1 : targets.length - 1)) % targets.length] ?? targets[0];
       flowPending = { token: tok, from: sessTargetId(sess), to: next };
       renderFlowView(LAST_ST);
       const nh = box.querySelector('[data-end-handle="' + cssEscape(tok) + '"]');
