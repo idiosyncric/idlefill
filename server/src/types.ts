@@ -688,6 +688,12 @@ export type EventKind =
   | 'job_throttled'
   | 'job_unthrottled'
   /**
+   * Theme colors (#68): an operator theme write (POST /api/theme). Detail
+   * carries the number of tokens the write applied. The values themselves
+   * are never logged (they ride the state file + the /api/state ADD key).
+   */
+  | 'theme_updated'
+  /**
    * Scheduled queue rebuild (issue #3): the client's rebuild loop ran since
    * the last heartbeat and reported fresh run state. The arbiter derives the
    * event from the registration payload (no new API surface) so the operator
@@ -756,9 +762,63 @@ export interface ClientKeyRow {
   created_at: number;
 }
 
+/**
+ * The dashboard CSS tokens the theme plane may set (#68) — the nine :root
+ * custom properties the dashboard renders with. The sanitizer accepts ONLY
+ * these keys (an unknown key drops); the value must pass the hex grammar
+ * below. Order matches dashboard/src/index.css :root (the source of truth the
+ * dashboard reads its DEFAULT_THEME from).
+ */
+export const THEME_TOKEN_KEYS = ['bg', 'panel', 'border', 'text', 'dim', 'ok', 'warn', 'err', 'accent'] as const;
+export type ThemeTokenKey = (typeof THEME_TOKEN_KEYS)[number];
+
+/** Hex grammar the theme sanitizer enforces (#68): #rgb or #rrggbb, nothing else. */
+export const THEME_HEX_RE = /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
+
+/**
+ * The :root defaults the theme seeds with (#68) — an exact mirror of
+ * dashboard/src/index.css :root (read from the file, not guessed). A key the
+ * operator has not set keeps its default; the dashboard falls back to the
+ * same :root values in the browser, so the two surfaces agree.
+ */
+export const THEME_DEFAULTS: Record<string, string> = {
+  bg: '#0d1117',
+  panel: '#161b22',
+  border: '#30363d',
+  text: '#c9d1d9',
+  dim: '#8b949e',
+  ok: '#3fb950',
+  warn: '#d29922',
+  err: '#f85149',
+  accent: '#58a6ff',
+};
+
+/**
+ * The operator-tuned dashboard color scheme (#68). A pure color map over the
+ * dashboard's nine CSS tokens (`--bg`, `--panel`, `--border`, `--text`,
+ * `--dim`, `--ok`, `--warn`, `--err`, `--accent`). Every value is a CSS hex
+ * color — the sanitizer enforces the hex grammar and drops every key that is
+ * not one of the nine. A pure color carries NO token or secret, so the map is
+ * anonymous-readable on /api/state (cosmetic, the ADD key is absent when
+ * unset). Written by setTheme (sanitize, then persist — same save shape as
+ * the project-settings plane); never a token.
+ */
+export interface ThemeColors {
+  colors: Record<string, string>;
+  updated_at: string;
+}
+
 export interface ArbiterState {
   /** Declared inference-server connections (seeded from config on first load). */
   servers: ServerConnection[];
+  /**
+   * The operator-tuned dashboard color scheme (#68). ADD-key sibling of
+   * `servers`: a state file from before #68 carries none. `null` = unset
+   * (the /api/state view omits the key entirely — the dashboard falls back
+   * to its :root defaults). Cosmetic values only: a pure hex color per
+   * token, never a secret.
+   */
+  theme?: ThemeColors | null;
   /**
    * Operator-declared model aliases (#66 D1), keyed by alias name. ADD-key
    * sibling of `servers`. An alias carries NO secret — `server_id` + engine

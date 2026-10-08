@@ -238,6 +238,14 @@ export type AliasRow = {
   updated_at: number;
 };
 
+// The operator-tuned dashboard color scheme (#68): the persisted theme map.
+// ADD-key — absent on /api/state until the operator sets one (the browser
+// falls back to the :root defaults). Cosmetic hex colors only, no secret.
+export type ThemeColors = {
+  colors: Record<string, string>;
+  updated_at: string;
+};
+
 export type AgentKeyRow = {
   id: string;
   label: string;
@@ -301,6 +309,8 @@ export type StateSnapshot = {
   model_aliases: ModelAliasEntry[];
   throttled_jobs: ThrottledJob[];
   mesh?: { instance_id: string; peers: MeshPeer[] };
+  /** The operator-tuned color scheme (#68). Absent until set. */
+  theme?: ThemeColors;
 };
 
 export type MetricPoint = {
@@ -459,6 +469,24 @@ export async function setProjectSettings(
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(settings),
+  }));
+}
+
+// The operator-tuned color scheme (#68): the settings write. Token-gated (the
+// qsToken pattern) like every other settings write. The arbiter sanitizes per
+// key (drop-don't-reject); the response carries the effective map after
+// sanitization. values: the nine-token map (or a subset the operator touched).
+export async function setTheme(colors: Record<string, string>): Promise<{
+  ok: boolean;
+  colors: Record<string, string>;
+  updated_at: string;
+  applied: number;
+  dropped: string[];
+}> {
+  return json(await fetch(`/api/theme${qsToken()}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ colors }),
   }));
 }
 

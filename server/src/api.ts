@@ -751,6 +751,37 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   });
 
   // ------------------------------------------------------------------
+  // Theme colors (#68): the operator-tuned dashboard color scheme
+  // ------------------------------------------------------------------
+
+  /**
+   * POST /api/theme: the theme write route. Token-gated like every settings
+   * write (the standard /api/* onRequest hook). Body: `{ colors }`.
+   *
+   * Drop-don't-reject: the arbiter sanitizes per key (hex grammar + known
+   * keys only). A bad key or a malformed value NEVER 400s — it drops that
+   * key and keeps the prior value (an all-bad payload keeps the prior map,
+   * never clears to empty). So this route always 200s with the EFFECTIVE
+   * map (the nine-token shape after sanitization) + updated_at + the count
+   * of tokens applied + the unknown keys dropped. The values are pure CSS
+   * colors — no token or secret ever crosses the wire.
+   */
+  app.post('/api/theme', async (req) => {
+    const body = (req.body ?? {}) as { colors?: unknown };
+    const colors = body.colors && typeof body.colors === 'object' && !Array.isArray(body.colors)
+      ? (body.colors as Record<string, unknown>)
+      : {};
+    const res = arbiter.setTheme(colors);
+    return {
+      ok: true,
+      colors: res.theme.colors,
+      updated_at: res.theme.updated_at,
+      applied: res.applied,
+      dropped: res.dropped,
+    };
+  });
+
+  // ------------------------------------------------------------------
   // Agent keys (#68): idlefill-issued credentials for aggregate callers
   // ------------------------------------------------------------------
 
@@ -1133,6 +1164,11 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       // (amendment discipline). The credential NEVER rides here either —
       // auth_set only, same write-only posture (#60 B).
       model_aliases: arbiter.modelAliases(),
+      // Dashboard color scheme (#68): the persisted theme map, the ADD key.
+      // Anonymous-readable — cosmetic values only (pure hex colors, no token
+      // or secret). Absent when unset (the dashboard falls back to its :root
+      // defaults); present with the full nine-token shape once set.
+      ...(arbiter.theme() ? { theme: arbiter.theme() } : {}),
       events: s.events.slice(Math.max(0, s.events.length - limit)).reverse(),
     };
   });

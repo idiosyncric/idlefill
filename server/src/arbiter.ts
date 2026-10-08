@@ -53,10 +53,21 @@ import type { IdleDetector } from './idle.js';
 import { activeLeaseExemptIps, defaultActivityPathFor } from './idle.js';
 import { buildCatalog, modelsProbeUrl, type CatalogEntry, type ModelsFetcher } from './catalog.js';
 import { mintInstanceId } from './mesh.js';
-import type { ClientKeyRow, IdleSignal, JobResultRow, JobThrottle, ModelAlias, ModelAliasPair, SessionOverride, SessionPin, SessionRecord } from './types.js';
+import type {
+  ClientKeyRow,
+  IdleSignal,
+  JobResultRow,
+  JobThrottle,
+  ModelAlias,
+  ModelAliasPair,
+  SessionOverride,
+  SessionPin,
+  SessionRecord,
+  ThemeColors,
+} from './types.js';
 import type { StateStore } from './state.js';
 import type { ClientOverride, Lease, ProjectAllocation, ServerConfig, ServerConnection, ServerProvider, UtcDate } from './types.js';
-import { PROVIDER_KINDS } from './types.js';
+import { PROVIDER_KINDS, THEME_DEFAULTS, THEME_HEX_RE, THEME_TOKEN_KEYS } from './types.js';
 
 /**
  * #66 D3: one published alias entry — the alias name with the WINNER pair
@@ -1799,6 +1810,70 @@ export class Arbiter {
       lease_ttl_seconds: p.lease_ttl_seconds,
       updated_at: prev.get(p.name)?.updated_at ?? nowMs,
     }));
+  }
+
+  // ------------------------------------------------------------------
+  // Theme colors (#68) — the operator-tuned dashboard color scheme
+  // ------------------------------------------------------------------
+
+  /**
+   * The theme write engine (#68). Sanitize, then persist — the SAME write
+   * shape as the project-settings plane (appendEvent + trim + save).
+   *
+   * Sanitizer (drop-don't-reject, the arbiter's standing posture for
+   * operator input):
+   *   - hex grammar only (THEME_HEX_RE): a non-conforming value drops THAT
+   *     key and keeps its prior value — a bad value never 400s the write and
+   *     never breaks the map.
+   *   - known keys only (the nine THEME_TOKEN_KEYS): an unknown key drops
+   *     silently — it never enters the map.
+   *   - a key the operator never set keeps its prior value (an absent key is
+   *     a no-op, not a clear); an all-bad payload therefore keeps the prior
+   *     map (it never clears to empty).
+   *   - a brand-new write (no prior map) seeds from THEME_DEFAULTS first so
+   *     the persisted map always carries the full nine-token shape.
+   *
+   * The values are pure CSS colors. A theme value never carries a token or
+   * secret (the hex grammar admits only hex), so the map is anonymous-readable
+   * on /api/state — the ADD key, present when set, absent when unset.
+   */
+  setTheme(colors: Record<string, unknown>): {
+    ok: true;
+    theme: ThemeColors;
+    /** The tokens this write actually applied (0 = the whole payload dropped). */
+    applied: number;
+    /** The tokens dropped as unknown keys. */
+    dropped: string[];
+  } {
+    const prior = this.store.state.theme?.colors ?? { ...THEME_DEFAULTS };
+    const next: Record<string, string> = { ...prior };
+    let applied = 0;
+    const dropped: string[] = [];
+    for (const [k, v] of Object.entries(colors ?? {})) {
+      const known = (THEME_TOKEN_KEYS as readonly string[]).includes(k);
+      if (!known) {
+        dropped.push(k);
+        continue;
+      }
+      if (typeof v === 'string' && THEME_HEX_RE.test(v)) {
+        next[k] = v;
+        applied += 1;
+      }
+      // else: a non-conforming value drops this key, keeps the prior value.
+    }
+    const nowIso = new Date().toISOString();
+    this.store.state.theme = { colors: next, updated_at: nowIso };
+    if (applied > 0) {
+      this.store.appendEvent({ kind: 'theme_updated', detail: `${applied} token(s) set` });
+    }
+    this.store.trim();
+    this.store.save();
+    return { ok: true, theme: this.store.state.theme, applied, dropped };
+  }
+
+  /** The persisted theme map, or null when unset (the /api/state ADD key omits it). */
+  theme(): ThemeColors | null {
+    return this.store.state.theme ?? null;
   }
 
   // ------------------------------------------------------------------

@@ -5,6 +5,7 @@ import {
   Command,
   LayoutDashboard,
   Server,
+  Settings as SettingsIcon,
 } from "lucide-react";
 import {
   Sidebar,
@@ -33,6 +34,8 @@ import { Projects } from "@/views/Projects";
 import { Models } from "@/views/Models";
 import { Agents } from "@/views/Agents";
 import { Usage } from "@/views/Usage";
+import { Settings } from "@/views/Settings";
+import { applyTheme } from "@/lib/theme";
 
 // The sidebar nav (shadcn sidebar-16 shape). Every parent item is itself a
 // view: picking "Resources" lands on its Overview. The chevron beside it
@@ -49,6 +52,7 @@ const NAV: NavItem[] = [
   },
   { id: "sessions", title: "Sessions", icon: Activity },
   { id: "usage", title: "Usage", icon: BarChart3 },
+  { id: "settings", title: "Settings", icon: SettingsIcon },
 ];
 
 const VIEW_KEY = "idlefill.viewTab";
@@ -114,7 +118,11 @@ export function App() {
     copyText(text).then((ok) => flash(set, ok ? "copied" : "copy failed"));
   };
 
-  // 5s poll, like the legacy dashboard (the WS push plane comes later).
+  // 5s poll, like the legacy dashboard (the WS push plane comes later). The
+  // apply channel for the color scheme (#68): at boot and on every poll, if
+  // the snapshot carries theme.colors, set each present key as a CSS custom
+  // property on <html> (the :root defaults stay the fallback — an absent key
+  // keeps the default).
   React.useEffect(() => {
     let alive = true;
     const pull = () =>
@@ -123,6 +131,7 @@ export function App() {
           if (!alive) return;
           setSt(s);
           setStErr(null);
+          applyTheme(s.theme?.colors);
         })
         .catch((e: Error) => alive && setStErr(e.message));
     pull();
@@ -246,6 +255,7 @@ export function App() {
           {view === "resources" && resTab === "projects" && <Projects st={st} />}
           {view === "resources" && resTab === "models" && <Models st={st} />}
           {view === "resources" && resTab === "agents" && <Agents st={st} />}
+          {view === "settings" && <Settings st={st} />}
         </main>
         <Toaster position="top-center" richColors={false} closeButton={false} />
       </SidebarInset>
