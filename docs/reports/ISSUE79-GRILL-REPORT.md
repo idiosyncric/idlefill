@@ -1,6 +1,6 @@
 # Grill report — issue #79: cross-mesh telemetry, remote view
 
-Grilling, 2026-10-09, main HEAD 75e14f7. Companion: docs/architecture/mesh-telemetry.md (LOCKED in shape, PROPOSED to the owner). No source file changed by this grill.
+Grilling, 2026-10-09, main HEAD 75e14f7. Companion: docs/architecture/mesh-telemetry.md (LOCKED — owner settled every open decision 2026-10-09; build wave filed as issue #86). No source file changed by this grill.
 
 ## Framing check
 
@@ -69,12 +69,12 @@ No data, no fake zeros. The coarse plane is unaffected: the 15s tick keeps pulli
 the snapshot, and the puller's own metrics continue. Default: drop-and-offline;
 the owner may allow the last successful answer, labeled stale (open decision 5).
 
-## OPEN DECISIONS
+## OPEN DECISIONS — resolved by the owner, 2026-10-09 (issue #79 final round)
 
-1. Accept the pull form, or re-grill the push-to-hub shape with a mesh.md amendment? (blocking)
-2. Does the pull ride the fleet peer_token, or a second secret for the metrics plane?
-3. Which series cross on demand: engine only, or engine plus lease plus session?
-4. Is the 48h raw window enough, or is the 400-day hour horizon the only range?
-5. Does an offline peer render its last-pulled aggregate, labeled stale, or nothing?
-6. Does the session series token field (often a model name) cross, or is the session series excluded?
-7. Is the 60s pull cache TTL the right default?
+1. Pull form ACCEPTED. Push-to-hub stays rejected by the mesh.md/#51 locks.
+2. The pull rides the fleet peer_token. No second secret.
+3. Engine, lease and session all cross on demand.
+4. The range mirrors the local clamp: 48h raw window, 400-day hour horizon, 7-day default.
+5. An offline peer renders nothing; stale labels a TTL cache hit only.
+6. The session series crosses, token field included: a derived key, not a credential.
+7. TTL default 60s (mesh_metrics_cache_s, 0 disables).

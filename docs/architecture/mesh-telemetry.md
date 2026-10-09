@@ -12,9 +12,9 @@ Map: #50 (`docs/architecture/mesh.md`, LOCKED — federation) · #51
 does not build) · #63 (`docs/architecture/aggregate-endpoint.md`, LOCKED —
 the write-only credential plane). Format model:
 `docs/architecture/engine-health-routing.md`. Citations re-verified against
-HEAD `4369a37` on 2026-10-09. Status: PROPOSED for the owner. Every D-block
-is LOCKED in shape. The owner must settle the Open questions before the
-build wave is filed. Nothing here is built.
+HEAD `4369a37` on 2026-10-09. Status: LOCKED — the owner settled every
+Open question on 2026-10-09 (issue #79, final round). The build wave is
+filed as issue #86. Nothing here is built.
 
 ## The gap, re-verified against the code
 
@@ -222,8 +222,8 @@ cross-machine read of a foreign machine's store, not a local dashboard
 read. The anonymous exception of the local route is the wrong posture for a
 peer surface.
 
-Open: the owner may still choose the second secret (Open question 1). The
-LOCKED statement is the scope posture, not the secret choice.
+LOCKED by the owner (2026-10-09, issue #79): the pull rides the fleet
+`peer_token`. No second secret for the metrics plane.
 
 ## D5 — Logs stay local (LOCKED)
 
@@ -269,8 +269,8 @@ aggregates only.
 **LOCKED, shape.** The Machines view renders the peer rows
 (`dashboard/src/views/Machines.tsx:30-125`, the `PeerCard` at
 `dashboard/src/views/Machines.tsx:61-125`). Each row gains one read-only
-expand. It pulls that peer's engine series (and the session series if the
-owner allows it, Open question 2) through the local arbiter (D3) and renders
+expand. It pulls that peer's engine series (and the lease and session
+series — the owner allowed all three, 2026-10-09) through the local arbiter (D3) and renders
 model names plus req/hr and tokens/hr sparklines. It reuses the #52/#57 Usage
 sparkline vocabulary. The response mirrors the local `/api/metrics` shape
 (D2), so the sparkline code serves local and remote points with one
@@ -328,7 +328,7 @@ absent means unset. Existing wire shapes keep every field byte-for-byte.
 
 ## What changes vs what stays untouched
 
-Changes (the build wave, after the owner settles the Open questions):
+Changes (the build wave, issue #86):
 
 - `server/src/api.ts`: the `GET /api/metrics/remote` route plus its
   `onRequest` hook scope (peer-token only).
@@ -349,17 +349,18 @@ Untouched (fenced):
   service. The client wire.
 - Tokens stay write-only. No read surface in this plane carries a token.
 
-## Open questions (owner input)
+## Open questions — RESOLVED by the owner, 2026-10-09 (issue #79)
 
-1. Does the detail pull ride the existing fleet `peer_token` (D4 default), or
-   does the owner want a second secret for the metrics plane now?
-2. Which series cross on demand: engine only, or engine plus lease plus
-   session?
-3. Is the 48-hour raw window enough for a cross-machine view, or is the
-   400-day hour horizon the only cross-mesh range?
-4. Does an offline peer render its last-pulled aggregate (labeled stale via
-   the `stale` ADD key), or nothing?
-5. The session series carries a `token` field (a derived key, often a model
-   name, `server/src/metrics.ts:94-100`). Is that fine to cross, or does the
-   owner want the session series excluded from the remote route by default?
-6. Is the 60-second pull cache TTL (`mesh_metrics_cache_s`) the right default?
+1. The detail pull rides the existing fleet `peer_token` (the D4 posture).
+   No second secret: #55 moves both secrets to per-instance ed25519 anyway.
+2. All three series cross on demand: engine, lease and session.
+3. The range mirrors the local clamp exactly: raw answers inside the peer's
+   own 48-hour window, hour answers up to the 400-day horizon, the 7-day
+   default window. No new range knob.
+4. An offline peer renders nothing new. A failed fetch drops the cache line
+   and the row renders offline under `PEER_STALE_MS`. The `stale` ADD key
+   labels only a cache hit inside the TTL, never a ghost of a dead peer.
+5. The session series crosses, `token` field included: a derived key, not a
+   credential (#63 untouched), and model names already cross the D1 channels.
+6. The 60-second pull-cache TTL (`mesh_metrics_cache_s`, `0` disables) is the
+   default.
