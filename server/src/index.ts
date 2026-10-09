@@ -207,6 +207,7 @@ async function main(): Promise<void> {
     // failed heartbeat never throws and never touches the last-known peer set
     // (the Service-down rule).
     heartbeatSender: buildHeartbeatSender(cfg, arbiter.identity()),
+    localPublicKey: () => arbiter.identity().publicKeyB64url,
     edgeFiller: (localId, edge, peerKey, peerName, direction) => {
       // The caller of the filler is this machine; the peer is the OTHER
       // end of the directed edge (the roster dedupe already skipped
