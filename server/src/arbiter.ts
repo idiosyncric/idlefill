@@ -1635,6 +1635,24 @@ export class Arbiter {
   }
 
   /**
+   * #78: the client that OWNS a session token (for the transcript forward).
+   * Resolves by `client_id` first (the register heartbeat names it), then by
+   * `client_name` (a row whose client_id predates that key). Returns null when
+   * the session names no owner, or the owner is not a registered client (an
+   * offline/swept row) — the caller then answers the honest "unavailable".
+   */
+  clientRouteForSession(token: string): { ip: string; proxy_port?: number } | null {
+    const s = this.store.state;
+    const sess = s.sessions.find((x) => x.token === token);
+    if (!sess) return null;
+    const client =
+      (sess.client_id ? s.clients.find((c) => c.client_id === sess.client_id) : undefined) ??
+      (sess.client_name ? s.clients.find((c) => c.name === sess.client_name) : undefined);
+    if (!client) return null;
+    return { ip: client.ip, proxy_port: client.proxy_port };
+  }
+
+  /**
    * The newest session activity (epoch-ms) on a server, or null. Feeds the
    * idle folding (#32): session traffic defeats idle and preempts leases
    * even when the engine feed exempts it (same-IP router).

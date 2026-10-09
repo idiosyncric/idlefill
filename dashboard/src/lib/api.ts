@@ -166,6 +166,24 @@ export type SessionPhase = {
   at: number;
 };
 
+// #78: the ROUTER's read-only transcript for one session — what the router
+// OBSERVED about each request (not the conversation). `at` = epoch-ms the
+// router saw the request; `model` / `tokens` = the last model name + streamed
+// token total the router sniffed on this session (absent = never observed).
+// `buckets` = the #45 10×60s request counts (oldest→newest). An empty requests
+// array is the honest "the router has no recorded traffic for this token".
+export type SessionTranscriptRequest = {
+  at: number;
+  model?: string;
+  tokens?: number;
+};
+
+export type SessionTranscript = {
+  token: string;
+  requests: SessionTranscriptRequest[];
+  buckets: number[];
+};
+
 export type SessionRow = {
   token: string;
   client_id?: string;
@@ -578,6 +596,17 @@ export async function setSessionPin(token: string, server_id: string | null) {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ server_id }),
+  }));
+}
+
+// #78 session viewer: the router's read-only transcript for one session.
+// Token-gated like the sibling session routes (the arbiter forwards it to the
+// owning client's loopback proxy). A 502 "transcript unavailable" is the
+// honest "the router can't be reached for this token" — the surface shows it
+// as a state line, never invents a transcript.
+export async function getSessionTranscript(token: string): Promise<SessionTranscript> {
+  return json(await fetch(`/api/sessions/${encodeURIComponent(token)}/transcript${qsToken()}`, {
+    cache: "no-store",
   }));
 }
 
