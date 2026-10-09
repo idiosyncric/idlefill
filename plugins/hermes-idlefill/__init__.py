@@ -10,6 +10,14 @@ session. Per call:
      the escape) while the gate reports the session `queued` or `paused`;
   3. run the provider call (`next_call`) exactly once.
 
+In-session hold signal (issue #46, slice 2 — the signal path only):
+while the gate reports `queued` or `paused` the plugin holds this
+call, and when the hold ends it writes ONE exception-only line to
+its own log naming the reason (the gate's state word) and how long
+the hold lasted, in whole seconds (the plugin's own measured hold
+episode — never a fabricated value, never a fake zero). No hold
+means no line. The token never appears in the line.
+
 Fail-open, always. Daemon unreachable, no session id, no gate port
 configured, or ANY unexpected error => the provider call proceeds
 immediately. A crashing gate must never wedge a conversation (Hermes
@@ -35,6 +43,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import time
 import urllib.parse
 import urllib.request
@@ -104,6 +113,21 @@ def _sleep(seconds: float) -> None:
 
 def _now() -> float:
     return time.monotonic()
+
+
+def _log(line: str) -> None:
+    """One line of the plugin's own log (stderr, fail-quiet).
+
+    The only output this plugin ever writes. The in-session hold
+    signal (issue #46) is exception-only: at most one call per hold
+    episode, and only after the gate reported queued or paused. A
+    log failure must never block the provider call.
+    """
+    try:
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
 
 
 # --- helpers (pure) ---------------------------------------------------------
@@ -195,11 +219,24 @@ def llm_execution_gate(request: Any, next_call: Callable[..., Any], **context: A
                 pass  # best-effort: the state poll below decides admission
             delay = _POLL_FIRST_S
             state = _gate_state(session_id, token)
+            held_state: Optional[str] = None
+            held_at: Optional[float] = None
             while state in ("queued", "paused"):
+                if held_state is None:
+                    held_state = state  # the reason: the gate's state word
+                    held_at = _now()
                 _sleep(delay)
                 delay = min(delay * _POLL_BACKOFF, _POLL_MAX_S)
                 state = _gate_state(session_id, token)
             # armed / unreachable / unknown state => admit (fail-open).
+            if held_state is not None and held_at is not None:
+                # One exception-only line per hold episode, at the end
+                # of the hold: the reason (the gate's state word) + how
+                # long this call was held (the plugin's own measured
+                # episode, whole seconds, never a fabricated value).
+                # The token never appears in the line.
+                held_s = max(0, int(_now() - held_at))
+                _log(f"held by idlefill gate ({held_state}, {held_s}s)")
     except Exception:
         pass  # fail-open: a gate failure must never wedge a conversation
     return next_call()

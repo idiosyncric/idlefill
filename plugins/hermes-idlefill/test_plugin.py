@@ -68,12 +68,29 @@ class GatePluginTest(unittest.TestCase):
         self.saved_port = os.environ.get("IDLEFILL_GATE_PORT")
         os.environ["IDLEFILL_GATE_PORT"] = PORT
         self._real_sleep = self.plugin._sleep
+        self._real_now = self.plugin._now
+        self._real_log = self.plugin._log
+        self.lines = []
+        self.plugin._log = self._record_log
+
+    def _record_log(self, line):
+        self.lines.append(line)
+
+    def _fake_now(self, values):
+        vals = list(values)
+
+        def now():
+            return vals.pop(0) if vals else 0.0
+
+        self.plugin._now = now
 
     def tearDown(self):
         os.environ.pop("IDLEFILL_GATE_PORT", None)
         if self.saved_port is not None:
             os.environ["IDLEFILL_GATE_PORT"] = self.saved_port
         self.plugin._sleep = self._real_sleep
+        self.plugin._now = self._real_now
+        self.plugin._log = self._real_log
         self.plugin._last_heartbeat.clear()
 
     def _run(self, states, session_id="20261009_test_gate", base_url="http://127.0.0.1:8800/v1"):
@@ -123,6 +140,50 @@ class GatePluginTest(unittest.TestCase):
         self.assertEqual(stub.next_calls, 1)
         self.assertEqual(stub.next_call_polls, 2)
         self.assertEqual(len(stub.sleeps), 1)
+
+    # --- issue #46 slice 2: the in-session hold signal ---
+
+    def test_queued_hold_emits_one_signal_line(self):
+        self._fake_now([1000.0, 2000.0, 2031.0])
+        stub, result = self._run(
+            [{"state": "queued"}, {"state": "queued"}, {"state": "armed"}],
+            base_url="http://127.0.0.1:11435/s/abc123",
+        )
+        self.assertEqual(result, "llm-response")
+        self.assertEqual(stub.next_calls, 1)
+        # Exactly ONE exception-only line for the whole hold episode
+        # (two queued reports, one line): the reason and the measured
+        # hold length (31s on the fake clock).
+        self.assertEqual(self.lines, ["held by idlefill gate (queued, 31s)"])
+        # The token never appears in the signal line.
+        for line in self.lines:
+            self.assertNotIn("abc123", line)
+
+    def test_paused_hold_emits_one_signal_line(self):
+        self._fake_now([1000.0, 5000.0, 5040.0])
+        stub, result = self._run([{"state": "paused"}, {"state": "armed"}])
+        self.assertEqual(result, "llm-response")
+        self.assertEqual(stub.next_calls, 1)
+        self.assertEqual(self.lines, ["held by idlefill gate (paused, 40s)"])
+
+    def test_armed_session_emits_no_signal_line(self):
+        stub, result = self._run([{"state": "armed"}])
+        self.assertEqual(result, "llm-response")
+        self.assertEqual(stub.next_calls, 1)
+        self.assertEqual(self.lines, [])  # no hold: no line at all
+
+    def test_unreachable_emits_no_line_and_still_admits(self):
+        down = ConnectionError("daemon down")
+        stub, result = self._run([down, down])
+        self.assertEqual(result, "llm-response")  # fail-open: admitted
+        self.assertEqual(stub.next_calls, 1)
+        self.assertEqual(self.lines, [])  # no gate data: no line
+
+    def test_malformed_state_emits_no_line_and_never_raises(self):
+        stub, result = self._run([{"state": "weird"}, None])
+        self.assertEqual(result, "llm-response")  # no exception escapes
+        self.assertEqual(stub.next_calls, 1)
+        self.assertEqual(self.lines, [])
 
     def test_unreachable_never_raises_and_admits(self):
         down = ConnectionError("daemon down")
