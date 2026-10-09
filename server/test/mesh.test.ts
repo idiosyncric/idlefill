@@ -786,7 +786,7 @@ test('roster: ROSTER_PULL_MS is the PROPOSED default (15 s, the poll tick)', () 
 });
 
 // ---------------------------------------------------------------------------
-<// Roster edge fill (#55 D4, the pairing ceremony — PROPOSED wire)
+// Roster edge fill (#55 D4, the pairing ceremony — PROPOSED wire)
 //
 // The roster publishes each instance's directed edges as an ADD key; the
 // local instance writes the LOCAL side's edge record (last-known-keys).
@@ -1005,7 +1005,9 @@ test('edge fill: an EMPTY local instance id disables the fill (no crash)', async
   });
   await m.pullRoster(async () => edgeEnvelope(), T0);
   assert.equal(calls.length, 0, 'no local id = no fill');
+});
 
+// ---------------------------------------------------------------------------
 // Fleet enrollment + signed roster pull (#55 D2 + D3, slice 7)
 //
 // The seam is closed: `buildRosterFetcher` returns the SIGNED fetcher when
@@ -1303,5 +1305,4 @@ test('slice 7: a stale credential re-enrolls (D2 recovery: fleet reset → wiped
   const rows = (await c2.signedRoster()) as { instances: { instance_id: string }[] };
   assert.ok(rows.instances.some((i) => i.instance_id === enr2.instance_id), 'the re-enrolled instance is in the roster');
   await stub.close();
->
 });
