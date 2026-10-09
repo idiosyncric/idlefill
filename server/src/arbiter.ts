@@ -1956,6 +1956,25 @@ export class Arbiter {
   }
 
   /**
+   * The D6 audit for a locally-WRITTEN edge record (#55 D4): the roster
+   * edge fill (or an operator mint) added a directed edge to this
+   * machine's `mesh_edges.json`. Detail carries the peer instance_id +
+   * the direction from the LOCAL side's perspective. No
+   * `source_instance_id`: no peer signed this write (the roster is a
+   * pull, not a request) — the audit is of a local state change, like
+   * the unpair event. Persists, like every other event write.
+   */
+  logMeshEdgeFormed(peerInstanceId: string, direction: 'controls_me' | 'i_control'): void {
+    const peer = peerInstanceId.slice(0, 64);
+    this.store.appendEvent({
+      kind: 'mesh_edge_formed',
+      detail: `${peer}: ${direction}`,
+    });
+    this.store.trim();
+    this.store.save();
+  }
+
+  /**
    * #67 acceptance fix: WHICH alias a session's model belongs to. The
    * router sniffs `history.model` from the RESPONSE — for an alias
    * session that is the winner pair's ENGINE id, never the alias name

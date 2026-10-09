@@ -37,6 +37,8 @@ import {
   type MeshFetcher,
   type MeshSnapshot,
   type RosterFetcher,
+  type RosterEdgeRow,
+  type EdgeFiller,
 } from '../src/mesh.js';
 import type { ServerConfig } from '../src/types.js';
 
@@ -775,4 +777,226 @@ test('roster: the pull is throttled to one per PROPOSED interval', async () => {
 
 test('roster: ROSTER_PULL_MS is the PROPOSED default (15 s, the poll tick)', () => {
   assert.equal(ROSTER_PULL_MS, 15_000);
+});
+
+// ---------------------------------------------------------------------------
+// Roster edge fill (#55 D4, the pairing ceremony — PROPOSED wire)
+//
+// The roster publishes each instance's directed edges as an ADD key; the
+// local instance writes the LOCAL side's edge record (last-known-keys).
+// The filler is a seam: these tests pass a recorder, the production
+// writer (index.ts) wraps EdgeStore.upsert ADD-only.
+// ---------------------------------------------------------------------------
+
+/** A 59-char base64url stand-in for an ed25519 SPKI key (the real shape). */
+const KEY_A = 'A'.repeat(59);
+const KEY_B = 'B'.repeat(59);
+const LOCAL = 'm-local1';
+
+interface FillCall {
+  localId: string;
+  edge: RosterEdgeRow;
+  peerKey: string;
+  peerName: string | undefined;
+  direction: 'controls_me' | 'i_control';
+}
+
+/** A roster envelope with a LOCAL row + peer rows carrying edges. */
+function edgeEnvelope(): unknown {
+  return {
+    instances: [
+      { instance_id: LOCAL, name: 'local', public_key: 'L'.repeat(59), urls: ['http://local:8787'], last_seen: T0, edges: [{ from: 'm-ctrl1', to: LOCAL }, { from: LOCAL, to: 'm-ctrl2' }] },
+      { instance_id: 'm-ctrl1', name: 'controller-one', public_key: KEY_A, urls: ['http://ctrl-1:8787'], last_seen: T0, edges: [{ from: 'm-ctrl1', to: LOCAL }] },
+      { instance_id: 'm-ctrl2', name: 'controller-two', public_key: KEY_B, urls: ['http://ctrl-2:8787'], last_seen: T0, edges: [{ from: LOCAL, to: 'm-ctrl2' }] },
+    ],
+  };
+}
+
+test('sanitizeRoster: the edges ADD key parses valid directed edges', () => {
+  const rows = sanitizeRoster(edgeEnvelope());
+  assert.equal(rows.length, 3, 'all three rows survive');
+  const local = rows.find((r) => r.instance_id === LOCAL)!;
+  assert.deepEqual(local.edges, [
+    { from: 'm-ctrl1', to: LOCAL },
+    { from: LOCAL, to: 'm-ctrl2' },
+  ], 'both of the local row\'s edges, order kept');
+  const ctrl1 = rows.find((r) => r.instance_id === 'm-ctrl1')!;
+  assert.deepEqual(ctrl1.edges, [{ from: 'm-ctrl1', to: LOCAL }], 'the peer row carries its edge too');
+});
+
+test('sanitizeRoster: edges ABSENT on a pre-ceremony roster = no edges (byte-for-byte)', () => {
+  const rows = sanitizeRoster({ instances: [{ instance_id: 'm-old', name: 'old', public_key: KEY_A, urls: ['http://old:8787'] }] });
+  assert.equal(rows.length, 1, 'the row survives without the field');
+  assert.deepEqual(rows[0]!.edges, [], 'absent = an empty edge list');
+});
+
+test('sanitizeRoster: malformed edges drop individually, never the row', () => {
+  const rows = sanitizeRoster({
+    instances: [
+      {
+        instance_id: LOCAL,
+        name: 'local',
+        public_key: 'L'.repeat(59),
+        urls: ['http://local:8787'],
+        edges: [
+          { from: 'm-good', to: LOCAL }, // valid — survives
+          { from: LOCAL, to: LOCAL }, // self-edge — dropped
+          { to: LOCAL }, // missing from — dropped
+          { from: 7, to: LOCAL }, // non-string from — dropped
+          { from: 'x'.repeat(65), to: LOCAL }, // over-long end — dropped
+          null,
+          'junk',
+          { from: 'm-good', to: LOCAL }, // duplicate — deduped
+        ],
+      },
+    ],
+  });
+  assert.equal(rows.length, 1, 'the ROW survives (edges are not row facts)');
+  assert.deepEqual(rows[0]!.edges, [{ from: 'm-good', to: LOCAL }], 'only the valid edge, deduped');
+});
+
+test('sanitizeRoster: the edge list is BOUNDED (untrusted input)', () => {
+  const many = Array.from({ length: 100 }, (_, i) => ({ from: `m-a${i}`, to: LOCAL }));
+  const rows = sanitizeRoster({ instances: [{ instance_id: LOCAL, name: 'l', public_key: 'L'.repeat(59), urls: ['http://local:8787'], edges: many }] });
+  assert.equal(rows[0]!.edges.length, 64, 'capped at the row bound');
+});
+
+test('edge fill: a roster edge for the LOCAL instance writes the LOCAL side\'s record (last-known-keys)', async () => {
+  const calls: FillCall[] = [];
+  const filler: EdgeFiller = (localId, edge, peerKey, peerName, direction) => {
+    calls.push({ localId, edge, peerKey, peerName, direction });
+  };
+  const m = new MeshFederation(baseCfg(await mkTmp(), { fleet_url: 'http://fleet-1:8789' }), async () => snap(), {
+    localInstanceId: () => LOCAL,
+    edgeFiller: filler,
+  });
+  await m.pullRoster(async () => edgeEnvelope(), T0);
+
+  // Two edges involve the local instance: m-ctrl1 -> local (local is
+  // controlled → controls_me) and local -> m-ctrl2 (local controls →
+  // i_control). The peer's public key comes from the PEER'S OWN row.
+  assert.equal(calls.length, 2, 'one fill per directed edge touching the local instance');
+  const inbound = calls.find((c) => c.edge.from === 'm-ctrl1')!;
+  assert.deepEqual(inbound, {
+    localId: LOCAL,
+    edge: { from: 'm-ctrl1', to: LOCAL },
+    peerKey: KEY_A, // the m-ctrl1 row's key, never the local row's
+    peerName: 'controller-one',
+    direction: 'controls_me', // this peer controls me
+  });
+  const outbound = calls.find((c) => c.edge.to === 'm-ctrl2')!;
+  assert.deepEqual(outbound, {
+    localId: LOCAL,
+    edge: { from: LOCAL, to: 'm-ctrl2' },
+    peerKey: KEY_B,
+    peerName: 'controller-two',
+    direction: 'i_control', // I control this peer
+  });
+  // The edge fill does not disturb the PEER SET: the roster rows still
+  // add their peers exactly as before (the fill is a side channel). The
+  // local row's own url is merged like any roster row (slice-5 behavior:
+  // the service lists this machine too; the merge never special-cases
+  // the local id — a peer entry for oneself is harmless: it is pulled
+  // with the peer_token and just shows the local snapshot).
+  const urls = m.view(T0).map((v) => v.url).sort();
+  assert.deepEqual(urls, ['http://ctrl-1:8787', 'http://ctrl-2:8787', 'http://local:8787'], 'the peer merge is byte-for-byte the slice-5 behavior');
+});
+
+test('edge fill: an edge the LOCAL instance does not touch writes nothing', async () => {
+  const calls: FillCall[] = [];
+  const filler: EdgeFiller = (localId, edge, peerKey, peerName, direction) => calls.push({ localId, edge, peerKey, peerName, direction });
+  const m = new MeshFederation(baseCfg(await mkTmp(), { fleet_url: 'http://fleet-1:8789' }), async () => snap(), {
+    localInstanceId: () => 'm-unrelated',
+    edgeFiller: filler,
+  });
+  await m.pullRoster(async () => edgeEnvelope(), T0);
+  assert.equal(calls.length, 0, 'none of the edges involve m-unrelated');
+});
+
+test('edge fill: a peer with NO usable key writes nothing (fail-closed, never a crash)', async () => {
+  const calls: FillCall[] = [];
+  const filler: EdgeFiller = (localId, edge, peerKey, peerName, direction) => calls.push({ localId, edge, peerKey, peerName, direction });
+  // The edge names m-ghost, which is NOT in the roster (no row, no key).
+  // The local row ALSO names an edge to a peer whose row has an unusable
+  // key (over 64 chars) — both must skip, never crash.
+  const env = {
+    instances: [
+      { instance_id: LOCAL, name: 'local', public_key: 'L'.repeat(59), urls: ['http://local:8787'], edges: [{ from: 'm-ghost', to: LOCAL }, { from: LOCAL, to: 'm-bigkey' }] },
+      { instance_id: 'm-bigkey', name: 'big', public_key: 'K'.repeat(65), urls: ['http://big:8787'], edges: [{ from: LOCAL, to: 'm-bigkey' }] },
+    ],
+  };
+  const m = new MeshFederation(baseCfg(await mkTmp(), { fleet_url: 'http://fleet-1:8789' }), async () => snap(), {
+    localInstanceId: () => LOCAL,
+    edgeFiller: filler,
+  });
+  await m.pullRoster(async () => env, T0);
+  assert.equal(calls.length, 0, 'no usable peer key = no record written (D8 fail-closed)');
+});
+
+test('edge fill: a SELF-edge on the roster writes nothing', async () => {
+  const calls: FillCall[] = [];
+  const filler: EdgeFiller = (localId, edge, peerKey, peerName, direction) => calls.push({ localId, edge, peerKey, peerName, direction });
+  const env = {
+    instances: [
+      { instance_id: LOCAL, name: 'local', public_key: 'L'.repeat(59), urls: ['http://local:8787'], edges: [{ from: LOCAL, to: LOCAL }] },
+    ],
+  };
+  const m = new MeshFederation(baseCfg(await mkTmp(), { fleet_url: 'http://fleet-1:8789' }), async () => snap(), {
+    localInstanceId: () => LOCAL,
+    edgeFiller: filler,
+  });
+  await m.pullRoster(async () => env, T0);
+  assert.equal(calls.length, 0, 'a machine cannot pair to itself');
+});
+
+test('edge fill: re-pulling the SAME roster does not re-write the edge (no 15 s churn)', async () => {
+  let calls = 0;
+  const filler: EdgeFiller = () => {
+    calls++;
+  };
+  const m = new MeshFederation(baseCfg(await mkTmp(), { fleet_url: 'http://fleet-1:8789' }), async () => snap(), {
+    localInstanceId: () => LOCAL,
+    edgeFiller: filler,
+  });
+  await m.pullRoster(async () => edgeEnvelope(), T0);
+  assert.equal(calls, 2, 'the first pull writes both edges');
+  await m.pullRoster(async () => edgeEnvelope(), T0 + ROSTER_PULL_MS);
+  assert.equal(calls, 2, 'the re-pull is a no-op for known (peer, key) pairs');
+});
+
+test('edge fill: an UNWROUGHT roster (no filler) pulls byte-for-byte as before', async () => {
+  const m = new MeshFederation(baseCfg(await mkTmp(), { fleet_url: 'http://fleet-1:8789' }), async () => snap());
+  await m.pullRoster(async () => edgeEnvelope(), T0);
+  const urls = m.view(T0).map((v) => v.url).sort();
+  // The roster lists the local instance too (slice-5 merge rule: every row
+  // is a peer row; the merge never special-cases the local id).
+  assert.deepEqual(urls, ['http://ctrl-1:8787', 'http://ctrl-2:8787', 'http://local:8787'], 'the merge is unchanged without the ceremony wiring');
+});
+
+test('edge fill: a THROWING filler never breaks the pull (the never-throw posture)', async () => {
+  let calls = 0;
+  const filler: EdgeFiller = () => {
+    calls++;
+    if (calls === 1) throw new Error('edges: malformed edge record');
+  };
+  const m = new MeshFederation(baseCfg(await mkTmp(), { fleet_url: 'http://fleet-1:8789' }), async () => snap(), {
+    localInstanceId: () => LOCAL,
+    edgeFiller: filler,
+  });
+  // Must resolve (not reject): a writer failure is a no-op for the edge.
+  await m.pullRoster(async () => edgeEnvelope(), T0);
+  assert.equal(calls, 2, 'both edges were attempted');
+  const urls = m.view(T0).map((v) => v.url).sort();
+  assert.deepEqual(urls, ['http://ctrl-1:8787', 'http://ctrl-2:8787', 'http://local:8787'], 'the peer merge survived the writer failure');
+});
+
+test('edge fill: an EMPTY local instance id disables the fill (no crash)', async () => {
+  const calls: FillCall[] = [];
+  const filler: EdgeFiller = (localId, edge, peerKey, peerName, direction) => calls.push({ localId, edge, peerKey, peerName, direction });
+  const m = new MeshFederation(baseCfg(await mkTmp(), { fleet_url: 'http://fleet-1:8789' }), async () => snap(), {
+    localInstanceId: () => '', // a not-yet-minted identity must not fill
+    edgeFiller: filler,
+  });
+  await m.pullRoster(async () => edgeEnvelope(), T0);
+  assert.equal(calls.length, 0, 'no local id = no fill');
 });
