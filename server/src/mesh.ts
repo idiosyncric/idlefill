@@ -16,6 +16,16 @@
  * keeps its last snapshot with a growing fetch age; past PEER_STALE_MS
  * (the 90s liveness precedent) it renders offline. Exception-only: the
  * error string rides the row only while the last fetch failed.
+ *
+ * Fleet roster seam (#55 D3, PROPOSED — docs/architecture/fleet-service.md):
+ * when `fleet_url` is set the arbiter pulls `GET /roster` from the fleet
+ * service on the pull interval and merges the roster rows into the peer
+ * set. The service is the directory, never the pipe: a merged row is
+ * pulled from its own /api/mesh on the normal cadence, exactly like a
+ * configured peer. The roster is ADD-only — it adds peers, never
+ * removes or modifies entries. Service unreachable = the pull fails
+ * silently and the last-known peer set stands byte-for-byte (the
+ * Service-down rule). Absent `fleet_url` = the pull never happens.
  */
 
 import { randomBytes } from 'node:crypto';
@@ -24,10 +34,17 @@ import type { ServerConfig } from './types.js';
 /** Peer liveness window — the 90s client-liveness precedent, reused. */
 export const PEER_STALE_MS = 90_000;
 
+/** PROPOSED: the fleet roster pull interval (#55 D3, owner choice 3).
+ *  15 s — the existing poll tick. Configurable via `fleet_roster_pull_ms`. */
+export const ROSTER_PULL_MS = 15_000;
+
 /** Hard caps on a REMOTE snapshot (it is untrusted input — same
  *  discipline as cleanPreview/cleanStats on the registration path). */
 const MAX_SERVERS = 20;
 const MAX_NAME = 64;
+/** Hard caps on a fleet ROSTER (untrusted input, same discipline). */
+const MAX_ROSTER_ROWS = 100;
+const MAX_URLS_PER_ROW = 16;
 
 /**
  * The coarse snapshot one arbiter publishes at GET /api/mesh and pulls
@@ -86,6 +103,79 @@ export interface PeerView {
 /** Fetch one peer's /api/mesh snapshot. Injectable for tests; throws on any failure. */
 export type MeshFetcher = (url: string, token: string) => Promise<unknown>;
 
+/**
+ * One row of the fleet roster (the shape `GET /roster` returns per
+ * instance — fleet/src/store.ts RosterEntry). Untrusted input: every
+ * field is validated before the row touches the peer map.
+ */
+export interface RosterRow {
+  instance_id: string;
+  name: string;
+  public_key: string;
+  urls: string[];
+  last_seen: number | null;
+}
+
+/**
+ * Fetch the fleet roster: `GET {fleetUrl}/roster`. Injectable for tests;
+ * throws on any failure (a failed pull is a no-op — the Service-down rule).
+ */
+export type RosterFetcher = (fleetUrl: string, now: number) => Promise<unknown>;
+
+/** Default (real) roster fetcher: GET {fleetUrl}/roster.
+ *  NOTE (#55 D3, PROPOSED seam): the fleet service's `GET /roster`
+ *  authenticates with a signed server nonce (D2 step 3). The production
+ *  call path that mints + signs the nonce lands with the enrollment slice
+ *  (the arbiter-side D2 client). Until then this fetcher is the SEAM:
+ *  `fleet_url` unset = no pull; when wired, this is where the signed
+ *  request goes. */
+export function makeRealRosterFetcher(timeoutMs = 10_000): RosterFetcher {
+  return async (fleetUrl, _now) => {
+    const base = fleetUrl.replace(/\/+$/, '');
+    const res = await fetch(`${base}/roster`, { signal: AbortSignal.timeout(timeoutMs) });
+    if (!res.ok) throw new Error(`roster fetch HTTP ${res.status}`);
+    return await res.json();
+  };
+}
+
+/**
+ * Validate + clamp a REMOTE roster (untrusted input — the same discipline
+ * as sanitizeSnapshot). Returns the usable rows. A malformed envelope
+ * (wrong shape) yields []. A malformed ROW is dropped individually —
+ * never trusted, never a crash. Row caps: MAX_ROSTER_ROWS rows,
+ * MAX_URLS_PER_ROW urls, strings length-capped.
+ */
+export function sanitizeRoster(raw: unknown): RosterRow[] {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return [];
+  const r = raw as Record<string, unknown>;
+  if (!Array.isArray(r.instances)) return [];
+  const out: RosterRow[] = [];
+  for (const row of r.instances.slice(0, MAX_ROSTER_ROWS)) {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
+    const ro = row as Record<string, unknown>;
+    // Identity is exact, not clamped: a 5000-char "instance_id" is hostile
+    // input, and truncating it would mint a fake identity. Drop the row.
+    const rawId = typeof ro.instance_id === 'string' ? ro.instance_id : '';
+    if (rawId.trim() === '' || rawId.length > 64) continue;
+    const name = typeof ro.name === 'string' ? ro.name.slice(0, MAX_NAME) : '';
+    const public_key = typeof ro.public_key === 'string' ? ro.public_key.slice(0, 256) : '';
+    const last_seen = typeof ro.last_seen === 'number' && Number.isFinite(ro.last_seen) ? Math.floor(ro.last_seen) : null;
+    const urls: string[] = [];
+    if (Array.isArray(ro.urls)) {
+      for (const u of ro.urls.slice(0, MAX_URLS_PER_ROW)) {
+        if (typeof u !== 'string') continue;
+        const clean = u.trim().slice(0, 2048);
+        if (clean === '' || clean === 'self') continue;
+        if (!/^https?:\/\//i.test(clean)) continue; // a mesh peer url is an http(s) address
+        if (!urls.includes(clean)) urls.push(clean);
+      }
+    }
+    if (urls.length === 0) continue; // a row with no usable url cannot be pulled from
+    out.push({ instance_id: rawId, name, public_key, urls, last_seen });
+  }
+  return out;
+}
+
 interface PeerEntry {
   url: string;
   name?: string;
@@ -93,12 +183,16 @@ interface PeerEntry {
   lastOk: number | null;
   lastError: string | null;
   snapshot: MeshSnapshot | null;
+  /** Set when the row came from a fleet roster pull (ADD provenance). */
+  rosterOrigin?: boolean;
 }
 
 export class MeshFederation {
   private readonly cfg: ServerConfig;
   private readonly fetcher: MeshFetcher;
   private readonly peers = new Map<string, PeerEntry>();
+  /** When a roster pull is due next (epoch-ms). 0 = never armed (no fleet_url). */
+  private nextRosterPullAt = 0;
 
   constructor(cfg: ServerConfig, fetcher: MeshFetcher) {
     this.cfg = cfg;
@@ -115,6 +209,63 @@ export class MeshFederation {
   /** True when at least one peer is configured (the tick can skip the work otherwise). */
   get enabled(): boolean {
     return this.peers.size > 0;
+  }
+
+  /**
+   * Pull the fleet roster (if configured) and merge its rows into the peer
+   * set. Never throws: a failed pull is a no-op (the Service-down rule —
+   * the last-known peer set stands byte-for-byte).
+   *
+   * Merge rule (PROPOSED — #55 D3): ADD-only. A roster row adds a peer at
+   * its first usable url. An explicit `mesh_peers` entry WINS over a roster
+   * row for the same url (it was declared by the operator) and over the
+   * same instance_id (the static registry is the truth; the roster only
+   * fills in peers the operator did not name). A roster row never removes
+   * or rewrites an existing entry.
+   */
+  async pullRoster(rosterFetcher: RosterFetcher, now: number): Promise<void> {
+    const fleetUrl = this.cfg.fleet_url;
+    if (!fleetUrl) return; // absent = the pull never happens
+    const intervalMs = this.cfg.fleet_roster_pull_ms ?? ROSTER_PULL_MS;
+    if (now < this.nextRosterPullAt) return; // not due yet (at most one pull per interval)
+    this.nextRosterPullAt = now + intervalMs;
+    let rows: RosterRow[];
+    try {
+      rows = sanitizeRoster(await rosterFetcher(fleetUrl, now));
+    } catch {
+      return; // unreachable / malformed envelope: the last-known set stands
+    }
+    // Merge rule (PROPOSED — #55 D3): ADD-only. An explicit `mesh_peers`
+    // entry WINS over a roster row for the same instance_id — the static
+    // registry is the truth the operator wrote. A configured peer's
+    // instanceId is null until its first fetch, so "configured" is judged
+    // by ORIGIN (rosterOrigin absent = from config), never by the observed
+    // id. A roster row also never claims the id of an already-known peer.
+    const configuredIds = new Set(
+      [...this.peers.values()]
+        .filter((p) => p.rosterOrigin !== true && p.instanceId !== null)
+        .map((p) => p.instanceId as string),
+    );
+    for (const row of rows) {
+      if (configuredIds.has(row.instance_id)) continue;
+      // A roster row whose instance is already known (from a previous pull)
+      // is not re-added: no rewrite, no url churn. ADD-only on the set.
+      const existing = [...this.peers.values()].find((p) => p.instanceId === row.instance_id);
+      if (existing) continue;
+      for (const url of row.urls) {
+        const clean = url.trim().replace(/\/+$/, '');
+        if (!clean || clean === 'self' || this.peers.has(clean)) continue;
+        this.peers.set(clean, {
+          url: clean,
+          name: row.name || undefined,
+          instanceId: row.instance_id,
+          lastOk: null,
+          lastError: null,
+          snapshot: null,
+          rosterOrigin: true,
+        });
+      }
+    }
   }
 
   /**

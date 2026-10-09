@@ -47,6 +47,12 @@ export const DEFAULTS: Omit<ServerConfig, 'state_file'> & {
   // Load-axis freshness window (#52 slice 1, D3): three polls at the
   // 15-second poll_ms.
   metrics_load_stale_s: 45,
+  // Fleet roster pull (#55 D3, PROPOSED). fleet_url default is ABSENT
+  // (undefined): with no fleet service the roster pull never happens and
+  // the peer set is the static mesh_peers config, byte-for-byte. The pull
+  // interval default is PROPOSED — the D3 owner choice 3: 15 s, the poll tick.
+  fleet_url: undefined,
+  fleet_roster_pull_ms: 15000,
 };
 
 /** Coerce a raw (partial) config object into a full ServerConfig, applying defaults per field. */
@@ -105,6 +111,17 @@ export function applyDefaults(raw: Partial<ServerConfig> | null | undefined): Se
     // display label only — never a credential. Absent/blank = unset; the
     // arbiter's fleetId() falls back to its persisted row, then `home`.
     fleet_id: typeof r.fleet_id === 'string' && r.fleet_id.trim() !== '' ? r.fleet_id.trim() : '',
+    // Fleet roster pull (#55 D3, PROPOSED — docs/architecture/fleet-service.md).
+    // ADD keys: ABSENT means unset. fleet_url absent/blank = no fleet service
+    // = the roster pull never happens (the peer set stays the static
+    // mesh_peers config, byte-for-byte). fleet_roster_pull_ms absent/garbage
+    // falls back to the PROPOSED default (15 s, the poll tick); non-positive
+    // is nonsense (the guard is the metrics_load_stale_s precedent).
+    fleet_url: typeof r.fleet_url === 'string' && r.fleet_url.trim() !== '' ? r.fleet_url.trim() : undefined,
+    fleet_roster_pull_ms: (() => {
+      const v = num(r.fleet_roster_pull_ms, DEFAULTS.fleet_roster_pull_ms ?? 15_000);
+      return v > 0 ? v : (DEFAULTS.fleet_roster_pull_ms ?? 15_000);
+    })(),
     log_glob: str(r.log_glob, DEFAULTS.log_glob),
     idle_seconds: num(r.idle_seconds, DEFAULTS.idle_seconds),
     poll_ms: num(r.poll_ms, DEFAULTS.poll_ms),

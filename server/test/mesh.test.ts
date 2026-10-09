@@ -29,11 +29,14 @@ import { IdleDetector } from '../src/idle.js';
 import {
   MeshFederation,
   PEER_STALE_MS,
+  ROSTER_PULL_MS,
   buildMeshSnapshot,
   sanitizeSnapshot,
+  sanitizeRoster,
   mintInstanceId,
   type MeshFetcher,
   type MeshSnapshot,
+  type RosterFetcher,
 } from '../src/mesh.js';
 import type { ServerConfig } from '../src/types.js';
 
@@ -587,4 +590,189 @@ test('fleet_id: two instances with different fleet_id values are distinguishable
   await c.refresh(T0);
   assert.equal(c.view(T0)[0]!.snapshot?.fleet_id, undefined);
   assert.equal(c.view(T0)[0]!.snapshot?.instance_id, 'm-fleet-c');
+});
+
+// ---------------------------------------------------------------------------
+// Fleet roster pull (#55 D3, PROPOSED — the roster discovery seam)
+//
+// The service is the directory, never the pipe: a roster row adds a peer
+// that is then pulled like any configured peer. The merge is ADD-only:
+// an explicit mesh_peers entry wins over a roster row for the same
+// instance_id, and a failed pull never touches the last-known peer set.
+// ---------------------------------------------------------------------------
+
+function rosterEnvelope(rows: Record<string, unknown>[]): unknown {
+  return { instances: rows };
+}
+
+function rosterRow(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    instance_id: 'm-roster1',
+    name: 'roster-one',
+    public_key: 'pk-roster-one',
+    urls: [ROSTER_URL],
+    last_seen: T0,
+    ...over,
+  };
+}
+
+const ROSTER_URL = 'http://roster-1:8787';
+
+test('roster: no fleet_url means the pull never happens (byte-for-byte unchanged)', async () => {
+  let rosterCalls = 0;
+  const fetcher: MeshFetcher = async () => snap();
+  const rosterFetcher: RosterFetcher = async () => {
+    rosterCalls++;
+    return rosterEnvelope([rosterRow()]);
+  };
+  const m = new MeshFederation(baseCfg(await mkTmp(), { mesh_peers: [{ url: PEER_URL }] }), fetcher);
+  assert.equal(m.enabled, true, 'the static peer is there');
+  // No fleet_url in baseCfg: the pull must be a no-op, every tick.
+  await m.pullRoster(rosterFetcher, T0);
+  await m.pullRoster(rosterFetcher, T0 + 2 * ROSTER_PULL_MS);
+  assert.equal(rosterCalls, 0, 'the roster fetcher was never called');
+  const urls = m.view(T0).map((v) => v.url);
+  assert.deepEqual(urls, [PEER_URL], 'the peer set is the static config, byte-for-byte');
+});
+
+test('roster: an unreachable fleet service falls back to mesh_peers with no crash', async () => {
+  const fetcher: MeshFetcher = async () => snap();
+  const m = new MeshFederation(
+    baseCfg(await mkTmp(), { mesh_peers: [{ url: PEER_URL, name: 'lab box' }], fleet_url: 'http://fleet-dead:8789' }),
+    fetcher,
+  );
+  await m.pullRoster(async () => {
+    throw new Error('fetch failed: ECONNREFUSED');
+  }, T0);
+  // No crash; the static peer set stands.
+  assert.deepEqual(m.view(T0).map((v) => v.url), [PEER_URL]);
+  // And the read plane still works: the configured peer is pulled normally.
+  await m.refresh(T0);
+  const v = m.view(T0)[0]!;
+  assert.equal(v.online, true);
+  assert.equal(v.name, 'lab box');
+  assert.equal(v.snapshot?.queue_depth, 7);
+  // A second failure also never crashes (the next pull is due after the
+  // PROPOSED 15 s interval and fails the same way).
+  await m.pullRoster(async () => {
+    throw new Error('fetch failed: ECONNREFUSED');
+  }, T0 + ROSTER_PULL_MS);
+  assert.deepEqual(m.view(T0 + ROSTER_PULL_MS).map((v) => v.url), [PEER_URL]);
+});
+
+test('roster: a roster row adds a peer that is pulled like a configured peer', async () => {
+  const meshFetcher: MeshFetcher = async (url, token) => {
+    assert.equal(token, PEER, 'the merged peer is pulled with the fleet read token');
+    if (url === `${ROSTER_URL}/api/mesh`) return { ...snap(), instance_id: 'm-roster1', name: 'roster-one' };
+    return snap();
+  };
+  const m = new MeshFederation(
+    baseCfg(await mkTmp(), {
+      mesh_peers: [{ url: PEER_URL, name: 'lab box' }],
+      fleet_url: 'http://fleet-1:8789',
+      peer_token: PEER,
+    }),
+    meshFetcher,
+  );
+  const rosterFetcher: RosterFetcher = async (fleetUrl) => {
+    assert.equal(fleetUrl, 'http://fleet-1:8789', 'pulls from the configured fleet url');
+    return rosterEnvelope([rosterRow()]);
+  };
+  // The roster row's url is NOT in mesh_peers: it must appear after the pull.
+  assert.equal(m.view(T0).find((v) => v.url === ROSTER_URL), undefined, 'precondition: not a configured peer');
+  await m.pullRoster(rosterFetcher, T0);
+  const after = m.view(T0);
+  assert.deepEqual(after.map((v) => v.url).sort(), [PEER_URL, ROSTER_URL], 'the roster row added a peer');
+  const r = after.find((v) => v.url === ROSTER_URL)!;
+  assert.equal(r.instance_id, 'm-roster1', 'the roster identity rides the row');
+  assert.equal(r.name, 'roster-one', 'the roster name rides the row');
+  // It behaves EXACTLY like a configured peer: refresh pulls its /api/mesh.
+  await m.refresh(T0);
+  const pulled = m.view(T0).find((v) => v.url === ROSTER_URL)!;
+  assert.equal(pulled.online, true, 'the merged peer was pulled (not an error row)');
+  assert.equal(pulled.error, undefined);
+  assert.equal(pulled.snapshot?.queue_depth, 7, 'its snapshot is the real peer snapshot');
+});
+
+test('roster: an explicit mesh_peers entry beats a roster row for the same instance_id', async () => {
+  // The configured peer reports instance m-roster1 on its FIRST fetch.
+  // The roster ALSO lists m-roster1 at a different url. The merge must
+  // keep ONLY the configured row (the explicit entry wins), never add the
+  // roster url as a second row for the same instance.
+  const m = new MeshFederation(
+    baseCfg(await mkTmp(), {
+      mesh_peers: [{ url: PEER_URL, name: 'lab box' }],
+      fleet_url: 'http://fleet-1:8789',
+      peer_token: PEER,
+    }),
+    async (url) => (url === `${PEER_URL}/api/mesh` ? { ...snap(), instance_id: 'm-roster1', name: 'peer-one' } : snap()),
+  );
+  // First: establish the configured peer's observed identity.
+  await m.refresh(T0);
+  assert.equal(m.view(T0)[0]!.instance_id, 'm-roster1', 'precondition: the configured peer reports m-roster1');
+  const rosterFetcher: RosterFetcher = async () =>
+    rosterEnvelope([
+      rosterRow({ instance_id: 'm-roster1', urls: ['http://roster-1:8787'] }),
+      rosterRow({ instance_id: 'm-roster2', name: 'roster-two', urls: ['http://roster-2:8787'] }),
+    ]);
+  await m.pullRoster(rosterFetcher, T0);
+  const urls = m.view(T0).map((v) => v.url).sort();
+  // m-roster1's roster url is NOT added (the explicit entry wins);
+  // m-roster2 (a NEW instance) IS added.
+  assert.deepEqual(urls, [PEER_URL, 'http://roster-2:8787']);
+  const kept = m.view(T0).find((v) => v.url === PEER_URL)!;
+  assert.equal(kept.name, 'lab box', 'the configured name is untouched by the roster');
+  // Idempotent: a second pull for the same row changes nothing.
+  await m.pullRoster(rosterFetcher, T0 + ROSTER_PULL_MS);
+  assert.deepEqual(m.view(T0 + ROSTER_PULL_MS).map((v) => v.url).sort(), [PEER_URL, 'http://roster-2:8787']);
+});
+
+test('roster: a malformed row is dropped, not trusted (the good rows survive)', async () => {
+  // Hostile rows: no identity, no usable urls, non-string junk, oversized
+  // strings, a non-array envelope member. Each is dropped; the one good
+  // row lands.
+  const m = new MeshFederation(baseCfg(await mkTmp(), { fleet_url: 'http://fleet-1:8789' }), async () => snap());
+  const rosterFetcher: RosterFetcher = async () =>
+    rosterEnvelope([
+      { name: 'no id', urls: ['http://no-id:8787'] },
+      { instance_id: 'm-nourl', urls: [] },
+      { instance_id: 'm-nonstr', urls: [7, null, 'self', 'ftp://nope'] },
+      { instance_id: 'x'.repeat(5000), name: 'y'.repeat(5000), public_key: 'z'.repeat(5000), urls: ['http://big:8787'] },
+      null,
+      'junk',
+      rosterRow({ instance_id: 'm-good', name: 'good', urls: ['http://good:8787', 'http://good:8787/'] }),
+    ]);
+  await m.pullRoster(rosterFetcher, T0);
+  const urls = m.view(T0).map((v) => v.url);
+  // Only the good row lands (the url deduped to one entry — the trailing
+  // slash is normalized by the merge, same rule as the config path).
+  assert.deepEqual(urls, ['http://good:8787'], 'the malformed rows are dropped, the good row is trusted only');
+  const row = m.view(T0)[0]!;
+  assert.equal(row.instance_id, 'm-good');
+  assert.equal(row.name, 'good');
+  // And the envelope-level malformations never crash the merge.
+  assert.equal(sanitizeRoster(null).length, 0);
+  assert.equal(sanitizeRoster({}).length, 0);
+  assert.equal(sanitizeRoster({ instances: 'nope' }).length, 0);
+  assert.equal(sanitizeRoster('nope').length, 0);
+});
+
+test('roster: the pull is throttled to one per PROPOSED interval', async () => {
+  let rosterCalls = 0;
+  const m = new MeshFederation(baseCfg(await mkTmp(), { fleet_url: 'http://fleet-1:8789' }), async () => snap());
+  const rosterFetcher: RosterFetcher = async () => {
+    rosterCalls++;
+    return rosterEnvelope([rosterRow()]);
+  };
+  // Due on the first tick (now >= 0). Not due again before the interval.
+  await m.pullRoster(rosterFetcher, T0);
+  assert.equal(rosterCalls, 1);
+  await m.pullRoster(rosterFetcher, T0 + 1000);
+  assert.equal(rosterCalls, 1, 'inside the PROPOSED interval: no second pull');
+  await m.pullRoster(rosterFetcher, T0 + ROSTER_PULL_MS);
+  assert.equal(rosterCalls, 2, 'the interval elapsed: the next pull happens');
+});
+
+test('roster: ROSTER_PULL_MS is the PROPOSED default (15 s, the poll tick)', () => {
+  assert.equal(ROSTER_PULL_MS, 15_000);
 });
