@@ -348,6 +348,71 @@ test('connector: a profile without a key is skipped; the rest of the round stand
   assert.ok(!gw.requests.some((r) => r.path === '/p/web-dev/api/sessions'), 'no request to an unkeyed profile');
 });
 
+test('#82 eviction: an ended row absent for GRACE reachable rounds is dropped', async () => {
+  // A gateway that reports an ended row for the first round, then goes quiet.
+  let seenEnded = true;
+  const srv = http.createServer((req, res) => {
+    const url = new URL(req.url ?? '/', 'http://x');
+    res.writeHead(200, { 'content-type': 'application/json' });
+    if (url.pathname === '/v1/health') return res.end(JSON.stringify({ status: 'ok', version: '0.21.6' }));
+    const rows = seenEnded
+      ? [{ id: 'ended1', title: 'done', last_active: 1760000000, ended_at: 1760000100, end_reason: 'user_closed' }]
+      : [{ id: 'live1', title: 'still here', last_active: 1760000200 }];
+    return res.end(JSON.stringify({ object: 'list', data: rows, limit: 200, offset: 0, has_more: false }));
+  });
+  await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+  cleanup.push(() => new Promise<void>((r) => srv.close(() => r())));
+  const port = (srv.address() as { port: number }).port;
+  let t = 0;
+  const c = new HermesGatewayConnector(gwCfg(`http://127.0.0.1:${port}`, { profiles: ['default'] }), {
+    now: () => (t += 60_000), // every poll clears the 30s cadence
+  });
+  await c.poll(); // round 1: ended1 present + ended
+  assert.ok(c.metaFor('ended1'), 'round 1 enriched');
+  seenEnded = false;
+  for (let i = 0; i < 19; i++) await c.poll(); // rounds 2..20: ended1 absent (still inside grace)
+  assert.ok(c.metaFor('ended1'), 'still standing inside the grace window (a page miss never evicts)');
+  await c.poll(); // round 21: 20 consecutive reachable rounds without it
+  assert.equal(c.metaFor('ended1'), undefined, 'dropped once GRACE reachable rounds pass');
+  assert.ok(c.metaFor('live1'), 'the live row keeps enriching');
+});
+
+test('#82 eviction: an outage does not age the ledger', async () => {
+  const rows1 = [{ id: 'e1', last_active: 1760000000, ended_at: 1760000100 }];
+  let mode: 'up-then' | 'down' | 'up-empty' = 'up-then';
+  const srv = http.createServer((req, res) => {
+    const url = new URL(req.url ?? '/', 'http://x');
+    if (mode === 'down') {
+      res.writeHead(500, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ status: 'err' })); // health non-200 ⇒ unreachable
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    if (url.pathname === '/v1/health') return res.end(JSON.stringify({ status: 'ok', version: '0.21.6' }));
+    return res.end(
+      JSON.stringify({ object: 'list', data: mode === 'up-then' ? rows1 : [], limit: 200, offset: 0, has_more: false }),
+    );
+  });
+  await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+  cleanup.push(() => new Promise<void>((r) => srv.close(() => r())));
+  const port = (srv.address() as { port: number }).port;
+  let t = 0;
+  const c = new HermesGatewayConnector(gwCfg(`http://127.0.0.1:${port}`, { profiles: ['default'] }), {
+    now: () => (t += 60_000),
+  });
+  await c.poll(); // reachable round 1: e1 ended
+  assert.ok(c.metaFor('e1'));
+  mode = 'down';
+  for (let i = 0; i < 40; i++) await c.poll(); // 40 UNREACHABLE rounds
+  // metaFor gates on reachability BY DESIGN (down ⇒ no meta) — the ledger
+  // itself must stand untouched: no aging while the gateway is down.
+  assert.equal(c.ledgerSize, 1, 'a down gateway never ages the ledger — the row stands');
+  mode = 'up-empty';
+  for (let i = 0; i < 19; i++) await c.poll(); // 19 reachable rounds without e1: grace not spent
+  assert.ok(c.metaFor('e1'), 'down rounds did not count toward the grace window');
+  await c.poll(); // 20th reachable round without it
+  assert.equal(c.metaFor('e1'), undefined, 'dropped once GRACE REACHABLE rounds pass');
+});
+
 test('config resolution: defaults, explicit list wins, disabled, key file', () => {
   const home = '/tmp/fake-home';
   const cfg = resolveHermesGatewayConfig(undefined, { IDLEFILL_HERMES_GATEWAY_KEY: 'env-key' }, home);

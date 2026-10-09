@@ -134,6 +134,24 @@ const DEFAULT_KEY_ENV = 'IDLEFILL_HERMES_GATEWAY_KEY';
 const DEFAULT_KEY_FILE = '~/.idlefill/hermes-gateway-keys.json';
 const DEFAULT_PROFILES_DIR = '~/.hermes/profiles';
 
+/**
+ * #82: the last-known ledger only ever grows — Hermes session ids
+ * accumulate for the daemon's whole uptime (LaunchAgent / systemd lifetime).
+ * Two bounded evictions, the same fail-quiet direction as the gate's
+ * `SESSION_ID_INDEX_MAX` (an evicted id resolves to nothing; `hermes_meta`
+ * then rides the heartbeat as ABSENT, and an absent key never clears the
+ * arbiter's stored block — so client-side eviction cannot erase what a
+ * better poll already published):
+ *   1. an entry whose Hermes row ENDED (`ended_at` present — a number or an
+ *      explicit null, both mean ended) that has not appeared in
+ *      LEDGER_EVICTION_GRACE_ROUNDS consecutive REACHABLE rounds is dropped
+ *      (20 rounds ≈ 10 min at the 30s cadence);
+ *   2. a hard size cap drops the least-recently-seen entries first.
+ * An unreachable round stamps nothing: a down gateway never ages the ledger.
+ */
+const LEDGER_EVICTION_GRACE_ROUNDS = 20;
+const LEDGER_MAX_ENTRIES = 5000;
+
 /** Expand a leading `~` against the OS home (test seam via `home`). */
 function expandHome(p: string, home: string): string {
   return p === '~' || p.startsWith('~/') ? join(home, p.slice(2)) : p;
@@ -431,6 +449,12 @@ export class HermesGatewayConnector {
   private readonly now: () => number;
   private readonly log: (msg: string) => void;
   private ledger = new Map<string, HermesSessionMeta>();
+  /** #82: session id → the (reachable) poll round that last reported it.
+   *  Bookkeeping for the ledger evictions; a parallel structure so the
+   *  published `HermesSessionMeta` shape never changes. */
+  private readonly lastSeenRound = new Map<string, number>();
+  /** Reachable-round counter (an unreachable round never advances it). */
+  private ageRound = 0;
   private reachable = false;
   private version: string | undefined;
   private fetchedAt: number | null = null;
@@ -465,6 +489,8 @@ export class HermesGatewayConnector {
       this.reachable = round.reachable;
       if (round.version) this.version = round.version;
       this.ledger = mergeLedgerRows(this.ledger, round.rows);
+      // #82: only a REACHABLE round ages the ledger (an outage never evicts).
+      if (round.reachable) this.pruneLedger(round.rows);
       this.fetchedAt = round.fetchedAt;
       if (!round.reachable && this.lastError !== 'unreachable') {
         this.lastError = 'unreachable';
@@ -479,6 +505,50 @@ export class HermesGatewayConnector {
       this.lastError = err instanceof Error ? err.message : String(err);
     } finally {
       this.inFlight = false;
+    }
+  }
+
+  /**
+   * #82: bound the last-known ledger, called after a REACHABLE round only.
+   * Stamps the round every id the round actually reported (rows that yield
+   * no meta stamp nothing — same drop rule as `mergeLedgerRows`), then:
+   *   1. drops entries whose stored meta carries `ended_at` (a number or an
+   *      explicit null — both mean the Hermes row ended; an ended session
+   *      can never re-activate its ledger row) AND which have not been
+   *      seen for LEDGER_EVICTION_GRACE_ROUNDS consecutive reachable
+   *      rounds — a transient page miss inside the grace never evicts;
+   *   2. if the map is still over LEDGER_MAX_ENTRIES, drops the
+   *      least-recently-seen entries to the cap (oldest-`lastSeen` first,
+   *      the SESSION_ID_INDEX_MAX posture).
+   * Fail-quiet direction: an evicted id makes `metaFor` answer undefined,
+   * `hermes_meta` rides the heartbeat ABSENT, and an absent key never
+   * clears the arbiter's stored block — eviction cannot erase history.
+   */
+  private pruneLedger(seenRows: Map<string, GatewaySessionRow>): void {
+    const round = ++this.ageRound;
+    for (const [id, row] of seenRows) {
+      if (rowToMeta(row)) this.lastSeenRound.set(id, round);
+    }
+    for (const [id, meta] of this.ledger) {
+      const seen = this.lastSeenRound.get(id) ?? 0;
+      const ended = meta.ended_at !== undefined; // number OR explicit null
+      if (ended && round - seen >= LEDGER_EVICTION_GRACE_ROUNDS) {
+        this.ledger.delete(id);
+        this.lastSeenRound.delete(id);
+      }
+    }
+    if (this.ledger.size > LEDGER_MAX_ENTRIES) {
+      const oldestFirst = [...this.lastSeenRound.keys()].sort(
+        (a, b) => (this.lastSeenRound.get(a) ?? 0) - (this.lastSeenRound.get(b) ?? 0),
+      );
+      let excess = this.ledger.size - LEDGER_MAX_ENTRIES;
+      for (const id of oldestFirst) {
+        if (excess <= 0) break;
+        if (this.ledger.delete(id)) {
+          this.lastSeenRound.delete(id);
+          excess--;
+        }
+      }
     }
   }
 
