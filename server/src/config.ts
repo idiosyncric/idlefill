@@ -62,6 +62,17 @@ export const DEFAULTS: Omit<ServerConfig, 'state_file'> & {
   // interval default is PROPOSED — the D3 owner choice 3: 15 s, the poll tick.
   fleet_url: undefined,
   fleet_roster_pull_ms: 15000,
+  // Fleet enrollment (#55 D2, PROPOSED, slice 7): the instance identity +
+  // the one-time enrollment token. BOTH default to ABSENT (undefined):
+  // the token is a SECRET the operator supplies (config.json is
+  // gitignored — a real token is never committed, never logged), and the
+  // instance id is the fleet-issued id persisted in
+  // fleet_enrollment.json after the first successful enroll. Any one of
+  // fleet_url / fleet_instance_id / fleet_enrollment_token absent = the
+  // signed roster pull is inert (the pull is a no-op, byte-for-byte — the
+  // pre-slice-7 behavior stands).
+  fleet_instance_id: undefined,
+  fleet_enrollment_token: undefined,
 };
 
 /** Coerce a raw (partial) config object into a full ServerConfig, applying defaults per field. */
@@ -131,6 +142,22 @@ export function applyDefaults(raw: Partial<ServerConfig> | null | undefined): Se
       const v = num(r.fleet_roster_pull_ms, DEFAULTS.fleet_roster_pull_ms ?? 15_000);
       return v > 0 ? v : (DEFAULTS.fleet_roster_pull_ms ?? 15_000);
     })(),
+    // Fleet enrollment (#55 D2, PROPOSED, slice 7). ADD keys: ABSENT means
+    // unset. fleet_instance_id is the fleet-issued identity (persisted in
+    // fleet_enrollment.json after the first enroll — the config value is
+    // the declaration seam, the file is the source of truth).
+    // fleet_enrollment_token is a SECRET: the operator supplies it
+    // (config.json is gitignored) and a real token is NEVER committed or
+    // logged. A blank/garbage value falls back to absent (undefined) — an
+    // empty token string would only spend the enroll call on a 400/401.
+    // Any one of fleet_url / fleet_instance_id / fleet_enrollment_token
+    // absent = the signed roster pull is inert (a no-op, byte-for-byte).
+    fleet_instance_id:
+      typeof r.fleet_instance_id === 'string' && r.fleet_instance_id.trim() !== '' ? r.fleet_instance_id.trim() : undefined,
+    fleet_enrollment_token:
+      typeof r.fleet_enrollment_token === 'string' && r.fleet_enrollment_token.trim() !== ''
+        ? r.fleet_enrollment_token.trim()
+        : undefined,
     log_glob: str(r.log_glob, DEFAULTS.log_glob),
     idle_seconds: num(r.idle_seconds, DEFAULTS.idle_seconds),
     poll_ms: num(r.poll_ms, DEFAULTS.poll_ms),

@@ -85,6 +85,38 @@ export interface ServerConfig {
    * when `fleet_url` is set.
    */
   fleet_roster_pull_ms?: number;
+  /**
+   * This instance's fleet-issued id (ADD key — absent = unset).
+   *
+   * #55 D3 (PROPOSED, slice 7): the id the fleet service assigns at
+   * enrollment (`m-<hex>`, fleet/src/store.ts) — the identity an instance
+   * signs roster/heartbeat requests with. Normally the arbiter receives it
+   * from `POST /enroll` and persists it in the sibling
+   * `fleet_enrollment.json` (server/src/fleet-client.ts, the #39/#55 D2
+   * posture — 0600, atomic tmp+rename, never in state.json); this config
+   * key is the DECLARATION seam that tells the arbiter "this instance has
+   * a fleet identity" — present (with fleet_url + the enrollment token) =
+   * the roster pull authenticates as a signed request. ABSENT = the signed
+   * pull is inert: the pull stays the pre-slice-7 no-op (the Service-down
+   * rule holds byte-for-byte). The fleet-issued id is the source of truth —
+   * the arbiter never invents one.
+   */
+  fleet_instance_id?: string;
+  /**
+   * The one-time enrollment token the operator minted at the fleet
+   * service (`POST /token`, fleet/src/index.ts) (ADD key — absent = unset).
+   *
+   * #55 D2 (PROPOSED, slice 7): single-use, short-TTL (15 min default,
+   * fleet/src/store.ts). Spent ONCE on `POST /enroll` to exchange for the
+   * long-lived session credential, which persists in
+   * `fleet_enrollment.json`. The token itself is a SECRET: it must come
+   * from the operator (config.json is gitignored — a real token is never
+   * committed, never logged). This key DEFAULTS TO UNDEFINED. A
+   * `token_used` / `token_expired` denial is terminal for that token: the
+   * operator mints a fresh one. Absent/blank = the signed pull is inert
+   * (no-op, byte-for-byte — same as `fleet_url` absent).
+   */
+  fleet_enrollment_token?: string;
   /** Glob of NInfer req-*.jsonl logs. Empty string disables the log-mtime signal. */
   log_glob: string;
   idle_seconds: number;
