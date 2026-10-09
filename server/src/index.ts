@@ -93,9 +93,6 @@ async function main(): Promise<void> {
   const loadCollectorMeta = new Map<string, { provider: ServerProvider; url: string }>();
   const loadCollectorFor = (row: ServerConnection): LoadCollector | null => {
     const kind: ServerProvider = row.provider ?? 'llama-swap';
-    // The D4 wave wires strata's live.state; this slice captures
-    // llama-swap /metrics and oMLX /health only.
-    if (kind === 'strata') return null;
     const meta = loadCollectorMeta.get(row.id);
     const stale = meta && (meta.provider !== kind || meta.url !== row.url);
     if (stale) {
@@ -108,6 +105,12 @@ async function main(): Promise<void> {
         url: row.url,
         provider: kind,
         ...(row.auth_token ? { auth_token: row.auth_token } : {}),
+        // The D3 freshness window bounds the veto: a reading older than
+        // this is unknown (load_busy absent). The D4 llama-swap threshold
+        // (the owner's knob) is UNSET BY DESIGN — absent = no predicate,
+        // load_busy absent, the verdict reads as pre-#52.
+        stale_window_ms: (cfg.metrics_load_stale_s ?? 45) * 1000,
+        llama_swap_busy_gpu_percent: cfg.metrics_llamaswap_busy_gpu_percent,
       });
       loadCollectors.set(row.id, c);
       loadCollectorMeta.set(row.id, { provider: kind, url: row.url });
@@ -159,6 +162,11 @@ async function main(): Promise<void> {
     // #64 D4: the /v1/models probe fetcher (credentialed per row, same
     // family as the feed fetchers above).
     modelsFetcher: makeRealModelsFetcher(),
+    // #52 slice 3 (the LOAD axis veto): the row's captured load reading at
+    // `now` — the same per-row source the /api/state signal block and the
+    // engine sample line publish. The arbiter folds a FRESH load_busy into
+    // the idle verdict (D2); absent = no load axis = pre-#52 verdict.
+    loadView,
   });
 
   // Metrics retention store (#51): append-only JSONL next to state.json.
@@ -239,7 +247,10 @@ async function main(): Promise<void> {
   // token truth. llama-swap rows keep feed-id deltas exactly as before.
   const sampleEngines = (now: number) => {
     for (const row of store.state.servers) {
-      const sig = arbiter.serverSignal(row.id, now);
+      // The VETOED verdict (the #52 load axis, slice 3): the sample's
+      // idle field is the verdict the signal block publishes (a fresh
+      // load_busy delays it). The load keys ride below from loadView.
+      const sig = arbiter.serverSignalVetoed(row.id, now);
       if (!sig) continue; // no detector = no sample for this row
       const url = `${String(row.url ?? '').replace(/\/$/, '')}${row.activity_path ?? ''}`;
       const kind: ServerProvider = row.provider ?? 'llama-swap';

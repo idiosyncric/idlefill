@@ -311,12 +311,16 @@ test('omlx: the credential rides the Authorization header (same family as the fe
   assert.equal(calls[0]?.headers?.authorization, 'Bearer sekret');
 });
 
-test('strata kind: no collector wired in this slice (the D4 wave)', async () => {
-  const { transport, calls } = fakeTransport(() => ({ ok: true, status: 200, text: '{}' }));
+test('strata kind: the /metrics collector reads live.state; a payload with no live object is UNKNOWN (no reading)', async () => {
+  const { transport, calls } = fakeTransport((url) =>
+    url === 'http://10.10.10.6:8080/metrics' ? { ok: true, status: 200, text: '{}' } : { ok: false, status: 404 },
+  );
   const c = new LoadCollector({ url: 'http://10.10.10.6:8080', provider: 'strata', transport });
+  // A body with no `live` object names no state → UNKNOWN, never a fake idle.
   assert.equal(await c.read(T0, null), null);
   assert.equal(c.current(T0), null);
-  assert.equal(calls.length, 0, 'no HTTP call at all for strata in this slice');
+  assert.equal(calls.length, 1, 'the strata collector polls /metrics (the feed adapter own payload)');
+  assert.equal(calls[0]!.url, 'http://10.10.10.6:8080/metrics');
 });
 
 // ---------------------------------------------------------------------------

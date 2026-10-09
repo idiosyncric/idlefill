@@ -228,7 +228,11 @@ function serverView(arbiter: Arbiter, cfg: ServerConfig, now: number, loadSignal
     }
   }
   return s.servers.map((row: ServerConnection) => {
-    const sig = arbiter.serverSignal(row.id, now);
+    // The VETOED signal (the #52 load axis): `idle` honors the fresh
+    // `load_busy` (the operator sees the verdict the grant gate uses);
+    // the load keys ride the `loadSignal` spread below (ADD keys). A
+    // row without the load axis reads byte-for-byte as before.
+    const sig = arbiter.serverSignalVetoed(row.id, now);
     const lastAct = sig?.last_activity ?? null;
     const signal = sig
       ? {
@@ -1653,8 +1657,10 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     const day = new Date().toISOString().slice(0, 10);
     // The top-level `idle` block is the WATCHED server's view (per-server
     // detail rides `servers[]`). A watched row without a detector reads
-    // degraded (fail-closed).
-    const sig = arbiter.serverSignal(WATCHED_SERVER_ID, now) ?? {
+    // degraded (fail-closed). The block honors the load-axis veto (#52
+    // slice 3): the feed says idle but a fresh load read says busy → the
+    // block reads not-idle (the load keys ride the per-server block).
+    const sig = arbiter.serverSignalVetoed(WATCHED_SERVER_ID, now) ?? {
       now,
       idle: false,
       idle_for_s: null,

@@ -10,31 +10,40 @@
  *   - oMLX: GET {url}/health → identity and pool residency (D8:
  *     `/health` is identity and residency, not load — no veto for this
  *     kind, ever, in this wave);
- *   - strata: NO collector wired in this slice (its `live.state` veto is
- *     the D4 wave; the strata feed adapter already rides the detector's
- *     /metrics poll).
+ *   - strata: GET {url}/metrics (the JSON the feed adapter already
+ *     parses, #60 B) → the single in-flight generation state
+ *     (`live.state`). The D4 predicate: `live.state` not in
+ *     {idle, stopped, none} means busy — no number needed.
  *
- * HARD RULE: nothing here feeds the verdict. The IdleDetector's idle
- * decision is untouched, and the readings publish only as ADD keys on
- * the signal block (`/api/state` per-row `signal`) and the #51 engine
- * sample line — display and sample. D4 stays OFF: the llama-swap GPU
- * busy threshold has no owner-set number, so the gauges are captured,
- * not vetoed on.
- *
- * Failure posture (mirrors the feed fetcher): a failed read — 4xx/5xx,
- * timeout, unreachable, malformed body — yields NO reading. The last
- * good reading stays; its age grows (`load_age_s`, labelled against the
- * `metrics_load_stale_s` window — which in this wave labels age only,
- * it does not veto anything). Absent = unset, never a fake zero. A
- * dead /metrics endpoint never degrades the verdict (D2 rule 3): the
- * collector is a separate plane from the feed-degraded fail-closed.
+ * The busy veto (#52 slice 3, D2/D4): the reading carries `load_busy`
+ * PRESENT ONLY on a FRESH read (the `stale_window_ms` window, D3).
+ * A stale or missing reading is UNKNOWN — `load_busy` is absent, the
+ * verdict falls back to the feed and mtime basis, and the feed-degraded
+ * fail-closed plane is untouched (D2 rules 2 and 3). The predicate is
+ * per kind:
+ *   - strata: `live.state` (ON, needs no number);
+ *   - llama-swap: `gpu_util_percent` ABOVE the owner-set
+ *     `metrics_llamaswap_busy_gpu_percent` (NO default — unset means
+ *     the kind has no predicate, the key stays absent, the verdict
+ *     reads byte-for-byte as pre-#52);
+ *   - oMLX: none (the key is always absent).
+ * HARD RULE (D2 rule 1): a busy read can only DELAY a grant. It can
+ * never make a busy engine read idle — the veto applies to `idle`
+ * only. Failure posture (mirrors the feed fetcher): a failed read —
+ * 4xx/5xx, timeout, unreachable, malformed body — yields NO reading.
+ * The last good reading stays; its age grows (`load_age_s`). Absent =
+ * unset, never a fake zero. A dead /metrics endpoint never degrades
+ * the verdict (D2 rule 3): the collector is a separate plane from the
+ * feed-degraded fail-closed.
  */
 
 import type { ActivityEntry, ServerProvider } from './types.js';
 
 /**
  * One captured reading (ADD keys — absent = unset). `read_at` is the
- * internal age basis; the wire exposes it as `load_age_s`.
+ * internal age basis; the wire exposes it as `load_age_s`. `load_busy`
+ * is computed at PUBLISH time (freshness is a function of `now`), so
+ * the captured reading never carries it.
  */
 export interface LoadReading {
   load_source?: string;
@@ -43,6 +52,8 @@ export interface LoadReading {
   gpu_mem_total_bytes?: number;
   tokens_per_second?: number;
   in_flight?: number;
+  /** The strata `live.state` value, verbatim (lower-cased) — the D4 busy predicate input. */
+  strata_live_state?: string;
   model_loaded?: string;
   /** Best-effort quant identity parsed from `model_loaded` (D5: absent when not parseable). */
   model_quant?: string;
@@ -51,13 +62,19 @@ export interface LoadReading {
 }
 
 /**
- * The published view of a reading: the keys above (minus `read_at`)
- * plus `load_age_s` (whole seconds since the last successful read).
- * These are exactly the ADD keys the signal block and the engine
- * sample line carry (design doc D5: the same key names on both).
+ * The published view of a reading: the keys above (minus `read_at` and
+ * the internal `strata_live_state` basis) plus `load_age_s` (whole
+ * seconds since the last successful read) and, PRESENT ONLY ON A FRESH
+ * READ, `load_busy` (the D4 predicate). These are exactly the ADD keys
+ * the signal block and the engine sample line carry (design doc D5:
+ * the same key names on both). A stale or missing reading publishes
+ * `load_age_s` (or nothing) but NEVER `load_busy` — stale is unknown,
+ * unknown is absent (D2 rule 2).
  */
 export interface LoadSignalView {
   load_source?: string;
+  /** The D4 busy predicate on this reading — present only on a FRESH read (the `stale_window_ms` window). Absent = unknown (stale, or the kind has no predicate, or the reading carries no predicate input). */
+  load_busy?: boolean;
   load_age_s?: number;
   gpu_util_percent?: number;
   gpu_mem_used_bytes?: number;
@@ -203,6 +220,53 @@ export function newestFeedTps(entries: ActivityEntry[]): number | null {
   return null;
 }
 
+/**
+ * The strata `live.state` from its /metrics payload (#52 slice 3, D4:
+ * the single in-flight generation slot). The SAME payload the feed
+ * adapter parses (`parseStrataMetrics` reads `live.state` for the
+ * in-flight activity entry) — the load read rides the collector's own
+ * /metrics fetch, no second HTTP call. Returns the state verbatim
+ * (lower-cased, trimmed), or null when the payload carries no usable
+ * `live` object. The D4 predicate is applied at publish time: not in
+ * {idle, stopped, none} means busy.
+ */
+export function parseStrataLoadState(body: unknown): string | null {
+  const j = (body ?? {}) as Record<string, unknown>;
+  const live = j.live as Record<string, unknown> | undefined;
+  if (!live || typeof live !== 'object') return null;
+  const state = String(live.state ?? '').trim().toLowerCase();
+  return state === '' ? null : state;
+}
+
+/**
+ * The D4 busy predicate, per kind, on a CAPTURED reading. Returns:
+ *   true  — a fresh read fired the predicate (the engine reads busy);
+ *   false — a fresh read says not busy (the engine reads not busy);
+ *   null  — UNKNOWN: no predicate for the kind (oMLX: none; llama-swap:
+ *           the owner's `metrics_llamaswap_busy_gpu_percent` is unset),
+ *           or the predicate input is missing (a llama-swap read with
+ *           no `gpu_util_percent` gauge). Unknown NEVER vetoes and
+ *           NEVER un-vetoes — `load_busy` is absent (D2 rules 1 and 2).
+ * A busy result can only DELAY a grant (D2 rule 1); nothing in this
+ * function can make a busy engine read idle.
+ */
+export function loadBusyFor(
+  kind: ServerProvider | undefined,
+  reading: LoadReading,
+  threshold?: number,
+): boolean | null {
+  if (kind === 'strata') {
+    const state = reading.strata_live_state;
+    return state === undefined ? null : state !== 'idle' && state !== 'stopped' && state !== 'none';
+  }
+  if (kind === 'omlx') return null; // D4: oMLX has NO veto (identity/residency, not load)
+  // llama-swap (default kind, #60 B): the threshold predicate.
+  const util = reading.gpu_util_percent;
+  if (typeof util !== 'number' || !Number.isFinite(util)) return null; // no gauge = unknown
+  if (typeof threshold !== 'number' || !Number.isFinite(threshold) || threshold <= 0) return null; // knob unset = NO predicate
+  return util > threshold; // ABOVE the threshold (a reading AT the number is not busy)
+}
+
 // ---------------------------------------------------------------------------
 // The collector.
 
@@ -215,12 +279,27 @@ export interface LoadCollectorOpts {
   auth_token?: string;
   /** Abort timeout for the load fetch (default 10 s, the feed fetcher's timeout). */
   fetch_timeout_ms?: number;
+  /**
+   * The D3 freshness window in milliseconds (`metrics_load_stale_s *
+   * 1000` from config). A reading older than this is UNKNOWN —
+   * `load_busy` is absent. Absent = no veto (the caller has not wired
+   * the window; the view still publishes the data keys).
+   */
+  stale_window_ms?: number;
+  /**
+   * The owner-set llama-swap busy threshold
+   * (`metrics_llamaswap_busy_gpu_percent`). UNSET BY DESIGN (no default):
+   * absent means the kind has NO busy predicate — `load_busy` is
+   * absent and the verdict reads byte-for-byte as pre-#52.
+   */
+  llama_swap_busy_gpu_percent?: number;
   /** Injectable transport (tests). Default: global fetch. */
   transport?: LoadTransport;
 }
 
 const LLAMASWAP_SOURCE = 'llamaswap-metrics';
 const OMLX_SOURCE = 'omlx-health';
+const STRATA_SOURCE = 'strata-metrics';
 
 export class LoadCollector {
   private readonly o: LoadCollectorOpts;
@@ -233,12 +312,12 @@ export class LoadCollector {
 
   /**
    * The kind's load surface, or null when no load collector is wired
-   * for the kind in this slice. Absent = the row's signal block carries
-   * no load keys at all (a pre-#52 row and a strata row read unchanged).
+   * for the kind. Absent = the row's signal block carries no load keys
+   * at all (a pre-#52 row reads unchanged).
    */
   static specFor(provider?: ServerProvider): { path: string; source: string } | null {
     if (provider === 'omlx') return { path: '/health', source: OMLX_SOURCE };
-    if (provider === 'strata') return null; // the D4 wave wires strata's live.state
+    if (provider === 'strata') return { path: '/metrics', source: STRATA_SOURCE }; // the JSON the feed adapter already parses
     return { path: '/metrics', source: LLAMASWAP_SOURCE }; // llama-swap (default kind)
   }
 
@@ -281,6 +360,21 @@ export class LoadCollector {
         if (parsed) {
           reading = { ...parsed, load_source: spec.source, read_at: now };
         }
+      } else if (this.o.provider === 'strata') {
+        // The strata /metrics JSON (the feed adapter's own payload): the
+        // single in-flight generation state is the D4 busy input. `live`
+        // absent or empty = the payload names no state → UNKNOWN (no
+        // reading), never a fake idle.
+        const state = parseStrataLoadState(JSON.parse(text));
+        if (state !== null) {
+          reading = {
+            strata_live_state: state,
+            // The single live slot (D5): 1 while generating, 0 otherwise.
+            in_flight: state === 'idle' || state === 'stopped' || state === 'none' ? 0 : 1,
+            load_source: spec.source,
+            read_at: now,
+          };
+        }
       } else {
         const parsed = parseLlamaSwapMetrics(text);
         if (parsed) {
@@ -305,15 +399,38 @@ export class LoadCollector {
   }
 
   /**
-   * The last reading + its age in whole seconds at `now`; null = no
-   * reading since boot. The age is LABELLED against the
-   * `metrics_load_stale_s` window by the display/sample consumers —
-   * in this wave it vetoes nothing (D3/D4: the veto wave builds the
-   * busy predicate on top of this same reading).
+   * The last reading at `now`, or null = no reading since boot. The
+   * age is `load_age_s` (whole seconds since the last successful read).
+   *
+   * The busy veto (D2/D3/D4): `load_busy` is present ONLY when the
+   * reading is FRESH (age ≤ the `stale_window_ms` window, D3) AND the
+   * kind's predicate answers. A stale reading is UNKNOWN — `load_busy`
+   * is ABSENT (the data keys still ride, so the operator sees why), and
+   * the verdict falls back to the feed and mtime basis. A reading whose
+   * predicate is unknown (oMLX: no predicate; llama-swap: the knob is
+   * unset; no gauge on the read) publishes NO `load_busy` either —
+   * unknown never vetoes and never un-vetoes. A dead /metrics endpoint
+   * never degrades the verdict (D2 rule 3): the load axis is a veto on
+   * top of the feed, not part of it.
    */
   current(now: number): LoadSignalView | null {
     if (!this.reading) return null;
-    const { read_at, ...rest } = this.reading;
-    return { ...rest, load_age_s: Math.max(0, Math.round((now - read_at) / 1000)) };
+    const { read_at, strata_live_state, ...rest } = this.reading;
+    const ageS = Math.max(0, Math.round((now - read_at) / 1000));
+    const view: LoadSignalView = { ...rest, load_age_s: ageS };
+    // Freshness (D3): within the window. No window configured → no veto
+    // (the data keys still ride; only the arbiter wires the window).
+    const windowMs = this.o.stale_window_ms;
+    const fresh = typeof windowMs === 'number' && Number.isFinite(windowMs) && now - read_at <= windowMs;
+    if (!fresh) return view;
+    // The D4 predicate (per kind). Absent knob / no predicate input /
+    // the kind has none → null → the key stays ABSENT.
+    const busy = loadBusyFor(
+      this.o.provider,
+      this.reading,
+      this.o.llama_swap_busy_gpu_percent,
+    );
+    if (busy !== null) view.load_busy = busy;
+    return view;
   }
 }

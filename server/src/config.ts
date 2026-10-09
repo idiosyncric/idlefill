@@ -47,6 +47,14 @@ export const DEFAULTS: Omit<ServerConfig, 'state_file'> & {
   // Load-axis freshness window (#52 slice 1, D3): three polls at the
   // 15-second poll_ms.
   metrics_load_stale_s: 45,
+  // llama-swap busy threshold (#52 slice 3, D4): a number on
+  // `gpu_util_percent` (0-100) above which a FRESH read vetoes a grant.
+  // NO default — the owner has not set a number (a fixed number on a
+  // spiky gauge cuts both ways). Absent = the kind has no busy
+  // predicate: `load_busy` is absent and the verdict reads exactly as
+  // pre-#52. Setting a number is the owner's switch to turn the
+  // llama-swap veto ON.
+  metrics_llamaswap_busy_gpu_percent: undefined,
 };
 
 /** Coerce a raw (partial) config object into a full ServerConfig, applying defaults per field. */
@@ -126,12 +134,21 @@ export function applyDefaults(raw: Partial<ServerConfig> | null | undefined): Se
     // retention in days. Non-positive/garbage falls back to the default.
     metrics_raw_window_hours: num(r.metrics_raw_window_hours, DEFAULTS.metrics_raw_window_hours ?? 48),
     metrics_retention_days: num(r.metrics_retention_days, DEFAULTS.metrics_retention_days ?? 400),
-    // Load-axis freshness window (#52 slice 1, D3): labels `load_age_s`
-    // only. Non-positive/garbage falls back to the default (45 s) — a
+    // Load-axis freshness window (#52 slice 1, D3): bounds the veto.
+    // Non-positive/garbage falls back to the default (45 s) — a
     // window of -1 s is nonsense (same guard as rawWindowHours).
     metrics_load_stale_s: (() => {
       const v = num(r.metrics_load_stale_s, DEFAULTS.metrics_load_stale_s ?? 45);
       return v > 0 ? v : (DEFAULTS.metrics_load_stale_s ?? 45);
+    })(),
+    // llama-swap busy threshold (#52 slice 3, D4): the owner's knob.
+    // NO default — unset means NO predicate for the kind (load_busy
+    // absent, the verdict reads as pre-#52). Only a finite, positive
+    // number sticks (0 or below would veto on every reading; garbage
+    // is refused, never coerced).
+    metrics_llamaswap_busy_gpu_percent: (() => {
+      const v = r.metrics_llamaswap_busy_gpu_percent;
+      return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : undefined;
     })(),
   };
 }

@@ -84,6 +84,17 @@ export interface EngineSampleLine {
    * sample only — never a verdict input (D4 stays off). ADD keys.
    */
   load_source?: string;
+  /**
+   * The D4 busy predicate on this tick's load reading (slice 3) —
+   * present only on a FRESH read (the `metrics_load_stale_s` window):
+   * strata `live.state` not in {idle, stopped, none}; llama-swap
+   * `gpu_util_percent` above the owner-set `metrics_llamaswap_busy_gpu_percent`
+   * (no default — absent knob = the key is absent); oMLX none. Stale is
+   * unknown → absent (D2 rule 2). A true load_busy DELAYS the grant: the
+   * sample's `idle` reflects it (the feed says idle, the engine is busy).
+   * ADD key.
+   */
+  load_busy?: boolean;
   load_age_s?: number;
   gpu_util_percent?: number;
   gpu_mem_used_bytes?: number;

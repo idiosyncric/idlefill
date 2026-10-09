@@ -51,6 +51,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import type { IdleDetector } from './idle.js';
 import { activeLeaseExemptIps, defaultActivityPathFor } from './idle.js';
+import type { LoadSignalView } from './load.js';
 import { buildCatalog, modelsProbeUrl, type CatalogEntry, type ModelsFetcher } from './catalog.js';
 import { mintInstanceId } from './mesh.js';
 import { Identity } from './identity.js';
@@ -363,6 +364,7 @@ function cleanReportedHermesMeta(v: unknown): HermesMetaBlock | undefined {
 
 export type LeaseRejectionReason =
   | 'not_idle'
+  | 'load_busy'
   | 'busy'
   | 'group_busy'
   | 'project_paused'
@@ -411,6 +413,15 @@ export class Arbiter {
   private detectors: Map<string, IdleDetector>;
   /** Optional factory so servers added via the API get a detector too. */
   private readonly detectorFactory?: (row: ServerConnection) => IdleDetector;
+  /**
+   * The row's captured load reading at `now` (the #52 LOAD axis, slice 3):
+   * the tick's per-row load read (index.ts wires this to its collector
+   * view). Optional — tests and arbiter builds without the wiring pass
+   * nothing, and the row then publishes NO load keys and NO veto
+   * (byte-parity with pre-#52). The view carries `load_busy` only on a
+   * FRESH read (D3); absent = unknown (D2 rule 2: unknown never vetoes).
+   */
+  private readonly loadView?: (row: ServerConnection, now: number) => LoadSignalView | null;
   /**
    * #64 D4: per-row `/v1/models` probe fetcher (credentialed per row, the
    * #60 B fetcher family). Absent = NO probe runs (tests + arbiter builds
@@ -483,13 +494,24 @@ export class Arbiter {
     store: StateStore,
     cfg: ServerConfig,
     detectors: IdleDetector | Map<string, IdleDetector>,
-    opts?: { detectorFactory?: (row: ServerConnection) => IdleDetector; modelsFetcher?: ModelsFetcher },
+    opts?: {
+      detectorFactory?: (row: ServerConnection) => IdleDetector;
+      modelsFetcher?: ModelsFetcher;
+      /**
+       * The row's captured load reading at `now` (the #52 LOAD axis,
+       * slice 3: the monotonic busy veto). The tick wires this to its
+       * per-row collector view. Absent = no load axis (byte-parity with
+       * pre-#52: no load keys, no veto).
+       */
+      loadView?: (row: ServerConnection, now: number) => LoadSignalView | null;
+    },
   ) {
     this.store = store;
     this.cfg = cfg;
     this.detectors = detectors instanceof Map ? detectors : new Map([[WATCHED_SERVER_ID, detectors]]);
     this.detectorFactory = opts?.detectorFactory;
     this.modelsFetcher = opts?.modelsFetcher;
+    this.loadView = opts?.loadView;
     // A fresh Arbiter must see the seeded server inventory, not just one
     // that went through index.ts: the API/tests construct the arbiter
     // directly. Idempotent — a non-empty state file is left untouched.
@@ -863,7 +885,21 @@ export class Arbiter {
     if (!det && params.signal === undefined && serverId !== WATCHED_SERVER_ID) {
       return { ok: false, reason: 'not_idle' };
     }
-    const sig = params.signal ?? det?.signal(now);
+    // An explicit `signal` (tests / single-server callers) applies
+    // verbatim — its `idle` already carries the caller's verdict.
+    const sig =
+      params.signal !== undefined
+        ? params.signal
+        : (() => {
+            const raw = det?.signal(now);
+            if (!raw) return null;
+            const row = this.store.state.servers.find((x) => x.id === serverId);
+            if (!row || !this.loadView) return raw;
+            const load = this.loadView(row, now);
+            if (!load) return raw;
+            const { load_busy, ...loadKeys } = load;
+            return { ...raw, ...loadKeys, ...(load_busy === true || load_busy === false ? { load_busy } : {}) };
+          })();
     if (!sig) return { ok: false, reason: 'not_idle' };
 
     // A 'pause' override is a hard stop for that client — it is reported
@@ -908,6 +944,13 @@ export class Arbiter {
     const forced = this.activeOverride(params.client_id, now)?.override === 'force';
     if (!forced) {
       if (!sig.idle) return { ok: false, reason: 'not_idle' };
+      // The monotonic busy veto (#52 slice 3, D2): the feed says idle but
+      // a FRESH load read says busy — the grant is DELAYED. Named
+      // 'load_busy' (not 'not_idle') so the operator sees WHICH axis held
+      // the grant back; the reason rides the denial counters and the
+      // /api/leases 409 as-is. A true load_busy can only delay (D2 rule
+      // 1); absent (stale, no knob, no predicate) never vetoes.
+      if (sig.load_busy === true) return { ok: false, reason: 'load_busy' };
       if (sessionBusy !== null && now - sessionBusy < this.effectiveIdleSeconds(params.project) * 1000) {
         return { ok: false, reason: 'not_idle' };
       }
@@ -1149,9 +1192,46 @@ export class Arbiter {
     return this.reidleAfter.has(serverId);
   }
 
-  /** The live idle signal for one server (null when it has no detector). */
+  /**
+   * The live idle signal for one server (null when it has no detector).
+   * RAW (pre-veto): the detector's feed+mtime basis. Use
+   * {@link serverSignalVetoed} for any read surface or decision that
+   * must honor the load-axis veto.
+   */
   serverSignal(serverId: string, now?: number): IdleSignal | null {
     return this.detectors.get(serverId)?.signal(now ?? Date.now()) ?? null;
+  }
+
+  /**
+   * The live idle signal with the #52 load-axis busy veto applied (the
+   * D2 contract): `idle = (not degraded and idle_for >= idle_seconds)
+   * AND not load_busy`, the load keys riding the same object.
+   *
+   * MONOTONIC (D2 rule 1): a `load_busy` true can only DELAY a grant —
+   * it flips `idle` true→false and touches nothing else. It can never
+   * make a busy engine read idle. A `load_busy` false never forces idle
+   * (the feed+mtime basis stands). Absent `load_busy` (no reading,
+   * stale reading, the kind has no predicate) is UNKNOWN — the verdict
+   * is byte-for-byte the detector's (D2 rules 2 and 3: unknown never
+   * vetoes and never un-vetoes; the feed-degraded fail-closed is
+   * untouched). The mesh snapshot (D7) reads the RAW signal on purpose
+   * — it stays byte-for-byte.
+   */
+  serverSignalVetoed(serverId: string, now?: number): IdleSignal | null {
+    const n = now ?? Date.now();
+    const sig = this.serverSignal(serverId, n);
+    if (!sig) return null;
+    const row = this.store.state.servers.find((x) => x.id === serverId);
+    if (!row) return sig;
+    const load = this.loadView?.(row, n);
+    if (!load) return sig;
+    const { load_busy, ...loadKeys } = load;
+    return {
+      ...sig,
+      ...loadKeys,
+      ...(load_busy === true || load_busy === false ? { load_busy } : {}),
+      ...(load_busy === true ? { idle: false } : {}),
+    };
   }
 
   // ------------------------------------------------------------------
