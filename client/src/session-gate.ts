@@ -87,6 +87,14 @@ export interface SessionGateSnapshot {
    * with an old arbiter that never echoes it back.
    */
   position?: number;
+  /**
+   * #46: epoch-ms the session FIRST started waiting (the parked anchor,
+   * the same clock the #47 aging measures), present while state is
+   * 'queued'. The hold's AGE surfaces from here — the router's clock,
+   * carried verbatim (the `phase.at` precedent); the surface ages it,
+   * never the arbiter. Absent when not queued or on an old router.
+   */
+  waitSince?: number;
 }
 
 /**
@@ -534,7 +542,17 @@ export class SessionGate {
       // #44: a queued session also carries its place in line (the queue is
       // router-local truth; surfaces render the number verbatim).
       const pos = this.queue.indexOf(token) + 1;
-      return { state: 'queued', waiting: s.holds.length, ...(pos > 0 ? { position: pos } : {}) };
+      // #46: the hold's anchor instant rides as the `waitSince` ADD-key —
+      // the age a parked session has waited, so the in-session 503 and
+      // the dashboard row can both say "held Ns" without re-deriving the
+      // clock. Absent until a hold exists (a session that is not waiting
+      // has no age).
+      return {
+        state: 'queued',
+        waiting: s.holds.length,
+        ...(pos > 0 ? { position: pos } : {}),
+        ...(s.waitStart !== undefined ? { waitSince: s.waitStart } : {}),
+      };
     }
     return null;
   }
@@ -846,6 +864,7 @@ export class SessionGate {
   }
 
   private park(s: Session, req: IncomingMessage, res: ServerResponse, path: string, forward: ForwardFn): void {
+    const firstHold = s.holds.length === 0;
     const h: Held = { req, res, path, forward, parkedAt: this.now(), done: false };
     s.holds.push(h);
     // #47: anchor the session's wait at its FIRST parked request — the
@@ -859,6 +878,15 @@ export class SessionGate {
     req.once('close', drop);
     h.capTimer = setTimeout(() => this.expireHold(s, h), this.deps.holdCapMs);
     h.capTimer.unref?.();
+    // #46: a park TRANSITION (the session's first parked request) rides the
+    // arbiter right away — the in-session "held by gate (Ns)" answer and
+    // the dashboard row must show the hold AND its age (the waitSince
+    // ADD-key on the gate block) within one poll window (~5s), not wait
+    // up to the 10s heartbeat throttle. The same "rides right away"
+    // precedent as the #67 phase transition; bounded by construction
+    // (≤1 per 0→1 park transition — a session that parks again after a
+    // release is its own fresh transition).
+    if (firstHold && s.registered && this.linkUp && !this.released) void this.register(s);
   }
 
   /** Client vanished while parked: forget the hold, free the queue slot. */
@@ -1134,6 +1162,43 @@ export class SessionGate {
     if (this.released) return;
     this.released = true;
     this.releaseAllHolds();
+  }
+
+  /**
+   * #46: stop/abort one session's PARKED holds — the idlefill half of a
+   * true turn interrupt. Every parked request on the token is answered
+   * with a retryable 503 + Retry-After (the SAME body/headers the
+   * hold-cap expiry writes, which the Hermes client already understands)
+   * and the queue slot is freed, so a paused / over-capacity session stops
+   * STALLING and instead gets a clean "held by the gate, retry in Ns"
+   * answer — the in-session "held by gate" feedback the issue asks for.
+   *
+   * Honest limits (stated so no surface over-promises):
+   *   - it does NOT interrupt an IN-FLIGHT turn: the gate never preempts
+   *     running traffic (the same rule priority honors);
+   *   - it does NOT clear the operator `pause` override: the operator's
+   *     hold still owns admission, so the NEXT request on a paused
+   *     session parks again. Releasing a hold answers the PARKED request;
+   *     it does not un-pause the session (that stays the operator's call).
+   *
+   * Unknown token, or a token with no parked holds, is a no-op (returns
+   * 0): the control endpoint must be idempotent and never error on a
+   * stale/bad handle.
+   */
+  releaseHold(token: string): number {
+    const s = this.sessions.get(token);
+    if (!s) return 0;
+    const n = s.holds.length;
+    if (n === 0) return 0;
+    this.log(`session ${s.token} hold released by operator (${n} parked request(s) answered 503 + Retry-After)`);
+    // Reuse the cap-expiry path so the 503 body/Retry-After match the
+    // hold-cap contract EXACTLY (one answer shape, two triggers).
+    for (const h of [...s.holds]) this.expireHold(s, h);
+    // expireHold forgets each hold (dequeuing when the last goes); offer the
+    // freed slot to the rest of the queue — a paused session is skipped by
+    // admitLoop and keeps its position, exactly like the slot-free path.
+    this.admitLoop();
+    return n;
   }
 
   private releaseAllHolds(): void {

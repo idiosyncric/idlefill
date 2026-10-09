@@ -483,10 +483,13 @@ export interface SessionRecord {
    * heartbeat (gate-state). 'active' = the session holds an inference slot
    * right now; 'queued' = it has ≥1 parked request waiting for admission;
    * `waiting` = parked-request count. null = the router reported no gate
-   * (idle session) — a session that stopped waiting never stays tagged.
-   * Absent on rows persisted before gate-state.
+   * gate (idle session) — a session that stopped waiting never stays tagged.
+   * Absent on rows persisted before gate-state. `waitSince` (#46) =
+   * epoch-ms the session FIRST started waiting (the hold's anchor instant,
+   * the router's clock carried verbatim — the surface ages the hold from
+   * it, never the arbiter); present while queued, absent on old routers.
    */
-  gate?: { state: 'active' | 'queued'; waiting: number; position?: number } | null;
+  gate?: { state: 'active' | 'queued'; waiting: number; position?: number; waitSince?: number } | null;
   /**
    * The REAL Hermes conversation id (#42 Slice 0), captured by the router
    * from the `X-Hermes-Session-Id` request header and published on the

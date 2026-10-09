@@ -186,10 +186,10 @@ export function leaseServerId(lease: { server_id?: string }): string {
  *   - anything else → undefined: INVALID, the field is DROPPED (never a
  *     rejected registration) and the stored value stands.
  */
-function normalizeSessionGate(v: unknown): { state: 'active' | 'queued'; waiting: number; position?: number } | null | undefined {
+function normalizeSessionGate(v: unknown): { state: 'active' | 'queued'; waiting: number; position?: number; waitSince?: number } | null | undefined {
   if (v === null || v === undefined) return null;
   if (typeof v !== 'object' || Array.isArray(v)) return undefined;
-  const g = v as { state?: unknown; waiting?: unknown; position?: unknown };
+  const g = v as { state?: unknown; waiting?: unknown; position?: unknown; waitSince?: unknown };
   if (g.state !== 'active' && g.state !== 'queued') return undefined;
   if (typeof g.waiting !== 'number' || !Number.isFinite(g.waiting) || !Number.isInteger(g.waiting) || g.waiting < 0) return undefined;
   // #44 add-key: 1-based queue position, only meaningful while queued.
@@ -199,7 +199,21 @@ function normalizeSessionGate(v: unknown): { state: 'active' | 'queued'; waiting
     typeof g.position === 'number' && Number.isInteger(g.position) && g.position >= 1
       ? g.position
       : undefined;
-  return { state: g.state, waiting: g.waiting, ...(position !== undefined ? { position } : {}) };
+  // #46 add-key: the hold's anchor instant (epoch-ms the session FIRST
+  // started waiting), only meaningful while queued. Same ADD-key posture
+  // as position: a malformed value is dropped (the block still rides),
+  // absent = an old router. The arbiter keeps it VERBATIM (the router's
+  // clock, the `phase.at` precedent) — it never re-derives the age.
+  const waitSince =
+    typeof g.waitSince === 'number' && Number.isFinite(g.waitSince) && g.waitSince >= 0
+      ? g.waitSince
+      : undefined;
+  return {
+    state: g.state,
+    waiting: g.waiting,
+    ...(position !== undefined ? { position } : {}),
+    ...(waitSince !== undefined ? { waitSince } : {}),
+  };
 }
 
 /**
