@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  idlefill fleet service — macOS LaunchAgent (#55 slice 4, D7).
+
+  Installs to: ~/Library/LaunchAgents/com.sam.idlefill.fleet.plist
+  Config:      <repo>/fleet/config.json  (gitignored: listen + db_file +
+               token_ttl_ms — the agent reads its own config, the plist
+               carries NO secrets)
+  State:       the SQLite file named by config.json's db_file key (D6: a
+               file, not a server). Never the repo checkout.
+
+  load:   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.sam.idlefill.fleet.plist
+  unload: launchctl bootout gui/$(id -u)/com.sam.idlefill.fleet
+  logs:   <repo>/fleet/logs/launchd.{out,err}.log
+
+  KeepAlive SuccessfulExit=false restarts the service on crash; the SQLite
+  file (D6) is the durable state, so a crash loses no roster row or
+  enrollment token.
+  Label is deliberately distinct from com.sam.idlefill.server (the arbiter)
+  and com.sam.idlefill.client (the daemon).
+
+  D7: tailnet-only reach. No published port. The plist carries no secrets.
+  The fleet service is generic (not idlefill-specific), so a Mac-hosted
+  fleet box is valid; on urza (Linux) the systemd unit is the primary.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.sam.idlefill.fleet</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/npx</string>
+        <!-- npx resolves tsx from the repo's hoisted node_modules
+             (WorkingDirectory is inside the workspace) — same pattern as
+             the server agent -->
+        <string>tsx</string>
+        <string>/Users/sam/Software/idlefill/fleet/src/index.ts</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/sam/Software/idlefill/fleet</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>NODE_ENV</key>
+        <string>production</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/sam/Software/idlefill/fleet/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/sam/Software/idlefill/fleet/logs/launchd.err.log</string>
+</dict>
+</plist>

@@ -1,0 +1,5 @@
+{
+  "listen": 8789,
+  "db_file": "/var/lib/fleetlink/fleet.db",
+  "token_ttl_ms": 900000
+}
