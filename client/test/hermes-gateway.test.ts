@@ -76,6 +76,10 @@ interface FakeGatewayOpts {
    *  for these ids and 404s every other id. A row here models a delegate
    *  child deliberately absent from the listing. */
   singleSessions?: Record<string, Record<string, GatewaySessionRow>>;
+  /** #83: status for exact-id reads NOT in singleSessions (default 404). A
+   *  non-404 (e.g. 500) models an ambiguous walk the connector must NOT
+   *  cache negative. */
+  singleRouteStatus?: number;
   /** Respond with 401 to authed ledger reads when the key does not match. */
   expectKeys?: Record<string, string>;
   /** Runs stub state: verb recording + canned responses. */
@@ -152,7 +156,7 @@ function startFakeGateway(opts: FakeGatewayOpts = {}): Promise<FakeGateway> {
           return send(401, { error: { code: 'gateway_auth_failed' } });
         }
         const row = opts.singleSessions?.[profile]?.[decodeURIComponent(sm[2] ?? '')];
-        if (!row) return send(404, { error: { code: 'session_not_found' } });
+        if (!row) return send(opts.singleRouteStatus ?? 404, { error: { code: 'session_not_found' } });
         return send(200, { object: 'hermes.session', session: row });
       }
       // Runs (the stub answers the seam's verbs).
@@ -583,33 +587,92 @@ test('#83 connector: a listed-out child enriches via a bounded single-session lo
   assert.equal(singleReqs(gw, CHILD_ROW.id as string).length, 2, 'a HIT stops the walk and never re-probes');
 });
 
-test('#83 connector: 404 posture + throttle — no flood, capped attempts', async () => {
+test('#83 connector: 404 negative cache — a definitive miss never repeats the HTTP walk', async () => {
   const gw = await startFakeGateway({
     health: { status: 200, version: '0.21.6' },
     defaultRows: [ROW_A],
     // No singleSessions: EVERY exact-id read 404s (the live posture for an
-    // id no profile owns).
+    // id no profile owns — a definitive "no such session" answer).
   });
   cleanup.push(() => gw.close());
   let t = 60_000; // clear the poll cadence gate (lastPollAt starts at 0)
   const c = new HermesGatewayConnector(gwCfg(gw.base), { now: () => t });
   await c.poll();
-  // One heartbeat burst: 10 miss-lookups, ONE probe per keyed profile.
+  // One heartbeat burst: 10 misses on the same id ⇒ ONE walk, ONE probe per
+  // keyed profile (default 404, web-dev 404).
   for (let i = 0; i < 10; i++) assert.equal(c.metaFor('ghost-9'), undefined);
   await waitFor(() => singleReqs(gw, 'ghost-9').length >= 2, 3000, 'the first probe pair (default + web-dev)');
   await new Promise((r) => setTimeout(r, 100));
   assert.equal(singleReqs(gw, 'ghost-9').length, 2, 'two keyed profiles ⇒ exactly 2 requests, not 10');
-  // Same clock: the retry window has not passed — later heartbeats add nothing.
-  for (let i = 0; i < 20; i++) assert.equal(c.metaFor('ghost-9'), undefined);
-  assert.equal(singleReqs(gw, 'ghost-9').length, 2, 'the retry window throttles the heartbeat cadence (10s ticks)');
-  // Past the retry window: one more round (attempt 2), then the cap holds.
-  t += 301_000;
-  assert.equal(c.metaFor('ghost-9'), undefined);
-  await waitFor(() => singleReqs(gw, 'ghost-9').length >= 4, 3000, 'the second (final) attempt pair');
-  t += 301_000;
-  for (let i = 0; i < 5; i++) assert.equal(c.metaFor('ghost-9'), undefined);
+  // The walk answered 404 from EVERY keyed profile ⇒ the id is cached NOT
+  // FOUND. Much later heartbeats (past the retry window, past the attempt
+  // cap) add ZERO requests: the same id never repeats the HTTP walk.
+  t += 600_000;
+  for (let i = 0; i < 50; i++) assert.equal(c.metaFor('ghost-9'), undefined);
   await new Promise((r) => setTimeout(r, 100));
-  assert.equal(singleReqs(gw, 'ghost-9').length, 4, 'SINGLE_MAX_ATTEMPTS × 2 profiles = 4 requests EVER');
+  assert.equal(singleReqs(gw, 'ghost-9').length, 2, 'the negative cache means NEVER re-fetched');
+  // A fresh poll round does not re-open it either.
+  t += 60_000;
+  await c.poll();
+  assert.equal(c.metaFor('ghost-9'), undefined);
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(singleReqs(gw, 'ghost-9').length, 2, 'round after round: the cached 404 stands');
+});
+
+test('#83 connector: throttle + attempt cap on AMBIGUOUS walks (no definitive 404 ⇒ retry, then stop)', async () => {
+  const gw = await startFakeGateway({
+    health: { status: 200, version: '0.21.6' },
+    defaultRows: [ROW_A],
+    // 500 on every exact-id read: the gateway never answers definitively, so
+    // the walk must NOT be cached negative — it retries once, then the
+    // SINGLE_MAX_ATTEMPTS cap closes it.
+    singleRouteStatus: 500,
+  });
+  cleanup.push(() => gw.close());
+  let t = 60_000;
+  const c = new HermesGatewayConnector(gwCfg(gw.base), { now: () => t });
+  await c.poll();
+  for (let i = 0; i < 10; i++) assert.equal(c.metaFor('amb-1'), undefined);
+  await waitFor(() => singleReqs(gw, 'amb-1').length >= 2, 3000, 'the first ambiguous walk (2 profiles)');
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(singleReqs(gw, 'amb-1').length, 2, 'same-clock heartbeats add nothing (in-flight + throttle)');
+  // Past the retry window: ONE more walk (attempt 2 of 2).
+  t += 301_000;
+  assert.equal(c.metaFor('amb-1'), undefined);
+  await waitFor(() => singleReqs(gw, 'amb-1').length >= 4, 3000, 'the second (final) attempt pair');
+  // Past the cap: nothing more, EVER.
+  t += 900_000;
+  for (let i = 0; i < 20; i++) assert.equal(c.metaFor('amb-1'), undefined);
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(singleReqs(gw, 'amb-1').length, 4, 'SINGLE_MAX_ATTEMPTS(2) × 2 keyed profiles = 4 requests EVER');
+});
+
+test('#83 connector: per-round cap — a flood of unknown ids schedules at most SINGLE_LOOKUPS_PER_ROUND lookups per round', async () => {
+  const gw = await startFakeGateway({
+    health: { status: 200, version: '0.21.6' },
+    defaultRows: [ROW_A],
+  });
+  cleanup.push(() => gw.close());
+  let t = 60_000;
+  const c = new HermesGatewayConnector(gwCfg(gw.base), { now: () => t });
+  await c.poll();
+  // 12 distinct unknown ids in one heartbeat burst; TWO more ids arrive later
+  // in the same round (the cap gate must keep them out).
+  const ids = Array.from({ length: 12 }, (_, i) => `flood-${i}`);
+  for (const id of ids) assert.equal(c.metaFor(id), undefined);
+  for (const id of ['flood-12', 'flood-13']) assert.equal(c.metaFor(id), undefined);
+  await waitFor(() => gw.requests.filter((r) => /\/api\/sessions\/flood-/.test(r.path)).length >= 16, 3000, 'the capped 8 ids × 2 profiles');
+  await new Promise((r) => setTimeout(r, 150));
+  const single = gw.requests.filter((r) => /\/api\/sessions\/flood-/.test(r.path));
+  const distinct = new Set(single.map((r) => r.path.split('/').pop()));
+  assert.equal(distinct.size, 8, 'only SINGLE_LOOKUPS_PER_ROUND=8 distinct ids get a walk this round');
+  assert.equal(single.length, 16, '8 ids × 2 keyed profiles = 16 requests, never 14×2');
+  // Next REACHABLE round reopens the budget: a new id schedules its walk.
+  t += 60_000;
+  await c.poll();
+  assert.equal(c.metaFor('flood-12'), undefined);
+  await waitFor(() => gw.requests.some((r) => r.path.endsWith('/api/sessions/flood-12')), 3000, 'the reopened budget admits the deferred id');
+  assert.ok(new Set(gw.requests.filter((r) => /\/api\/sessions\/flood-/.test(r.path)).map((r) => r.path.split('/').pop())).size >= 9);
 });
 
 test('#83 connector: unreachable / unkeyed ⇒ ZERO single-route requests (fail-open stands)', async () => {

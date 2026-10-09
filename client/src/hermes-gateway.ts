@@ -179,16 +179,23 @@ const LEDGER_MAX_ENTRIES = 5000;
  * ANY exact id — children included (`_get_existing_session_or_404` →
  * `db.get_session`; `_session_response` publishes the same safe-keys the
  * listing row carries, plus `is_internal_child`). So a ledger MISS schedules
- * ONE bounded per-id lookup: at most `SINGLE_MAX_ATTEMPTS` per id, at least
- * `SINGLE_RETRY_MS` apart, only while the gateway is reachable and the
- * profile has a key, deduped by the in-flight set. The attempts bookkeeping
- * itself is capped (oldest record dropped) so a hostile id stream cannot
- * grow it. Fail-open unchanged: nothing is scheduled while unreachable /
- * unkeyed / disabled — a down gateway still sees zero extra requests.
+ * ONE bounded per-id lookup: at most `SINGLE_LOOKUPS_PER_ROUND` distinct ids
+ * scheduled per poll round, at most `SINGLE_MAX_ATTEMPTS` walks per id, at
+ * least `SINGLE_RETRY_MS` apart, only while the gateway is reachable and the
+ * profile has a key, deduped by the in-flight set. The walk RESULT is cached:
+ * a walk in which EVERY keyed profile answered an explicit 404 marks the id
+ * NOT FOUND (negative cache) — the same id is then NEVER fetched again; only
+ * ambiguous walks (transport failure, 401s, malformed bodies) may retry,
+ * bounded by the attempt cap and the throttle. The attempts bookkeeping and
+ * the negative cache are each size-capped (oldest record dropped) so a
+ * hostile id stream cannot grow them. Fail-open unchanged: nothing is
+ * scheduled while unreachable / unkeyed / disabled — a down gateway still
+ * sees zero extra requests, byte-for-byte the pre-#73 wire.
  */
 const SINGLE_MAX_ATTEMPTS = 2;
 const SINGLE_RETRY_MS = 300_000;
 const SINGLE_TRACKED_MAX = 1000;
+const SINGLE_LOOKUPS_PER_ROUND = 8;
 
 /** Expand a leading `~` against the OS home (test seam via `home`). */
 function expandHome(p: string, home: string): string {
@@ -552,6 +559,10 @@ export class HermesGatewayConnector {
       this.ledger = mergeLedgerRows(this.ledger, round.rows);
       // #82: only a REACHABLE round ages the ledger (an outage never evicts).
       if (round.reachable) this.pruneLedger(round.rows);
+      // #83: a fresh REACHABLE round reopens the per-round lookup budget. An
+      // unreachable round changes nothing (no lookups are scheduled while
+      // down, and the budget spent before the outage is not the concern).
+      if (round.reachable) this.roundMissIds = new Set();
       this.fetchedAt = round.fetchedAt;
       if (!round.reachable && this.lastError !== 'unreachable') {
         this.lastError = 'unreachable';
@@ -639,15 +650,32 @@ export class HermesGatewayConnector {
    */
   private readonly singleAttempts = new Map<string, { attempts: number; lastAt: number }>();
   private readonly singleInFlight = new Set<string>();
+  /** #83 negative cache: ids whose walk found an EXPLICIT 404 from every
+   *  keyed profile — the gateway answered definitively "no such session", so
+   *  the same id is never fetched again (insertion-ordered Set, size-capped
+   *  with the oldest entry dropped, the SESSION_ID_INDEX_MAX posture). Only
+   *  an ambiguous walk (transport failure, 401, malformed body) leaves an id
+   *  out of this cache so it can retry under the throttle. */
+  private readonly singleNotFound = new Set<string>();
+  /** #83 per-round cap: the distinct ids scheduled for a single-session
+   *  lookup since the last REACHABLE poll round (reset every round, so a
+   *  flood of unknown ids can never exceed SINGLE_LOOKUPS_PER_ROUND
+   *  lookups per cadence). */
+  private roundMissIds = new Set<string>();
 
   /** Schedule one bounded single-session lookup for a ledger miss (fire and
-   *  forget; never throws outward). Throttle: ≤ SINGLE_MAX_ATTEMPTS per id,
-   *  ≥ SINGLE_RETRY_MS apart, one in flight per id. */
+   *  forget; never throws outward). Guards, in order: negative cache (a
+   *  cached 404 is never re-fetched), in-flight dedup, per-round cap, then
+   *  the per-id throttle (≤ SINGLE_MAX_ATTEMPTS walks, ≥ SINGLE_RETRY_MS
+   *  apart). */
   private missEnrich(id: string): void {
+    if (this.singleNotFound.has(id)) return; // cached miss ⇒ zero HTTP, ever
     if (this.singleInFlight.has(id)) return;
+    if (this.roundMissIds.size >= SINGLE_LOOKUPS_PER_ROUND && !this.roundMissIds.has(id)) return;
     const nowMs = this.now();
     const rec = this.singleAttempts.get(id);
     if (rec && (rec.attempts >= SINGLE_MAX_ATTEMPTS || nowMs - rec.lastAt < SINGLE_RETRY_MS)) return;
+    this.roundMissIds.add(id);
     this.singleAttempts.set(id, { attempts: (rec?.attempts ?? 0) + 1, lastAt: nowMs });
     if (this.singleAttempts.size > SINGLE_TRACKED_MAX) {
       const oldest = this.singleAttempts.keys().next();
@@ -662,12 +690,20 @@ export class HermesGatewayConnector {
    *  are probed in config order, first exact hit wins). Every failure is
    *  fail-quiet: a transport error ends the probe, a 401/404/non-200/malformed
    *  answer moves to the next profile; the attempt already stands against
-   *  the throttle either way. */
+   *  the throttle either way.
+   *  #83 result cache: if EVERY keyed profile answered an explicit 404 the id
+   *  is cached NOT FOUND (never re-fetched — the gateway gave a definitive
+   *  answer). An ambiguous walk (transport failure, a 401/403, a malformed
+   *  body, a foreign id in the answer) does NOT cache: the id stays eligible
+   *  for its remaining bounded attempt. */
   private async lookupSingle(id: string): Promise<void> {
+    let everyKeyedProfileSaidNotFound = true;
+    let keyedProfileCount = 0;
     try {
       for (const profile of this.cfg.profiles) {
         const key = profile === 'default' ? this.cfg.key : this.cfg.profileKeys.get(profile);
         if (!key) continue; // unkeyed profile: not addressable, no request
+        keyedProfileCount++;
         let res: Response;
         try {
           res = await this.fetchImpl(`${this.cfg.base_url}${sessionPath(profile, id)}`, {
@@ -675,9 +711,11 @@ export class HermesGatewayConnector {
             signal: AbortSignal.timeout(this.cfg.timeout_ms),
           });
         } catch {
-          return; // transport failure: fail-quiet, the attempt is spent
+          return; // transport failure: fail-quiet, ambiguous — never cached
         }
-        if (res.status !== 200) continue; // 404/401/etc: try the next keyed profile
+        if (res.status === 404) continue; // definitive miss for THIS profile
+        everyKeyedProfileSaidNotFound = false;
+        if (res.status !== 200) continue; // 401/403/5xx: try the next keyed profile
         let body: unknown;
         try {
           body = await res.json();
@@ -698,6 +736,14 @@ export class HermesGatewayConnector {
         this.lastSeenRound.set(id, this.ageRound);
         this.log(`hermes single-session lookup enriched ${id} (profile ${profile})`);
         return;
+      }
+      if (keyedProfileCount > 0 && everyKeyedProfileSaidNotFound) {
+        this.singleNotFound.add(id);
+        if (this.singleNotFound.size > SINGLE_TRACKED_MAX) {
+          const oldest = this.singleNotFound.keys().next();
+          if (!oldest.done) this.singleNotFound.delete(oldest.value);
+        }
+        this.log(`hermes single-session lookup: ${id} not found (cached, no re-fetch)`);
       }
     } finally {
       this.singleInFlight.delete(id);

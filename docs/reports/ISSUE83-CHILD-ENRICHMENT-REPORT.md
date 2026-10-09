@@ -18,24 +18,37 @@
 Option A, contained ENTIRELY inside the connector — no daemon (`index.ts`), gate, arbiter, or wire change:
 
 - `metaFor(sessionId)` normalizes the id (`normalizeSessionId` — the same trim/cap rule `rowToMeta` applies to row ids) and on a ledger MISS (enabled + reachable only) calls `missEnrich(id)` — fire-and-forget — while still returning `undefined` THIS heartbeat (the miss publish stays byte-for-byte pre-#83; a later heartbeat carries the merged row).
-- `missEnrich` throttle + cache: at most `SINGLE_MAX_ATTEMPTS = 2` per id, at least `SINGLE_RETRY_MS = 300_000` apart, one in flight per id (`singleInFlight` dedup — the 10s heartbeat cadence cannot flood); the attempts bookkeeping is size-capped at `SINGLE_TRACKED_MAX = 1000` (oldest record dropped, the `SESSION_ID_INDEX_MAX` posture).
+- `missEnrich` throttle + cache: at most `SINGLE_MAX_ATTEMPTS = 2` walks per id, at least `SINGLE_RETRY_MS = 300_000` apart, one in flight per id (`singleInFlight` dedup — the 10s heartbeat cadence cannot flood); the attempts bookkeeping is size-capped at `SINGLE_TRACKED_MAX = 1000` (oldest record dropped, the `SESSION_ID_INDEX_MAX` posture).
+- **Negative 404 cache (this slice):** `lookupSingle` tracks the walk's verdict. If EVERY keyed profile answered an explicit 404 the gateway gave a definitive "no such session" answer: the id is cached in `singleNotFound` and is **never fetched again** (size-capped 1000, oldest dropped). An ambiguous walk — transport failure, 401/403, 5xx, malformed body, a foreign id in the answer — is NOT cached, so the id keeps its remaining bounded attempt under the throttle.
+- **Per-round cap (this slice):** `SINGLE_LOOKUPS_PER_ROUND = 8` distinct ids may be scheduled per REACHABLE poll round (`roundMissIds`, reset every reachable round). A flood of unknown ids therefore never exceeds 8 ids × keyed profiles requests per cadence; deferred ids are admitted by the next round.
 - `lookupSingle(id)`: probes `GET {prefix}/api/sessions/{id}` (`sessionPath(profile, id)` — new export, same profile-mirror rule, id URL-escaped) per KEYED profile in config order (the gate header carries the id only — owning profile unknown), first exact hit wins; 401/404/non-200/malformed moves to the next profile, a transport error ends the probe; every path is fail-quiet. A hit merges through the existing `mergeHermesMeta` (last-known-wins) into `ledger` and stamps `lastSeenRound` with the current reachable round so the #82 eviction rules age the row normally (an ended child evicts after the grace; the hard cap can still LRU it — a re-miss after eviction can spend the remaining attempt, bounded).
 - Fail-open unchanged: connector disabled, gateway down, or no key for any profile ⇒ NOTHING is scheduled — a down gateway still sees zero extra requests and the heartbeat is byte-for-byte the pre-#73 shape.
 
 ## Harness + build output
 
-`client/test/hermes-gateway.test.ts` — fake gateway gained a single-session route stub (per-profile canned rows, 404 `session_not_found` for every other id, same `expectKeys` auth discipline). Five new tests:
+`client/test/hermes-gateway.test.ts` — fake gateway gained a single-session route stub (per-profile canned rows, 404 `session_not_found` for every other id, same `expectKeys` auth discipline) plus a `singleRouteStatus` knob to model a non-404 ambiguous route. Seven connector-level #83 tests now:
 
 1. child enriches via the probe walk: default 404s, web-dev answers (per-profile key asserted); first heartbeat still publishes absent; a HIT stops the walk and never re-probes; published meta shape unchanged (`is_internal_child` never published);
-2. 404 posture + throttle: a 10-miss burst ⇒ exactly 2 requests (one per keyed profile); same-clock heartbeats add nothing; after the retry window ONE more pair, then the attempt cap holds — 4 requests EVER;
-3. unreachable ⇒ zero lookups scheduled; reachable + fully unkeyed ⇒ zero requests;
-4. a single-route 401 on one profile keeps probing the next (web-dev hit after default 401);
-5. daemon-level (real ClientDaemon + gate + fake arbiter): a listed-out child id on the traffic ⇒ the miss probes the exact-id route, a LATER heartbeat carries `hermes_meta` — and `include_children` never appears in any listing query.
+2. **404 negative cache:** a 10-miss burst ⇒ exactly 2 requests (one per keyed profile); 50 heartbeats past the retry window (fake clock) add ZERO — the cached definitive miss is never re-fetched, and a fresh poll round does not re-open it;
+3. **throttle + attempt cap on ambiguous walks:** a 500 on every exact-id read (no definitive answer, so no negative cache) ⇒ one walk, ONE retry after `SINGLE_RETRY_MS`, then the cap holds — 4 requests EVER;
+4. **per-round cap:** 14 unknown ids in one burst ⇒ exactly `SINGLE_LOOKUPS_PER_ROUND = 8` distinct ids walked (8 × 2 keyed profiles = 16 requests), the deferred ids admitted only after the next reachable round;
+5. unreachable ⇒ zero lookups scheduled; reachable + fully unkeyed ⇒ zero requests;
+6. a single-route 401 on one profile keeps probing the next (web-dev hit after default 401);
+7. daemon-level (real ClientDaemon + gate + fake arbiter): a listed-out child id on the traffic ⇒ the miss probes the exact-id route, a LATER heartbeat carries `hermes_meta` — and `include_children` never appears in any listing query.
 
 Also pinned `sessionPath` in the path test. (Harness catch: the fake-clock throttle test must start its clock past the poll-cadence gate, else `poll()` skips and nothing is scheduled.)
 
-`tsx --test test/hermes-gateway.test.ts`: 24/24. `npm test --workspace client`: 187/187. Whole-repo `npm run test`: exit 0, zero failures across all 7 workspaces. `npm run build`: exit 0. `npx tsc --noEmit -p client/tsconfig.json`: clean.
+`tsx --test test/hermes-gateway.test.ts`: **26/26**. `npm test --workspace client`: **197/197**. Whole-repo `npm run test`: **exit 0, 673/673 pass** (server 414, client 197, career-ops 17, noop 2, shell-ui 3, dashboard 4, fleet 36 — zero failures). `npm run build`: exit 0. `npx tsc --noEmit -p client/tsconfig.json`: clean.
+
+## Live route evidence (read-only curl, gateway `http://127.0.0.1:8642`, v0.21.6)
+
+The single-session route EXISTS and resolves delegate children by exact id. Auth used the operator's own `API_SERVER_KEY` from `~/.hermes/.env` (the connector's own `~/.idlefill/hermes-gateway-keys.json` is still unprovisioned on this machine — see the limit note below):
+
+- `GET /api/sessions?limit=200` → 200, 200 rows; the delegate child `20261008_155926_ea090f` (`_delegate_from: 20261008_154307_477561`) is **absent** from the default listing — the exact posture the probe exists for.
+- `GET /api/sessions/20261008_155926_ea090f` → **200** `{object:'hermes.session', session:{id, model 'Qwen3.8-27B', message_count 76, tool_call_count 59, input_tokens 404262, output_tokens 34421, reasoning_tokens 25484, estimated_cost_usd 0.0, ended_at 1791490494.78, end_reason 'agent_close', is_internal_child: true}}`.
+- `GET /api/sessions/does-not-exist-xyz` → **404** `{error:{code:'session_not_found'}}` — the definitive-miss posture the negative cache keys on.
+- `GET /api/sessions?limit=200&include_children=true` → the child appears, confirming why the connector must never widen the listing.
 
 ## Live verification limit (recorded honestly)
 
-No operator gateway key is provisioned on this machine (`~/.idlefill/hermes-gateway-keys.json` absent, no `IDLEFILL_HERMES*` in the client LaunchAgent), and the connector is not currently switched on in the daemon env — so no authenticated live single-route probe was made. Auth + payload shape were verified against the RUNNING Hermes 0.21.6 source (routes, decorators, response builders above) and the child-row counts against read-only live SQLite. When the operator provisions keys (`key_file` / `key_env` + `IDLEFILL_HERMES_GATEWAY=1`), the daemon-level test's posture reproduces against the live gateway unchanged.
+No operator key is provisioned for the CONNECTOR (`~/.idlefill/hermes-gateway-keys.json` absent, no `IDLEFILL_HERMES*` in the client LaunchAgent), and the connector is not currently switched on in the daemon env — so the probe has not run through the live daemon. The live route itself WAS verified authenticated (curl above, using the operator's own `API_SERVER_KEY` from `~/.hermes/.env`): 200 for a delegate child's exact id, 404 for an unknown id. When the operator provisions keys (`key_file` / `key_env` + `IDLEFILL_HERMES_GATEWAY=1`), the daemon-level test's posture reproduces against the live gateway unchanged.
