@@ -42,7 +42,8 @@
  */
 
 import { constants, chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { homedir } from 'node:os';
+import { dirname, join } from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 
@@ -62,6 +63,17 @@ export interface ClientHermesOpts {
   configPath: string | null;
   /** Boot-time view of the connector config (base_url / profiles / key_file / enabled / env switch). */
   status: () => ClientHermesStatus;
+  /** Home the key file's leading `~` expands against (test seam; default homedir()). */
+  home?: string;
+}
+
+/** Expand a leading `~` against the OS home — the SAME rule
+ *  `resolveHermesGatewayConfig` applies to the connector's key_file. The
+ *  boot status carries the RAW config value (`~/.idlefill/...`); without
+ *  this expansion a write lands in a literal `~` directory under the
+ *  daemon's cwd (the shipped-bug this guards). */
+function expandHome(p: string, home: string): string {
+  return p === '~' || p.startsWith('~/') ? join(home, p.slice(2)) : p;
 }
 
 const HERMES_PATH = '/client/hermes-gateway';
@@ -285,15 +297,18 @@ export function handleClientHermes(req: IncomingMessage, res: ServerResponse, ur
     return true;
   }
 
+  const home = opts.home ?? homedir();
+
   if (req.method === 'GET') {
     const st = opts.status();
     res.writeHead(200, { 'content-type': 'application/json', ...cors });
     res.end(
       JSON.stringify({
         ...st,
+        key_file: expandHome(st.key_file, home), // the ABSOLUTE truth (a `~` here would be a lie)
         // NEVER key values — the names that carry one (re-read live, so a
         // stored-but-not-yet-applied state is visible to the page).
-        stored_profiles: storedKeyProfiles(st.key_file),
+        stored_profiles: storedKeyProfiles(expandHome(st.key_file, home)),
       }),
     );
     return true;
@@ -348,7 +363,7 @@ export function handleClientHermes(req: IncomingMessage, res: ServerResponse, ur
         }
       }
       if (v.keys.size > 0) {
-        const err = writeKeyFile(st.key_file, v.keys);
+        const err = writeKeyFile(expandHome(st.key_file, home), v.keys);
         if (err) {
           res.writeHead(500, { 'content-type': 'application/json', ...cors });
           res.end(JSON.stringify({ error: err }));
@@ -356,7 +371,7 @@ export function handleClientHermes(req: IncomingMessage, res: ServerResponse, ur
         }
       }
       res.writeHead(200, { 'content-type': 'application/json', ...cors });
-      res.end(JSON.stringify({ restart_required: true, stored_profiles: storedKeyProfiles(st.key_file) }));
+      res.end(JSON.stringify({ restart_required: true, stored_profiles: storedKeyProfiles(expandHome(st.key_file, home)) }));
     });
     req.on('error', () => {
       /* aborted upload — nothing to answer */

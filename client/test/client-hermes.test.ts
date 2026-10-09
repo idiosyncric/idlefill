@@ -67,12 +67,17 @@ function bootStatus(keyFile: string, over: Partial<ClientHermesStatus> = {}): Cl
   };
 }
 
-async function startSurface(opts: { configPath: string | null; keyFile: string; status?: Partial<ClientHermesStatus> }) {
+async function startSurface(opts: { configPath: string | null; keyFile: string; status?: Partial<ClientHermesStatus>; home?: string }) {
   const proxy = startLlmProxy({
     port: 0,
     target: 'http://127.0.0.1:1',
     clientProjects: { token: TOKEN, configPath: opts.configPath },
-    clientHermes: { token: TOKEN, configPath: opts.configPath, status: () => bootStatus(opts.keyFile, opts.status) },
+    clientHermes: {
+      token: TOKEN,
+      configPath: opts.configPath,
+      status: () => bootStatus(opts.keyFile, opts.status),
+      ...(opts.home ? { home: opts.home } : {}),
+    },
   });
   cleanup.push(() => proxy.stop());
   await waitProxyReady(proxy.server);
@@ -191,6 +196,28 @@ test('#84 PUT validation is fail-closed whole-body (400, nothing written)', asyn
   assert.equal(validateHermesBody({ keys: { ['x'.repeat(65)]: 'k' } }).ok, false, 'profile name length capped');
   const ok = validateHermesBody({ enabled: false, keys: { p: null } });
   assert.ok(ok.ok && ok.enabled === false && ok.keys.get('p') === null);
+});
+
+test('#84 a `~` key_file expands against home — never a literal ~ dir under the cwd', async () => {
+  // The shipped-bug guard: boot config carries the RAW '~/.idlefill/...'
+  // value; an unexpanded write lands in a literal `~` under the daemon's
+  // cwd and the connector (which expands) never sees the key.
+  const { dir, configPath } = scratchDirs();
+  const home = join(dir, 'fake-home');
+  mkdirSync(home);
+  const real = join(home, '.gw-keys.json');
+  const proxy = await startSurface({ configPath, keyFile: '~/.gw-keys.json', home });
+  const res = await fetch(`${proxy.base_url}/client/hermes-gateway`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json', ...edit() },
+    body: JSON.stringify({ keys: { default: 'kd' } }),
+  });
+  assert.equal(res.status, 200);
+  assert.equal(readFileSync(real, 'utf-8').includes('kd'), true, 'written under the HOME, not the cwd');
+  const get = await fetch(`${proxy.base_url}/client/hermes-gateway`, { headers: edit() });
+  const body = (await get.json()) as ClientHermesStatus & { stored_profiles: string[] };
+  assert.equal(body.key_file, real, 'GET reports the ABSOLUTE key file, not the raw tilde');
+  assert.deepEqual(body.stored_profiles, ['default']);
 });
 
 test('#84 a malformed existing key file is REFUSED (500), never overwritten', async () => {
