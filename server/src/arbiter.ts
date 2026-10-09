@@ -2539,6 +2539,32 @@ export class Arbiter {
   }
 
   /**
+   * This instance's fleet membership label (#55 D5, locked): which tenant
+   * this machine belongs to — the SaaS seam, machine identity ONLY.
+   * Precedence: a non-blank config `fleet_id` wins (the operator's standing
+   * declaration), then the persisted state row (survives a config edit that
+   * drops the key), then the `home` default. Persisted on the instance row
+   * next to `instance_id` (the state file is the identity store). A display
+   * label only — no accounts, sessions, or roles behind it (D5: record the
+   * seam, build nothing human-facing).
+   */
+  fleetId(): string {
+    const s = this.store.state;
+    if (typeof this.cfg.fleet_id === 'string' && this.cfg.fleet_id.trim() !== '') {
+      const v = this.cfg.fleet_id.trim().slice(0, 64);
+      if (s.fleet_id !== v) {
+        s.fleet_id = v;
+        this.store.save();
+      }
+      return v;
+    }
+    if (typeof s.fleet_id === 'string' && s.fleet_id.trim() !== '') return s.fleet_id;
+    s.fleet_id = 'home';
+    this.store.save();
+    return s.fleet_id;
+  }
+
+  /**
    * This instance's ed25519 identity (#55 D1, locked): minted at first
    * use, persisted in a sibling `identity.json` (0600, the atomic
    * tmp+rename posture of the state file). The private key NEVER enters

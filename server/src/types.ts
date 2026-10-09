@@ -63,6 +63,14 @@ export interface ServerConfig {
   peer_token?: string;
   /** This instance's mesh display name (default: the OS hostname). */
   mesh_name?: string;
+  /**
+   * Fleet membership label (#55 D5, locked: docs/architecture/fleet-service.md).
+   * Which tenant this instance belongs to — the SaaS seam, machine identity
+   * ONLY. Default `home` when unset. ADD key: absent in config = unset (the
+   * arbiter falls back to its persisted row, then the `home` default). Carries
+   * no secret — a display label, never a credential.
+   */
+  fleet_id?: string;
   /** Glob of NInfer req-*.jsonl logs. Empty string disables the log-mtime signal. */
   log_glob: string;
   idle_seconds: number;
@@ -987,6 +995,16 @@ export interface ArbiterState {
    * ONLY mesh data in the state file — peer snapshots stay ephemeral.
    */
   instance_id?: string;
+  /**
+   * Fleet membership label (#55 D5, locked): which tenant this instance
+   * belongs to. Persisted on the instance row next to `instance_id`.
+   * ADD-key sibling of `instance_id`: state files from before the seam carry
+   * none (the state loader tolerates the missing key) and the arbiter falls
+   * back to config, then the `home` default. A display label only — never a
+   * secret, no accounts/sessions/roles behind it (D5: the seam, not the
+   * feature).
+   */
+  fleet_id?: string;
   /** Persisted operator state for each configured project. */
   projects: ProjectStateRow[];
   clients: ClientRecord[];

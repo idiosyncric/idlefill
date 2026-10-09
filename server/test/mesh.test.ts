@@ -490,3 +490,101 @@ test('totalQueueDepth sums client-reported depths (the coarse mesh depth)', () =
   arbiter.registerClient('c2', undefined, '10.0.0.2', [{ name: 'career-ops', model: 'm', estimated_seconds: 900, queue_depth: 1 }]);
   assert.equal(arbiter.totalQueueDepth(), 13);
 });
+
+// ---------------------------------------------------------------------------
+// fleet_id seam (#55 D5, slice 2) — the multi-tenant seam, machine identity
+// only: one ADD key on the instance row, default `home`, config-overridable,
+// published on the mesh snapshot. No accounts, sessions, or roles.
+// ---------------------------------------------------------------------------
+
+test('fleet_id: a config with the key set produces the value on the row and the snapshot', async () => {
+  const dir = await mkTmp();
+  const store = new StateStore(join(dir, 'state.json'));
+  const cfg = baseCfg(dir, { fleet_id: 'urza-lab' });
+  const det = new IdleDetector({
+    fetchActivity: async () => [],
+    logMtime: () => null,
+    llama_swap_url: cfg.llama_swap_url,
+    activity_path: cfg.activity_path,
+    log_glob: '',
+    idle_seconds: cfg.idle_seconds,
+  });
+  const arb = new Arbiter(store, cfg, det);
+  assert.equal(arb.fleetId(), 'urza-lab', 'config value wins');
+  // Persisted on the instance row, next to instance_id (the identity store).
+  arb.instanceId();
+  store.save();
+  const raw = JSON.parse(readFileSync(cfg.state_file, 'utf-8'));
+  assert.equal(raw.fleet_id, 'urza-lab', 'fleet_id is in state.json');
+  assert.ok(raw.instance_id, 'the instance row itself is still persisted');
+  // And it rides the mesh snapshot as an ADD key.
+  const snap = buildMeshSnapshot(arb.instanceId(), 'a', [], 0, 0, 0, T0, undefined, undefined, arb.fleetId());
+  assert.equal(snap.fleet_id, 'urza-lab');
+});
+
+test('fleet_id: no config key (and no persisted row) produces the `home` default', async () => {
+  const dir = await mkTmp();
+  const store = new StateStore(join(dir, 'state.json'));
+  const cfg = baseCfg(dir); // fleet_id absent — baseCfg carries no such key
+  assert.equal(cfg.fleet_id, undefined, 'precondition: the config key is absent');
+  const det = new IdleDetector({
+    fetchActivity: async () => [],
+    logMtime: () => null,
+    llama_swap_url: cfg.llama_swap_url,
+    activity_path: cfg.activity_path,
+    log_glob: '',
+    idle_seconds: cfg.idle_seconds,
+  });
+  const arb = new Arbiter(store, cfg, det);
+  assert.equal(arb.fleetId(), 'home', 'the D5 default');
+  const raw = JSON.parse(readFileSync(cfg.state_file, 'utf-8'));
+  assert.equal(raw.fleet_id, 'home', 'the default is persisted too');
+  // A reload reads the persisted row: same answer, no config involved.
+  const again = new StateStore(cfg.state_file);
+  const arb2 = new Arbiter(again, baseCfg(dir), det);
+  assert.equal(arb2.fleetId(), 'home');
+});
+
+test('fleet_id: an old-shaped snapshot without the field parses fine (absent = unset, never a crash)', () => {
+  const legacy: Record<string, unknown> = {
+    instance_id: 'm-legacy1',
+    name: 'old peer',
+    ts: T0,
+    servers: [],
+    queue_depth: 3,
+    sessions: 0,
+    active_leases: 0,
+  }; // pre-slice-2 shape: no fleet_id key at all
+  const out = sanitizeSnapshot(legacy);
+  assert.ok(out, 'the legacy snapshot is still a usable snapshot');
+  assert.equal(out.instance_id, 'm-legacy1');
+  assert.equal(out.queue_depth, 3);
+  assert.equal(out.fleet_id, undefined, 'absent stays unset — not `home`, not a crash');
+  // And the reader's view of it is well-formed.
+  const cfg = baseCfg('/tmp', { mesh_peers: [{ url: 'http://legacy-peer' }] });
+  const fed = new MeshFederation(cfg, async () => legacy);
+  void fed.refresh(T0);
+});
+
+test('fleet_id: two instances with different fleet_id values are distinguishable in the snapshot reader', async () => {
+  const snapA = { ...snap(), instance_id: 'm-fleet-a', fleet_id: 'alpha-fleet' };
+  const snapB = { ...snap(), instance_id: 'm-fleet-b', fleet_id: 'beta-fleet' };
+  const fed = new MeshFederation(
+    baseCfg(await mkTmp(), { mesh_peers: [{ url: 'http://a' }, { url: 'http://b' }] }),
+    async (url) => (url === 'http://a/api/mesh' ? snapA : snapB),
+  );
+  await fed.refresh(T0);
+  const view = fed.view(T0);
+  const a = view.find((v) => v.url === 'http://a')!;
+  const b = view.find((v) => v.url === 'http://b')!;
+  assert.equal(a.snapshot?.fleet_id, 'alpha-fleet');
+  assert.equal(b.snapshot?.fleet_id, 'beta-fleet');
+  assert.notEqual(a.snapshot?.fleet_id, b.snapshot?.fleet_id, 'the two tenants are told apart by the reader');
+  // One of the two is a pre-seam peer: its label is simply unset, and the
+  // other instance's label is untouched by it.
+  const legacy = { ...snap(), instance_id: 'm-fleet-c' };
+  const c = new MeshFederation(baseCfg(await mkTmp(), { mesh_peers: [{ url: 'http://c' }] }), async () => legacy);
+  await c.refresh(T0);
+  assert.equal(c.view(T0)[0]!.snapshot?.fleet_id, undefined);
+  assert.equal(c.view(T0)[0]!.snapshot?.instance_id, 'm-fleet-c');
+});

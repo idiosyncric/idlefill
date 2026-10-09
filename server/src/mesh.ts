@@ -45,6 +45,13 @@ export interface MeshSnapshot {
   version?: string;
   /** The publisher's ed25519 public key (#55 D1) — ADD key; absent = unset. */
   public_key?: string;
+  /**
+   * Fleet membership label (#55 D5, locked) — which tenant this instance
+   * belongs to. ADD key: absent on a snapshot from a pre-#55-slice-2 peer =
+   * unset (the reader treats it as no label; never a crash). A display label
+   * only — never a secret.
+   */
+  fleet_id?: string;
   /** One row per LOCAL engine this arbiter owns — coarse signal only. */
   servers: {
     name: string;
@@ -167,6 +174,8 @@ export function buildMeshSnapshot(
   version?: string,
   /** The publisher's ed25519 public key (#55 D1) — ADD key, absent = unset. */
   publicKey?: string,
+  /** Fleet membership label (#55 D5) — ADD key, absent = unset. */
+  fleetId?: string,
 ): MeshSnapshot {
   const snap: MeshSnapshot = {
     instance_id: instanceId,
@@ -187,6 +196,10 @@ export function buildMeshSnapshot(
   // publisher mints an identity, ABSENT (unset) otherwise; existing readers
   // that predate the field simply ignore it.
   if (typeof publicKey === 'string' && publicKey.trim() !== '') snap.public_key = publicKey.slice(0, 64);
+  // #55 D5: the fleet membership label. ADD key — present when the publisher
+  // has one, ABSENT (unset) otherwise; old readers ignore it, a snapshot
+  // without the field parses fine on this side.
+  if (typeof fleetId === 'string' && fleetId.trim() !== '') snap.fleet_id = fleetId.trim().slice(0, MAX_NAME);
   return snap;
 }
 
@@ -231,6 +244,10 @@ export function sanitizeSnapshot(raw: unknown): MeshSnapshot | null {
   // #55 D1: the publisher's public key — ADD key, untrusted input, length-
   // capped like the rest. Absent on pre-#55 peers; the field stays unset.
   if (typeof r.public_key === 'string' && r.public_key.trim() !== '') out.public_key = r.public_key.slice(0, 64);
+  // #55 D5: the fleet membership label — ADD key, untrusted input, length-
+  // capped like the rest. Absent on pre-slice-2 peers; the field stays
+  // unset, never a crash.
+  if (typeof r.fleet_id === 'string' && r.fleet_id.trim() !== '') out.fleet_id = r.fleet_id.trim().slice(0, MAX_NAME);
   return out;
 }
 

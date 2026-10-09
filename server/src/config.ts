@@ -101,6 +101,10 @@ export function applyDefaults(raw: Partial<ServerConfig> | null | undefined): Se
       : [],
     peer_token: typeof r.peer_token === 'string' ? r.peer_token : '',
     mesh_name: typeof r.mesh_name === 'string' && r.mesh_name.trim() !== '' ? r.mesh_name.trim() : '',
+    // Fleet membership label (#55 D5, locked): the multi-tenant seam. A
+    // display label only — never a credential. Absent/blank = unset; the
+    // arbiter's fleetId() falls back to its persisted row, then `home`.
+    fleet_id: typeof r.fleet_id === 'string' && r.fleet_id.trim() !== '' ? r.fleet_id.trim() : '',
     log_glob: str(r.log_glob, DEFAULTS.log_glob),
     idle_seconds: num(r.idle_seconds, DEFAULTS.idle_seconds),
     poll_ms: num(r.poll_ms, DEFAULTS.poll_ms),
