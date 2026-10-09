@@ -395,6 +395,42 @@ export interface ClientRecord {
    * arbiter stops leaking lines). Absent on old clients.
    */
   client_log?: string[];
+  /**
+   * The client daemon's LOCAL Hermes profile roster (#80), published on
+   * the register heartbeat: which Hermes profiles exist on THIS machine
+   * and which of them already route through idlefill (adopted). The
+   * dashboard's Agents pane joins these rows to the minted agent keys by
+   * EXACT profile-name = key-label match (never fuzzy). ADD-key: stored on
+   * a valid report (a sanitized array of ≤24 rows; a malformed member
+   * drops only that row), an all-malformed / non-array report is treated as
+   * absent (drops the whole key), and absent NEVER clears the stored value
+   * — a daemon without a Hermes home (the Linux daemons) omits the key and
+   * the roster pane hides, it does not show an empty list. The arbiter
+   * stores + echoes it verbatim (client-truth discipline: it has no view of
+   * any client's ~/.hermes). Display/audit only; never a gate.
+   */
+  agent_roster?: AgentRosterRow[];
+}
+
+/**
+ * One row of a client's local Hermes profile roster (#80). The daemon
+ * classifies each `~/.hermes/profiles/<name>` directory from its
+ * config.yaml (`model.provider` + endpoint URLs only — it never follows a
+ * `key_env` reference, never reads a profile `.env`). `posture`:
+ * `adopted` = an endpoint names this machine's own aggregate port (routes
+ * through idlefill); `external` = a model block present but routing
+ * elsewhere; `unset` = no config.yaml / no model block. `provider` +
+ * `base_url` are display-only (absent when not known).
+ */
+export interface AgentRosterRow {
+  /** The profile directory name (one name per row, used consistently). */
+  profile: string;
+  /** `adopted` | `external` | `unset`. */
+  posture: 'adopted' | 'external' | 'unset';
+  /** model.provider — display only; absent when the model block lacks it. */
+  provider?: string;
+  /** The endpoint URL justifying the posture (absent for unset / userinfo). */
+  base_url?: string;
 }
 
 /**

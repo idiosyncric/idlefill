@@ -312,7 +312,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   // ------------------------------------------------------------------
 
   app.post('/api/clients/register', async (req, reply) => {
-    const body = (req.body ?? {}) as { name?: string; ip?: string; projects?: ProjectAllocation[]; version?: unknown; protocol?: unknown; revision?: unknown; gate_posture?: unknown; proxy_port?: unknown; aggregate_port?: unknown; daemon_behind?: unknown; client_log?: unknown };
+    const body = (req.body ?? {}) as { name?: string; ip?: string; projects?: ProjectAllocation[]; version?: unknown; protocol?: unknown; revision?: unknown; gate_posture?: unknown; proxy_port?: unknown; aggregate_port?: unknown; daemon_behind?: unknown; client_log?: unknown; agent_roster?: unknown };
     const name = typeof body.name === 'string' ? body.name.trim() : '';
     if (!name) return reply.code(400).send({ error: 'name required' });
     const remote = (req.ip ?? '').split(':').pop() ?? 'unknown';
@@ -453,14 +453,20 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     // loopback arbiter. A plain array pass-through here — bounded (≤120
     // lines, per-line cap, non-strings dropped) in registerClient.
     const client_log = Array.isArray(body.client_log) ? (body.client_log as string[]) : undefined;
+    // Agent roster (#80): the client's LOCAL Hermes profiles + posture. A
+    // plain pass-through here — sanitized (bounded array, malformed members
+    // dropped individually, non-array/all-dropped → absent) in registerClient
+    // via cleanAgentRoster. Absent on old clients and on daemons without a
+    // Hermes home: absent NEVER clears the stored roster.
+    const agent_roster = Array.isArray(body.agent_roster) ? (body.agent_roster as unknown) : undefined;
     const res = arbiter.registerClient(
       name,
       typeof body.ip === 'string' && body.ip.trim() ? body.ip.trim() : undefined,
       remote,
       projects,
       undefined,
-      version !== undefined || protocol !== undefined || revision !== undefined || gate_posture !== undefined || proxy_port !== undefined || aggregate_port !== undefined || daemon_behind !== undefined || client_log !== undefined
-        ? { version, protocol, revision, gate_posture, proxy_port, aggregate_port, daemon_behind, client_log }
+      version !== undefined || protocol !== undefined || revision !== undefined || gate_posture !== undefined || proxy_port !== undefined || aggregate_port !== undefined || daemon_behind !== undefined || client_log !== undefined || agent_roster !== undefined
+        ? { version, protocol, revision, gate_posture, proxy_port, aggregate_port, daemon_behind, client_log, agent_roster }
         : undefined,
     );
     return reply.code(200).send({ client_id: res.client_id, created: res.created });
@@ -812,6 +818,23 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   /** GET /api/client-keys: the public rows (id/label/created_at). No hash, no plaintext. */
   app.get('/api/client-keys', async () => {
     return { keys: arbiter.clientKeys() };
+  });
+
+  /**
+   * GET /api/agent-roster (#80): the LOCAL machine's Hermes profile roster —
+   * which profiles exist on this box and which already route through
+   * idlefill (adopted). LOCAL-truth: the dashboard is served by this
+   * machine's own arbiter, so the route returns only the ONLINE loopback
+   * client's roster (the daemon reporting from its own box); a remote
+   * client's roster would name a different machine's profiles and is not
+   * honest here (cross-machine is the #55 fleet plane). When no loopback
+   * client is online or it reported no roster, the body carries no `roster`
+   * key — the dashboard then hides the roster card (it does not show an
+   * empty list). Token-gated like the other authoring reads.
+   */
+  app.get('/api/agent-roster', async () => {
+    const local = arbiter.localAgentRoster();
+    return local ? { client: local.client, roster: local.roster } : {};
   });
 
   /**

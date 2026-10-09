@@ -67,8 +67,52 @@ import type {
   ThemeColors,
 } from './types.js';
 import type { StateStore } from './state.js';
-import type { ClientOverride, Lease, ProjectAllocation, ServerConfig, ServerConnection, ServerProvider, UtcDate } from './types.js';
+import type { ClientOverride, Lease, ProjectAllocation, ServerConfig, ServerConnection, ServerProvider, UtcDate, AgentRosterRow } from './types.js';
 import { PROVIDER_KINDS, THEME_DEFAULTS, THEME_HEX_RE, THEME_TOKEN_KEYS } from './types.js';
+
+/**
+ * Sanitize a reported agent roster (#80) for storage on the client row.
+ *
+ * Edge posture (the gate_posture / client_log pattern):
+ *   - a non-array (or a missing report) → undefined, so the caller treats it
+ *     as ABSENT (a malformed report never poisons the state file, and absent
+ *     never clears the stored value);
+ *   - each member is checked INDIVIDUALLY and a malformed member is dropped
+ *     while the rest are kept: `profile` a non-empty string ≤64 chars,
+ *     `posture` an exact enum value (adopted|external|unset), `provider` /
+ *     `base_url` optional strings (≤512, a URL can be long) — anything else
+ *     (non-object, bad posture, empty profile, over-long string) drops just
+ *     that row;
+ *   - bounded hard at 24 rows (a display list, not a dump — the profiles dir
+ *     is small; a hostile/buggy client can't bloat the state file).
+ *
+ * Returns undefined for a non-array or an all-dropped array (no empty list is
+ * stored, and the caller leaves the stored roster untouched in that case).
+ */
+export function cleanAgentRoster(raw: unknown): AgentRosterRow[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const POSTURES: ReadonlySet<string> = new Set(['adopted', 'external', 'unset']);
+  const out: AgentRosterRow[] = [];
+  for (const r of raw as unknown[]) {
+    if (out.length >= 24) break;
+    if (!r || typeof r !== 'object' || Array.isArray(r)) continue;
+    const o = r as Record<string, unknown>;
+    const profile = typeof o.profile === 'string' ? o.profile.trim() : '';
+    if (profile === '' || profile.length > 64) continue;
+    if (typeof o.posture !== 'string' || !POSTURES.has(o.posture)) continue;
+    const row: AgentRosterRow = { profile, posture: o.posture as AgentRosterRow['posture'] };
+    if (typeof o.provider === 'string') {
+      const p = o.provider.trim();
+      if (p !== '' && p.length <= 512) row.provider = p;
+    }
+    if (typeof o.base_url === 'string') {
+      const u = o.base_url.trim();
+      if (u !== '' && u.length <= 512) row.base_url = u;
+    }
+    out.push(row);
+  }
+  return out.length > 0 ? out : undefined;
+}
 
 /**
  * #66 D3: one published alias entry — the alias name with the WINNER pair
@@ -383,7 +427,7 @@ export class Arbiter {
     observedIp: string,
     projects?: ProjectAllocation[],
     now?: number,
-    info?: { version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open'; proxy_port?: number; aggregate_port?: number; daemon_behind?: boolean; client_log?: string[] },
+    info?: { version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open'; proxy_port?: number; aggregate_port?: number; daemon_behind?: boolean; client_log?: string[]; agent_roster?: unknown },
   ): { client_id: string; created: boolean } {
     const s = this.store.state;
     const seen = now ?? Date.now();
@@ -459,6 +503,20 @@ export class Arbiter {
         if (t !== '') clientLog.push(t.slice(0, 300));
       }
     }
+    // Agent roster (#80): the client's LOCAL Hermes profiles + posture.
+    // Sanitized the edge way (the gate_posture/client_log pattern):
+    //   - non-array → the key is absent (a malformed report never poisons
+    //     the state file);
+    //   - each member is checked individually: `profile` a non-empty
+    //     string ≤64 chars (trim), `posture` an exact enum value
+    //     (adopted|external|unset), `provider`/`base_url` optional strings
+    //     (≤512 — a URL with a long query; display-only). A member failing
+    //     its shape check is DROPPED individually, the rest are kept;
+    //   - a present array stores (an all-dropped array → undefined, treated
+    //     as absent — no empty list is stored, and absent NEVER clears the
+    //     stored value: a daemon without a Hermes home omits the key, so an
+    //     old client's roster survives a mixed-version re-registration).
+    const roster = cleanAgentRoster(info?.agent_roster);
     const existing = s.clients.find((c) => c.name === name);
     if (existing) {
       if (validIp(observedIp)) existing.ip = observedIp; // observed wins
@@ -507,6 +565,12 @@ export class Arbiter {
         if (clientLog && clientLog.length > 0) existing.client_log = clientLog;
         else delete existing.client_log;
       }
+      // Agent roster (#80): same ADD-key rule — a present, valid roster
+      // updates the row; absent (old client / no Hermes home) leaves it
+      // exactly as it was (never cleared). A cleaned empty roster is
+      // undefined, so a re-register carrying an all-malformed roster does
+      // NOT wipe the previously stored one.
+      if (roster !== undefined) existing.agent_roster = roster;
       this.store.save();
       return { client_id: existing.client_id, created: false };
     }
@@ -533,6 +597,9 @@ export class Arbiter {
       // log tail = no key).
       ...(daemonBehind === true ? { daemon_behind: true } : {}),
       ...(clientLog && clientLog.length > 0 ? { client_log: clientLog } : {}),
+      // Agent roster (#80): lands only when a valid (non-empty) roster was
+      // reported — same ADD-key store rule as the heartbeat path.
+      ...(roster !== undefined ? { agent_roster: roster } : {}),
     });
     this.store.appendEvent({ kind: 'client_registered', detail: `${name} (${client_id})` });
     // A fresh registration that already carries rebuild state (client
@@ -2361,6 +2428,32 @@ export class Arbiter {
     return this.store.state.client_keys.map(({ id, label, created_at }) => ({ id, label, created_at }));
   }
 
+  /**
+   * The LOCAL machine's agent roster (#80): the roster row of the ONLINE
+   * loopback client (the daemon that reported to THIS arbiter from its own
+   * machine — observed IP is loopback). The roster is local-truth (the
+   * dashboard is served by this machine's own arbiter), so only that
+   * client's roster is honest here; a remote client's roster would name
+   * a different box's profiles. Returns undefined when no loopback client
+   * is online or that client reported no roster (the read route then says
+   * so rather than showing an empty list).
+   */
+  localAgentRoster(now?: number): { client: string; roster: AgentRosterRow[] } | undefined {
+    const n = now ?? Date.now();
+    // Pick the online loopback client with the newest last_seen (the live local
+    // daemon); a tie falls to the later row (deterministic). In practice there
+    // is exactly one online loopback client per machine (its own daemon).
+    let best: (typeof this.store.state.clients)[number] | undefined;
+    for (const c of this.store.state.clients) {
+      if (c.last_seen === undefined || n - c.last_seen >= 90_000) continue;
+      if (!isLoopbackIp(c.observed_ip || c.ip)) continue;
+      if (!c.agent_roster || c.agent_roster.length === 0) continue;
+      if (!best || c.last_seen >= best.last_seen) best = c;
+    }
+    if (!best) return undefined;
+    return { client: best.name, roster: best.agent_roster! };
+  }
+
   /** The digests the machine's own router enforces (loopback route only). */
   clientKeyDigests(): string[] {
     return this.store.state.client_keys.map((k) => k.hash);
@@ -2485,6 +2578,21 @@ export function utcDay(ms: number): UtcDate {
  */
 export function validIp(v: string | undefined): v is string {
   return typeof v === 'string' && v.trim() !== '' && v.trim() !== 'unknown';
+}
+
+/**
+ * True when the observed client IP is loopback (localhost / 127.0.0.0/8 /
+ * ::1). The #80 agent roster is LOCAL-truth (the dashboard is served by this
+ * machine's own arbiter), so the read surface returns only the ONLINE
+ * loopback client's roster — the daemon reporting from its own box. A
+ * remote (tailnet) client's roster would name a DIFFERENT machine's profiles
+ * and is not honest here (cross-machine is the #55 fleet plane).
+ */
+export function isLoopbackIp(v: string | undefined): boolean {
+  if (typeof v !== 'string') return false;
+  const host = v.trim();
+  if (host === 'localhost' || host === '::1' || host === '[::1]') return true;
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
 }
 
 /**
