@@ -1553,3 +1553,138 @@ test('slice 8: the production sender enrolls ONCE (shared credential) and signs 
   assert.equal(stub.heartbeatCount, 2, 'the interval elapsed: the heartbeat happens again');
   await stub.close();
 });
+
+test('slice 9: the roster row for THIS instance never becomes a self-peer', async () => {
+  const m = new MeshFederation(
+    baseCfg(await mkTmp(), { fleet_url: 'http://fleet-1:8789' }),
+    async () => snap(),
+    { localPublicKey: () => 'PUB-LOCAL' },
+  );
+  await m.pullRoster(
+    async () => rosterEnvelope([
+      rosterRow({ instance_id: 'm-self', name: 'this box', public_key: 'PUB-LOCAL', urls: ['http://self-lan:8787'] }),
+      rosterRow({ instance_id: 'm-other', public_key: 'PUB-OTHER', urls: ['http://other-lan:8787'] }),
+    ]),
+    T0,
+  );
+  assert.deepEqual(m.view(T0).map((v) => v.url), ['http://other-lan:8787'], 'the local row is skipped, the real peer lands');
+});
+
+test('slice 9: a configured peer is never reconciled away by the roster', async () => {
+  const m = new MeshFederation(
+    baseCfg(await mkTmp(), { mesh_peers: [{ url: PEER_URL, name: 'lab box' }], fleet_url: 'http://fleet-1:8789' }),
+    async () => snap(),
+  );
+  await m.refresh(T0);
+  await m.pullRoster(
+    async () => rosterEnvelope([rosterRow({ instance_id: snap().instance_id, name: 'lab box', urls: ['http://lab-moved:8787'] })]),
+    T0 + ROSTER_PULL_MS,
+  );
+  const urls = m.view(T0 + ROSTER_PULL_MS).map((v) => v.url);
+  assert.ok(urls.includes(PEER_URL), 'the configured url survives');
+  assert.equal(urls.length, 1, 'one peer for one instance: the roster did not duplicate it');
+});
+
+// ---------------------------------------------------------------------------
+// Slice 9: roster urls make a peer pullable without mesh_peers (#55 D3)
+//
+// Peer identity is the INSTANCE, not the url. A tailnet address moves; the
+// roster row reports the new urls and the old ones stop answering. A row that
+// reports no usable url contributes nothing. An explicit `mesh_peers` entry
+// always wins. A url that is already a peer key is never re-pointed.
+// ---------------------------------------------------------------------------
+
+test('slice 9: no fleet_url means the roster never touches the peer set', async () => {
+  const m = new MeshFederation(baseCfg(await mkTmp(), { mesh_peers: [{ url: PEER_URL, name: 'lab box' }] }), async () => snap());
+  await m.pullRoster(async () => rosterEnvelope([rosterRow({ instance_id: 'm-x', urls: ['http://ghost:8787'] })]), T0);
+  assert.deepEqual(m.view(T0).map((v) => v.url), [PEER_URL], 'no fleet_url = no roster peer, byte-for-byte');
+});
+
+test('slice 9: a roster row with urls becomes a peer a refresh can pull (no mesh_peers config at all)', async () => {
+  const dir = await mkTmp();
+  const rosterUrl = 'http://tailnet-a:8787';
+  const fetched: string[] = [];
+  const m = new MeshFederation(
+    baseCfg(dir, { fleet_url: 'http://fleet-1:8789', peer_token: PEER }),
+    async (url) => {
+      fetched.push(url);
+      if (url === `${rosterUrl}/api/mesh`) return { ...snap(), instance_id: 'm-tailnet-a', name: 'tailnet a' };
+      return snap();
+    },
+  );
+  assert.equal(m.enabled, false, 'precondition: with no mesh_peers and no roster yet, the plane is inert');
+  await m.pullRoster(async () => rosterEnvelope([rosterRow({ instance_id: 'm-tailnet-a', name: 'tailnet a', urls: [rosterUrl] })]), T0);
+  assert.equal(m.enabled, true, 'the roster row alone enables the read plane (no mesh_peers needed)');
+  assert.deepEqual(m.view(T0).map((v) => v.url), [rosterUrl], 'the roster url is the peer');
+  await m.refresh(T0);
+  assert.ok(fetched.includes(`${rosterUrl}/api/mesh`), 'the refresh actually fetched the roster url');
+  const row = m.view(T0)[0];
+  assert.equal(row.instance_id, 'm-tailnet-a', 'the peer carries the roster identity');
+  assert.equal(row.online, true, 'the pull succeeded, so the peer is online');
+  assert.equal(row.name, 'tailnet a', 'the roster name is carried');
+});
+
+test('slice 9: a roster row with no usable url adds nothing', async () => {
+  const m = new MeshFederation(baseCfg(await mkTmp(), { fleet_url: 'http://fleet-1:8789' }), async () => snap());
+  await m.pullRoster(
+    async () => rosterEnvelope([
+      rosterRow({ instance_id: 'm-empty', urls: [] }),
+      rosterRow({ instance_id: 'm-junk', urls: ['ftp://nope', 'self', '', '   '] }),
+    ]),
+    T0,
+  );
+  assert.deepEqual(m.view(T0), [], 'no urls = no peers, never a crash');
+});
+
+test('slice 9: an explicit mesh_peers entry still beats a roster row for the same instance', async () => {
+  const m = new MeshFederation(
+    baseCfg(await mkTmp(), { mesh_peers: [{ url: PEER_URL, name: 'lab box' }], fleet_url: 'http://fleet-1:8789', peer_token: PEER }),
+    async () => snap(),
+  );
+  await m.refresh(T0);
+  assert.equal(m.view(T0)[0]!.instance_id, snap().instance_id, 'precondition: the configured peer has an observed id');
+  await m.pullRoster(
+    async () => rosterEnvelope([rosterRow({ instance_id: snap().instance_id, urls: ['http://roster-moved:8787'] })]),
+    T0,
+  );
+  assert.deepEqual(m.view(T0).map((v) => v.url), [PEER_URL], 'the static entry is not replaced, and no duplicate is added');
+  assert.equal(m.view(T0)[0]!.name, 'lab box', 'the configured name stands');
+});
+
+test('slice 9: a moved tailnet address updates the peer instead of duplicating it', async () => {
+  const m = new MeshFederation(baseCfg(await mkTmp(), { fleet_url: 'http://fleet-1:8789' }), async () => snap());
+  await m.pullRoster(async () => rosterEnvelope([rosterRow({ instance_id: 'm-moved', name: 'laptop', urls: ['http://100.64.0.9:8787'] })]), T0);
+  assert.deepEqual(m.view(T0).map((v) => v.url), ['http://100.64.0.9:8787'], 'the first address is the peer');
+  // The address moves: the roster now reports a different url for the SAME instance.
+  await m.pullRoster(
+    async () => rosterEnvelope([rosterRow({ instance_id: 'm-moved', name: 'laptop', urls: ['http://100.94.165.102:8787'] })]),
+    T0 + ROSTER_PULL_MS,
+  );
+  const urls = m.view(T0 + ROSTER_PULL_MS).map((v) => v.url);
+  assert.deepEqual(urls, ['http://100.94.165.102:8787'], 'the old address is dropped, the new one stands — one row, no duplicate');
+  assert.equal(m.view(T0 + ROSTER_PULL_MS).length, 1, 'exactly one peer row for one instance');
+});
+
+test('slice 9: two urls for one instance are both pullable, and a url claimed by two instances is never re-pointed', async () => {
+  const m = new MeshFederation(baseCfg(await mkTmp(), { fleet_url: 'http://fleet-1:8789' }), async () => snap());
+  await m.pullRoster(
+    async () => rosterEnvelope([
+      rosterRow({ instance_id: 'm-a', urls: ['http://a:8787', 'https://a-backup:8787'] }),
+      rosterRow({ instance_id: 'm-b', urls: ['http://a:8787'] }), // same url, different instance
+    ]),
+    T0,
+  );
+  const urls = m.view(T0).map((v) => v.url).sort();
+  assert.deepEqual(urls, ['http://a:8787', 'https://a-backup:8787'], 'both of m-a urls land; the collision is not re-pointed');
+  const held = m.view(T0).find((v) => v.url === 'http://a:8787')!;
+  assert.equal(held.instance_id, 'm-a', 'the first instance to claim the url keeps it');
+});
+
+test('slice 9: a peer the roster stops reporting is dropped on the next pull (the Service-down rule stands)', async () => {
+  const m = new MeshFederation(baseCfg(await mkTmp(), { fleet_url: 'http://fleet-1:8789' }), async () => snap());
+  await m.pullRoster(async () => rosterEnvelope([rosterRow({ instance_id: 'm-live', urls: ['http://live:8787'] })]), T0);
+  assert.deepEqual(m.view(T0).map((v) => v.url), ['http://live:8787']);
+  // The instance leaves the fleet (no row for it at all).
+  await m.pullRoster(async () => rosterEnvelope([]), T0 + ROSTER_PULL_MS);
+  assert.deepEqual(m.view(T0 + ROSTER_PULL_MS).map((v) => v.url), ['http://live:8787'], 'a pull that returns no rows does NOT clear the set — an unreachable service leaves the last-known peers standing');
+});

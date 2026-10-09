@@ -432,6 +432,11 @@ export interface FederationOptions {
    *  `buildHeartbeatSender`; tests inject a recorder or a throwing
    *  transport to prove the Service-down rule. */
   heartbeatSender?: HeartbeatSender;
+  /** THIS instance's ed25519 public key (#55 D1). A roster row carrying the
+   *  SAME key is this machine — the fleet roster returns every instance,
+   *  including the local one. Absent = no self-detection (a self-row merges
+   *  like any other row). */
+  localPublicKey?: () => string;
 }
 
 export class MeshFederation {
@@ -440,6 +445,7 @@ export class MeshFederation {
   private readonly localInstanceId?: () => string;
   private readonly edgeFiller?: EdgeFiller;
   private readonly heartbeatSender?: HeartbeatSender;
+  private readonly localPublicKey?: () => string;
   private readonly peers = new Map<string, PeerEntry>();
   /** When a roster pull is due next (epoch-ms). 0 = never armed (no fleet_url). */
   private nextRosterPullAt = 0;
@@ -457,6 +463,7 @@ export class MeshFederation {
     this.localInstanceId = opts.localInstanceId;
     this.edgeFiller = opts.edgeFiller;
     this.heartbeatSender = opts.heartbeatSender;
+    this.localPublicKey = opts.localPublicKey;
     for (const p of cfg.mesh_peers ?? []) {
       const url = String(p?.url ?? '').trim().replace(/\/+$/, '');
       if (!url || url === 'self') continue;
@@ -508,15 +515,38 @@ export class MeshFederation {
     );
     for (const row of rows) {
       if (configuredIds.has(row.instance_id)) continue;
-      // A roster row whose instance is already known (from a previous pull)
-      // is not re-added: no rewrite, no url churn. ADD-only on the set.
-      const existing = [...this.peers.values()].find((p) => p.instanceId === row.instance_id);
-      if (existing) continue;
-      for (const url of row.urls) {
-        const clean = url.trim().replace(/\/+$/, '');
-        if (!clean || clean === 'self' || this.peers.has(clean)) continue;
-        this.peers.set(clean, {
-          url: clean,
+      // Never become your own peer: the roster returns EVERY instance,
+      // including this one. A self-row would add a self-loop the refresh
+      // then fetches. Match on the PUBLIC KEY (the fleet-issued instance id
+      // is not the local mesh instance id), not the id.
+      if (this.localPublicKey) {
+        try {
+          if (row.public_key && row.public_key === this.localPublicKey()) continue;
+        } catch { /* no identity available: treat the row as any peer */ }
+      }
+      // Slice 9 (#55 D3): peer identity is the INSTANCE, not the url. A
+      // tailnet address moves; the roster row reports the new urls and the
+      // old ones stop answering. Reconcile the url set for this instance
+      // instead of ADD-only accumulating a stale address forever.
+      //   - an entry whose url the roster no longer reports is dropped;
+      //   - a declared url not already a peer key is added.
+      // An explicit `mesh_peers` entry is never touched: it is judged by
+      // ORIGIN (rosterOrigin absent), so the operator's static registry
+      // still wins, and a url that is already a peer key is never
+      // re-pointed. A row with no usable url contributes nothing (the
+      // sanitizer drops it before this loop — byte-for-byte the old
+      // behavior).
+      const declared = row.urls
+        .map((u) => u.trim().replace(/\/+$/, ''))
+        .filter((u) => u !== '' && u !== 'self' && /^https?:\/\//i.test(u));
+      for (const p of [...this.peers.values()]) {
+        if (p.rosterOrigin !== true || p.instanceId !== row.instance_id) continue;
+        if (!declared.includes(p.url)) this.peers.delete(p.url);
+      }
+      for (const url of declared) {
+        if (this.peers.has(url)) continue; // already a peer (config or another instance): never re-point
+        this.peers.set(url, {
+          url,
           name: row.name || undefined,
           instanceId: row.instance_id,
           lastOk: null,
