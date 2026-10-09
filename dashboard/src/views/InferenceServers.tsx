@@ -41,6 +41,7 @@ import {
   type EngineGroup,
 } from "@/lib/api";
 import { ago, fmt, liveWord, probeWord, PROVIDER_CHOICES } from "@/lib/format";
+import { loadRead, LOAD_FRESHNESS_DEFAULT_S } from "@/lib/load-read";
 
 const METRICS_24H = 24 * 3600_000; // the card's sparkline window
 const TONE: Record<string, string> = {
@@ -186,6 +187,7 @@ export function InferenceServers({ st }: { st: StateSnapshot | null }) {
               now={st?.now ?? Date.now()}
               running={runningAnywhere.has(s.id)}
               points={metrics[s.id] ?? []}
+              staleS={st?.metrics_load_stale_s ?? LOAD_FRESHNESS_DEFAULT_S}
               group={groupOfRow(s)}
               groups={groups}
               srvName={srvName}
@@ -461,6 +463,7 @@ function ServerCard({
   now,
   running,
   points,
+  staleS,
   group,
   groups,
   srvName,
@@ -472,6 +475,7 @@ function ServerCard({
   now: number;
   running: boolean;
   points: MetricPoint[];
+  staleS: number;
   group: EngineGroup | null;
   groups: EngineGroup[];
   srvName: (id: string) => string;
@@ -483,6 +487,11 @@ function ServerCard({
     ? liveWord({ idle: !!s.signal?.idle, degraded: !!s.signal?.degraded }, running || s.models.some((m) => m.running))
     : liveWord(null, false);
   const probe = probeWord(s.model_source);
+  // The LOAD axis (#52 slice 2): the captured measurement beside the idle
+  // verdict. A SEPARATE line — the idle word is the verdict, the load read
+  // is the measurement (two axes, never merged into one word). Absent read
+  // (load_source missing) = null = render nothing.
+  const load = loadRead(s.signal, staleS);
   const [armed, setArmed] = React.useState(false);
   const armTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -523,6 +532,25 @@ function ServerCard({
           className={`size-1.5 shrink-0 rounded-full ${probe.tone === "ok" ? "bg-ok" : "bg-err"}`}
           title={probe.note}
         />
+        {/* The LOAD axis (#52 slice 2): the captured engine load read beside
+            the idle word. A measurement, not a verdict — it sits on its own
+            line beside (never inside) the idle word, so a busy engine and an
+            idle verdict never blur into one word. Exception-only: no load
+            read = nothing renders here; a stale read (load_age_s above the
+            configured freshness window) dims, the values still show. */}
+        {load && (
+          <span
+            className={`min-w-0 truncate text-[11px] text-dim ${load.stale ? "opacity-60" : ""}`}
+            title={
+              load.stale
+                ? `engine load read — ${load.source} · STALE: older than ${staleS}s (the values may be out of date)`
+                : `engine load read — ${load.source}${load.parts.length > 0 ? `: ${load.parts.join(" · ")}` : ""}`
+            }
+          >
+            {load.source}
+            {load.parts.length > 0 ? ` · ${load.parts.join(" · ")}` : ""}
+          </span>
+        )}
         {s.engaged && (
           <Badge variant="outline" className="shrink-0 rounded-pill border-accent/50 px-1.5 py-0 text-[10px] font-normal text-accent" title="an active lease or session holds an engine slot on this row">
             engaged

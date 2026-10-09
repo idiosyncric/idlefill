@@ -20,6 +20,7 @@ import { utcDay, type Arbiter, WATCHED_SERVER_ID } from './arbiter.js';
 import { seriesKeyOf, type MetricsBucket, type MetricsSeries, type MetricsStore } from './metrics.js';
 import { buildMeshSnapshot, type MeshFederation } from './mesh.js';
 import { isLoopbackAddress } from './catalog.js';
+import type { LoadSignalView } from './load.js';
 import type { ClientRecord, CycleStatusRow, ProjectAllocation, QueuePreviewRow, RebuildRunState, ServerConfig, ServerConnection } from './types.js';
 
 export interface ApiDeps {
@@ -38,6 +39,14 @@ export interface ApiDeps {
    * valid; absent = GET /api/metrics answers 501 (the store is not wired).
    */
   metrics?: MetricsStore;
+  /**
+   * The row's captured load reading at `now` (the #52 LOAD axis — slice 1
+   * captured it onto the sample line; slice 2 rides it onto the row's
+   * signal block for the dashboard). Optional so existing callers/tests
+   * stay valid; absent = the row publishes NO load keys (byte-parity with
+   * pre-#52). Display and sample only — never a verdict input.
+   */
+  loadSignal?: (row: ServerConnection, now: number) => LoadSignalView | null;
 }
 
 /** Validate a request token against the configured set. */
@@ -197,7 +206,7 @@ function todayTotals(leases: { project: string; status: string; ended_at?: numbe
  * row); a row whose source has no detector yet carries `signal: null` and
  * is fail-closed for grants.
  */
-function serverView(arbiter: Arbiter, cfg: ServerConfig, now: number) {
+function serverView(arbiter: Arbiter, cfg: ServerConfig, now: number, loadSignal?: (row: ServerConnection, now: number) => LoadSignalView | null) {
   const s = arbiter['store'].state;
   const activeClients = new Set(arbiter.activeLeases(now).map((l) => l.client_name));
   const runningModels = new Set<string>();
@@ -233,6 +242,12 @@ function serverView(arbiter: Arbiter, cfg: ServerConfig, now: number) {
             const a = arbiter.sessionActivityOn(row.id, now);
             return a === null ? null : Math.max(0, Math.round((now - a) / 1000));
           })(),
+          // The LOAD axis (#52 slice 2): the captured reading's ADD keys
+          // (load_source, load_age_s, the gauges). Display only — nothing
+          // here feeds the verdict. Absent (no collector for the kind, or
+          // never read) = the spread is empty → the signal block stays
+          // byte-for-byte as today.
+          ...(loadSignal?.(row, now) ?? {}),
         }
       : null;
     // Model inventory: the last /v1/models probe that ANSWERED wins over
@@ -271,7 +286,7 @@ function serverView(arbiter: Arbiter, cfg: ServerConfig, now: number) {
 
 /** Attach the API routes (authed) and the dashboard (public read). */
 export function buildApi(deps: ApiDeps): FastifyInstance {
-  const { arbiter, cfg, publicDir, mesh, metrics } = deps;
+  const { arbiter, cfg, publicDir, mesh, metrics, loadSignal } = deps;
 
   const app = fastify({ logger: false });
   app.decorate('idlefill', { arbiter, cfg, publicDir });
@@ -681,7 +696,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   // ------------------------------------------------------------------
 
   app.get('/api/servers', async (req) => {
-    return { servers: serverView(arbiter, cfg, Date.now()) };
+    return { servers: serverView(arbiter, cfg, Date.now(), loadSignal) };
   });
 
   /**
@@ -1267,6 +1282,11 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
 
     return {
       now,
+      // The load-read freshness window (#52 slice 1 knob) rides the state so
+      // the dashboard can label a stale read against the SAME window the
+      // arbiter labels it with. Absent on configs without the key = the view
+      // falls back to its default. ADD key (add, never rename).
+      metrics_load_stale_s: cfg.metrics_load_stale_s,
       idle: {
         idle: sig.idle,
         idle_seconds: cfg.idle_seconds,
@@ -1306,7 +1326,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       // federation is wired (a build without the mesh module stays as-is).
       ...(mesh ? { mesh: { instance_id: arbiter.instanceId(), peers: mesh.view(now) } } : {}),
       projects: projectView(arbiter, cfg, s.clients, day, now, todayTotals(s.leases, day)),
-      servers: serverView(arbiter, cfg, now),
+      servers: serverView(arbiter, cfg, now, loadSignal),
       // Aggregate endpoint catalog (#64 D4): the arbiter-built, deduped
       // model→row map the router's :8800 listener routes on. ADD key —
       // present from the first tick; an old router ignores it. Carries

@@ -18,6 +18,20 @@ export type ServerSignal = {
   no_signal_reason?: string | null;
   reidle_gated?: boolean;
   session_last_activity_age_s?: number | null;
+  // The LOAD axis (#52 slice 1 capture, slice 2 display). ADD keys — absent
+  // on a pre-#52 arbiter, or when the row's kind has no load collector, or
+  // the read never succeeded. The display renders nothing when absent and
+  // dims when load_age_s exceeds the freshness window.
+  load_source?: string;
+  load_age_s?: number;
+  gpu_util_percent?: number;
+  gpu_mem_used_bytes?: number;
+  gpu_mem_total_bytes?: number;
+  tokens_per_second?: number;
+  in_flight?: number;
+  model_loaded?: string;
+  model_quant?: string;
+  omlx_loaded_count?: number;
 };
 
 export type ServerRow = {
@@ -348,6 +362,12 @@ export type MeshPeer = {
 
 export type StateSnapshot = {
   now: number;
+  /**
+   * The load-read freshness window in seconds (the arbiter's
+   * `metrics_load_stale_s`). Absent on a build that predates the key — the
+   * view falls back to the shared default (lib/load-read.ts).
+   */
+  metrics_load_stale_s?: number;
   idle: {
     idle: boolean;
     idle_seconds?: number;
