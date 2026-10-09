@@ -19,11 +19,27 @@ export type SettingsSnapshot = {
 
 export type GlanceRow = { id: string; label: string };
 
+/* #59: one inference-server load readout (the Rust spec projects the
+   arbiter's `servers[]` rows — serverView in server/src/api.ts). `line`
+   = the load facts (Exception-Only, null for healthy load-less rows),
+   `status` = the marker line ("degraded" / "no signal", null when
+   healthy), `tone` = the marker line's class (err = red, dim = muted;
+   "no signal" is dim — never a fake zero), `idle` = the idle countdown
+   (null when no activity is provable). */
+export type GlanceServerLoad = {
+  name: string;
+  line: string | null;
+  status: string | null;
+  tone: "err" | "dim";
+  idle: string | null;
+};
+
 export type GlanceState = {
   word: string;
   red: boolean;
   sessionsCount: string | null;
   exceptionLines: string[];
+  serverLoads: GlanceServerLoad[];
   rows: GlanceRow[];
   relaunch: boolean;
 };

@@ -1,9 +1,12 @@
 /* The glance view (D1): renders ONLY what the pure specs produce —
    glance_state returns the status word, the sessions count + exception
-   lines, the action rows, and the exception-only relaunch flag. The
-   verdict stays in Rust (cargo tests pin it); this view is a projector.
-   Rust re-invokes window.__glanceRefresh() after each 5s tick
-   (lib.rs eval), so the refresh seam stays under the same name. */
+   lines, the inference-server load readouts (#59, the arbiter's
+   servers[] rows projected by the Rust spec — Exception-Only section:
+   no servers = no rows at all), the action rows, and the exception-only
+   relaunch flag. The verdict stays in Rust (cargo tests pin it); this
+   view is a projector. Rust re-invokes window.__glanceRefresh() after
+   each 5s tick (lib.rs eval), so the refresh seam stays under the same
+   name. */
 import { useCallback, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
@@ -41,6 +44,27 @@ export default function Glance() {
           {line}
         </div>
       ))}
+      {/* Inference-server load (#59): renders ONLY the specs' readouts —
+          the section is Exception-Only (no servers = no rows at all).
+          The name is the row's identity (console text); the load facts
+          are dim; the marker line ("degraded" red, "no signal" dim —
+          never a fake zero) rides the row's tone. */}
+      {s.serverLoads.length > 0 && (
+        <div className="my-[6px_0_2px]">
+          {s.serverLoads.map((sv) => (
+            <div key={sv.name} className="my-[2px_0]">
+              <span className="font-semibold">{sv.name}</span>
+              {sv.line && <span className="text-dim"> · {sv.line}</span>}
+              {sv.idle && <span className="text-dim"> · {sv.idle}</span>}
+              {sv.status && (
+                <span className={`ml-[6px] ${sv.tone === "err" ? "text-err" : "text-dim"}`}>
+                  {sv.status}
+                </span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
       {/* Action rows ride the vendored shadcn Button (ghost, full
           width): the popover tone is the body background, hover is
           the card tone — the tokens replace the old .row rules. */}
