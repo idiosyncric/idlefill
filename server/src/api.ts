@@ -1162,6 +1162,9 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       // pre-#55 builds, ignored by old readers. The private key stays in
       // identity.json (0600) and never rides the wire.
       arbiter.identity().publicKeyB64url,
+      // Fleet membership label (#55 D5): ADD key — the multi-tenant seam,
+      // machine identity only. Absent = unset; never a secret.
+      arbiter.fleetId(),
     );
   });
 
