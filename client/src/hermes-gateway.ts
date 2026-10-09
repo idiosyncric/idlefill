@@ -134,6 +134,18 @@ const DEFAULT_KEY_ENV = 'IDLEFILL_HERMES_GATEWAY_KEY';
 const DEFAULT_KEY_FILE = '~/.idlefill/hermes-gateway-keys.json';
 const DEFAULT_PROFILES_DIR = '~/.hermes/profiles';
 
+/**
+ * #81: the gateway clamps `limit` to 200 (`_handle_list_sessions` parses it
+ * with `maximum=200`, v0.21.6), so 200 is the largest page obtainable. The
+ * list envelope carries `has_more`; a profile whose recency window is deeper
+ * than one page must not silently enrich only the freshest 200 rows (the
+ * last-known-wins merge would keep publishing the stale tail forever).
+ * `LEDGER_MAX_PAGES` bounds the round: a hostile or buggy `has_more` can
+ * never make a profile's round unbounded.
+ */
+const LEDGER_PAGE_SIZE = 200;
+const LEDGER_MAX_PAGES = 5;
+
 /** Expand a leading `~` against the OS home (test seam via `home`). */
 function expandHome(p: string, home: string): string {
   return p === '~' || p.startsWith('~/') ? join(home, p.slice(2)) : p;
@@ -383,37 +395,46 @@ async function fetchRound(cfg: HermesGatewayConfig, fetchImpl: FetchImpl, nowMs:
     // is simply not fetchable, its rows stay last-known).
     const key = profile === 'default' ? cfg.key : cfg.profileKeys.get(profile);
     if (!key) continue; // no operator key for this profile: rows stay last-known
-    let res: Response;
-    try {
-      res = await fetchImpl(
-        `${base}${ledgerPath(profile)}?limit=200`,
-        { headers: { authorization: `Bearer ${key}` }, signal: timeout() },
-      );
-    } catch {
-      continue; // profile fetch failed (timeout/refused): the rest of the round stands
-    }
-    // 401: the server IS up (reachable already set from health) but this
-    // key is wrong/foreign — keep the last-known rows, no meta this round.
-    if (res.status === 401 || res.status === 403) continue;
-    if (res.status !== 200) continue;
-    let body: unknown;
-    try {
-      body = await res.json();
-    } catch {
-      continue;
-    }
-    const data = (body as { data?: unknown }).data;
-    if (!Array.isArray(data)) continue;
-    for (const raw of data) {
-      if (typeof raw !== 'object' || raw === null) continue;
-      const row = raw as GatewaySessionRow;
-      const m = rowToMeta(row);
-      if (!m) continue;
-      // Same id from two profiles: the newer `last_active` wins the round.
-      const prev = rows.get(m.id);
-      const prevTs = toEpochMs(prev?.last_active) ?? 0;
-      const nextTs = m.meta.last_active ?? 0;
-      if (!prev || nextTs >= prevTs) rows.set(m.id, row);
+    // #81: page the ledger. One request is capped at the gateway's own
+    // 200-row maximum; follow `has_more` up to LEDGER_MAX_PAGES so a deep
+    // recency window enriches every listed session, not just the freshest
+    // page. A failed/short page ends THIS profile's round (fail-quiet —
+    // the pages already merged stand; the rest of the round stands).
+    for (let page = 0; page < LEDGER_MAX_PAGES; page++) {
+      const offset = page * LEDGER_PAGE_SIZE;
+      let res: Response;
+      try {
+        res = await fetchImpl(
+          `${base}${ledgerPath(profile)}?limit=${LEDGER_PAGE_SIZE}&offset=${offset}`,
+          { headers: { authorization: `Bearer ${key}` }, signal: timeout() },
+        );
+      } catch {
+        break; // profile fetch failed (timeout/refused): the rest of the round stands
+      }
+      // 401: the server IS up (reachable already set from health) but this
+      // key is wrong/foreign — keep the last-known rows, no meta this round.
+      if (res.status === 401 || res.status === 403) break;
+      if (res.status !== 200) break;
+      let body: unknown;
+      try {
+        body = await res.json();
+      } catch {
+        break;
+      }
+      const env = body as { data?: unknown; has_more?: unknown };
+      if (!Array.isArray(env.data)) break; // malformed envelope: the round stands as-is
+      for (const raw of env.data) {
+        if (typeof raw !== 'object' || raw === null) continue;
+        const row = raw as GatewaySessionRow;
+        const m = rowToMeta(row);
+        if (!m) continue;
+        // Same id from two profiles (or two shifted pages): the newer `last_active` wins the round.
+        const prev = rows.get(m.id);
+        const prevTs = toEpochMs(prev?.last_active) ?? 0;
+        const nextTs = m.meta.last_active ?? 0;
+        if (!prev || nextTs >= prevTs) rows.set(m.id, row);
+      }
+      if (env.has_more !== true) break; // the list envelope decides: absent/false ⇒ last page
     }
   }
   return { reachable, version, rows, fetchedAt: nowMs };
