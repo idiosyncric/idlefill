@@ -61,6 +61,12 @@ interface FakeGatewayOpts {
   health?: { status: number; version?: string } | null;
   defaultRows?: GatewaySessionRow[];
   profileRows?: Record<string, GatewaySessionRow[]>;
+  /** #81: paginate the default ledger like a deep gateway — the stub
+   *  serves `rows` in fixed-size pages and sets has_more honestly. */
+  paginateDefault?: { rows: GatewaySessionRow[]; pageSize: number };
+  /** #81: force page N (0-based) of the default ledger to fail (HTTP 500),
+   *  proving a mid-pagination failure leaves the earlier pages merged. */
+  failDefaultPage?: number;
   /** Respond with 401 to authed ledger reads when the key does not match. */
   expectKeys?: Record<string, string>;
   /** Runs stub state: verb recording + canned responses. */
@@ -75,19 +81,19 @@ interface FakeGatewayOpts {
 
 interface FakeGateway {
   base: string;
-  requests: { method: string; path: string; auth: string; body?: string }[];
+  requests: { method: string; path: string; query: string; auth: string; body?: string }[];
   close: () => Promise<void>;
 }
 
 function startFakeGateway(opts: FakeGatewayOpts = {}): Promise<FakeGateway> {
-  const requests: { method: string; path: string; auth: string; body?: string }[] = [];
+  const requests: { method: string; path: string; query: string; auth: string; body?: string }[] = [];
   const server = http.createServer((req, res) => {
     const body: string[] = [];
     req.on('data', (c) => body.push(c));
     req.on('end', () => {
       const j = body.join('');
       const url = new URL(req.url ?? '/', 'http://x');
-      requests.push({ method: req.method ?? '', path: url.pathname, auth: req.headers.authorization ?? '', ...(j ? { body: j } : {}) });
+      requests.push({ method: req.method ?? '', path: url.pathname, query: url.search, auth: req.headers.authorization ?? '', ...(j ? { body: j } : {}) });
       const send = (status: number, payload: unknown) => {
         res.writeHead(status, { 'content-type': 'application/json' });
         res.end(JSON.stringify(payload));
@@ -105,6 +111,24 @@ function startFakeGateway(opts: FakeGatewayOpts = {}): Promise<FakeGateway> {
         const expected = opts.expectKeys?.[profile];
         if (expected && (req.headers.authorization ?? '') !== `Bearer ${expected}`) {
           return send(401, { error: { code: 'gateway_auth_failed' } });
+        }
+        // #81: a paginating stub — page the rows by the request's own
+        // limit/offset and answer has_more honestly (the v0.21.6 envelope).
+        if (profile === 'default' && opts.paginateDefault) {
+          const offset = Number(url.searchParams.get('offset') ?? 0);
+          const all = opts.paginateDefault.rows;
+          const size = opts.paginateDefault.pageSize;
+          if (opts.failDefaultPage !== undefined && Math.floor(offset / size) === opts.failDefaultPage) {
+            return send(500, { error: 'page boom' });
+          }
+          const data = all.slice(offset, offset + size);
+          return send(200, {
+            object: 'list',
+            data,
+            limit: size,
+            offset,
+            has_more: offset + data.length < all.length,
+          });
         }
         const rows = profile === 'default' ? (opts.defaultRows ?? []) : (opts.profileRows?.[profile] ?? []);
         return send(200, { object: 'list', data: rows, limit: 200, offset: 0, has_more: false });
@@ -315,6 +339,79 @@ test('connector: gateway down ⇒ unreachable, no meta, no crash, quiet log', as
   await c2.poll(); // t=20s → inside the 5s cadence? no: 10s > 5s → runs
   assert.equal(c2.ledgerSize, 0);
   assert.ok(logs.length >= 1, 'one quiet log line, never a crash');
+});
+
+// ---------------------------------------------------------------------------
+// #81: ledger pagination
+// ---------------------------------------------------------------------------
+
+test('#81 connector: follows has_more to enrich a deep ledger (not just page 1)', async () => {
+  const deep: GatewaySessionRow[] = [];
+  for (let i = 0; i < 450; i++) {
+    deep.push({ id: `sess_${String(i).padStart(4, '0')}`, title: `row ${i}`, last_active: 1760000000 + i });
+  }
+  const gw = await startFakeGateway({
+    health: { status: 200, version: '0.21.6' },
+    paginateDefault: { rows: deep, pageSize: 200 },
+  });
+  cleanup.push(() => gw.close());
+  const c = new HermesGatewayConnector(gwCfg(gw.base));
+  await c.poll();
+  // Every row across three pages enriches — the oldest page included.
+  assert.equal(c.ledgerSize, 450);
+  assert.ok(c.metaFor('sess_0449'), 'page-3 (oldest) row enriches');
+  assert.ok(c.metaFor('sess_0000'), 'page-1 row enriches');
+  // The round paged with the gateway's own page size + running offsets.
+  const ledgerReqs = gw.requests.filter((r) => r.path === '/api/sessions');
+  assert.equal(ledgerReqs.length, 3, '3 pages for 450 rows');
+  assert.deepEqual(
+    ledgerReqs.map((r) => r.query),
+    ['?limit=200&offset=0', '?limit=200&offset=200', '?limit=200&offset=400'],
+  );
+});
+
+test('#81 connector: a mid-pagination page failure keeps the merged pages (fail-quiet)', async () => {
+  const deep: GatewaySessionRow[] = [];
+  for (let i = 0; i < 300; i++) {
+    deep.push({ id: `p_${i}`, title: `row ${i}`, last_active: 1760000000 + i });
+  }
+  const gw = await startFakeGateway({
+    health: { status: 200, version: '0.21.6' },
+    paginateDefault: { rows: deep, pageSize: 200 },
+    failDefaultPage: 1, // page 2 (offset 200) 500s
+  });
+  cleanup.push(() => gw.close());
+  const c = new HermesGatewayConnector(gwCfg(gw.base));
+  await c.poll();
+  assert.equal(c.ledgerSize, 200, 'page 1 merged; the failed page stops the profile round');
+  assert.ok(c.metaFor('p_0'));
+  assert.equal(c.metaFor('p_250'), undefined, 'the failed page never poisons the round');
+  assert.deepEqual(c.snapshot(), { version: '0.21.6', reachable: true }, 'reachable stands (health was fine)');
+});
+
+test('#81 connector: a hostile always-true has_more is capped at LEDGER_MAX_PAGES', async () => {
+  // A raw stub that ALWAYS reports has_more:true with a fresh id per page.
+  const hostile = http.createServer((req, res) => {
+    const url = new URL(req.url ?? '/', 'http://x');
+    res.writeHead(200, { 'content-type': 'application/json' });
+    if (url.pathname === '/v1/health') return res.end(JSON.stringify({ status: 'ok', version: 'x' }));
+    const off = Number(url.searchParams.get('offset') ?? 0);
+    return res.end(
+      JSON.stringify({
+        object: 'list',
+        data: [{ id: `h_${off}`, last_active: 1760000000 }],
+        limit: 200,
+        offset: off,
+        has_more: true,
+      }),
+    );
+  });
+  await new Promise<void>((r) => hostile.listen(0, '127.0.0.1', r));
+  cleanup.push(() => new Promise<void>((r) => hostile.close(() => r())));
+  const port = (hostile.address() as { port: number }).port;
+  const c = new HermesGatewayConnector(gwCfg(`http://127.0.0.1:${port}`, { profiles: ['default'] }));
+  await c.poll();
+  assert.equal(c.ledgerSize, 5, 'bounded: exactly LEDGER_MAX_PAGES rows (one per page)');
 });
 
 test('connector: 401 ⇒ reachable but last-known rows stand (no key provisioned)', async () => {
