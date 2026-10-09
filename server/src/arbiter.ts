@@ -56,6 +56,8 @@ import { buildCatalog, modelsProbeUrl, type CatalogEntry, type ModelsFetcher } f
 import { mintInstanceId } from './mesh.js';
 import { Identity } from './identity.js';
 import { EdgeStore, edgesFileOf } from './edges.js';
+import { PairingClient } from './pairing.js';
+import { enrollmentFileOf, loadEnrollment } from './fleet-client.js';
 import type {
   ClientKeyRow,
   EngineGroup,
@@ -405,6 +407,7 @@ export class Arbiter {
    * (D8 fail-closed: no edge, nothing unlocked).
    */
   private edgesStore: EdgeStore | null = null;
+  private pairingClient: PairingClient | null = null;
   /**
    * Per-server idle detectors, keyed by server_id (the watched server is
    * WATCHED_SERVER_ID). A server row with no detector is fail-closed for
@@ -2830,6 +2833,38 @@ export class Arbiter {
       this.edgesStore = new EdgeStore(edgesFileOf(this.cfg.state_file));
     }
     return this.edgesStore;
+  }
+
+  /**
+   * The pairing surface (#55 D4, slice 10): the fleet ceremony client
+   * wired to THIS machine's edge store. With no fleet config the client
+   * is null and every call answers `fleet_not_configured` — pairing stays
+   * inert, byte-for-byte the pre-slice behavior. Built lazily so an
+   * arbiter that never pairs never opens a fleet client.
+   */
+  pairing(): PairingClient {
+    if (!this.pairingClient) {
+      this.pairingClient = new PairingClient(this.cfg, this.identity(), this.edges());
+    }
+    return this.pairingClient;
+  }
+
+  /**
+   * The FLEET-issued instance id for this machine, or null when it is not
+   * enrolled. The roster and the pairing ceremony speak this namespace; the
+   * locally-minted `instance_id` (mesh.md D2) is a different one. The edge
+   * fill must compare against the fleet id (server/src/index.ts
+   * `localInstanceId`), otherwise a real ceremony never matches a roster
+   * edge row and the record is never written.
+   */
+  fleetInstanceId(): string | null {
+    const rec = loadEnrollment(enrollmentFileOf(this.cfg.state_file));
+    if (rec && typeof rec.instance_id === 'string' && rec.instance_id.trim() !== '') {
+      return rec.instance_id.trim();
+    }
+    return typeof this.cfg.fleet_instance_id === 'string' && this.cfg.fleet_instance_id.trim() !== ''
+      ? this.cfg.fleet_instance_id.trim()
+      : null;
   }
 
   /** Sum of queue depths across every registered client (the mesh's coarse depth). */

@@ -385,7 +385,13 @@ export function sanitizeRoster(raw: unknown): RosterRow[] {
         if (!urls.includes(clean)) urls.push(clean);
       }
     }
-    if (urls.length === 0) continue; // a row with no usable url cannot be pulled from
+    // A row with no usable url cannot be PULLED from (no peer is added).
+    // But it may still carry pairing edges (#55 D4), and dropping it would
+    // silently lose a real pairing for a machine that has not heartbeated a
+    // url yet. Keep the row when it carries edges; drop it when it carries
+    // nothing usable at all.
+    const hasEdges = Array.isArray(ro.edges) && ro.edges.length > 0;
+    if (urls.length === 0 && !hasEdges) continue;
     // The `edges` ADD key (#55 D4): the directed edges this row's
     // instance takes part in. Untrusted input, same discipline as urls:
     // bounded count, strings exact + length-capped, a malformed edge
