@@ -411,6 +411,18 @@ public. The config commit is a normal build-wave commit
    publishes, and verifies the live feed). It cuts Release #4: tag
    `v4`, SemVer `1.0.4` (D5 correction above).
 
+Seam corrections from the first signed run (2026-10-09): (1) the
+`tauri/build.sh` `TAURI_CONFIG`-env seam never reached the bundler —
+tauri-cli v2 only WRITES `TAURI_CONFIG` (for the build.rs ACL plane)
+and never reads it; every past build carried the committed `1.0.0`
+silently. The bundler seam is the CLI `-c/--config` (inline JSON);
+`build.sh` now passes the patch there (and still exports
+`TAURI_CONFIG` for the ACL plane). (2) `release.sh`'s auth header was
+built as a bare scheme+token — curl drops a `-H` value with no header
+name, so every write went anonymous (401; the public-repo GETs hid
+it), and this Forgejo rejects the `Bearer` scheme: the header is
+`Authorization: token <token>`.
+
 A build wave can do everything else without secrets: the plugin
 dependency and the Rust commands, the settings UI rows, the
 `endpoints` block, the `TAURI_CONFIG` merge mechanics, the

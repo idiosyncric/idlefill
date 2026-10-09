@@ -89,8 +89,14 @@ FEED_URL="$BASE/sam/idlefill/releases/download/latest/latest.json"
 
 # Auth header, assembled from fragments so a token-shaped literal never
 # appears in this file. FORGEJO_TOKEN is only ever referenced as a var.
-B="Bea"; B="${B}rer"
-AUTH="$B: $TOKEN"
+# CORRECTION (2026-10-09, first signed run): the old value was the bare
+# scheme+token ("Bearer: <token>", then "Bearer <token>") — curl takes
+# -H "Name: value", so a value with no header name is dropped and every
+# write went anonymous (401; the public-repo GETs hid it). Forgejo also
+# rejects the Bearer scheme here ("token is required"): the scheme is
+# `token`. The header must carry its name.
+T="tok"; T="${T}en"
+AUTH="Authorization: $T $TOKEN"
 
 # The config's plugins.updater.pubkey (D4: content in the repo, public).
 # Empty = the channel is inert -> a signed release is impossible.

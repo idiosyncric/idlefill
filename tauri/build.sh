@@ -13,7 +13,8 @@
 #   output: src-tauri/target/release/bundle/macos/Idlefill.app
 #
 # Environment:
-#   IDLEFILL_VERSION   -> tauri.conf.json's `version` via TAURI_CONFIG.
+#   IDLEFILL_VERSION   -> tauri.conf.json's `version` via the CLI's
+#                         -c/--config merge (the bundler seam).
 #                         MUST be semver (tauri rejects "1.0" — "1.0.0"
 #                         is the equivalent). Default 1.0.0.
 #   IDLEFILL_BUILD_MARKER -> baked into the binary via option_env!
@@ -60,18 +61,24 @@ MARKER="${IDLEFILL_BUILD_MARKER:-dev}"
 python3 "$HERE/make-tray-icon.py" "$SRC/icons/tray-icon.rgba"
 
 export IDLEFILL_BUILD_MARKER="$MARKER"
-# Version override through tauri's config-merge env (tauri-utils
-# config.rs merges this JSON patch over tauri.conf.json at build time).
-# The release pass (#75) adds `bundle.createUpdaterArtifacts: true` to the
-# SAME patch — D4 LOCKED: the flag is set on the release pass only, never
-# committed (a committed `true` would fail every keyless checkout build).
-# json_patch::merge deep-merges, so this patch coexists with the committed
-# bundle block (it only adds createUpdaterArtifacts).
+# Version override through the CLI's --config merge seam (inline JSON
+# patched over tauri.conf.json before bundling). The release pass (#75)
+# adds `bundle.createUpdaterArtifacts: true` to the SAME patch — D4
+# LOCKED: the flag is set on the release pass only, never committed (a
+# committed `true` would fail every keyless checkout build). The merge
+# deep-merges, so this patch coexists with the committed bundle block
+# (it only adds createUpdaterArtifacts).
+#
+# CORRECTION (2026-10-09, first signed run): the old seam — exporting the
+# patch as TAURI_CONFIG — NEVER reached the bundler. tauri-cli 2.12.1
+# only WRITES TAURI_CONFIG (helpers/config.rs:170, for the build.rs ACL
+# plane); it never reads it from the env. The env patch only ever
+# reached the codegen plane. The bundler's seam is `-c/--config`.
 UPDATER=0
 if [ "${IDLEFILL_UPDATER_ARTIFACTS:-0}" = "1" ]; then
   UPDATER=1
 fi
-export TAURI_CONFIG="$(python3 - "$VERSION" "$UPDATER" <<'PY'
+CONFIG_PATCH="$(python3 - "$VERSION" "$UPDATER" <<'PY'
 import json, sys
 patch = {"version": sys.argv[1]}
 if sys.argv[2] == "1":
@@ -79,6 +86,10 @@ if sys.argv[2] == "1":
 print(json.dumps(patch))
 PY
 )"
+# Still exported: the build.rs ACL/codegen plane DOES read TAURI_CONFIG
+# (tauri-utils acl/build.rs:427).
+export TAURI_CONFIG="$CONFIG_PATCH"
+CONFIG_ARGS=(-c "$CONFIG_PATCH")
 # The tauri CLI is the sole build entry (ISSUE69-GRILL-REPORT: the spike
 # proved `cargo-tauri tauri build` emits the bundle). A bare `cargo build`
 # BEFORE it was once a "warm the deps" step — measured 2026-10-08, it is
@@ -92,7 +103,7 @@ if command -v cargo-tauri >/dev/null 2>&1; then
   # bare "${arr[@]}" over an EMPTY array dies "unbound variable" under
   # set -u (the release path, TAURI_BUILD_ARGS empty; hit live
   # 2026-10-07 via update.sh). The guarded form expands to nothing.
-  (cd "$SRC" && cargo-tauri tauri build ${TAURI_BUILD_ARGS[@]+"${TAURI_BUILD_ARGS[@]}"})
+  (cd "$SRC" && cargo-tauri tauri build ${CONFIG_ARGS[@]+"${CONFIG_ARGS[@]}"} ${TAURI_BUILD_ARGS[@]+"${TAURI_BUILD_ARGS[@]}"})
   echo "built: $APP"
 else
   # The CLI is the only bundler; without it the best a build can do is
