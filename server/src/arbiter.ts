@@ -273,6 +273,78 @@ function cleanReportedHistory(
   return out;
 }
 
+/**
+ * #73: sanitize the `hermes_meta` ADD-key (the gateway session ledger's
+ * facts for one session, joined by the client on the session_id).
+ * Per-member drop-don't-reject, like cleanReportedHistory:
+ *   - non-object/null → undefined (the block is DROPPED — never a
+ *     rejection, and NEVER a clear of the stored block: absent means
+ *     "no report this heartbeat", last-known-wins);
+ *   - strings (title/model/end_reason) bounded and trimmed;
+ *   - counters (message/tool/token counts) non-negative integers ≤1e12;
+ *   - estimated_cost_usd a finite number ≥0;
+ *   - last_active a finite number >0 (epoch-ms; the client converts);
+ *   - ended_at: number (same rule as last_active) or null (ended without
+ *     a reason — an explicit null RIDES and replaces the stored value);
+ *   - a block with NOTHING valid → undefined (absent → the stored block
+ *     stands; the ledger is last-known-wins, an old router never sends
+ *     the key at all).
+ */
+export type HermesMetaBlock = {
+  title?: string;
+  model?: string;
+  message_count?: number;
+  tool_call_count?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  reasoning_tokens?: number;
+  estimated_cost_usd?: number;
+  last_active?: number;
+  ended_at?: number | null;
+  end_reason?: string | null;
+};
+
+function cleanReportedHermesMeta(v: unknown): HermesMetaBlock | undefined {
+  if (typeof v !== 'object' || v === null) return undefined;
+  const h = v as Record<string, unknown>;
+  const out: HermesMetaBlock = {};
+  const str = (key: string, cap: number): string | undefined => {
+    const s = h[key];
+    if (typeof s !== 'string') return undefined;
+    const t = s.trim();
+    return t !== '' ? t.slice(0, cap) : undefined;
+  };
+  const int = (key: string): number | undefined => {
+    const n = h[key];
+    return typeof n === 'number' && Number.isInteger(n) && n >= 0 && n <= 1e12 ? n : undefined;
+  };
+  const title = str('title', 256);
+  if (title !== undefined) out.title = title;
+  const model = str('model', 128);
+  if (model !== undefined) out.model = model;
+  for (const key of ['message_count', 'tool_call_count', 'input_tokens', 'output_tokens', 'reasoning_tokens'] as const) {
+    const n = int(key);
+    if (n !== undefined) out[key] = n;
+  }
+  const cost = h.estimated_cost_usd;
+  if (typeof cost === 'number' && Number.isFinite(cost) && cost >= 0) out.estimated_cost_usd = cost;
+  const lastActive = h.last_active;
+  if (typeof lastActive === 'number' && Number.isFinite(lastActive) && lastActive > 0) out.last_active = lastActive;
+  if (h.ended_at !== undefined) {
+    if (h.ended_at === null) out.ended_at = null; // explicit null rides
+    else {
+      const t = h.ended_at;
+      if (typeof t === 'number' && Number.isFinite(t) && t > 0) out.ended_at = t;
+    }
+  }
+  const endReason = str('end_reason', 64);
+  if (endReason !== undefined) out.end_reason = endReason;
+  // Nothing survived sanitization: the block is absent (the stored
+  // block stands — last-known-wins, never a fake zero, never a clear).
+  if (Object.keys(out).length === 0) return undefined;
+  return out;
+}
+
 export type LeaseRejectionReason =
   | 'not_idle'
   | 'busy'
@@ -427,7 +499,7 @@ export class Arbiter {
     observedIp: string,
     projects?: ProjectAllocation[],
     now?: number,
-    info?: { version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open'; proxy_port?: number; aggregate_port?: number; daemon_behind?: boolean; client_log?: string[]; agent_roster?: unknown },
+    info?: { version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open'; proxy_port?: number; aggregate_port?: number; daemon_behind?: boolean; client_log?: string[]; agent_roster?: unknown; hermes_version?: unknown; gateway_reachable?: unknown },
   ): { client_id: string; created: boolean } {
     const s = this.store.state;
     const seen = now ?? Date.now();
@@ -517,6 +589,20 @@ export class Arbiter {
     //     stored value: a daemon without a Hermes home omits the key, so an
     //     old client's roster survives a mixed-version re-registration).
     const roster = cleanAgentRoster(info?.agent_roster);
+    // #73: the gateway host facts (slice B). `hermes_version`: string
+    // ≤64 (the gateway's health-reported version) — same edge rule as
+    // version/revision, absent leaves the row as-is (never a fake version
+    // on the row). `gateway_reachable`: an EXACT boolean — `false` is the
+    // exception report (the "gateway down" badge), `true` is the healthy
+    // report; both update the row, ABSENT (old client / connector
+    // disabled / before the first poll round) leaves it exactly as-is
+    // (never clears a stored `false` — the operator's stale badge is
+    // swept by the row sweep, not by a heartbeat that never reports).
+    const hermesVersion =
+      typeof info?.hermes_version === 'string' && info.hermes_version.trim() !== '' && info.hermes_version.trim().length <= 64
+        ? info.hermes_version.trim()
+        : undefined;
+    const gatewayReachable = typeof info?.gateway_reachable === 'boolean' ? info.gateway_reachable : undefined;
     const existing = s.clients.find((c) => c.name === name);
     if (existing) {
       if (validIp(observedIp)) existing.ip = observedIp; // observed wins
@@ -571,6 +657,12 @@ export class Arbiter {
       // undefined, so a re-register carrying an all-malformed roster does
       // NOT wipe the previously stored one.
       if (roster !== undefined) existing.agent_roster = roster;
+      // #73 gateway host facts (slice B): same heartbeat rule as
+      // version/revision — a present, valid report updates the row (both
+      // the `true` and the exception `false`); absent (old client /
+      // connector disabled / pre-first-round) leaves it exactly as-is.
+      if (hermesVersion) existing.hermes_version = hermesVersion;
+      if (gatewayReachable !== undefined) existing.gateway_reachable = gatewayReachable;
       this.store.save();
       return { client_id: existing.client_id, created: false };
     }
@@ -600,6 +692,10 @@ export class Arbiter {
       // Agent roster (#80): lands only when a valid (non-empty) roster was
       // reported — same ADD-key store rule as the heartbeat path.
       ...(roster !== undefined ? { agent_roster: roster } : {}),
+      // #73 gateway host facts (slice B): land only on a present, valid
+      // report (same ADD-key store rule as the heartbeat path).
+      ...(hermesVersion ? { hermes_version: hermesVersion } : {}),
+      ...(gatewayReachable !== undefined ? { gateway_reachable: gatewayReachable } : {}),
     });
     this.store.appendEvent({ kind: 'client_registered', detail: `${name} (${client_id})` });
     // A fresh registration that already carries rebuild state (client
@@ -1564,7 +1660,7 @@ export class Arbiter {
    */
   registerSession(
     token: string,
-    opts: { client_id?: string; client_name?: string; server_id?: string; last_activity?: number; gate?: unknown; session_id?: unknown; history?: unknown; phase?: unknown; now?: number },
+    opts: { client_id?: string; client_name?: string; server_id?: string; last_activity?: number; gate?: unknown; session_id?: unknown; history?: unknown; phase?: unknown; hermes_meta?: unknown; now?: number },
   ): { ok: boolean; reason?: string; created: boolean; session?: SessionRecord } {
     const t = typeof token === 'string' ? token.trim() : '';
     if (!t || t.length > 128) return { ok: false, reason: 'token required (≤128 chars)', created: false };
@@ -1582,6 +1678,13 @@ export class Arbiter {
     // leaves the stored block (ADD-key posture — heartbeats with traffic
     // refresh it; an old client simply never sends it).
     const history = cleanReportedHistory(opts.history, nowMs);
+    // #73: the gateway session ledger's facts (the observed complement).
+    // Per-member drop-don't-reject, and LAST-KNOWN-WINS: a valid block
+    // updates; an ABSENT or all-invalid block NEVER clears the stored one
+    // (a poll that loses a row, a gateway outage, or an old router leaves
+    // what a better poll reported — the ledger is not ephemeral state like
+    // the gate/phase blocks).
+    const hermesMeta = cleanReportedHermesMeta(opts.hermes_meta);
     const s = this.store.state;
     const existing = s.sessions.find((x) => x.token === t);
     if (existing) {
@@ -1604,6 +1707,9 @@ export class Arbiter {
       // (no live stream); invalid/absent (undefined) ⇒ dropped, the stored
       // phase stands (an old router simply never sends the key).
       if (phaseVerdict !== undefined) existing.phase = phaseVerdict;
+      // #73 hermes_meta, last-known-wins like session_id/history: a valid
+      // report updates; an absent/invalid one never clears the stored block.
+      if (hermesMeta) existing.hermes_meta = hermesMeta;
       this.store.save();
       return { ok: true, created: false, session: existing };
     }
@@ -1621,6 +1727,9 @@ export class Arbiter {
       ...(sessionId ? { session_id: sessionId } : {}),
       ...(history ? { history } : {}),
       ...(phaseVerdict !== undefined ? { phase: phaseVerdict } : {}),
+      // #73: a valid hermes_meta rides the fresh row; an absent/invalid
+      // one leaves the row without the key (the first report creates it).
+      ...(hermesMeta ? { hermes_meta: hermesMeta } : {}),
     };
     s.sessions.push(session);
     this.store.appendEvent({ kind: 'session_registered', detail: `${t}${session.client_name ? ` (${session.client_name})` : ''}${session.server_id ? ` → ${session.server_id}` : ''}` });

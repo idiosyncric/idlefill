@@ -89,7 +89,7 @@ function bearer(req: { headers: Record<string, unknown>; query: unknown }): stri
 function projectView(
   arbiter: Arbiter,
   cfg: ServerConfig,
-  clients: { name: string; last_seen: number; projects: { name: string; model: string; estimated_seconds: number; queue_depth: number; queue_preview?: QueuePreviewRow[]; stats?: Record<string, number | string>; last_rebuild?: RebuildRunState; cycles?: CycleStatusRow[]; cycle_cap?: number }[]; version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open'; proxy_port?: number; daemon_behind?: boolean }[],
+  clients: { name: string; last_seen: number; projects: { name: string; model: string; estimated_seconds: number; queue_depth: number; queue_preview?: QueuePreviewRow[]; stats?: Record<string, number | string>; last_rebuild?: RebuildRunState; cycles?: CycleStatusRow[]; cycle_cap?: number }[]; version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open'; proxy_port?: number; daemon_behind?: boolean; hermes_version?: string; gateway_reachable?: boolean }[],
   day: string,
   now: number,
   today: Record<string, { finished: number; failed: number }>,
@@ -138,6 +138,13 @@ function projectView(
           // display facts (absent = current or a pre-#61-step-3 client —
           // both render the row unchanged).
           ...(c.daemon_behind ? { daemon_behind: true } : {}),
+          // #73: the Hermes gateway host facts (slice B), echoed
+          // exception-only like the other display facts. `gateway_reachable`
+          // rides on BOTH values: false is the exception the dashboard
+          // badges; true is the healthy report (surfaces render the badge
+          // only on false — the echo keeps the stored value visible).
+          ...(c.hermes_version ? { hermes_version: c.hermes_version } : {}),
+          ...(c.gateway_reachable !== undefined ? { gateway_reachable: c.gateway_reachable } : {}),
         };
       })
       .sort((a, b) => Number(b.online) - Number(a.online) || a.client.localeCompare(b.client));
@@ -312,7 +319,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   // ------------------------------------------------------------------
 
   app.post('/api/clients/register', async (req, reply) => {
-    const body = (req.body ?? {}) as { name?: string; ip?: string; projects?: ProjectAllocation[]; version?: unknown; protocol?: unknown; revision?: unknown; gate_posture?: unknown; proxy_port?: unknown; aggregate_port?: unknown; daemon_behind?: unknown; client_log?: unknown; agent_roster?: unknown };
+    const body = (req.body ?? {}) as { name?: string; ip?: string; projects?: ProjectAllocation[]; version?: unknown; protocol?: unknown; revision?: unknown; gate_posture?: unknown; proxy_port?: unknown; aggregate_port?: unknown; daemon_behind?: unknown; client_log?: unknown; agent_roster?: unknown; hermes_version?: unknown; gateway_reachable?: unknown };
     const name = typeof body.name === 'string' ? body.name.trim() : '';
     if (!name) return reply.code(400).send({ error: 'name required' });
     const remote = (req.ip ?? '').split(':').pop() ?? 'unknown';
@@ -459,14 +466,20 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     // via cleanAgentRoster. Absent on old clients and on daemons without a
     // Hermes home: absent NEVER clears the stored roster.
     const agent_roster = Array.isArray(body.agent_roster) ? (body.agent_roster as unknown) : undefined;
+    // #73: the gateway host facts (slice B) — plain pass-throughs,
+    // sanitized in registerClient (hermes_version: string ≤64;
+    // gateway_reachable: exact boolean). Absent on old clients and on
+    // daemons without the connector: absent NEVER clears a stored value.
+    const hermes_version = typeof body.hermes_version === 'string' ? body.hermes_version : undefined;
+    const gateway_reachable = typeof body.gateway_reachable === 'boolean' ? body.gateway_reachable : undefined;
     const res = arbiter.registerClient(
       name,
       typeof body.ip === 'string' && body.ip.trim() ? body.ip.trim() : undefined,
       remote,
       projects,
       undefined,
-      version !== undefined || protocol !== undefined || revision !== undefined || gate_posture !== undefined || proxy_port !== undefined || aggregate_port !== undefined || daemon_behind !== undefined || client_log !== undefined || agent_roster !== undefined
-        ? { version, protocol, revision, gate_posture, proxy_port, aggregate_port, daemon_behind, client_log, agent_roster }
+      version !== undefined || protocol !== undefined || revision !== undefined || gate_posture !== undefined || proxy_port !== undefined || aggregate_port !== undefined || daemon_behind !== undefined || client_log !== undefined || agent_roster !== undefined || hermes_version !== undefined || gateway_reachable !== undefined
+        ? { version, protocol, revision, gate_posture, proxy_port, aggregate_port, daemon_behind, client_log, agent_roster, hermes_version, gateway_reachable }
         : undefined,
     );
     return reply.code(200).send({ client_id: res.client_id, created: res.created });
@@ -976,6 +989,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       session_id?: unknown;
       history?: unknown;
       phase?: unknown;
+      hermes_meta?: unknown;
     };
     const token = typeof body.token === 'string' ? body.token.trim() : '';
     if (!token) return reply.code(400).send({ error: 'token required' });
@@ -999,6 +1013,11 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       // absent = the no-phase report (the stored phase CLEARS), and the
       // three-verdict sanitizer lives in registerSession.
       phase: body.phase,
+      // #73: the gateway session ledger's facts (the observed complement).
+      // Forwarded VERBATIM like `gate` — the sanitizer lives in
+      // registerSession (per-member drop-don't-reject; last-known-wins:
+      // absent never clears the stored block).
+      ...(body.hermes_meta !== undefined ? { hermes_meta: body.hermes_meta } : {}),
     });
     if (!res.ok) return reply.code(400).send({ error: res.reason ?? 'invalid' });
     return reply.code(res.created ? 201 : 200).send({ created: res.created, session: res.session });
