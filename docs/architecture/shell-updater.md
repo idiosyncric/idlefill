@@ -1,5 +1,11 @@
 # Shell updater — issue #75 (grill, 2026-10-09)
 
+Status: ALL LOCKED (2026-10-09). D1–D7 LOCKED from the grill; Q-e
+settled by the owner: option (a), the operator host signs. The two
+owner steps ("Owner steps" below) are locked as decided and filed as
+the release-endpoint wave: key generation on this host, and the first
+signed run cutting Release #4 (tag `v4`, SemVer `1.0.4`).
+
 ## What this doc amends
 
 This doc is the shell updater plane for the Tauri shell
@@ -263,9 +269,9 @@ Rejected alternatives:
 - `createUpdaterArtifacts: true` committed: breaks the universal
   checkout build on every keyless machine.
 - `v1_compatible` artifacts: the shell has no v1 history. Off.
-- The key in a Forgejo secret for CI: that is the signing-host
-  question (Q-e, PROPOSED). The doc names the operator host as the
-  default.
+- The key in a Forgejo secret for CI: that was the signing-host
+  question (Q-e, LOCKED 2026-10-09: option (a), the operator host).
+  Rejected: no private key on the CI runner.
 
 Trade-off: one key on one host. Losing it breaks the updater until a
 new keypair exists, and the new public key forces a shell rebuild.
@@ -277,9 +283,15 @@ LOCKED. The shell's `tauri.conf.json` `version` becomes `1.0.<N>`,
 where N is the release number `release.sh` already validates
 (integer ≥ 1, tag `v<N>` — the tag scheme and the validation are
 unchanged, `release.sh:38-46`). The current `1.0.0` stands as the
-pre-update baseline (the #69 cutover build). The first updater
-release (v1) publishes `1.0.1`. The updater compares SemVer. A version equal
-to or below the installed one is ignored.
+pre-update baseline (the #69 cutover build). The updater compares
+SemVer. A version equal to or below the installed one is ignored.
+
+Correction at lock (2026-10-09): the tag namespace is NOT fresh —
+`v1`, `v2`, `v3` already exist (the numbered-release era, "Release
+#N" / `Idlefill N.zip`; root `package.json` sits at `2`). The grill's
+"first updater release (v1) publishes 1.0.1" predates that check.
+The sequence continues: the first updater release is N=4 — tag `v4`,
+SemVer `1.0.4`.
 
 `tauri/build.sh` already takes `IDLEFILL_VERSION` and merges it into
 `version` through the `TAURI_CONFIG` env (lines 11-13, 49-54,
@@ -382,10 +394,11 @@ manual path), the page (`dashboard/`, the arbiter's served surface),
 the D1–D6 and D8–D9 mechanics, the `--version` marker contract, the
 retired Swift planes, the daemon + arbiter LaunchAgent labels.
 
-## Blocked on the owner
+## Owner steps — LOCKED as decided (2026-10-09)
 
-A build wave cannot do these two steps without the owner's
-participation (the doc writes no secret and only names the steps):
+The owner settled these two steps (2026-10-09, issue #75) and the
+release-endpoint wave carries them out on the operator host (Q-e,
+option (a)). The doc still writes no secret:
 
 1. Key generation: `cargo-tauri signer generate` on the operator
    host. The private key lands at
@@ -395,7 +408,8 @@ public. The config commit is a normal build-wave commit
    that follows the generation).
 2. The first signed run: the first `release.sh` pass with the key
    (it emits the bundle and the `.sig`, assembles `latest.json`,
-   publishes, and verifies the live feed).
+   publishes, and verifies the live feed). It cuts Release #4: tag
+   `v4`, SemVer `1.0.4` (D5 correction above).
 
 A build wave can do everything else without secrets: the plugin
 dependency and the Rust commands, the settings UI rows, the
@@ -405,13 +419,12 @@ version-scheme plumbing, and the dry-run harness (the temp-release
 round trip with stand-in artifacts — the GET and parse checks need no
 real signature).
 
-## Open questions (owner input)
+## Owner decisions (settled 2026-10-09)
 
-- **Q-e PROPOSED — the signing host.** The first release signs on
-  the operator host (this Mac, the key's home, D4). Later releases:
-  (a) the operator keeps signing locally (recommended: one key on
-  one host, no key on the CI runner), or (b) the private key is
-  provisioned on the CI runner (urza) so the tag-triggered pipeline
-  signs. This is a security decision: the private key's placement on
-  a CI host. The doc names (a) as the default until the owner decides
-  otherwise.
+- **Q-e LOCKED — the signing host: (a), the operator host.** The
+  owner decided (2026-10-09, issue #75): the operator keeps signing
+  locally — one key on one host (this Mac, the key's home, D4), for
+  the first release AND for later releases. (b) — provisioning the
+  private key on the CI runner (urza) for a tag-triggered pipeline —
+  stays rejected: no private key on a CI host. If the owner ever
+  picks (b), that is a new decision against this lock.

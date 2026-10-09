@@ -59,8 +59,9 @@ plane stays retired, and the `--version` marker contract survives),
 D8, D9, Q-c (the single tray click), and Q-d (one LaunchAgent).
 
 The new plane and its decisions live in
-`docs/architecture/shell-updater.md` (its D1-D7, LOCKED except Q-e
-PROPOSED). This doc cites that doc as the inherited constraint. It
+`docs/architecture/shell-updater.md` (its D1-D7 and Q-e, all LOCKED;
+Q-e settled 2026-10-09: the operator host signs, no key on the CI
+runner). This doc cites that doc as the inherited constraint. It
 does not restate it.
 
 ## The rules this doc inherits
