@@ -41,6 +41,13 @@ export const PEER_STALE_MS = 90_000;
  *  15 s — the existing poll tick. Configurable via `fleet_roster_pull_ms`. */
 export const ROSTER_PULL_MS = 15_000;
 
+/** PROPOSED: the fleet heartbeat interval (#55 D3, owner choice 1, slice 8).
+ *  60 s — quieter than the 15 s poll tick; a moved address is re-published
+ *  within a minute. Configurable via `fleet_heartbeat_ms`. The heartbeat
+ *  RIDES the existing poll tick (no second network loop): at most one
+ *  heartbeat per interval, NOT one per poll. */
+export const HEARTBEAT_MS = 60_000;
+
 /** Hard caps on a REMOTE snapshot (it is untrusted input — same
  *  discipline as cleanPreview/cleanStats on the registration path). */
 const MAX_SERVERS = 20;
@@ -260,6 +267,93 @@ export function buildRosterFetcher(cfg: ServerConfig, identity: Identity): Roste
 }
 
 /**
+ * One fleet heartbeat send (#55 D3, slice 8): the arbiter's live urls +
+ * coarse presence to the fleet service's `POST /heartbeat`. Injectable for
+ * tests; the production sender (see `buildHeartbeatSender`) is fail-quiet
+ * (null on any failure, never throws) — but `MeshFederation.sendHeartbeat`
+ * wraps the seam in a try/catch anyway, so a THROWSING transport (the test
+ * seam) cannot break the tick or touch the last-known peer set (the
+ * Service-down rule).
+ */
+export type HeartbeatSender = (urls: string[], presence: 'online' | 'offline') => Promise<unknown | null>;
+
+/**
+ * The fleet heartbeat sender (#55 D3 owner choice 1, slice 8): the
+ * production replacement for the pre-slice-8 "no heartbeat" behavior.
+ * Enrolls ONCE (the SAME sibling `fleet_enrollment.json` as the roster
+ * pull — `ensureEnrolled` is idempotent, so the one-time token is spent
+ * exactly once across roster + heartbeat), then signs a fresh nonce per
+ * heartbeat with the arbiter's ed25519 key (D2 step 3: no shared fleet
+ * secret ever exists). The arbiter publishes its OWN urls
+ * (`fleet_own_urls` — the operator's reachability declaration; the mesh
+ * peers are INBOUND, this is the OUTBOUND self-declaration) + coarse
+ * presence ('online' — a running arbiter is, by definition, online).
+ *
+ * Gating: ALL of `fleet_url` / `fleet_instance_id` / `fleet_enrollment_token`
+ * present = the signed heartbeat; any one absent = the sender is inert
+ * (a no-op returning null — no enroll, no network, no credential touched,
+ * byte-for-byte the pre-slice-8 behavior).
+ *
+ * Failure posture (the Service-down rule): a failed heartbeat is a NO-OP
+ * (fail-quiet: `heartbeatOnce` returns null on any failure, never throws).
+ *
+ * Injectable seams (tests): `enroll` / `heartbeat` replace the
+ * `FleetClient` call path without a network; the default is the real
+ * `FleetClient` bound to the #55 D1 identity.
+ */
+export interface HeartbeatSenderOpts {
+  /** The enrollment file path (default: `enrollmentFileOf(stateFile)`). */
+  file?: string;
+  /** Replaces the enroll call (tests): returns {ok, instance_id, credential, error?}. */
+  enroll?: () => Promise<{ ok: boolean; instance_id?: string; credential?: string; error?: string }>;
+  /** Replaces the signed heartbeat call (tests): returns the raw response or null. */
+  heartbeat?: (urls: string[], presence: 'online' | 'offline') => Promise<unknown | null>;
+}
+
+export function buildHeartbeatSender(
+  cfg: ServerConfig,
+  identity: Identity,
+  opts: HeartbeatSenderOpts = {},
+): HeartbeatSender {
+  if (!cfg.fleet_url || !cfg.fleet_instance_id || !cfg.fleet_enrollment_token) {
+    // Any of the three absent = the heartbeat is inert (byte-for-byte the
+    // pre-slice-8 behavior: no enroll attempt, no network, no credential
+    // file touched). The caller (MeshFederation.sendHeartbeat) also gates
+    // on the three keys, so this is the second, defense-in-depth gate.
+    return () => Promise.resolve(null);
+  }
+  const base = cfg.fleet_url.replace(/\/+$/, '');
+  const file = opts.file ?? enrollmentFileOf(cfg.state_file);
+  const clientCfg: FleetClientConfig = {
+    fleet_url: base,
+    fleet_enrollment_token: cfg.fleet_enrollment_token ?? '',
+    // The heartbeat name: the mesh display name, falling back to the
+    // config's server_name, then the hostname (a display label, never a
+    // secret) — the same name the roster pull enrolls under.
+    name: cfg.mesh_name || cfg.server_name || 'arbiter',
+  };
+  const client = new FleetClient(file, clientCfg, identity);
+  const enroll = opts.enroll ?? (() => client.ensureEnrolled());
+  const send =
+    opts.heartbeat ??
+    (async (urls: string[], presence: 'online' | 'offline') => {
+      // A persisted credential makes this a no-op; a missing credential
+      // attempts the enroll first (idempotent — already spent = a no-op).
+      void (await client.ensureEnrolled()).ok;
+      return client.heartbeatOnce(urls, presence);
+    });
+  return async (urls, presence) => {
+    // Enroll once (idempotent — a persisted credential skips the spend);
+    // a failed enroll is a no-op heartbeat (fail-quiet, never a throw).
+    const r = await enroll();
+    if (!r.ok || r.instance_id === undefined || r.credential === undefined) {
+      return null;
+    }
+    return send(urls, presence);
+  };
+}
+
+/**
  * Validate + clamp a REMOTE roster (untrusted input — the same discipline
  * as sanitizeSnapshot). Returns the usable rows. A malformed envelope
  * (wrong shape) yields []. A malformed ROW is dropped individually —
@@ -333,6 +427,11 @@ export interface FederationOptions {
   localInstanceId?: () => string;
   /** The local edge-record writer (#55 D4 fill seam). Absent = no fill. */
   edgeFiller?: EdgeFiller;
+  /** The fleet heartbeat sender (#55 D3, slice 8). Absent = no heartbeat
+   *  (byte-for-byte the pre-slice-8 behavior). The production wiring is
+   *  `buildHeartbeatSender`; tests inject a recorder or a throwing
+   *  transport to prove the Service-down rule. */
+  heartbeatSender?: HeartbeatSender;
 }
 
 export class MeshFederation {
@@ -340,9 +439,13 @@ export class MeshFederation {
   private readonly fetcher: MeshFetcher;
   private readonly localInstanceId?: () => string;
   private readonly edgeFiller?: EdgeFiller;
+  private readonly heartbeatSender?: HeartbeatSender;
   private readonly peers = new Map<string, PeerEntry>();
   /** When a roster pull is due next (epoch-ms). 0 = never armed (no fleet_url). */
   private nextRosterPullAt = 0;
+  /** When a fleet heartbeat is due next (epoch-ms). 0 = never armed
+   *  (no fleet_url / no heartbeat sender — the pre-slice-8 behavior). */
+  private nextHeartbeatAt = 0;
   /** (peer, key) pairs already filled into the local edge store since
    *  boot — the roster pull runs every 15 s; the edge file is rewritten
    *  only when a NEW (peer, key) pair arrives, never on every pull. */
@@ -353,6 +456,7 @@ export class MeshFederation {
     this.fetcher = fetcher;
     this.localInstanceId = opts.localInstanceId;
     this.edgeFiller = opts.edgeFiller;
+    this.heartbeatSender = opts.heartbeatSender;
     for (const p of cfg.mesh_peers ?? []) {
       const url = String(p?.url ?? '').trim().replace(/\/+$/, '');
       if (!url || url === 'self') continue;
@@ -484,6 +588,49 @@ export class MeshFederation {
           }
         }
       }
+    }
+  }
+
+  /**
+   * Send the fleet heartbeat (if configured): the arbiter's OWN live urls
+   * (`cfg.fleet_own_urls` — the operator's reachability declaration) + coarse
+   * presence ('online' — a running arbiter is, by definition, online) to
+   * the fleet service. Rides the EXISTING poll tick (no second network
+   * loop): at most ONE heartbeat per `fleet_heartbeat_ms` interval (the
+   * PROPOSED 60 s default), NOT one per poll (the 15 s poll tick).
+   *
+   * Gating: all of `fleet_url` / `fleet_instance_id` / `fleet_enrollment_token`
+   * present AND a `heartbeatSender` wired = the heartbeat; any one absent
+   * (or no sender) = the heartbeat never happens, byte-for-byte the
+   * pre-slice-8 behavior.
+   *
+   * Failure posture (the Service-down rule): a FAILED heartbeat NEVER throws
+   * and NEVER touches the last-known peer set — the peer map is left
+   * untouched, the arbiter never crashes on fleet trouble. The interval gate
+   * still advances on failure (a failing fleet is re-tried on the NEXT
+   * interval, not every poll — no hammering a downed service).
+   */
+  async sendHeartbeat(now: number): Promise<void> {
+    // Any of the three fleet keys absent = the heartbeat never happens
+    // (byte-for-byte the pre-slice-8 behavior; matches buildRosterFetcher
+    // and buildHeartbeatSender's gating).
+    if (!this.cfg.fleet_url || !this.cfg.fleet_instance_id || !this.cfg.fleet_enrollment_token) return;
+    if (!this.heartbeatSender) return; // no sender wired = no heartbeat
+    const intervalMs = this.cfg.fleet_heartbeat_ms ?? HEARTBEAT_MS;
+    if (now < this.nextHeartbeatAt) return; // not due yet (at most one heartbeat per interval)
+    this.nextHeartbeatAt = now + intervalMs;
+    // The arbiter's OWN urls (the outbound self-declaration) + coarse
+    // presence. A running arbiter is online by definition — presence is
+    // the coarse value, not a health probe.
+    const urls = (this.cfg.fleet_own_urls ?? []).map((u) => u.trim()).filter((u) => u !== '');
+    try {
+      await this.heartbeatSender(urls, 'online');
+    } catch {
+      // Service-down rule: a failed/throwing heartbeat is a no-op. The
+      // last-known peer set stands byte-for-byte (the peer map is never
+      // touched by the heartbeat path), and the tick never throws. The
+      // interval gate already advanced (set above), so a downed fleet is
+      // re-tried on the NEXT interval, not every poll.
     }
   }
 

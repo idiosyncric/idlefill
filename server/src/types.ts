@@ -86,6 +86,16 @@ export interface ServerConfig {
    */
   fleet_roster_pull_ms?: number;
   /**
+   * Fleet heartbeat interval in ms (#55 D3 owner choice 1, PROPOSED — the
+   * value is the owner's to pick). Default 60 s (the D3 PROPOSED cadence):
+   * quieter than the 15 s poll tick, still re-publishes a moved address
+   * within a minute. A heartbeat is sent at most once per interval — it
+   * rides the EXISTING poll tick (no second network loop; at most one
+   * heartbeat per interval, not one per poll). Only read when `fleet_url`
+   * is set; any of the three fleet keys absent = no heartbeat at all.
+   */
+  fleet_heartbeat_ms?: number;
+  /**
    * This instance's fleet-issued id (ADD key — absent = unset).
    *
    * #55 D3 (PROPOSED, slice 7): the id the fleet service assigns at
@@ -102,6 +112,17 @@ export interface ServerConfig {
    * the arbiter never invents one.
    */
   fleet_instance_id?: string;
+  /**
+   * The operator's declaration of where THIS arbiter is reachable (#55
+   * D3, PROPOSED — slice 8): the tailnet IPv4/IPv6 address(es) and/or any
+   * published route. Rides the fleet heartbeat (`POST /heartbeat` urls[])
+   * so the roster row carries live, pullable urls. ADD key: absent =
+   * unset = the heartbeat publishes an empty urls[] (the row stays
+   * unreachable until the operator declares a url). Trusted operator
+   * input (the `mesh_peers` posture); the fleet service re-sanitizes it
+   * server-side (bounded, length-capped). Never a secret — an address.
+   */
+  fleet_own_urls?: string[];
   /**
    * The one-time enrollment token the operator minted at the fleet
    * service (`POST /token`, fleet/src/index.ts) (ADD key — absent = unset).

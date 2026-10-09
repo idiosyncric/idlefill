@@ -33,11 +33,13 @@ import {
   MeshFederation,
   PEER_STALE_MS,
   ROSTER_PULL_MS,
+  HEARTBEAT_MS,
   buildMeshSnapshot,
   sanitizeSnapshot,
   sanitizeRoster,
   mintInstanceId,
   buildRosterFetcher,
+  buildHeartbeatSender,
   type MeshFetcher,
   type MeshSnapshot,
   type RosterFetcher,
@@ -45,6 +47,7 @@ import {
   type EdgeFiller,
 } from '../src/mesh.js';
 import { FleetClient, enrollmentFileOf, loadEnrollment, enrollmentFileMode } from '../src/fleet-client.js';
+import { applyDefaults } from '../src/config.js';
 import { Identity } from '../src/identity.js';
 import type { ServerConfig } from '../src/types.js';
 
@@ -1304,5 +1307,249 @@ test('slice 7: a stale credential re-enrolls (D2 recovery: fleet reset → wiped
   // And the re-enrolled identity can pull the roster again.
   const rows = (await c2.signedRoster()) as { instances: { instance_id: string }[] };
   assert.ok(rows.instances.some((i) => i.instance_id === enr2.instance_id), 'the re-enrolled instance is in the roster');
+  await stub.close();
+});
+
+// ---------------------------------------------------------------------------
+// Slice 8: the fleet heartbeat on the federation tick (#55 D3 owner choice 1)
+//
+// The arbiter publishes its OWN live urls (cfg.fleet_own_urls) + coarse
+// presence ('online') to the fleet service's POST /heartbeat, RIDING the
+// existing poll tick (no second network loop). At most ONE heartbeat per
+// fleet_heartbeat_ms interval (PROPOSED 60 s), NOT one per poll. Gated on
+// all of fleet_url / fleet_instance_id / fleet_enrollment_token — any one
+// absent = no heartbeat, byte-for-byte pre-slice-8. A failed heartbeat never
+// throws and never touches the last-known peer set (the Service-down rule).
+// ---------------------------------------------------------------------------
+
+const OWN_URL = 'http://100.64.0.9:8787';
+
+interface HbCall {
+  urls: string[];
+  presence: 'online' | 'offline';
+}
+
+test('slice 8: no fleet keys = no heartbeat attempt (byte-for-byte pre-slice-8)', async () => {
+  const dir = await mkTmp();
+  const calls: HbCall[] = [];
+  const sender = async (urls: string[], presence: 'online' | 'offline') => {
+    calls.push({ urls, presence });
+    return { ok: true };
+  };
+  // Variant A: no fleet keys at all (fleet_url absent).
+  const cfgA = baseCfg(dir, { mesh_peers: [{ url: PEER_URL, name: 'lab box' }] });
+  assert.equal(cfgA.fleet_url, undefined, 'precondition: no fleet_url');
+  const meshA = new MeshFederation(cfgA, async () => snap(), { heartbeatSender: sender });
+  await meshA.sendHeartbeat(T0);
+  await meshA.sendHeartbeat(T0 + 3 * HEARTBEAT_MS);
+  assert.equal(calls.length, 0, 'no heartbeat attempt with fleet_url absent');
+  assert.deepEqual(meshA.view(T0).map((v) => v.url), [PEER_URL], 'the static peer set stands, byte-for-byte');
+  assert.ok(!existsSync(enrollmentFileOf(cfgA.state_file)), 'no fleet_enrollment.json — no enroll was attempted');
+  // Variant B: fleet_url present but the identity + token absent.
+  const cfgB = baseCfg(dir, {
+    mesh_peers: [{ url: PEER_URL }],
+    fleet_url: 'http://fleet.example:8789',
+  });
+  const meshB = new MeshFederation(cfgB, async () => snap(), { heartbeatSender: sender });
+  await meshB.sendHeartbeat(T0);
+  await meshB.sendHeartbeat(T0 + 3 * HEARTBEAT_MS);
+  assert.equal(calls.length, 0, 'no heartbeat attempt with the identity + token absent');
+  assert.deepEqual(meshB.view(T0).map((v) => v.url), [PEER_URL], 'the static peer set stands');
+  assert.ok(!existsSync(enrollmentFileOf(cfgB.state_file)), 'still no credential file');
+  // Variant C: a no-sender federation (the pre-slice-8 wiring) never beats
+  // even a fully-provisioned config.
+  const cfgC = baseCfg(dir, {
+    fleet_url: 'http://fleet.example:8789',
+    fleet_instance_id: 'declared-seam',
+    fleet_enrollment_token: 'tok',
+  });
+  const meshC = new MeshFederation(cfgC, async () => snap());
+  await meshC.sendHeartbeat(T0);
+  assert.equal(calls.length, 0, 'no heartbeat sender wired = no heartbeat (pre-slice-8)');
+});
+
+test('slice 8: the PROPOSED cadence default is 60 s and one heartbeat happens once per interval, not once per poll', async () => {
+  const dir = await mkTmp();
+  const identity = Identity.mint();
+  const calls: HbCall[] = [];
+  const sender = async (urls: string[], presence: 'online' | 'offline') => {
+    calls.push({ urls, presence });
+    return { ok: true };
+  };
+  const cfg = baseCfg(dir, {
+    fleet_url: 'http://fleet.example:8789',
+    fleet_instance_id: 'declared-seam',
+    fleet_enrollment_token: 'tok',
+  });
+  // The PROPOSED default: `baseCfg` is a raw literal (no defaults applied), so
+  // the cadence comes from applyDefaults and the fallback constant.
+  assert.equal(applyDefaults({ fleet_url: 'http://fleet.example:8789' }).fleet_heartbeat_ms, 60_000, 'applyDefaults carries the PROPOSED 60 s cadence');
+  assert.equal(HEARTBEAT_MS, 60_000, 'the named PROPOSED constant is 60 s');
+  assert.equal(cfg.fleet_heartbeat_ms, undefined, 'a bare config leaves the cadence unset (the tick falls back to HEARTBEAT_MS)');
+  const mesh = new MeshFederation(cfg, async () => snap(), { heartbeatSender: sender });
+  // The poll tick (15 s) fires FIVE times across one 60 s cadence window.
+  const POLL = 15_000;
+  await mesh.sendHeartbeat(T0); // poll 1 → due → heartbeat #1
+  await mesh.sendHeartbeat(T0 + POLL); // poll 2 → not due
+  await mesh.sendHeartbeat(T0 + 2 * POLL); // poll 3 → not due
+  await mesh.sendHeartbeat(T0 + 3 * POLL); // poll 4 → not due
+  await mesh.sendHeartbeat(T0 + 4 * POLL); // poll 5 (== T0 + 60 s) → due → heartbeat #2
+  assert.equal(calls.length, 2, 'ONE heartbeat per 60 s interval — NOT one per 15 s poll (4 polls inside, 0 sent)');
+  // The first heartbeat armed the gate; the 60 s boundary re-fires exactly once.
+  await mesh.sendHeartbeat(T0 + 5 * POLL); // poll 6 (T0+75 s) → not due
+  assert.equal(calls.length, 2, 'still throttled after the interval elapsed');
+});
+
+test('slice 8: a throwing transport does not break the tick and does not change the peer set (Service-down rule)', async () => {
+  const dir = await mkTmp();
+  const cfg = baseCfg(dir, {
+    mesh_peers: [{ url: PEER_URL, name: 'lab box' }],
+    fleet_url: 'http://fleet.example:8789',
+    fleet_instance_id: 'declared-seam',
+    fleet_enrollment_token: 'tok',
+  });
+  // The production sender (buildHeartbeatSender) against an UNREACHABLE
+  // fleet_url: heartbeatOnce fails on the transport (connect ECONNREFUSED)
+  // and returns null — it never throws. But to PROVE the Service-down rule
+  // against a THROWSING transport, we inject one that rejects outright.
+  let throwCount = 0;
+  const mesh = new MeshFederation(cfg, async () => snap(), {
+    heartbeatSender: async () => {
+      throwCount += 1;
+      throw new Error('boom: transport blew up');
+    },
+  });
+  // Pre-state: the static peer set (the "last-known" peer set).
+  const before = mesh.view(T0).map((v) => v.url).sort();
+  assert.deepEqual(before, [PEER_URL], 'precondition: the last-known peer set');
+  // The throwing heartbeat must NOT reject (the tick must never crash).
+  await mesh.sendHeartbeat(T0); // must resolve, not throw
+  await mesh.sendHeartbeat(T0 + 2 * HEARTBEAT_MS); // a later interval also safe
+  // The peer set is UNCHANGED, byte-for-byte (the heartbeat never touches it).
+  const after = mesh.view(T0 + 2 * HEARTBEAT_MS).map((v) => v.url).sort();
+  assert.deepEqual(after, before, 'the last-known peer set stands byte-for-byte after a throwing heartbeat');
+  // And the read plane still works after the swallowed failure.
+  await mesh.refresh(T0 + 2 * HEARTBEAT_MS);
+  assert.equal(mesh.view(T0 + 2 * HEARTBEAT_MS)[0]!.online, true, 'no crash — the mesh read plane is untouched');
+  // The interval gate still advanced on failure (a downed fleet is retried on
+  // the NEXT interval, not every poll): three calls total across three
+  // intervals, and every one was swallowed rather than thrown.
+  await mesh.sendHeartbeat(T0 + 3 * HEARTBEAT_MS);
+  assert.equal(throwCount, 3, 'three intervals fired, all three throws swallowed by the tick');
+});
+
+test('slice 8: the urls sent are the arbiter\'s own configured urls (cfg.fleet_own_urls) with coarse presence "online"', async () => {
+  const dir = await mkTmp();
+  const identity = Identity.mint();
+  const calls: HbCall[] = [];
+  const sender = async (urls: string[], presence: 'online' | 'offline') => {
+    calls.push({ urls, presence });
+    return { ok: true };
+  };
+  const ownUrls = ['http://100.64.0.9:8787', 'https://tailnet.example:8787'];
+  const cfg = baseCfg(dir, {
+    mesh_peers: [{ url: PEER_URL, name: 'a DIFFERENT inbound peer' }],
+    fleet_url: 'http://fleet.example:8789',
+    fleet_instance_id: 'declared-seam',
+    fleet_enrollment_token: 'tok',
+    fleet_own_urls: ownUrls,
+  });
+  const mesh = new MeshFederation(cfg, async () => snap(), { heartbeatSender: sender });
+  await mesh.sendHeartbeat(T0);
+  assert.equal(calls.length, 1, 'one heartbeat');
+  assert.deepEqual(calls[0]!.urls, ownUrls, 'the urls sent are the arbiter\'s OWN configured urls (NOT the inbound mesh_peers)');
+  assert.equal(calls[0]!.presence, 'online', 'the coarse presence is "online" (a running arbiter)');
+  // The inbound mesh_peers are NOT sent as the self-declaration.
+  assert.ok(!calls[0]!.urls.includes(PEER_URL), 'the inbound peer url is not the self-declaration');
+  // Variant: fleet_own_urls absent = an empty urls[] is published (the row
+  // stays unreachable until the operator declares a url) — never a crash.
+  const cfg2 = baseCfg(dir, {
+    fleet_url: 'http://fleet.example:8789',
+    fleet_instance_id: 'declared-seam',
+    fleet_enrollment_token: 'tok',
+  });
+  const mesh2 = new MeshFederation(cfg2, async () => snap(), { heartbeatSender: sender });
+  await mesh2.sendHeartbeat(T0);
+  assert.equal(calls.length, 2, 'a second heartbeat (fresh mesh, fresh gate)');
+  assert.deepEqual(calls[1]!.urls, [], 'fleet_own_urls absent = an empty urls[] is published');
+  // The production buildHeartbeatSender (gated) is inert without the keys.
+  const senderInert = buildHeartbeatSender(baseCfg(dir, {}), identity);
+  assert.equal(await senderInert([OWN_URL], 'online'), null, 'buildHeartbeatSender is inert without the three fleet keys');
+});
+
+// The roster pull and the heartbeat sender are SEPARATE FleetClient instances
+// over the SAME enrollment file. The pull enrolls first; the heartbeat client
+// constructed afterwards must pick the persisted credential up from disk
+// instead of re-spending the single-use token (ensureEnrolled re-reads the
+// file — the #55 slice-8 fix the live proof exposed).
+test('slice 8: the heartbeat sender reuses the credential the roster pull already persisted (no second enroll, no spent token)', async () => {
+  const stub = new StubFleet();
+  const base = await stub.start();
+  const dir = await mkTmp();
+  const identity = Identity.mint();
+  const token = stub.mintToken();
+  const cfg = baseCfg(dir, {
+    fleet_url: base,
+    fleet_instance_id: 'declared-seam',
+    fleet_enrollment_token: token,
+    fleet_own_urls: [OWN_URL],
+    mesh_name: 'home-arbiter',
+  });
+  // The roster pull runs FIRST and spends the one-time token.
+  const fed = new MeshFederation(cfg, async () => snap(), {
+    heartbeatSender: buildHeartbeatSender(cfg, identity),
+  });
+  await fed.pullRoster(buildRosterFetcher(cfg, identity), T0);
+  assert.equal(stub.enrollCount, 1, 'the pull enrolled once');
+  assert.equal(stub.tokenUsed(token), true, 'the token is spent');
+  // Now the heartbeat sender (its own FleetClient instance, same file) must
+  // send a heartbeat WITHOUT a second enroll.
+  await fed.sendHeartbeat(T0);
+  assert.equal(stub.enrollCount, 1, 'the heartbeat did NOT re-enroll (no second token spend)');
+  assert.equal(stub.heartbeatCount, 1, 'the heartbeat reached the service');
+  const arb = [...stub.instances.values()].find((i) => i.public_key === identity.publicKeyB64url);
+  assert.deepEqual(arb!.urls, [OWN_URL], 'the heartbeat urls are the configured own urls');
+  await stub.close();
+});
+
+test('slice 8: the production sender enrolls ONCE (shared credential) and signs a real heartbeat against the stub fleet (real HTTP, real crypto)', async () => {
+  const stub = new StubFleet();
+  const base = await stub.start();
+  const dir = await mkTmp();
+  const identity = Identity.loadOrCreate(join(dir, 'state.json'));
+  const token = stub.mintToken();
+  const cfg = baseCfg(dir, {
+    fleet_url: base,
+    fleet_instance_id: 'declared-seam',
+    fleet_enrollment_token: token,
+    fleet_own_urls: [OWN_URL],
+    mesh_name: 'home-arbiter',
+  });
+  const sender = buildHeartbeatSender(cfg, identity);
+  const mesh = new MeshFederation(cfg, async () => snap(), { heartbeatSender: sender });
+  await mesh.sendHeartbeat(T0);
+  // Enroll: exactly ONCE (the one-time token spent once across the heartbeat).
+  assert.equal(stub.enrollCount, 1, 'one enroll (the token is single-use)');
+  assert.equal(stub.tokenUsed(token), true, 'the token was consumed');
+  const arb = [...stub.instances.values()].find((i) => i.public_key === identity.publicKeyB64url);
+  assert.ok(arb, 'the arbiter enrolled with its #55 D1 public key');
+  // The signed heartbeat was accepted and recorded the OWN urls + presence.
+  assert.equal(stub.heartbeatCount, 1, 'one signed heartbeat hit the service');
+  assert.deepEqual(arb.urls, [OWN_URL], 'the heartbeat urls are the arbiter\'s own configured urls');
+  assert.equal(arb.presence, 'online', 'the coarse presence is online');
+  assert.equal(typeof arb.last_seen, 'number', 'last_seen was set by the heartbeat');
+  // The credential persisted to the sibling file (shared with the roster pull).
+  const file = enrollmentFileOf(cfg.state_file);
+  assert.ok(existsSync(file), 'fleet_enrollment.json was persisted (the shared credential)');
+  assert.equal(enrollmentFileMode(file), 0o600, 'owner-only (0600)');
+  const rec = loadEnrollment(file);
+  assert.equal(rec?.instance_id, arb.instance_id, 'the persisted id matches the service');
+  // Throttled: a second send inside the interval does NOT re-enroll or re-heartbeat.
+  await mesh.sendHeartbeat(T0 + 1000);
+  assert.equal(stub.enrollCount, 1, 'no re-enroll inside the interval');
+  assert.equal(stub.heartbeatCount, 1, 'no second heartbeat inside the interval');
+  // Past the interval: re-heartbeats, still signed, still accepted.
+  await mesh.sendHeartbeat(T0 + HEARTBEAT_MS);
+  assert.equal(stub.heartbeatCount, 2, 'the interval elapsed: the heartbeat happens again');
   await stub.close();
 });
