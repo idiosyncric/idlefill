@@ -1158,6 +1158,10 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       // The arbiter's own version (display-only; the client handshake
       // precedent). Absent on a build that never baked one.
       process.env.IDLEFILL_VERSION,
+      // The per-instance ed25519 public key (#55 D1): ADD key — absent on
+      // pre-#55 builds, ignored by old readers. The private key stays in
+      // identity.json (0600) and never rides the wire.
+      arbiter.identity().publicKeyB64url,
     );
   });
 

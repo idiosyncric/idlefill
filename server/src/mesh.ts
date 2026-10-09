@@ -43,6 +43,8 @@ export interface MeshSnapshot {
   ts: number;
   /** Version handshake facts (display-only, exception-only). */
   version?: string;
+  /** The publisher's ed25519 public key (#55 D1) — ADD key; absent = unset. */
+  public_key?: string;
   /** One row per LOCAL engine this arbiter owns — coarse signal only. */
   servers: {
     name: string;
@@ -163,6 +165,8 @@ export function buildMeshSnapshot(
   activeLeases: number,
   now: number,
   version?: string,
+  /** The publisher's ed25519 public key (#55 D1) — ADD key, absent = unset. */
+  publicKey?: string,
 ): MeshSnapshot {
   const snap: MeshSnapshot = {
     instance_id: instanceId,
@@ -179,6 +183,10 @@ export function buildMeshSnapshot(
     active_leases: Number.isFinite(activeLeases) && activeLeases >= 0 ? Math.floor(activeLeases) : 0,
   };
   if (version) snap.version = String(version).slice(0, MAX_NAME);
+  // #55 D1: the publisher's ed25519 public key. ADD key — present when the
+  // publisher mints an identity, ABSENT (unset) otherwise; existing readers
+  // that predate the field simply ignore it.
+  if (typeof publicKey === 'string' && publicKey.trim() !== '') snap.public_key = publicKey.slice(0, 64);
   return snap;
 }
 
@@ -220,6 +228,9 @@ export function sanitizeSnapshot(raw: unknown): MeshSnapshot | null {
     active_leases: num(r.active_leases),
   };
   if (typeof r.version === 'string' && r.version.trim() !== '') out.version = r.version.slice(0, MAX_NAME);
+  // #55 D1: the publisher's public key — ADD key, untrusted input, length-
+  // capped like the rest. Absent on pre-#55 peers; the field stays unset.
+  if (typeof r.public_key === 'string' && r.public_key.trim() !== '') out.public_key = r.public_key.slice(0, 64);
   return out;
 }
 

@@ -53,6 +53,7 @@ import type { IdleDetector } from './idle.js';
 import { activeLeaseExemptIps, defaultActivityPathFor } from './idle.js';
 import { buildCatalog, modelsProbeUrl, type CatalogEntry, type ModelsFetcher } from './catalog.js';
 import { mintInstanceId } from './mesh.js';
+import { Identity } from './identity.js';
 import type {
   ClientKeyRow,
   EngineGroup,
@@ -301,6 +302,12 @@ export interface TickResult {
 export class Arbiter {
   private readonly store: StateStore;
   private readonly cfg: ServerConfig;
+  /**
+   * Per-instance ed25519 identity (#55 D1): minted lazily on the first
+   * `identity()` call and persisted in a sibling identity.json (0600,
+   * atomic tmp+rename). The private key never touches state.json.
+   */
+  private identityInstance: Identity | null = null;
   /**
    * Per-server idle detectors, keyed by server_id (the watched server is
    * WATCHED_SERVER_ID). A server row with no detector is fail-closed for
@@ -2515,6 +2522,20 @@ export class Arbiter {
     s.instance_id = mintInstanceId();
     this.store.save();
     return s.instance_id;
+  }
+
+  /**
+   * This instance's ed25519 identity (#55 D1, locked): minted at first
+   * use, persisted in a sibling `identity.json` (0600, the atomic
+   * tmp+rename posture of the state file). The private key NEVER enters
+   * state.json. A corrupt identity file degrades to a fresh mint — the
+   * arbiter boots.
+   */
+  identity(): Identity {
+    if (!this.identityInstance) {
+      this.identityInstance = Identity.loadOrCreate(this.cfg.state_file);
+    }
+    return this.identityInstance;
   }
 
   /** Sum of queue depths across every registered client (the mesh's coarse depth). */
