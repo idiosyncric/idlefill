@@ -296,6 +296,16 @@ const RING_MAX = 240;
  *  (probe tokens, old chats) stayed in the Sessions list forever. */
 const RING_TTL_MS = 600_000;
 
+/**
+ * #42 slice 2: cap on the session_id → token index (in-memory, a restart
+ * starts empty). 256 entries: one machine runs a few dozen live Hermes
+ * sessions at most (the #80 roster bound is 24 profiles), so the cap
+ * evicts only a hostile flood. The eviction direction is fail-quiet: an
+ * evicted (stale) id resolves to nothing and the /gate/state answer
+ * stays 'armed' — never a hold, never a fake state.
+ */
+const SESSION_ID_INDEX_MAX = 256;
+
 /** #45: the `history` ADD-key shape published on the register heartbeat. */
 export interface SessionHistory {
   /** requests/min counts, 60s buckets, oldest→newest, always 10 entries. */
@@ -339,6 +349,21 @@ export interface SessionTranscript {
   requests: SessionTranscriptRequest[];
   /** requests/min counts, 60s buckets, oldest→newest, always 10 entries. */
   buckets: number[];
+}
+
+/**
+ * #42 slice 2: the plugin's state read — the exact shape
+ * `GET /gate/state?session_id=...[&token=...]` answers. `state` is the
+ * gate's REAL admission state for the resolved session: 'armed' (nothing
+ * holds the session — admit), 'queued' (a parked request waits for a
+ * slot), 'paused' (the operator hold owns admission). `position` is the
+ * 1-based queue place — present only while the session actually sits in
+ * the queue (never a fake zero, the #44 posture). The token never
+ * appears in this shape: the body is state + position only.
+ */
+export interface GateStateResponse {
+  state: 'armed' | 'queued' | 'paused';
+  position?: number;
 }
 
 /** #45: compact request history for the register heartbeat — counts per
@@ -412,7 +437,7 @@ export const SESSION_ID_HEADER = 'x-hermes-session-id';
 
 /** Bound + sanitize a reported session id (same drop-don't-reject posture
  *  as the token rule): printable, ≤128 chars, else treated as absent. */
-function cleanSessionId(v: unknown): string | undefined {
+export function cleanSessionId(v: unknown): string | undefined {
   if (typeof v !== 'string') return undefined;
   const s = v.trim();
   if (!s || s.length > 128) return undefined;
@@ -457,6 +482,18 @@ export class SessionGate {
    *  token (touch) clears the tombstone — the token re-registers on its
    *  own first-sight path. In-memory; a restart starts empty. */
   private readonly dropped = new Set<string>();
+  /**
+   * #42 slice 2: session_id → token index. The plugin knows its Hermes
+   * session id; the gate keys sessions by token. Populated by the
+   * register path (the header capture in touch() and every register fire)
+   * and by the /gate/heartbeat bind. Bounded (SESSION_ID_INDEX_MAX): a
+   * re-insert keeps the newest binding ahead of the oldest-first
+   * eviction (Map order = insertion order). In-memory; a restart starts
+   * empty (first traffic / heartbeat re-learns). A stale or unknown id
+   * resolves to nothing — the /gate/state answer then stays fail-quiet
+   * ('armed'), never a fake hold.
+   */
+  private readonly sessionIdIndex = new Map<string, string>();
 
   private readonly interactiveWindowMs: number;
   private readonly agingMs: number;
@@ -557,6 +594,96 @@ export class SessionGate {
     return null;
   }
 
+  /**
+   * #42 slice 2: bind the session_id → token pair (the index's writer).
+   * Re-inserts at the tail (Map order = insertion order = recency order);
+   * past SESSION_ID_INDEX_MAX the OLDEST insertion is evicted.
+   */
+  private indexSessionId(s: Session): void {
+    if (!s.session_id) return;
+    const id = s.session_id;
+    this.sessionIdIndex.delete(id);
+    this.sessionIdIndex.set(id, s.token);
+    while (this.sessionIdIndex.size > SESSION_ID_INDEX_MAX) {
+      const oldest = this.sessionIdIndex.keys().next();
+      if (oldest.done) break;
+      this.sessionIdIndex.delete(oldest.value);
+    }
+  }
+
+  /**
+   * #42 slice 2: the plugin's heartbeat bind — the gate half of
+   * `POST /gate/heartbeat {session_id, token?}`. With a token in the
+   * payload the pair binds directly (last-write-wins, the same posture
+   * as the header capture); without one the learned index is consulted
+   * (a session the router already saw by token). The bound row's
+   * `session_id` updates, the index re-inserts, and the register
+   * throttle may fire a heartbeat to the arbiter (the session_id ADD-key
+   * lands on the arbiter row — one contract, two sources).
+   *
+   * The bind touches NO ring entry, NO queue slot, NO hold: a plugin
+   * heartbeat is not router traffic (a ring entry would fake request
+   * recency — the #76 drop rule must see real traffic only), and it must
+   * never move the queue. Returns true when a binding landed; false =
+   * nothing to bind (a malformed id, no token, no learned pair) — the
+   * caller still answers 200 (fail-quiet: a bad heartbeat never errors).
+   */
+  heartbeatSession(sessionId: unknown, token?: unknown): boolean {
+    const id = cleanSessionId(sessionId);
+    if (!id) return false;
+    let tok: string | undefined;
+    if (typeof token === 'string') {
+      const t = token.trim();
+      if (t.length > 0 && t.length <= 128) tok = t;
+    }
+    if (!tok) tok = this.sessionIdIndex.get(id);
+    if (!tok) return false;
+    const s = this.ensure(tok);
+    s.session_id = id; // last-write-wins (the header-capture posture)
+    this.indexSessionId(s);
+    if (this.now() - s.lastRegisterAttempt >= this.heartbeatMs) void this.register(s);
+    return true;
+  }
+
+  /**
+   * #42 slice 2: the plugin's state read — the gate half of
+   * `GET /gate/state?session_id=...[&token=...]`. Resolves the token (the
+   * explicit param, else the learned id→token index) and reports the
+   * gate's REAL state for it: 'paused' (the operator hold owns
+   * admission), 'queued' (a parked request waits for a slot), 'armed'
+   * (nothing holds this session — admit). A released gate, a down
+   * arbiter link (fail-open — nothing can be held), an unknown id, an
+   * unknown token, or a stale binding all answer 'armed': an unknown
+   * session must NEVER cause a hold. `position` rides only while the
+   * session sits in the queue (1-based, the #44 posture — never a fake
+   * zero). The token never leaves this method (the response body is
+   * state + position only).
+   */
+  gateStateForSession(sessionId: unknown, token?: unknown): GateStateResponse {
+    if (this.released || !this.linkUp) return { state: 'armed' };
+    let tok: string | undefined;
+    if (typeof token === 'string') {
+      const t = token.trim();
+      if (t.length > 0 && t.length <= 128) tok = t;
+    }
+    if (!tok) {
+      const id = cleanSessionId(sessionId);
+      if (id) tok = this.sessionIdIndex.get(id);
+    }
+    if (!tok) return { state: 'armed' };
+    const s = this.sessions.get(tok);
+    if (!s) return { state: 'armed' };
+    if (s.override === 'pause') {
+      const pos = this.queue.indexOf(tok) + 1;
+      return { state: 'paused', ...(pos > 0 ? { position: pos } : {}) };
+    }
+    if (s.holds.length > 0) {
+      const pos = this.queue.indexOf(tok) + 1;
+      return { state: 'queued', ...(pos > 0 ? { position: pos } : {}) };
+    }
+    return { state: 'armed' };
+  }
+
   // ------------------------------------------------------------------
   // Request path (called by the proxy for /s/<token>/… hits)
   // ------------------------------------------------------------------
@@ -638,7 +765,13 @@ export class SessionGate {
     // A captured id rides forward from the first request that carried it;
     // a later headerless request never clears it (last-known-wins, the same
     // posture as the client-published display fields).
-    if (sessionId) s.session_id = sessionId;
+    if (sessionId) {
+      s.session_id = sessionId;
+      // #42 slice 2: the id→token index learns the pair the moment the
+      // router sees it (every register fire re-inserts — the existing
+      // register path stays the updater, the recency order follows it).
+      this.indexSessionId(s);
+    }
     // #47: the reported priority class (last-write-wins, the same posture
     // as the captured session id — a later headerless request never
     // clears a class the session already reported).
@@ -666,6 +799,10 @@ export class SessionGate {
 
   private async register(s: Session): Promise<void> {
     s.lastRegisterAttempt = this.now();
+    // #42 slice 2: the existing register path is the index's named
+    // updater — every fire re-inserts the binding, so a session that
+    // re-registers stays ahead of the eviction order.
+    this.indexSessionId(s);
     try {
       // #45: the compact history only when the session has traffic (an
       // idle row stays exactly as it was — ADD-key posture). #67: the
@@ -735,6 +872,12 @@ export class SessionGate {
       if (!recentRing && s.inflight === 0 && s.holds.length === 0 && s.override === null && !s.pin) {
         const lastRing = s.ring.at(-1);
         const idleNote = lastRing !== undefined ? ` no local traffic for ${Math.round((now - lastRing) / 60000)}m` : ' no local traffic since adoption';
+        // #42 slice 2: the dropped row's id→token binding is stale —
+        // clear it when it still names this token (another token may
+        // have re-bound the same id since; only clear the match).
+        if (s.session_id && this.sessionIdIndex.get(s.session_id) === s.token) {
+          this.sessionIdIndex.delete(s.session_id);
+        }
         this.sessions.delete(s.token);
         this.dropped.add(s.token);
         this.log(`session ${s.token} dropped (${idleNote}, no operator state) — the arbiter's stale sweep retires the row`);
