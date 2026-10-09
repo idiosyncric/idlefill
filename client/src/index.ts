@@ -1737,8 +1737,14 @@ export class ClientDaemon {
         maxActive: this.cfg.max_active_agent_sessions ?? 2,
         holdCapMs: this.cfg.session_hold_cap_ms ?? 120_000,
         clientName: this.cfg.client_name,
+        // #47: admission priority classes + per-session budgets (opt-in,
+        // default OFF — the historical strict-FIFO park stays untouched).
+        priorityEnabled: this.cfg.session_priority === true,
+        tokenBudget: this.cfg.session_token_budget,
+        agingMs: this.cfg.session_aging_ms,
+        interactiveWindowMs: this.cfg.session_interactive_window_ms,
         log: (m) => this.log.info(m),
-        register: async (token, gate, sessionId, history, phase, lastActivity) => {
+        register: async (token, gate, sessionId, history, phase, lastActivity, priority) => {
           // #64 D5: an aggregate-derived session key (model name / header
           // id) carries the catalog-chosen row as `server_id` — idle
           // folding + preemption then land on the engine the request
@@ -1786,6 +1792,12 @@ export class ClientDaemon {
             // as the explicit CLEAR so a finished stream never stays
             // tagged; an old arbiter ignores the extra key (back-compat).
             ...(phase !== undefined ? { phase } : {}),
+            // #47: the session's resolved admission class (interactive /
+            // background). ADD-key: absent when priority is OFF (the
+            // default) or the class is unresolved — an old arbiter ignores
+            // the extra key (back-compat); a new arbiter surfaces it on
+            // the session row.
+            ...(priority ? { priority } : {}),
           });
           return status === 200 || status === 201;
         },
@@ -1810,7 +1822,7 @@ export class ClientDaemon {
     });
     await waitProxyReady(this.proxy.server);
     this.log.info(
-      `proxy up: ${this.proxy.base_url} → ${this.cfg.llm_target}${this.gate ? ` (session gate on: max ${this.cfg.max_active_agent_sessions ?? 2} sessions, hold cap ${this.cfg.session_hold_cap_ms ?? 120000}ms)` : ' (session gate off)'}`,
+      `proxy up: ${this.proxy.base_url} → ${this.cfg.llm_target}${this.gate ? ` (session gate on: max ${this.cfg.max_active_agent_sessions ?? 2} sessions, hold cap ${this.cfg.session_hold_cap_ms ?? 120000}ms${this.cfg.session_priority ? `, priority on${this.cfg.session_token_budget ? ` (budget ${this.cfg.session_token_budget})` : ''}` : ''})` : ' (session gate off)'}`,
     );
     // Aggregate endpoint (#64 D1): the SECOND loopback listener inside
     // this SAME process (mesh D5 counts processes, not listeners), in
