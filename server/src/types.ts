@@ -865,6 +865,23 @@ export type EventKind =
    */
   | 'theme_updated'
   /**
+   * Mesh control audit (#39 slice 2, D7): the target applied a relayed
+   * control action. Detail carries the action (and the target row it hit).
+   * `source_instance_id` (ADD key below) carries the REQUESTING instance —
+   * the target is the machine whose state changed, and its log is the
+   * audit of record.
+   */
+  | 'mesh_control'
+  /**
+   * Mesh unpair audit (#39 slice 2, D6): the operator removed a local
+   * edge record (POST /api/mesh/unpair, the admin plane). Detail carries
+   * the controller instance_id whose edge is gone. A sibling of
+   * `mesh_control` — the unpair is an admin action, not a relayed control
+   * action, so it carries no `source_instance_id` (no requester signed
+   * it; the operator acted).
+   */
+  | 'mesh_edge_unpaired'
+  /**
    * Scheduled queue rebuild (issue #3): the client's rebuild loop ran since
    * the last heartbeat and reported fresh run state. The arbiter derives the
    * event from the registration payload (no new API surface) so the operator
@@ -879,6 +896,12 @@ export interface EventRecord {
   project?: string;
   lease_id?: string;
   detail?: string;
+  /**
+   * The requesting instance for a `mesh_control` event (#39 slice 2, D7).
+   * ADD key: absent on every pre-existing record — old records are
+   * unchanged, old readers ignore the new field.
+   */
+  source_instance_id?: string;
 }
 
 /**
