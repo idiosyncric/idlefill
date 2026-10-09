@@ -17,6 +17,12 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { Sparkline } from "@/components/Sparkline";
 import { copyText } from "@/lib/clipboard";
 import {
@@ -67,6 +73,55 @@ function mintToken(): string {
 function readMode(): "rows" | "flow" {
   const m = localStorage.getItem(MODE_KEY);
   return m === "flow" ? "flow" : "rows";
+}
+
+// #77: "open in the Hermes desktop" — navigate the page to hermes://open/<id>.
+// The dashboard is the desktop's WKWebView over an external origin (no IPC), so
+// a page navigation is the only lever: WKWebView hands the unregistered custom
+// scheme to the OS, which routes it to the registered Hermes desktop app. The
+// click is fail-quiet — a scheme nothing answers is a no-op.
+function openInHermesDesktop(sessionId: string) {
+  try {
+    window.location.href = "hermes://open/" + encodeURIComponent(sessionId);
+  } catch {
+    /* fail-quiet: no handler registered for hermes:// on this platform */
+  }
+}
+
+// The per-row open affordance, rendered right after the hermes chip. A row that
+// carries a session id deep-links; a row without one renders the button
+// disabled (wrapped in a span so the tooltip still fires on the
+// pointer-events-none disabled Button — the shadcn sidebar workaround).
+function HermesOpenButton({ sessionId }: { sessionId?: string }) {
+  if (sessionId) {
+    return (
+      <Button
+        size="xs"
+        variant="outline"
+        className="h-6 px-2 text-[11px]"
+        title="open this session in the Hermes desktop (hermes://open/&lt;id&gt;)"
+        onClick={() => openInHermesDesktop(sessionId)}
+      >
+        open
+      </Button>
+    );
+  }
+  return (
+    <TooltipProvider delayDuration={0}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span>
+            <Button size="xs" variant="outline" className="h-6 px-2 text-[11px]" disabled>
+              open
+            </Button>
+          </span>
+        </TooltipTrigger>
+        <TooltipContent>
+          this row carries no Hermes session id — nothing to open
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +279,7 @@ function SessionRowView({ s, st }: { s: SessionRow; st: StateSnapshot }) {
           hermes {String(s.session_id)}
         </span>
       )}
+      <HermesOpenButton sessionId={s.session_id} />
       {s.server_id && !s.engine_pin && (
         <span className="text-[11px] text-dim" title="the engine this session routes to">
           → {serverName(st, s.server_id)}
