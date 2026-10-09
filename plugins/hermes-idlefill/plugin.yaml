@@ -1,0 +1,7 @@
+name: hermes-idlefill
+version: 1.0.0
+description: "Holds each Hermes LLM call at the idlefill session gate (register + queue/pause) before the provider call."
+author: "sam"
+kind: standalone
+provides_middleware:
+  - llm_execution
