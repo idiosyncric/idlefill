@@ -27,7 +27,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startLlmProxy, waitProxyReady, type LlmProxy } from '../src/proxy.js';
-import { SessionGate, sniffPhaseChunk, type SessionGateSnapshot, type SessionHistory, type SessionPhaseSnapshot } from '../src/session-gate.js';
+import { SessionGate, sniffPhaseChunk, cleanPriority, PRIORITY_HEADER, type SessionGateSnapshot, type SessionHistory, type SessionPhaseSnapshot } from '../src/session-gate.js';
 import { ClientDaemon } from '../src/index.js';
 import type { ClientConfig } from '../src/config.js';
 import { startFakeArbiter, type FakeArbiter } from './fake-arbiter.js';
@@ -47,10 +47,13 @@ function startControllableUpstream(): Promise<{
   url: string;
   hits: { method: string; path: string; body: string }[];
   release: (n?: number) => void;
+  /** #47: make the next release() answer with this total_tokens. */
+  setUsage: (n: number) => void;
   close: () => Promise<void>;
 }> {
   const hits: { method: string; path: string; body: string }[] = [];
   const waiting: Array<http.ServerResponse> = [];
+  let nextUsage: number | null = null; // #47: per-release total_tokens override
   const server = http.createServer((req, res) => {
     let body = '';
     req.on('data', (c) => (body += c));
@@ -65,6 +68,11 @@ function startControllableUpstream(): Promise<{
       resolveP({
         url: `http://127.0.0.1:${port}`,
         hits,
+        // #47: make the NEXT release() answer with a given total_tokens
+        // (the gate's token-budget demotion compares the streamed peak).
+        setUsage(n: number) {
+          nextUsage = n;
+        },
         release(n = 1) {
           for (let i = 0; i < n && waiting.length > 0; i++) {
             const res = waiting.shift()!;
@@ -74,8 +82,10 @@ function startControllableUpstream(): Promise<{
             // them (a fixed stand-in when the body didn't parse).
             let model = 'resp-model';
             try { model = (JSON.parse(hit?.body || '{}') as { model?: string }).model ?? model; } catch { /* keep default */ }
+            const totalTokens = nextUsage ?? 42;
+            nextUsage = null;
             res.writeHead(200, { 'content-type': 'application/json' });
-            res.end(JSON.stringify({ id: 'chatcmpl-1', model, choices: [{ message: { content: 'hi' } }], usage: { total_tokens: 42 } }));
+            res.end(JSON.stringify({ id: 'chatcmpl-1', model, choices: [{ message: { content: 'hi' } }], usage: { total_tokens: totalTokens } }));
           }
         },
         close: () =>
@@ -96,6 +106,21 @@ function postChat(baseUrl: string, path: string): Promise<Response> {
   });
 }
 
+/**
+ * #47: a chat request whose body carries `tag` in the user content — the
+ * controllable upstream records bodies, so the admission ORDER of sessions
+ * is readable back from `up.hits` (the prefix-stripped path is identical
+ * for every session; the body tag is what distinguishes them). `headers`
+ * is where the `X-Hermes-Priority` class report rides.
+ */
+function postTag(baseUrl: string, path: string, tag: string, headers: Record<string, string> = {}): Promise<Response> {
+  return fetch(`${baseUrl}${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...headers },
+    body: JSON.stringify({ model: 'm', messages: [{ role: 'user', content: tag }] }),
+  });
+}
+
 async function waitFor(pred: () => boolean, timeoutMs = 3000, what = 'condition'): Promise<void> {
   const started = Date.now();
   for (;;) {
@@ -109,26 +134,70 @@ async function waitFor(pred: () => boolean, timeoutMs = 3000, what = 'condition'
 function makeGate(opts: {
   maxActive?: number;
   holdCapMs?: number;
-  register?: (token: string, gate: SessionGateSnapshot | null, sessionId?: string, history?: SessionHistory, phase?: SessionPhaseSnapshot | null, lastActivity?: number) => Promise<boolean>;
+  register?: (
+    token: string,
+    gate: SessionGateSnapshot | null,
+    sessionId?: string,
+    history?: SessionHistory,
+    phase?: SessionPhaseSnapshot | null,
+    lastActivity?: number,
+    priority?: 'interactive' | 'background' | null,
+  ) => Promise<boolean>;
   now?: () => number;
   clientName?: string;
-} = {}): { gate: SessionGate; registered: string[]; calls: { token: string; gate: SessionGateSnapshot | null; sessionId?: string; history?: SessionHistory; phase?: SessionPhaseSnapshot | null; lastActivity?: number }[] } {
+  // #47 knobs (opt-in admission priority + per-session budgets).
+  priorityEnabled?: boolean;
+  tokenBudget?: number;
+  interactiveWindowMs?: number;
+  agingMs?: number;
+  log?: (m: string) => void;
+} = {}): {
+  gate: SessionGate;
+  registered: string[];
+  logs: string[];
+  calls: {
+    token: string;
+    gate: SessionGateSnapshot | null;
+    sessionId?: string;
+    history?: SessionHistory;
+    phase?: SessionPhaseSnapshot | null;
+    lastActivity?: number;
+    priority?: 'interactive' | 'background' | null;
+  }[];
+} {
   const registered: string[] = [];
-  const calls: { token: string; gate: SessionGateSnapshot | null; sessionId?: string; history?: SessionHistory; phase?: SessionPhaseSnapshot | null; lastActivity?: number }[] = [];
+  const logs: string[] = [];
+  const calls: {
+    token: string;
+    gate: SessionGateSnapshot | null;
+    sessionId?: string;
+    history?: SessionHistory;
+    phase?: SessionPhaseSnapshot | null;
+    lastActivity?: number;
+    priority?: 'interactive' | 'background' | null;
+  }[] = [];
   const gate = new SessionGate({
     maxActive: opts.maxActive ?? 1,
     holdCapMs: opts.holdCapMs ?? 30_000,
     now: opts.now,
     clientName: opts.clientName,
+    priorityEnabled: opts.priorityEnabled,
+    tokenBudget: opts.tokenBudget,
+    interactiveWindowMs: opts.interactiveWindowMs,
+    agingMs: opts.agingMs,
+    log: (m) => {
+      logs.push(m);
+      opts.log?.(m);
+    },
     register:
       opts.register ??
-      (async (token, gateSnapshot, sessionId, history, phase, lastActivity) => {
+      (async (token, gateSnapshot, sessionId, history, phase, lastActivity, priority) => {
         registered.push(token);
-        calls.push({ token, gate: gateSnapshot, sessionId, history, phase, lastActivity });
+        calls.push({ token, gate: gateSnapshot, sessionId, history, phase, lastActivity, priority });
         return true;
       }),
   });
-  return { gate, registered, calls };
+  return { gate, registered, logs, calls };
 }
 
 async function harness(opts: { gate: SessionGate }): Promise<{ proxy: LlmProxy; up: Awaited<ReturnType<typeof startControllableUpstream>> }> {
@@ -369,7 +438,7 @@ test('register calls carry the gate snapshot (active at refresh, queued while pa
   // instant. No gate block (idle snapshot), no phase yet.
   const resA = postChat(proxy.base_url, '/s/tokA/v1/chat/completions');
   await waitFor(() => up.hits.length === 1, 3000, 'A forwarded');
-  assert.deepEqual(calls[0], { token: 'tokA', gate: null, sessionId: undefined, history: { rpm: [0, 0, 0, 0, 0, 0, 0, 0, 0, 1] }, phase: null, lastActivity: 2_000_000 }, 'first-sight register: no gate block, no phase (#67), the request already counted (#45 history) with its real instant (#76: the ring fills before the register fires)');
+  assert.deepEqual(calls[0], { token: 'tokA', gate: null, sessionId: undefined, history: { rpm: [0, 0, 0, 0, 0, 0, 0, 0, 0, 1] }, phase: null, lastActivity: 2_000_000, priority: null }, 'first-sight register: no gate block, no phase (#67), the request already counted (#45 history) with its real instant (#76: the ring fills before the register fires)');
 
   // B first-sights and parks; its register fires at first sight (before
   // the park), so it is also gate-less — the REFRESH is what reports it.
@@ -1140,4 +1209,244 @@ test('#67 pin: absent/malformed engine_pin blocks learn nothing (fail-quiet); a 
   assert.equal(gate.pinFor('t5')?.engine_model, 'row-id', 'the splice key rides through untouched');
   gate.onStatePoll([{ token: 't1' }]);
   assert.equal(gate.pinFor('t1'), null, 'the pin clears when the arbiter stops publishing it');
+});
+
+// ---------------------------------------------------------------------------
+// #47: admission priority classes + per-session budgets (opt-in)
+// ---------------------------------------------------------------------------
+
+test('#47 cleanPriority: bounds a reported class (drop-don\'t-reject)', () => {
+  assert.equal(cleanPriority('interactive'), 'interactive');
+  assert.equal(cleanPriority('  Background '), 'background');
+  assert.equal(cleanPriority('urgent'), undefined, 'an unknown class is dropped');
+  assert.equal(cleanPriority(7 as never), undefined, 'a non-string is dropped');
+  assert.equal(cleanPriority(undefined), undefined);
+  assert.equal(PRIORITY_HEADER, 'x-hermes-priority');
+});
+
+test('#47 (acceptance) max=1 + a streaming background agent: an interactive session\'s first request is admitted within one in-flight-request boundary, and the background resumes after it', async () => {
+  const { gate } = makeGate({ maxActive: 1, priorityEnabled: true });
+  const { proxy, up } = await harness({ gate });
+  gate.onStatePoll([]); // arbiter reachable
+
+  // 1. A BACKGROUND agent holds the only slot, streaming (reports its class).
+  const bgP1 = postTag(proxy.base_url, '/s/bg/v1/chat/completions', 'bg-turn-1', { [PRIORITY_HEADER]: 'background' });
+  await waitFor(() => up.hits.length === 1, 3000, 'background turn 1 forwarded');
+
+  // 2. An INTERACTIVE session's FIRST request arrives — no free slot ⇒ it
+  //    parks (the background is streaming, not yet parked).
+  const intP = postTag(proxy.base_url, '/s/int/v1/chat/completions', 'int-turn-1', { [PRIORITY_HEADER]: 'interactive' });
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(up.hits.length, 1, 'the interactive request parks (no free slot)');
+  assert.equal(gate.queueDepth, 1, 'the interactive session is queued');
+
+  // 3. The boundary: the background's in-flight turn finishes. The
+  //    interactive first request is admitted WITHIN this one
+  //    in-flight-request boundary (the slot frees ⇒ the parked
+  //    interactive is released).
+  up.release(1);
+  await waitFor(() => up.hits.length === 2, 3000, 'the interactive first request admitted within one in-flight-request boundary');
+  assert.match(up.hits[1]!.body, /"int-turn-1"/, 'the interactive first request was admitted when the boundary freed');
+  assert.equal((await bgP1).status, 200);
+
+  // 4. The background agent keeps working: its NEXT turn arrives while the
+  //    interactive holds the slot ⇒ it parks.
+  const bgP2 = postTag(proxy.base_url, '/s/bg/v1/chat/completions', 'bg-turn-2');
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(up.hits.length, 2, 'the background turn 2 parks behind the interactive');
+  assert.equal(gate.queueDepth, 1, 'the background session is queued');
+
+  // 5. The interactive turn finishes → the background session RESUMES
+  //    (its parked turn is released whole, no client retry).
+  up.release(1);
+  await intP;
+  await waitFor(() => up.hits.length === 3, 3000, 'the background session resumed after the interactive turn');
+  assert.match(up.hits[2]!.body, /"bg-turn-2"/, 'the parked background turn proceeded, whole');
+  up.release(1);
+  const [rBg2, rInt] = await Promise.all([bgP2, intP]);
+  assert.equal(rBg2.status, 200);
+  assert.equal(rInt.status, 200);
+  assert.equal(gate.queueDepth, 0, 'the queue drains');
+});
+
+test('#47 (acceptance, no header) a fresh session is INTERACTIVE by cadence: it is admitted within one in-flight boundary ahead of a parked background session', async () => {
+  const { gate } = makeGate({ maxActive: 1, priorityEnabled: true });
+  const { proxy, up } = await harness({ gate });
+  gate.onStatePoll([]);
+
+  // A background agent holds the slot; a SECOND background session parks
+  // behind it (no in-flight of its own).
+  const bgA1 = postTag(proxy.base_url, '/s/bgA/v1/chat/completions', 'bgA-turn-1', { [PRIORITY_HEADER]: 'background' });
+  await waitFor(() => up.hits.length === 1, 3000, 'background A turn 1 forwarded');
+  const bgB1 = postTag(proxy.base_url, '/s/bgB/v1/chat/completions', 'bgB-turn-1', { [PRIORITY_HEADER]: 'background' });
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(up.hits.length, 1, 'the second background session parked');
+
+  // A FRESH session reports NO header: its class is INFERRED from cadence —
+  // a request inside the window is interactive. It parks too.
+  const intP = postTag(proxy.base_url, '/s/int/v1/chat/completions', 'int-turn-1');
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(up.hits.length, 1, 'the interactive request parks too');
+
+  // The boundary: bgA turn 1 finishes. The cadence-inferred interactive
+  // (rank 1) is admitted AHEAD of the parked background (rank 2).
+  up.release(1);
+  await waitFor(() => up.hits.length === 2, 3000, 'the slot freed');
+  assert.match(up.hits[1]!.body, /"int-turn-1"/, 'the cadence-inferred interactive request was admitted ahead of the parked background turn');
+  up.release(1);
+  await intP;
+  // The background session resumes after the interactive turn.
+  await waitFor(() => up.hits.length === 3, 3000, 'the background session resumed');
+  assert.match(up.hits[2]!.body, /"bgB-turn-1"/);
+  up.release(1);
+  await Promise.all([bgA1, bgB1]);
+  assert.equal(gate.queueDepth, 0);
+});
+
+test('#47 no-starvation: a background session parked ≥ agingMs is promoted ahead of a newly-arrived interactive request', async () => {
+  const { gate } = makeGate({ maxActive: 1, priorityEnabled: true, agingMs: 200 });
+  const { proxy, up } = await harness({ gate });
+  gate.onStatePoll([]);
+
+  // An interactive session holds the slot.
+  const intP1 = postTag(proxy.base_url, '/s/int/v1/chat/completions', 'int-turn-1', { [PRIORITY_HEADER]: 'interactive' });
+  await waitFor(() => up.hits.length === 1, 3000, 'interactive turn 1 forwarded');
+
+  // A background session's request PARKS (it has no in-flight of its own).
+  const bgP = postTag(proxy.base_url, '/s/bg/v1/chat/completions', 'bg-turn-1', { [PRIORITY_HEADER]: 'background' });
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(up.hits.length, 1, 'the background request parked');
+
+  // Wait PAST the aging threshold: the parked background session now ages
+  // into rank 0 (ahead of interactive).
+  await new Promise((r) => setTimeout(r, 250));
+
+  // A NEW interactive request (a fresh session) arrives behind the aged
+  // background one.
+  const intP2 = postTag(proxy.base_url, '/s/int2/v1/chat/completions', 'int2-turn-1', { [PRIORITY_HEADER]: 'interactive' });
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(up.hits.length, 1, 'both parked (no free slot)');
+
+  // The boundary: int turn 1 finishes. The AGED background session (rank
+  // 0) must be admitted ahead of the fresh interactive request (rank 1) —
+  // background never starves.
+  up.release(1);
+  await waitFor(() => up.hits.length === 2, 3000, 'the slot freed');
+  assert.match(up.hits[1]!.body, /"bg-turn-1"/, 'the aged background session was promoted ahead of the fresh interactive request');
+  assert.doesNotMatch(up.hits[1]!.body, /"int2-turn-1"/, 'the fresh interactive request waited its turn');
+  up.release(1);
+  await intP1;
+  await bgP;
+  // Now the fresh interactive request is admitted.
+  await waitFor(() => up.hits.length === 3, 3000, 'the interactive request admitted after the background');
+  assert.match(up.hits[2]!.body, /"int2-turn-1"/);
+  up.release(1);
+  await intP2;
+  assert.equal(gate.queueDepth, 0);
+});
+
+test('#47 the knob OFF is byte-for-byte the historical strict-FIFO park (an interactive class never jumps a background parked earlier)', async () => {
+  const { gate } = makeGate({ maxActive: 1 }); // priorityEnabled: undefined → OFF
+  const { proxy, up } = await harness({ gate });
+  gate.onStatePoll([]);
+
+  // A background session A holds the slot; a SECOND background session B
+  // parks behind it; a fresh interactive C parks behind B.
+  const bgA1 = postTag(proxy.base_url, '/s/bgA/v1/chat/completions', 'bgA-turn-1', { [PRIORITY_HEADER]: 'background' });
+  await waitFor(() => up.hits.length === 1, 3000, 'background A turn 1 forwarded');
+  const bgB1 = postTag(proxy.base_url, '/s/bgB/v1/chat/completions', 'bgB-turn-1', { [PRIORITY_HEADER]: 'background' });
+  await new Promise((r) => setTimeout(r, 150));
+  const intP = postTag(proxy.base_url, '/s/int/v1/chat/completions', 'int-turn-1', { [PRIORITY_HEADER]: 'interactive' });
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(up.hits.length, 1, 'B and the interactive request park (strict FIFO)');
+
+  // The boundary: A finishes. Strict FIFO admits B (the queue head) — the
+  // interactive request does NOT jump it.
+  up.release(1);
+  await waitFor(() => up.hits.length === 2, 3000, 'the slot freed');
+  assert.match(up.hits[1]!.body, /"bgB-turn-1"/, 'knob OFF: the head of the FIFO queue is admitted — the interactive request never jumps');
+  up.release(1);
+  await bgA1;
+  await bgB1;
+  await waitFor(() => up.hits.length === 3, 3000, 'the interactive request admitted last');
+  assert.match(up.hits[2]!.body, /"int-turn-1"/);
+  up.release(1);
+  await intP;
+  assert.equal(gate.queueDepth, 0);
+});
+
+test('#47 per-session token budget: exceeding it DEMOTES to background (admission order only, never a hard stop)', async () => {
+  const { gate, logs } = makeGate({ maxActive: 1, priorityEnabled: true, tokenBudget: 100 });
+  const { proxy, up } = await harness({ gate });
+  gate.onStatePoll([]);
+
+  // A session that reports interactive but streams a turn OVER budget
+  // (300 > 100): the gate demotes it to background on the usage chunk.
+  const bigP = postTag(proxy.base_url, '/s/big/v1/chat/completions', 'big-turn-1', { [PRIORITY_HEADER]: 'interactive' });
+  await waitFor(() => up.hits.length === 1, 3000, 'the big turn forwarded');
+
+  // A background agent parks behind it.
+  const bgP = postTag(proxy.base_url, '/s/bg/v1/chat/completions', 'bg-turn-1', { [PRIORITY_HEADER]: 'background' });
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(up.hits.length, 1, 'the background turn parked');
+
+  // The big turn finishes carrying total_tokens 300 (> budget 100): the
+  // session is demoted to background. Its NEXT request now ranks last.
+  up.setUsage(300);
+  up.release(1);
+  await waitFor(() => logs.some((l) => l.includes('demoted to background')), 3000, 'the budget demotion');
+  await bigP; // 200 — the demotion is NOT a hard stop; the in-flight turn answered.
+
+  // A fresh interactive session arrives, and the demoted session requests
+  // again. The background turn was admitted on the boundary above and is
+  // in flight — so both of these park behind it.
+  const intP = postTag(proxy.base_url, '/s/int/v1/chat/completions', 'int-turn-1', { [PRIORITY_HEADER]: 'interactive' });
+  await new Promise((r) => setTimeout(r, 150));
+  const bigP2 = postTag(proxy.base_url, '/s/big/v1/chat/completions', 'big-turn-2', { [PRIORITY_HEADER]: 'interactive' });
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(up.hits.length, 2, 'the big turn + the resumed background turn reached the engine');
+  assert.equal(gate.queueDepth, 2, 'the fresh interactive and the demoted session are parked');
+
+  // The boundary: the background turn finishes. The FRESH INTERACTIVE
+  // session (rank 1) must be admitted ahead of the demoted session (rank
+  // 2 — it still reports interactive, but the budget latch wins).
+  up.release(1);
+  await waitFor(() => up.hits.length === 3, 3000, 'the fresh interactive admitted ahead of the demoted session');
+  assert.match(up.hits[2]!.body, /"int-turn-1"/, 'the fresh interactive outranks the demoted session');
+
+  // The interactive turn finishes → the demoted session RESUMES (the
+  // demotion is admission-order only — it still gets its slot; never a
+  // hard stop).
+  up.release(1);
+  await waitFor(() => up.hits.length === 4, 3000, 'the demoted session resumed');
+  assert.match(up.hits[3]!.body, /"big-turn-2"/, 'the demoted session was admitted last, then answered 200');
+  up.release(1);
+  await intP;
+  await bigP2;
+  assert.equal(gate.queueDepth, 0);
+  assert.match(logs.find((l) => l.includes('demoted'))!, /peak tokens 300 > budget 100/);
+});
+
+test('#47 the register heartbeat reports the resolved class as the `priority` ADD-key only when the knob is ON', async () => {
+  // Knob ON: the class rides the register body.
+  const on = makeGate({ maxActive: 1, priorityEnabled: true });
+  const { proxy: proxyOn, up: upOn } = await harness({ gate: on.gate });
+  on.gate.onStatePoll([]);
+  const rOn = postTag(proxyOn.base_url, '/s/rep/v1/chat/completions', 'rep-1', { [PRIORITY_HEADER]: 'interactive' });
+  await new Promise((r) => setTimeout(r, 150));
+  const callOn = on.calls.at(-1);
+  assert.equal(callOn?.priority, 'interactive', 'the reported class rides the heartbeat');
+  upOn.release(1);
+  await rOn;
+
+  // Knob OFF: the key is never sent (ADD-key posture, byte-for-byte).
+  const off = makeGate({ maxActive: 1 });
+  const { proxy: proxyOff, up: upOff } = await harness({ gate: off.gate });
+  off.gate.onStatePoll([]);
+  const rOff = postTag(proxyOff.base_url, '/s/rep/v1/chat/completions', 'rep-1', { [PRIORITY_HEADER]: 'interactive' });
+  await new Promise((r) => setTimeout(r, 150));
+  const callOff = off.calls.at(-1);
+  assert.equal(callOff?.priority, null, 'knob OFF: the class is never reported');
+  upOff.release(1);
+  await rOff;
 });

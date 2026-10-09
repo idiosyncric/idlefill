@@ -30,6 +30,38 @@
  *
  * Plain `/v1/...` traffic (the lease-gated job flow) never enters the gate —
  * the proxy's single-target passthrough contract is untouched.
+ *
+ * #47: ADMISSION PRIORITY CLASSES + PER-SESSION BUDGETS (opt-in).
+ * When `priorityEnabled` is true (the client config's `session_priority`
+ * knob, DEFAULT OFF — pure FIFO is unchanged), every session carries a
+ * priority class (interactive > background) resolved at admission time:
+ *
+ *   1. REPORTED — the session's `X-Hermes-Priority` header (the
+ *      middleware plugin knows the platform; the value is `interactive`
+ *      or `background`), last-write-wins. This is the class the register
+ *      heartbeat's session payload reports.
+ *   2. INFERRED — otherwise, a session with a request inside
+ *      `interactiveWindowMs` (default 30s) is interactive; else it is
+ *      background. (Request cadence: an interactive TUI keeps requesting;
+ *      a background agent goes quiet between turns.)
+ *   3. DEMOTED — a session whose peak streamed `total_tokens` exceeds
+ *      `tokenBudget` is demoted to the lowest priority (background). The
+ *      demotion is LATCHED and affects ADMISSION ONLY — the session is
+ *      never hard-stopped (its requests are still admitted, just last).
+ *
+ * The ADMISSION RANK of a PARKED session (lower is admitted first when a
+ * slot frees):
+ *   0 = a background session that has waited ≥ `agingMs` (default 60s) —
+ *       the no-starvation guarantee: it is promoted ahead of interactive
+ *       sessions so a parked background agent is never starved;
+ *   1 = interactive;
+ *   2 = background.
+ * Ties within a rank keep arrival order (FIFO).
+ *
+ * What priority does NOT do: it never preempts an IN-FLIGHT request, it
+ * never raises the `maxActive` slot cap, and it never touches the hold
+ * cap. It only orders WHICH parked session is admitted next. With the
+ * knob OFF, admission is exactly the historical strict-FIFO park.
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -130,6 +162,11 @@ export interface SessionGateDeps {
      *  recorded traffic — the caller reports its own clock instead of the
      *  heartbeat tick (the inflation a 10s tick caused on the arbiter rows). */
     lastActivity?: number,
+    /** #47: the session's resolved admission class (interactive/background)
+     *  — reported as the `priority` ADD-key on the register heartbeat when
+     *  priority is enabled. null/absent = the key is omitted (ADD-key
+     *  posture; a knob-off gate or an old arbiter is unaffected). */
+    priority?: 'interactive' | 'background' | null,
   ) => Promise<boolean>;
   /** #54: this client's registered name (client/config.json client_name).
    *  Arbiter session rows naming a DIFFERENT client are not adopted —
@@ -144,6 +181,21 @@ export interface SessionGateDeps {
   holdCapMs: number;
   /** Register/heartbeat throttle window per session. Default 10s. */
   heartbeatMs?: number;
+  /** #47: enable admission priority classes (the `session_priority`
+   *  config knob). Default false = OFF → the historical strict-FIFO park. */
+  priorityEnabled?: boolean;
+  /** #47: per-session token budget. A session whose peak streamed
+   *  `total_tokens` exceeds it is demoted to background (admission only,
+   *  never a hard stop). undefined = no budget. Only meaningful when
+   *  `priorityEnabled`. */
+  tokenBudget?: number;
+  /** #47: cadence window (ms) for the INFERRED class — a session with a
+   *  request inside this window is interactive. Default 30s. */
+  interactiveWindowMs?: number;
+  /** #47: age-based aging threshold (ms) — a PARKED background session
+   *  that has waited this long is promoted ahead of interactive sessions
+   *  (no starvation). Default 60s. */
+  agingMs?: number;
   log?: (msg: string) => void;
   /** Clock seam for tests. Default Date.now. */
   now?: () => number;
@@ -210,6 +262,19 @@ interface Session {
    */
   pin?: SessionPinRow | null;
 
+  /** #47: the REPORTED priority class (from the `X-Hermes-Priority`
+   *  header, last-write-wins). Absent = not reported → cadence inference. */
+  reportedPriority?: 'interactive' | 'background';
+  /** #47: latched demotion (peak streamed tokens exceeded `tokenBudget`)
+   *  — the session is admitted as background. Once set, never cleared.
+   *  Admission-only: never a hard stop. */
+  demoted?: boolean;
+  /** #47: the instant the session FIRST started waiting (parked) — the
+   *  anchor for age-based aging. Absent = not currently waiting. */
+  waitStart?: number;
+  /** #47: the PEAK `total_tokens` observed in this session's streamed
+   *  usage (sticky max across requests). The token-budget comparison. */
+  tokensPeak?: number;
 }
 
 /** #45: cap on the in-memory request ring (a restart starts empty). */
@@ -314,6 +379,24 @@ function cleanSessionId(v: unknown): string | undefined {
   return s;
 }
 
+/**
+ * #47: the header a session (its middleware plugin, which knows the
+ * platform) may carry to REPORT its priority class. Value is
+ * `interactive` or `background` (case-insensitive). Absent/malformed =
+ * the gate infers the class from request cadence. One contract, two
+ * sources — the header is the inbound channel the gate reads; the
+ * register heartbeat is where the class is reported to the arbiter.
+ */
+export const PRIORITY_HEADER = 'x-hermes-priority';
+
+/** #47: bound a reported priority class (drop-don't-reject, like the
+ *  session-id rule): only `interactive` / `background` survive. */
+export function cleanPriority(v: unknown): 'interactive' | 'background' | undefined {
+  if (typeof v !== 'string') return undefined;
+  const s = v.trim().toLowerCase();
+  return s === 'interactive' || s === 'background' ? s : undefined;
+}
+
 /** `/s/<token>/rest…` — the session path contract (token ≤128 chars, arbiter rule). */
 export const SESSION_PATH_RE = /^\/s\/([^/]+)(\/.*)?$/;
 
@@ -332,8 +415,13 @@ export class SessionGate {
    *  own first-sight path. In-memory; a restart starts empty. */
   private readonly dropped = new Set<string>();
 
+  private readonly interactiveWindowMs: number;
+  private readonly agingMs: number;
+
   constructor(private readonly deps: SessionGateDeps) {
     this.heartbeatMs = deps.heartbeatMs ?? 10_000;
+    this.interactiveWindowMs = deps.interactiveWindowMs ?? 30_000;
+    this.agingMs = deps.agingMs ?? 60_000;
   }
 
   private now(): number {
@@ -402,7 +490,11 @@ export class SessionGate {
     // updates from live traffic, headerless clients leave it untouched.
     // touch() counts the request into the ring (before the register fire)
     // and does the first-sight bookkeeping.
-    const s = this.touch(token, cleanSessionId(req.headers[SESSION_ID_HEADER]));
+    const s = this.touch(
+      token,
+      cleanSessionId(req.headers[SESSION_ID_HEADER]),
+      cleanPriority(req.headers[PRIORITY_HEADER]),
+    );
 
     // #67: `forward` may be a LATE BOUND seam (the aggregate router
     // resolves the engine at CALL time — a pin the operator writes
@@ -448,7 +540,11 @@ export class SessionGate {
   }
 
   /** First-sight bookkeeping: create the row + throttled registration. */
-  private touch(token: string, sessionId?: string): Session {
+  private touch(
+    token: string,
+    sessionId?: string,
+    priority?: 'interactive' | 'background',
+  ): Session {
     // #76 follow-up: traffic is the re-engagement. A dropped token gets a
     // fresh row + its own first-sight register (the arbiter is idempotent
     // on the token — no data loss).
@@ -466,6 +562,10 @@ export class SessionGate {
     // a later headerless request never clears it (last-known-wins, the same
     // posture as the client-published display fields).
     if (sessionId) s.session_id = sessionId;
+    // #47: the reported priority class (last-write-wins, the same posture
+    // as the captured session id — a later headerless request never
+    // clears a class the session already reported).
+    if (priority) s.reportedPriority = priority;
     // #45: count the request the moment the router sees it (forwarded OR
     // parked — a parked request is still a request), BEFORE the register
     // fire below: the first-sight register then reports this request's
@@ -513,6 +613,10 @@ export class SessionGate {
         hist,
         s.phase ? { state: s.phase.state, at: s.phase.at } : null,
         lastActivity,
+        // #47: the resolved admission class rides the register heartbeat's
+        // session payload (ADD-key). Only when the knob is ON — the
+        // default-OFF posture keeps the wire byte-for-byte unchanged.
+        this.deps.priorityEnabled ? this.resolvedClass(s) : null,
       );
       if (ok) {
         if (!this.linkUp) {
@@ -574,6 +678,9 @@ export class SessionGate {
       if (settled) return;
       settled = true;
       s.inflight--;
+      // #47: the session has NO local state left (no in-flight, no parked
+      // holds) — its wait anchor clears (aging measures PARKED waits).
+      if (s.inflight === 0 && s.holds.length === 0) s.waitStart = undefined;
       // #67: the session has no live stream any more — its phase clears
       // (the next heartbeat carries the no-phase report, the arbiter
       // CLEARS the stored block). Only the last settling request writes.
@@ -606,6 +713,28 @@ export class SessionGate {
           if (!s.tokens) {
             const n = sniffUsageChunk(chunk);
             if (n !== undefined) s.tokens = n;
+          }
+          // #47: the token BUDGET compares the session's PEAK streamed
+          // total (a greedy session's single big turn is what the budget
+          // bounds) — update it per usage chunk and demote ONCE when it
+          // crosses the configured budget (admission-only, never a hard
+          // stop; the latch is sticky, so a later small turn never
+          // re-promotes a greedy session).
+          if (s.tokens !== undefined && s.tokensPeak !== s.tokens) {
+            const peak = Math.max(s.tokensPeak ?? 0, s.tokens);
+            s.tokensPeak = peak;
+            const budget = this.deps.tokenBudget;
+            if (
+              this.deps.priorityEnabled &&
+              budget !== undefined &&
+              !s.demoted &&
+              peak > budget
+            ) {
+              s.demoted = true;
+              this.log(
+                `session ${s.token} demoted to background (peak tokens ${peak} > budget ${budget}) — admission only, not a hard stop`,
+              );
+            }
           }
           if (s.model && s.tokens) detach();
         };
@@ -660,6 +789,11 @@ export class SessionGate {
   private park(s: Session, req: IncomingMessage, res: ServerResponse, path: string, forward: ForwardFn): void {
     const h: Held = { req, res, path, forward, parkedAt: this.now(), done: false };
     s.holds.push(h);
+    // #47: anchor the session's wait at its FIRST parked request — the
+    // age-based aging in admitLoop() measures how long the SESSION has
+    // been waiting (not one request), so a background agent that keeps
+    // parking new requests still ages on the same clock.
+    if (s.waitStart === undefined) s.waitStart = this.now();
     const drop = () => this.dropHold(s, h);
     // While parked nothing has been answered, so close/aborted = client gone.
     req.once('aborted', drop);
@@ -716,14 +850,29 @@ export class SessionGate {
   private forgetHold(s: Session, h: Held): void {
     const i = s.holds.indexOf(h);
     if (i >= 0) s.holds.splice(i, 1);
-    if (s.holds.length === 0 && s.inflight === 0) this.dequeue(s.token);
+    if (s.holds.length === 0 && s.inflight === 0) {
+      this.dequeue(s.token);
+      s.waitStart = undefined; // #47: no longer waiting — reset the aging anchor.
+    }
   }
 
   /**
-   * Admit queued sessions while slots are free, strict FIFO. A paused
-   * head-of-queue is SKIPPED (the operator hold is not a slot wait — it
+   * Admit queued sessions while slots are free.
+   *
+   * Strict FIFO (the historical default, and the behavior when
+   * `priorityEnabled` is OFF): the head of the queue is admitted, a
+   * paused head is SKIPPED (the operator hold is not a slot wait — it
    * must not starve the rest of the queue) and keeps its position, so an
    * unpause takes the next free slot without queue-jumping.
+   *
+   * #47 (priority ON): among the NON-paused parked sessions the one with
+   * the LOWEST admission rank is admitted, ties keeping arrival order
+   * (FIFO within a rank). Ranks: 0 = a background session that has waited
+   * ≥ `agingMs` (the no-starvation promotion — it goes ahead of
+   * newly-arrived interactive requests), 1 = interactive, 2 = background.
+   * A paused session is always skipped regardless of rank (the operator
+   * hold wins over the class). Priority never preempts in-flight traffic
+   * — it only decides which PARKED session is released next.
    */
   private admitLoop(): void {
     if (this.released) {
@@ -737,24 +886,73 @@ export class SessionGate {
     }
     for (;;) {
       if (this.activeCount >= this.deps.maxActive || this.queue.length === 0) return;
-      let admitted = false;
-      for (let i = 0; i < this.queue.length; i++) {
-        const tok = this.queue[i];
-        const s = tok ? this.sessions.get(tok) : undefined;
-        if (!s || (s.holds.length === 0 && s.inflight === 0)) {
-          if (tok) this.queue.splice(i, 1);
-          admitted = true; // stale row removed — rescan
-          break;
-        }
-        if (s.override === 'pause') continue;
-        this.queue.splice(i, 1);
-        this.log(`admitting session ${s.token} (${s.holds.length} parked request(s))`);
-        this.releaseHoldsOf(s);
-        admitted = true;
-        break;
+      const staleIdx = this.queue.findIndex(
+        (tok) =>
+          !(tok ? this.sessions.get(tok) : undefined) ||
+          ((this.sessions.get(tok)?.holds.length ?? 0) === 0 &&
+            (this.sessions.get(tok)?.inflight ?? 0) === 0),
+      );
+      if (staleIdx >= 0) {
+        // Stale row (session gone / fully settled): drop it and rescan,
+        // exactly like the FIFO path.
+        this.queue.splice(staleIdx, 1);
+        continue;
       }
-      if (!admitted) return; // queue non-empty but every head is paused
+      // #47: when the knob is OFF the "rank" is the queue index — the
+      // historical strict-FIFO pick, byte-for-byte. When ON, the rank is
+      // the admission class (with the aging promotion); ties keep arrival
+      // order. Paused sessions are never candidates (operator hold wins).
+      const candidates: { i: number; rank: number }[] = [];
+      for (let i = 0; i < this.queue.length; i++) {
+        const s = this.sessions.get(this.queue[i]!)!;
+        if (s.override === 'pause') continue;
+        candidates.push({ i, rank: this.deps.priorityEnabled ? this.priorityRank(s) : i });
+      }
+      if (candidates.length === 0) return; // every queued session is paused
+      candidates.sort((a, b) => (a.rank !== b.rank ? a.rank - b.rank : a.i - b.i));
+      const pick = candidates[0]!;
+      const tok = this.queue[pick.i]!;
+      const s = this.sessions.get(tok)!;
+      this.queue.splice(pick.i, 1);
+      this.log(
+        `admitting session ${s.token} (${s.holds.length} parked request(s))${
+          this.deps.priorityEnabled ? ` [rank ${pick.rank}]` : ''
+        }`,
+      );
+      this.releaseHoldsOf(s);
     }
+  }
+
+  /**
+   * #47: the admission rank of a PARKED session (lower = admitted first).
+   *   0 = a BACKGROUND session that has waited ≥ `agingMs` — the
+   *       no-starvation promotion: it goes ahead of interactive sessions
+   *       so a long-queued background agent is never starved;
+   *   1 = INTERACTIVE (reported via the `X-Hermes-Priority` header, or
+   *       inferred: a request inside `interactiveWindowMs`);
+   *   2 = BACKGROUND.
+   * A demoted session (peak tokens over budget) is ranked background
+   * regardless of its reported/inferred class.
+   */
+  private priorityRank(s: Session): number {
+    const cls = this.resolvedClass(s);
+    const waited = s.waitStart !== undefined ? this.now() - s.waitStart : 0;
+    if (cls === 'background' && waited >= this.agingMs) return 0;
+    return cls === 'interactive' ? 1 : 2;
+  }
+
+  /**
+   * #47: the session's resolved admission class — reported (last
+   * write-wins) beats cadence inference (a request inside
+   * `interactiveWindowMs` ⇒ interactive, else background); a latched
+   * budget demotion forces background.
+   */
+  private resolvedClass(s: Session): 'interactive' | 'background' {
+    if (s.demoted) return 'background';
+    if (s.reportedPriority) return s.reportedPriority;
+    const last = s.ring.at(-1);
+    const recent = last !== undefined && this.now() - last < this.interactiveWindowMs;
+    return recent ? 'interactive' : 'background';
   }
 
   /** Forward every parked request of a session through the gate now. */

@@ -137,6 +137,37 @@ export interface ClientConfig {
    * retryable 503 + Retry-After. Must stay under the client's own request
    * timeout (Hermes: HERMES_API_TIMEOUT default 1800s). */
   session_hold_cap_ms?: number;
+  /**
+   * #47: admission priority classes (interactive > background) + the
+   * no-starvation aging promotion. DEFAULT OFF — when false the gate is
+   * exactly the historical strict-FIFO park, so existing deployments do
+   * not shift. When true the router admits an interactive session's
+   * request ahead of parked background requests at the FIFO boundary, and
+   * a background session parked ≥ `session_aging_ms` goes ahead of
+   * newly-arrived interactive requests.
+   */
+  session_priority?: boolean;
+  /**
+   * #47: per-session token budget (from streamed usage). A session whose
+   * peak total_tokens exceeds it is DEMOTED to the lowest priority
+   * (admission only — never a hard stop). Optional; when absent no
+   * demotion happens. Only meaningful with `session_priority: true`.
+   */
+  session_token_budget?: number;
+  /**
+   * #47: age-based aging threshold (ms) — a parked BACKGROUND session that
+   * has waited this long is promoted ahead of interactive sessions
+   * (the no-starvation guarantee). Default 60s. Only meaningful with
+   * `session_priority: true`.
+   */
+  session_aging_ms?: number;
+  /**
+   * #47: cadence window (ms) for the INFERRED priority class — a session
+   * with a request inside this window is interactive (a reported
+   * `X-Hermes-Priority` header always wins over inference). Default 30s.
+   * Only meaningful with `session_priority: true`.
+   */
+  session_interactive_window_ms?: number;
   projects: ClientProjectConfig[];
   /**
    * The true idlefill repo root — the `{repo}` expansion target in executor
@@ -173,6 +204,13 @@ const DEFAULTS = {
   session_gate: true,
   max_active_agent_sessions: 2,
   session_hold_cap_ms: 120_000,
+  // #47: admission priority is OPT-IN — default OFF keeps every existing
+  // deployment on the historical strict-FIFO park.
+  session_priority: false,
+  // #47: aging (background never starves) + cadence-inference windows.
+  session_aging_ms: 60_000,
+  session_interactive_window_ms: 30_000,
+  // session_token_budget is intentionally UNSET by default (no budget).
 };
 
 export function loadClientConfig(
@@ -237,6 +275,15 @@ export function loadClientConfig(
     session_gate: typeof r.session_gate === 'boolean' ? r.session_gate : DEFAULTS.session_gate,
     max_active_agent_sessions: Math.max(1, Math.floor(num(r.max_active_agent_sessions, DEFAULTS.max_active_agent_sessions))),
     session_hold_cap_ms: Math.max(1000, Math.floor(num(r.session_hold_cap_ms, DEFAULTS.session_hold_cap_ms))),
+    // #47: admission priority classes — explicit boolean, default OFF so
+    // current behaviour is unchanged. `session_token_budget` is only
+    // honored with a finite positive value (absent/garbage = no budget).
+    session_priority: typeof r.session_priority === 'boolean' ? r.session_priority : DEFAULTS.session_priority,
+    ...(typeof r.session_token_budget === 'number' && Number.isFinite(r.session_token_budget) && r.session_token_budget > 0
+      ? { session_token_budget: Math.floor(r.session_token_budget) }
+      : {}),
+    session_aging_ms: Math.max(1000, Math.floor(num(r.session_aging_ms, DEFAULTS.session_aging_ms))),
+    session_interactive_window_ms: Math.max(1000, Math.floor(num(r.session_interactive_window_ms, DEFAULTS.session_interactive_window_ms))),
     projects: Array.isArray(r.projects)
       ? r.projects.map((p: Record<string, unknown>) => {
           const explicitExecutor = String(p.executor ?? '');
