@@ -120,12 +120,22 @@ export interface ServerConfig {
   metrics_retention_days?: number;
   /**
    * Load-axis freshness window (#52 slice 1, D3): seconds after which a
-   * captured load reading is labelled STALE by `load_age_s` (display and
-   * sample only). In this wave it labels age ONLY — it does not veto
-   * anything and the verdict never reads it (the busy veto is D4, not
-   * built). Default 45 (three polls at the 15-second `poll_ms`).
+   * captured load reading is stale. A stale reading is UNKNOWN (D2 rule 2):
+   * it never vetoes and never supports. Default 45 (three polls at the
+   * 15-second `poll_ms`).
    */
   metrics_load_stale_s?: number;
+  /**
+   * llama-swap busy threshold (#52 slice 3, D4): a number on
+   * `gpu_util_percent` (0-100) ABOVE which a FRESH load read makes
+   * `load_busy` true. UNSET BY DESIGN (no default): until the owner sets
+   * a number, the llama-swap kind has NO busy predicate — `load_busy`
+   * is absent and the verdict reads byte-for-byte as pre-#52. Setting a
+   * number is the owner's switch to turn the llama-swap veto ON.
+   * Non-positive or non-finite input is refused (unset): a threshold of
+   * 0 or below would veto on every reading.
+   */
+  metrics_llamaswap_busy_gpu_percent?: number;
 }
 
 /**
@@ -774,21 +784,35 @@ export interface IdleSignal {
   no_signal_reason?: string | null;
 
   // --------------------------------------------------------------------
-  // Load axis (#52 slice 1 — DATA ONLY).
+  // Load axis (#52 — DATA, then the monotonic busy veto).
   //
   // The collector (server/src/load.ts) reads the engine's own load
-  // surface inside the existing poll tick. This wave CAPTURES only:
-  // every key below is display-and-sample, and NOTHING in this block is
-  // read by the verdict. The `idle`, `idle_for_s`, and degraded fields
-  // above are computed exactly as before, with no input from here (D4:
-  // the llama-swap busy threshold is OFF until the owner sets a number).
-  // Absent = no reading since boot (or no collector for the kind); a
-  // stale reading is never faked and never zero-filled.
+  // surface inside the existing poll tick. Slice 1 CAPTURED the reading
+  // (display and sample only); slice 3 wires the D4 busy predicate on
+  // top of the same reading. Every key below is an ADD key. Absent =
+  // no reading since boot (or no collector for the kind); a stale
+  // reading is UNKNOWN (D2 rule 2) — never faked, never zero-filled.
+  // The `idle` field above is the verdict: feed+mtime basis AND NOT
+  // `load_busy` (D2). The load axis can only DELAY a grant — never
+  // make a busy engine read idle.
   // ------------------------------------------------------------------
 
   /** Which load surface produced the reading (design doc D5): `llamaswap-metrics` | `omlx-health` | `strata-metrics`. Absent = no load collector wired for the kind. ADD key. */
   load_source?: string;
-  /** Seconds since the last successful load read (the `metrics_load_stale_s` window labels it, it does not veto anything yet). Absent = no reading since boot. ADD key. */
+  /**
+   * The D4 busy predicate on this row's LAST load reading (slice 3):
+   * strata — `live.state` not in {idle, stopped, none}; llama-swap —
+   * `gpu_util_percent` above `metrics_llamaswap_busy_gpu_percent`
+   * (the knob, owner-set — no default); oMLX — none (the kind has no
+   * predicate, the key is always absent). PRESENT only on a FRESH read
+   * (the `metrics_load_stale_s` window, D3): a stale or missing reading
+   * is UNKNOWN — the key is absent, so the verdict falls back to the
+   * feed and mtime basis. A dead load source never degrades the verdict
+   * (D2 rule 3). The veto applies to `idle` ONLY — a busy read can
+   * never make an engine read idle (D2 rule 1). ADD key.
+   */
+  load_busy?: boolean;
+  /** Seconds since the last successful load read (labelled against the `metrics_load_stale_s` window, which also bounds the veto: a read older than the window is unknown, D3). Absent = no reading since boot. ADD key. */
   load_age_s?: number;
   /** llama-swap `/metrics` GPU utilization gauge (0-100). Absent = no reading. ADD key. */
   gpu_util_percent?: number;
