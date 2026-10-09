@@ -24,6 +24,7 @@ import { SESSION_PATH_RE, type SessionGate } from './session-gate.js';
 import { handleClientProjects, type ClientProjectsOpts } from './client-projects.js';
 import { handleSessionControl, type SessionControlOpts } from './session-control.js';
 import { handleClientHermes, type ClientHermesOpts } from './client-hermes.js';
+import { handleHermesTranscript, type HermesTranscriptOpts } from './hermes-transcript.js';
 
 /**
  * #78: `GET /sessions/<token>/transcript` — the read-only surface for the
@@ -113,6 +114,15 @@ export function startLlmProxy(opts: {
    * path falls to plain passthrough exactly as before.
    */
   clientHermes?: ClientHermesOpts;
+  /**
+   * #85 slice A: the on-demand transcript surface. When set, GET
+   * `/client/hermes-transcript/<session_id>?offset=…&limit=…` is answered
+   * ON THIS SAME loopback server (Host/Origin/token guarded inside
+   * handleHermesTranscript) and proxied to the gateway — transcript bytes
+   * never touch the arbiter wire. Absent = the path falls to plain
+   * passthrough exactly as before.
+   */
+  hermesTranscript?: HermesTranscriptOpts;
 }): LlmProxy {
   const target = new URL(opts.target);
   const log: ProxyLogEntry[] = [];
@@ -240,6 +250,36 @@ export function startLlmProxy(opts: {
         u84 = new URL('http://127.0.0.1/');
       }
       if (handleClientHermes(req, res, u84, opts.clientHermes)) return;
+    }
+    // #85 slice A: the on-demand transcript surface (same loopback bind,
+    // answered BEFORE passthrough — a gateway proxy call can never reach the
+    // LLM target). Absent ⇒ the path falls through untouched.
+    if (opts.hermesTranscript && rawUrl.startsWith('/client/hermes-transcript/')) {
+      let ut: URL;
+      try {
+        ut = new URL(rawUrl, 'http://127.0.0.1');
+      } catch {
+        ut = new URL('http://127.0.0.1/');
+      }
+      // Async (it awaits the bounded gateway walk): fire-safe, never an
+      // unhandled rejection. handleHermesTranscript answers the refusal
+      // itself on every contract path; this catch only covers a seam
+      // surprise after the response was half-written.
+      handleHermesTranscript(req, res, ut, opts.hermesTranscript).catch(() => {
+        if (!res.headersSent) {
+          try {
+            res.writeHead(500, { 'content-type': 'application/json' });
+          } catch {
+            /* raced with socket teardown */
+          }
+        }
+        try {
+          res.end();
+        } catch {
+          /* ignore */
+        }
+      });
+      return;
     }
     // #46: the session-control surface (POST /sessions/<token>/release).
     // Answered BEFORE the transcript / gate / passthrough paths so the
