@@ -213,7 +213,17 @@ async function main(): Promise<void> {
   }
   store.save();
 
-  const app = buildApi({ arbiter: apiArbiter, cfg, publicDir: dashboardDir(entryDir), mesh, metrics });
+  // #52 slice 2 (the LOAD axis): the captured reading rides the row's signal
+  // block on /api/state (display only — never a verdict input). loadView is
+  // the tick's per-row read (the same source the engine sample line uses).
+  const app = buildApi({
+    arbiter: apiArbiter,
+    cfg,
+    publicDir: dashboardDir(entryDir),
+    mesh,
+    metrics,
+    loadSignal: (row, now) => loadView(row, now),
+  });
   const wss = attachWebSocket(app, arbiter, cfg);
   const broadcast = (app as unknown as Record<string, unknown>).broadcastWs as (obj: unknown) => void;
 

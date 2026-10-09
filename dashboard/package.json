@@ -8,7 +8,7 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "test": "true",
+    "test": "tsx --test --test-timeout=20000 --test-force-exit test/load-read.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
