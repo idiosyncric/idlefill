@@ -29,10 +29,12 @@
  * the last-known peer set byte-for-byte, the arbiter never crashes on
  * fleet trouble, and nothing here ever throws.
  *
- * What this module does NOT do: heartbeats (D3 cadence — the arbiter's
- * live urls come from its own config; the heartbeat path is a named
- * TODO, one line in `heartbeatOnce`'s caller's future), pairing (D4),
- * key rotation, or deployment (D7).
+ * What this module does NOT do: the heartbeat CADENCE (the caller's
+ * concern — the arbiter's live urls come from its own config; the
+ * cadence rides the mesh federation tick, server/src/mesh.ts
+ * `sendHeartbeat`, #55 D3 slice 8: `heartbeatOnce` is the transport,
+ * the tick owns the interval), pairing (D4), key rotation, or
+ * deployment (D7).
  *
  * Deps: `node:crypto` + `node:fs` + `node:path` only (D7:
  * dependency-free Node). No new dependency.
@@ -207,6 +209,16 @@ export class FleetClient {
    * path stays inert (the pre-slice-5 behavior stands).
    */
   async ensureEnrolled(): Promise<EnrollResult> {
+    // A second client on the SAME file (the roster pull and the heartbeat
+    // sender are separate FleetClient instances) can enroll while this one
+    // still holds a null in-memory session from construction. Re-read the
+    // persisted credential BEFORE spending the single-use token: otherwise a
+    // already-spent token burns a 400 and the heartbeat silently never
+    // happens (#55 slice 8, found by the live proof).
+    if (!this.enrolled) {
+      const rec = loadEnrollment(this.path);
+      if (rec !== null) this.session = { instance_id: rec.instance_id, credential: rec.credential };
+    }
     if (this.enrolled) {
       return { ok: true, instance_id: this.session!.instance_id ?? undefined, credential: this.session!.credential ?? undefined };
     }

@@ -17,7 +17,7 @@ import type { ActivityFetcher } from './idle.js';
 import type { LoadSignalView } from './load.js';
 import { FeedDeltaTracker, MetricsStore, HOUR_MS, instrumentArbiterForMetrics } from './metrics.js';
 import { CounterDeltaTracker, OmlxUsageReaders } from './omlx.js';
-import { buildRosterFetcher, MeshFederation, makeRealMeshFetcher } from './mesh.js';
+import { buildRosterFetcher, buildHeartbeatSender, MeshFederation, makeRealMeshFetcher } from './mesh.js';
 import { StateStore } from './state.js';
 import type { ActivityEntry, EngineCounters, RequestsSource, ServerConnection, ServerProvider } from './types.js';
 
@@ -195,6 +195,18 @@ async function main(): Promise<void> {
   // answers with this instance's own snapshot for peers that list us).
   const mesh = new MeshFederation(cfg, makeRealMeshFetcher(), {
     localInstanceId: () => arbiter.instanceId(),
+    // Fleet heartbeat (#55 D3, slice 8): the arbiter publishes its OWN live
+    // urls (cfg.fleet_own_urls — the operator's reachability declaration) +
+    // coarse presence ('online') to the fleet service on the PROPOSED 60 s
+    // cadence, RIDING this same poll tick (no second network loop). Gated on
+    // ALL of fleet_url / fleet_instance_id / fleet_enrollment_token — any one
+    // absent = no heartbeat, byte-for-byte the pre-slice-8 behavior. The
+    // sender reuses the sibling fleet_enrollment.json (ensureEnrolled is
+    // idempotent — the one-time token is spent once across roster + heartbeat)
+    // and signs a fresh nonce per heartbeat with the #55 D1 identity. A
+    // failed heartbeat never throws and never touches the last-known peer set
+    // (the Service-down rule).
+    heartbeatSender: buildHeartbeatSender(cfg, arbiter.identity()),
     edgeFiller: (localId, edge, peerKey, peerName, direction) => {
       // The caller of the filler is this machine; the peer is the OTHER
       // end of the directed edge (the roster dedupe already skipped
@@ -403,6 +415,14 @@ async function main(): Promise<void> {
       // (service down = the last-known peer set stands). fleet_url absent =
       // a no-op. (pullRoster throttles to one pull per fleet_roster_pull_ms.)
       await mesh.pullRoster(rosterFetcher, now);
+      // Fleet heartbeat (#55 D3 owner choice 1, PROPOSED, slice 8): the
+      // arbiter publishes its OWN urls (cfg.fleet_own_urls) + coarse presence
+      // on the PROPOSED 60 s cadence — RIDING this same poll tick (no second
+      // network loop; at most one heartbeat per interval, not one per poll).
+      // Gated on all three fleet keys (any absent = a no-op, byte-for-byte
+      // pre-slice-8). Never throws: a failed heartbeat leaves the
+      // last-known peer set untouched (the Service-down rule).
+      await mesh.sendHeartbeat(now);
       // Mesh pull (#50): refresh peer snapshots on the SAME poll cadence.
       // (The #50 report said "refresh rides the existing tickOnce" — it
       // never actually did: mesh.refresh had no production caller, so the

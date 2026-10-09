@@ -62,6 +62,23 @@ export const DEFAULTS: Omit<ServerConfig, 'state_file'> & {
   // interval default is PROPOSED — the D3 owner choice 3: 15 s, the poll tick.
   fleet_url: undefined,
   fleet_roster_pull_ms: 15000,
+  // Fleet heartbeat (#55 D3 owner choice 1, PROPOSED — slice 8): the
+  // cadence at which the arbiter publishes its own live urls + coarse
+  // presence to the fleet service. PROPOSED default 60 s (the D3 draft:
+  // "a heartbeat every 60 s is quieter") — quieter than the 15 s poll
+  // tick. A heartbeat happens AT MOST ONCE PER INTERVAL and rides the
+  // existing poll tick (no second network loop). Any of fleet_url /
+  // fleet_instance_id / fleet_enrollment_token absent = no heartbeat at
+  // all (byte-for-byte the pre-slice-8 behavior).
+  fleet_heartbeat_ms: 60000,
+  // Fleet heartbeat urls (#55 D3, PROPOSED — slice 8): the operator's
+  // declaration of where THIS arbiter is reachable (its tailnet
+  // address(es) / any published route). ADD key: ABSENT (undefined) = the
+  // heartbeat publishes an empty urls[] (the roster row stays
+  // unreachable until the operator declares a url). Trusted operator
+  // input (the mesh_peers posture — the fleet service sanitizes it
+  // server-side anyway).
+  fleet_own_urls: undefined,
   // Fleet enrollment (#55 D2, PROPOSED, slice 7): the instance identity +
   // the one-time enrollment token. BOTH default to ABSENT (undefined):
   // the token is a SECRET the operator supplies (config.json is
@@ -142,6 +159,23 @@ export function applyDefaults(raw: Partial<ServerConfig> | null | undefined): Se
       const v = num(r.fleet_roster_pull_ms, DEFAULTS.fleet_roster_pull_ms ?? 15_000);
       return v > 0 ? v : (DEFAULTS.fleet_roster_pull_ms ?? 15_000);
     })(),
+    // Fleet heartbeat (#55 D3 owner choice 1, PROPOSED — slice 8). The
+    // cadence default is 60 s (the D3 PROPOSED value: quieter than the
+    // 15 s poll tick). Non-positive/garbage falls back to the PROPOSED
+    // default (the same guard as fleet_roster_pull_ms).
+    fleet_heartbeat_ms: (() => {
+      const v = num(r.fleet_heartbeat_ms, DEFAULTS.fleet_heartbeat_ms ?? 60_000);
+      return v > 0 ? v : (DEFAULTS.fleet_heartbeat_ms ?? 60_000);
+    })(),
+    // Fleet heartbeat urls (#55 D3, PROPOSED — slice 8): the operator's
+    // own-reachability declaration. ADD key: ABSENT = unset (the
+    // heartbeat publishes an empty urls[]). Entries are trimmed,
+    // blank ones dropped (the mesh_peers url posture). No http(s)
+    // scheme requirement here: the tailnet url is what the operator
+    // writes (the fleet service re-sanitizes server-side).
+    fleet_own_urls: Array.isArray(r.fleet_own_urls)
+      ? r.fleet_own_urls.filter((u): u is string => typeof u === 'string').map((u) => u.trim()).filter((u) => u !== '')
+      : undefined,
     // Fleet enrollment (#55 D2, PROPOSED, slice 7). ADD keys: ABSENT means
     // unset. fleet_instance_id is the fleet-issued identity (persisted in
     // fleet_enrollment.json after the first enroll — the config value is
