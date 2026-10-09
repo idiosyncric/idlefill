@@ -456,14 +456,24 @@ function SessionRowView({ s, st }: { s: SessionRow; st: StateSnapshot }) {
           variant="outline"
           className="rounded-pill px-1.5 py-0 text-[10px] font-normal"
           title={
-            position > 0
-              ? `position ${position} in the router's FIFO queue — held behind another session`
-              : waiting > 1
-                ? "held at the router behind another session"
-                : "held at the router behind another session"
+            (() => {
+              const parts: string[] = [];
+              if (position > 0) parts.push(`position ${position} in the router's FIFO queue`);
+              const heldFor =
+                s.gate?.waitSince != null ? `held ${ago(now - (s.gate!.waitSince as number))}` : null;
+              if (heldFor) parts.push(`${heldFor} at the gate`);
+              parts.push(
+                `held ${waiting > 1 ? `${waiting} request(s) ` : ""}behind another session — the operator can release the hold (pause ⇒ the turn stops stalling, answered "held by gate", retry in ~15s)`,
+              );
+              return parts.join(" · ");
+            })()
           }
         >
-          {position > 0 ? `queued · #${position}` : waiting > 1 ? `queued · ${waiting} waiting` : "queued"}
+          {(() => {
+            const base = position > 0 ? `#${position}` : waiting > 1 ? `${waiting} waiting` : "";
+            const heldFor = s.gate?.waitSince != null ? ` · ${ago(now - (s.gate!.waitSince as number))}` : "";
+            return `queued${base ? ` · ${base}` : ""}${heldFor}`;
+          })()}
         </Badge>
       )}
       <span className="ml-auto flex items-center gap-1.5">

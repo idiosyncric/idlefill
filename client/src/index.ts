@@ -1819,6 +1819,14 @@ export class ClientDaemon {
       // pasting holds. No config FILE (env-config launch) = routes answer
       // 503 rather than inventing a file to write.
       clientProjects: { token: this.cfg.token, configPath: this.cfg.config_path ?? null },
+      // #46: the true-pause interrupt half — POST /sessions/<token>/release
+      // on this SAME loopback bind answers a paused/over-capacity
+      // session's parked holds with the retryable 503 + Retry-After (the
+      // in-session "held by gate" feedback) and frees the queue slot.
+      // Guarded like the config editor (Host/Origin/token); the token
+      // compared is the one this daemon already holds. No gate ⇒ absent
+      // (a gate-less daemon has no parked holds to release).
+      ...(this.gate ? { sessionControl: { token: this.cfg.token, gate: this.gate } } : {}),
     });
     await waitProxyReady(this.proxy.server);
     this.log.info(

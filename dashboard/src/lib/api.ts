@@ -152,6 +152,10 @@ export type SessionGate = {
   state: "active" | "queued";
   waiting: number;
   position?: number;
+  /** #46: epoch-ms the session FIRST started waiting (the hold's anchor;
+   *  the router's clock, carried verbatim). The row ages the hold from it.
+   *  Absent on old routers / a non-queued gate. */
+  waitSince?: number;
 };
 
 export type SessionHistory = {

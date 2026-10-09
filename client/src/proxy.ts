@@ -22,6 +22,7 @@ import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { SESSION_PATH_RE, type SessionGate } from './session-gate.js';
 import { handleClientProjects, type ClientProjectsOpts } from './client-projects.js';
+import { handleSessionControl, type SessionControlOpts } from './session-control.js';
 
 /**
  * #78: `GET /sessions/<token>/transcript` — the read-only surface for the
@@ -76,6 +77,15 @@ export function startLlmProxy(opts: {
    * behaves exactly as before (the path falls to plain passthrough).
    */
   clientProjects?: ClientProjectsOpts;
+  /**
+   * #46: session-control surface (the true-pause interrupt half). When
+   * set, `POST /sessions/<token>/release` is answered ON THIS SAME
+   * loopback server (guarded Host/Origin/token inside
+   * handleSessionControl) — it releases the token's parked holds. Absent
+   * = the path falls to plain passthrough exactly as before (a control
+   * path never reaches the LLM target).
+   */
+  sessionControl?: SessionControlOpts;
 }): LlmProxy {
   const target = new URL(opts.target);
   const log: ProxyLogEntry[] = [];
@@ -191,6 +201,19 @@ export function startLlmProxy(opts: {
         u = new URL('http://127.0.0.1/');
       }
       if (handleClientProjects(req, res, u, opts.clientProjects)) return;
+    }
+    // #46: the session-control surface (POST /sessions/<token>/release).
+    // Answered BEFORE the transcript / gate / passthrough paths so the
+    // control write can never reach the LLM target or be mistaken for
+    // session traffic. Absent ⇒ falls through untouched.
+    if (opts.sessionControl) {
+      let u: URL;
+      try {
+        u = new URL(rawUrl, 'http://127.0.0.1');
+      } catch {
+        u = new URL('http://127.0.0.1/');
+      }
+      if (handleSessionControl(req, res, u, opts.sessionControl)) return;
     }
     const m = opts.gate ? SESSION_PATH_RE.exec(rawUrl) : null;
     // #78: the session viewer's read-only transcript surface. Answered BEFORE

@@ -402,7 +402,16 @@ test('snapshot: active / queued / both / idle — the router queue truth', async
   // B parks behind A ⇒ queued with its waiting count.
   const resB = postChat(proxy.base_url, '/s/tokB/v1/chat/completions');
   await waitFor(() => gate.queueDepth === 1, 1000, 'B queued');
-  assert.deepEqual(gate.snapshot('tokB'), { state: 'queued', waiting: 1, position: 1 }, 'parked ⇒ queued + count + 1st in line (#44)');
+  const snapB = gate.snapshot('tokB');
+  assert.equal(snapB?.state, 'queued', 'parked ⇒ queued');
+  assert.equal(snapB?.waiting, 1, 'parked ⇒ waiting count');
+  assert.equal(snapB?.position, 1, 'parked ⇒ 1st in line (#44)');
+  // #46: the hold's anchor instant rides as the waitSince ADD-key (the age
+  // a parked session has waited). This test has no clock seam ⇒ a real
+  // epoch-ms instant, asserted present + plausible (not a whole-object
+  // deepEqual, so the real-clock value stays deterministic to assert).
+  assert.equal(typeof snapB?.waitSince, 'number', 'parked ⇒ carries the waitSince anchor (#46)');
+  assert.ok((snapB?.waitSince ?? 0) > 0, 'waitSince is a positive epoch-ms instant');
 
   // BOTH: pause A while it still holds the slot — its next request parks
   // behind the operator hold while inflight > 0 ⇒ active, count reported.
@@ -453,7 +462,9 @@ test('register calls carry the gate snapshot (active at refresh, queued while pa
   await waitFor(() => calls.length === 4, 1000, 'heartbeat registers');
   const byTok = new Map(calls.slice(2).map((c) => [c.token, c.gate]));
   assert.deepEqual(byTok.get('tokA'), { state: 'active', waiting: 0 });
-  assert.deepEqual(byTok.get('tokB'), { state: 'queued', waiting: 1, position: 1 });
+  // #46: the queued snapshot carries waitSince = the anchor clock value at
+  // park time (the clock seam is 2_000_000, before the +10_001 tick).
+  assert.deepEqual(byTok.get('tokB'), { state: 'queued', waiting: 1, position: 1, waitSince: 2_000_000 });
 
   // Drain everything (sequential releases — B only reaches the upstream
   // after A's slot frees); the next heartbeat then reports idle ⇒ null

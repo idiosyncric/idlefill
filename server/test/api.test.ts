@@ -1419,6 +1419,62 @@ test('sessions: gate block over REST — stored, carried by /api/state + /api/se
   assert.equal(plain.status, 200);
 });
 
+// #46: the waitSince ADD-key on the gate block — the hold's anchor instant
+// (the router's clock, carried verbatim). Stored + echoed while present;
+// a malformed value is DROPPED (the block still rides, minus the key, never
+// a rejected heartbeat); an old router that omits it leaves the row keyless.
+test('sessions: gate block waitSince ADD-key — stored + echoed verbatim, malformed dropped, absent = keyless', async () => {
+  const base46 = 's-gate-ws';
+  // A queued block WITH waitSince is stored + echoed verbatim (the age the
+  // dashboard + in-session 503 render from it).
+  const reg = await fetch(`${base}/api/sessions/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ token: base46, gate: { state: 'queued', waiting: 1, position: 2, waitSince: 1_700_000_000_000 } }),
+  });
+  assert.equal(reg.status, 201);
+  const created = (await reg.json()) as { session: { gate: unknown } };
+  assert.deepEqual(created.session.gate, { state: 'queued', waiting: 1, position: 2, waitSince: 1_700_000_000_000 }, 'create carries the waitSince ADD-key');
+  const st = (await (await fetch(`${base}/api/state?limit=5`, { headers: auth })).json()) as {
+    sessions: { token: string; gate?: unknown }[];
+  };
+  assert.deepEqual(st.sessions.find((x) => x.token === base46)?.gate, { state: 'queued', waiting: 1, position: 2, waitSince: 1_700_000_000_000 }, '/api/state echoes waitSince verbatim (router clock, never re-derived)');
+
+  // Malformed waitSince: the ADD-key is DROPPED from the block, the
+  // (otherwise valid) block still Rides (minus the key), and the heartbeat
+  // is never rejected (the three-verdict ADD-key posture, exactly like
+  // position — distinct from an invalid BLOCK, which is dropped wholesale).
+  const bad = await fetch(`${base}/api/sessions/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ token: base46, gate: { state: 'queued', waiting: 1, position: 2, waitSince: 'not-a-number' } }),
+  });
+  assert.equal(bad.status, 200, 'a malformed waitSince never rejects the heartbeat');
+  const stBad = (await (await fetch(`${base}/api/state?limit=5`, { headers: auth })).json()) as {
+    sessions: { token: string; gate?: unknown }[];
+  };
+  assert.deepEqual(
+    stBad.sessions.find((x) => x.token === base46)?.gate,
+    { state: 'queued', waiting: 1, position: 2 },
+    'malformed waitSince: the key is dropped from the block, the block still rides',
+  );
+
+  // An old router that omits waitSince: the block rides WITHOUT the key
+  // (ADD-key posture — an absent key never clobbers a stored one… but a
+  // NEW valid block without the key replaces the stored one minus the key,
+  // since the whole block is last-write-wins). The keyless block is stored.
+  const old = await fetch(`${base}/api/sessions/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ token: base46, gate: { state: 'queued', waiting: 3 } }),
+  });
+  assert.equal(old.status, 200);
+  const stOld = (await (await fetch(`${base}/api/state?limit=5`, { headers: auth })).json()) as {
+    sessions: { token: string; gate?: unknown }[];
+  };
+  assert.deepEqual(stOld.sessions.find((x) => x.token === base46)?.gate, { state: 'queued', waiting: 3 }, 'an old router\'s keyless block replaces the stored block without waitSince');
+});
+
 test('sessions: operator override via API — set, expose, clear; 404 unknown token', async () => {
   await fetch(`${base}/api/sessions/register`, { method: 'POST', headers: auth, body: JSON.stringify({ token: 's-http-2' }) });
 
