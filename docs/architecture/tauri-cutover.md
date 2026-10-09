@@ -34,6 +34,35 @@ tauri-plugin-deep-link 2.6.1, tauri-plugin-single-instance 2.5.2. The
 spike lives in `/tmp/idlefill-tauri-spike` (never in the repo tree). The
 report `docs/reports/ISSUE69-GRILL-REPORT.md` carries its outputs.
 
+## AMENDMENT (2026-10-09, issue #75 grill — the shell updater plane)
+
+Scope: this amendment supersedes two clauses inside D7 below. Every
+other clause of this doc stays LOCKED and unchanged.
+
+1. SUPERSEDED — the D7 opening line: "LOCKED: no updater of any kind
+   in the artifact." The Tauri shell gains a signed updater channel
+   (`tauri-plugin-updater`, Tauri v2), fed by the existing Forgejo
+   release endpoint. The daemon and the arbiter carry no updater.
+2. SUPERSEDED — Q-b's artifact clause inside D7: "NOTHING on
+   releases. No app zip, no appcast, no signing." A Forgejo release
+   now carries the shell's two updater artifacts: `latest.json` and
+   the signed `Idlefill.app.tar.gz`. Q-b's checkout clause stands for
+   the daemon and the arbiter, and `update.sh` stays the shell's
+   manual/checkout path. It no longer stands as the shell's only
+   path.
+
+Stands unchanged and is reaffirmed here: D1 (one artifact, and the window close keeps the app alive), D2 (the runtime external page),
+D3 (the document-start token seam), D4 (lifecycle parity and the
+settings shape), D5 (deep links), D6 (the blank-origin behavior and
+the Q-a auto-reload), D7's retirement inventory (every retired Swift
+plane stays retired, and the `--version` marker contract survives),
+D8, D9, Q-c (the single tray click), and Q-d (one LaunchAgent).
+
+The new plane and its decisions live in
+`docs/architecture/shell-updater.md` (its D1-D7, LOCKED except Q-e
+PROPOSED). This doc cites that doc as the inherited constraint. It
+does not restate it.
+
 ## The rules this doc inherits
 
 - The page is the surface (#61). The app loads the LIVE origin from
