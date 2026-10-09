@@ -8,15 +8,14 @@ noted. The full captures sit at the end of this file.
 Companion: `docs/architecture/metrics-sidecar.md` (the design this inventory
 feeds). Map: #51 (the store), #50 (mesh, co-location), #62 (kind adapters).
 
-Status (2026-10-09, slice 1): the CAPTURE half of the design shipped on
-branch `issue-52-capture` — the llama-swap feed `tokens` block +
-`duration_ms` kept (ADD), the llama-swap `/metrics` and oMLX `/health`
-fetches with the D5 ADD keys, `metrics_load_stale_s` (default 45, age
-labelling only). The idle verdict is UNCHANGED (D4 stays off — the owner
-has not set the llama-swap busy threshold). What is still PROPOSED: the
-busy veto, strata `in_flight`, the dashboard load read, `queue_depth`
-values. See `ISSUE52-CAPTURE-REPORT.md` (what shipped vs still
-PROPOSED, the verdict byte-identity proof, the test evidence).
+Status (2026-10-09, grill close): slices 1–4 shipped on main — the
+CAPTURE half (feed `tokens` block + `duration_ms` kept, llama-swap
+`/metrics` + oMLX `/health` fetches, the D5 ADD keys,
+`metrics_load_stale_s`), the dashboard load read, the monotonic busy
+veto (inert for llama-swap — the owner kept the threshold knob UNSET),
+and the strata collector credential fix. The strata experiment is
+OBSERVED LIVE (re-probe addendum below). The design decisions are all
+LOCKED; see `ISSUE52-GRILL-REPORT.md`.
 
 ## The want list
 
@@ -290,6 +289,90 @@ GET /api/mesh -> 401 (no peer token; expected, mesh.md D2)
    adapter already uses (a fixed non-IP src, no self-exemption).
 3. Model and quant identity as structured fields, so the verdict and the
    dashboard name what the engine actually holds.
+
+## Re-probe addendum (2026-10-09, later in the day — the grill pass)
+
+Same machine, same method, ~16:30 UTC. The picture flipped: the two
+engines that were up at 05:55 are down, the one that was 502 is back.
+
+**strata / urza — BACK, and the #52 experiment is OBSERVED LIVE.**
+
+```
+GET /health -> 200
+{"status": "ok", "max_context": 262144, "model": "qwen3.8-flash-next-iq3_s", "images": true, "api_key": true, "loaded": true, "service": "strata"}
+
+GET /metrics (keyless) -> 401
+{"error": {"type": "authentication_error", "message": "missing or wrong API key"}}
+```
+
+The 401 is the expected shape: the row credential lives with the
+arbiter (slice 4 proved it rides the load read too). The row's live
+signal block, sampled across three arbiter ticks while a generation
+ran and finished (verbatim, the decisive record):
+
+```
+t+0s  {"idle": false, "idle_for_s": 9,  "load_source": "strata-metrics", "in_flight": 1, "load_busy": true,  "load_age_s": 9,  "degraded": false}
+t+16s {"idle": false, "idle_for_s": 20, "load_source": "strata-metrics", "in_flight": 0, "load_busy": false, "load_age_s": 14, "degraded": false}
+t+32s {"idle": false, "idle_for_s": 16, "load_source": "strata-metrics", "in_flight": 0, "load_busy": false, "load_age_s": 15, "degraded": false}
+```
+
+Generating → `in_flight` 1, `load_busy` true (the veto live on the
+verdict); finish → 0 / false on a FRESH read (not absent, not stale);
+hold. The strata `live.state` vocabulary needed no enumeration: the
+adapter treats everything outside {idle, stopped, none} as busy, so
+any unknown state fails to the conservative side.
+
+**llama-swap / urza — DOWN at re-probe.** `/metrics`, the feed, and
+`/health` all answer `000` (connection failure, Tailscale route
+refused). The live row reads `degraded` true, "activity fetch failed",
+`idle_for_s` null, and NO load keys — the D2-rule-3 plane in the wild:
+a dead engine degrades through the FEED, the load axis publishes
+nothing rather than a fake zero. The 05:55 captures above stand as the
+record.
+
+**oMLX — DOWN at re-probe.** `/health`, `/api/status`, `/admin/api/*`
+all `000`; nothing listens on :8000 (the 05:55 `/health` capture
+stands). Installed version: **0.7.0** (`brew list --versions omlx`,
+the current stable; 0.7.1.dev1 is a pre-release).
+
+**Upstream research (the grill pass, against the upstream repos):**
+
+- llama-swap (`mostlygeek/llama-swap`): `/metrics` is a documented,
+  maintained surface — the README lists it ("system and GPU metrics
+  for prometheus"), the gauge names are generated in
+  `internal/perf/prometheus.go` (matching the verbatim capture:
+  `llamaswap_gpu_util_percent` etc.) and pinned by the upstream's own
+  test, and the repo bundles `docs/grafana/example-dashboard.json`.
+  IN-FLIGHT: exists since v235 ("show inflight activity requests",
+  PR #895) and expanded in v240 (PR #923) — but ONLY on the WebSocket
+  events plane (`handleAPIEvents`, `InflightRequestEntry` with
+  `id/model/req_path/elapsed_ms/...`). The HTTP `/api/metrics/activity`
+  answers finished rows only. There is no HTTP in-flight count to wait
+  for.
+- oMLX (`jundot/omlx`): the probe hit `/health` and never `/api/status`
+  — a probe hole, not an engine gap. v0.7.0 `GET /api/status`
+  (`omlx/server.py`, `verify_api_key` — ANY valid API key, incl. a sub
+  key) returns: `status`, `version`, `models_loaded`,
+  **`loaded_models`** (the actual loaded ids), **`active_requests`**
+  (aggregate in-flight across loaded engines), **`waiting_requests`**
+  (the scheduler queue), `total_requests`, `total_prompt_tokens`,
+  `total_completion_tokens`, `total_cached_tokens`,
+  `cache_efficiency`, `avg_prefill_tps`, `avg_generation_tps`,
+  `model_memory_used` / `model_memory_max`. `GET /admin/api/activity`
+  (MAIN key only) adds per-model active/waiting with `queue_position`
+  and elapsed, `total_active_requests` / `total_waiting_requests`,
+  `model_memory_used/max`, and the `memory_pressure` block.
+
+**Corrected gap row for oMLX** (supersedes the table above for this
+kind; the others stand):
+
+| Want | oMLX (0.7.0, `/api/status`) |
+| --- | --- |
+| Queue depth | `waiting_requests` — the first queue count in the fleet |
+| In-flight requests | `active_requests` — a direct busy read |
+| Tokens per second | `avg_prefill_tps` / `avg_generation_tps` + `total_*` counters |
+| KV-cache pressure | still none (model memory vs ceiling + admin `memory_pressure` are proxies) |
+| Model and quant identity | `loaded_models` (real loaded ids; the quant parses from them) |
 
 ## Full captures (verbatim, untruncated)
 
