@@ -23,13 +23,22 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+  SheetDescription,
+} from "@/components/ui/sheet";
 import { Sparkline } from "@/components/Sparkline";
 import { copyText } from "@/lib/clipboard";
 import {
   apiToken,
   setSessionOverride,
   setSessionPin,
+  getSessionTranscript,
   type SessionRow,
+  type SessionTranscript,
   type StateSnapshot,
 } from "@/lib/api";
 import { ago, isOnline, sessGateLabelText, sessStateWord, sessStale } from "@/lib/format";
@@ -125,6 +134,136 @@ function HermesOpenButton({ sessionId }: { sessionId?: string }) {
 }
 
 // ---------------------------------------------------------------------------
+// #78: the session viewer — a Sheet that shows the ROUTER's read-only view of
+// one session's requests (request time + the model + streamed token total the
+// router observed, plus the 60s request buckets). It is NOT a chat reader: the
+// router only ever saw timing + a sniffed model + a token total, never the
+// conversation, so the panel says so plainly and shows exactly that and nothing
+// more. Data: GET /api/sessions/<token>/transcript (arbiter → client proxy).
+// ---------------------------------------------------------------------------
+
+function TranscriptSheet({ token, title, onClose }: { token: string; title: string; onClose: () => void }) {
+  const [data, setData] = React.useState<SessionTranscript | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+  const [loading, setLoading] = React.useState(true);
+
+  React.useEffect(() => {
+    let live = true;
+    setLoading(true);
+    setError(null);
+    getSessionTranscript(token)
+      .then((t) => {
+        if (live) setData(t);
+      })
+      .catch((e) => {
+        if (live) setError((e as Error).message);
+      })
+      .finally(() => {
+        if (live) setLoading(false);
+      });
+    return () => {
+      live = false;
+    };
+  }, [token]);
+
+  const requests = data?.requests ?? [];
+  const buckets = data?.buckets ?? [];
+  const totalRequests = requests.length;
+  const anyTokens = requests.some((r) => typeof r.tokens === "number");
+  const anyModel = requests.some((r) => Boolean(r.model));
+
+  return (
+    <Sheet open onOpenChange={(open) => !open && onClose()}>
+      <SheetContent side="right" className="w-[min(440px,92vw)] gap-0">
+        <SheetHeader className="border-b border-border px-4 py-3">
+          <SheetTitle className="font-mono text-[13px]">{title}</SheetTitle>
+          <SheetDescription className="text-[11px] leading-relaxed text-dim">
+            the router&apos;s view, not the full conversation — what the router observed per
+            request (time, model, streamed token total), never the messages
+          </SheetDescription>
+        </SheetHeader>
+
+        <div className="flex flex-col gap-3 overflow-y-auto px-4 py-3">
+          {loading && (
+            <div className="text-[12px] text-dim">loading the router&apos;s view…</div>
+          )}
+
+          {!loading && error && (
+            <div className="flex flex-col gap-1 text-[12px] text-err">
+              <span className="font-semibold">transcript unavailable</span>
+              <span className="text-dim">{error}</span>
+              <span className="text-dim">
+                the router that owns this session may be offline, or it reports no
+                loopback port the arbiter can reach.
+              </span>
+            </div>
+          )}
+
+          {!loading && !error && (
+            <>
+              {/* Honest state: a 502 is shown above; an empty ring is the
+                  honest "no requests the router saw". */}
+              {totalRequests === 0 ? (
+                <div className="flex flex-col gap-1 rounded-md border border-border bg-panel/50 px-3 py-3 text-[12px] text-dim">
+                  <span className="font-semibold text-foreground/80">no requests in the router&apos;s ring</span>
+                  <span>
+                    the router has recorded no traffic for this token — the ring is
+                    in-memory, so a daemon restart starts it empty.
+                  </span>
+                </div>
+              ) : (
+                <>
+                  <div className="flex items-center justify-between text-[11px] text-dim">
+                    <span>
+                      {totalRequests} request{totalRequests === 1 ? "" : "s"} the router observed
+                      {anyTokens ? " · token totals" : ""}
+                      {anyModel ? " · model" : ""}
+                    </span>
+                  </div>
+
+                  <div className="flex flex-col gap-1">
+                    {requests.map((r, i) => (
+                      <div
+                        key={`${r.at}-${i}`}
+                        className="flex items-center gap-2 rounded-md border border-border bg-panel/50 px-2.5 py-1.5 text-[12px]"
+                      >
+                        <span className="font-mono tabular-nums" title="when the router saw this request">
+                          {new Date(r.at).toLocaleTimeString([], { hour12: false })}
+                        </span>
+                        <span className="text-dim">{ago(Date.now() - r.at)}</span>
+                        <span className="ml-auto flex items-center gap-2">
+                          {typeof r.tokens === "number" && (
+                            <span className="text-dim" title="last total_tokens the router saw streaming on this session">
+                              {r.tokens >= 1000 ? `${Math.round(r.tokens / 100) / 10}k` : r.tokens} tok
+                            </span>
+                          )}
+                          {r.model && (
+                            <Badge variant="outline" className="rounded-pill px-1.5 py-0 text-[10px] font-normal" title="last model the router sniffed on this session">
+                              {r.model}
+                            </Badge>
+                          )}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+
+                  {buckets.length > 0 && (
+                    <div className="mt-1 flex items-center gap-2 text-[11px] text-dim">
+                      <span>requests / min, last 10 min</span>
+                      <Sparkline values={buckets} className="h-[16px] w-[90px] flex-none" />
+                    </div>
+                  )}
+                </>
+              )}
+            </>
+          )}
+        </div>
+      </SheetContent>
+    </Sheet>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Sessions — interactive traffic the router self-registered (#32/#33).
 // The router enforces admission; this view displays arbiter truth and offers
 // the operator controls: the per-session gate (pause / force / clear) and
@@ -204,6 +343,7 @@ export function Sessions({ st }: { st: StateSnapshot | null }) {
 // engine pin select, and the gate select.
 function SessionRowView({ s, st }: { s: SessionRow; st: StateSnapshot }) {
   const now = st.now;
+  const [viewOpen, setViewOpen] = React.useState(false);
   const word = sessStateWord(s, now);
   const stale = sessStale(s, now);
   const shortTok = String(s.token ?? "").slice(0, 8);
@@ -280,6 +420,22 @@ function SessionRowView({ s, st }: { s: SessionRow; st: StateSnapshot }) {
         </span>
       )}
       <HermesOpenButton sessionId={s.session_id} />
+      <Button
+        size="xs"
+        variant="ghost"
+        className="h-6 px-2 text-[11px] text-dim"
+        title="view the router's observed requests for this session (the router's view, not the conversation)"
+        onClick={() => setViewOpen(true)}
+      >
+        view
+      </Button>
+      {viewOpen && (
+        <TranscriptSheet
+          token={s.token}
+          title={`session ${shortTok} — router's view`}
+          onClose={() => setViewOpen(false)}
+        />
+      )}
       {s.server_id && !s.engine_pin && (
         <span className="text-[11px] text-dim" title="the engine this session routes to">
           → {serverName(st, s.server_id)}

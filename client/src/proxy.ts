@@ -23,6 +23,15 @@ import type { AddressInfo } from 'node:net';
 import { SESSION_PATH_RE, type SessionGate } from './session-gate.js';
 import { handleClientProjects, type ClientProjectsOpts } from './client-projects.js';
 
+/**
+ * #78: `GET /sessions/<token>/transcript` — the read-only surface for the
+ * router's per-session request ring (the session viewer's data source). Distinct
+ * from the gate's `/s/<token>/...` passthrough (that regex requires `/s/`, so
+ * `/sessions/...` can never be mistaken for session traffic). Token ≤128 chars
+ * (the arbiter rule), matching the gate's token bound.
+ */
+const TRANSCRIPT_PATH_RE = /^\/sessions\/([^/]+)\/transcript$/;
+
 export interface ProxyLogEntry {
   ts: number;
   method: string;
@@ -184,6 +193,38 @@ export function startLlmProxy(opts: {
       if (handleClientProjects(req, res, u, opts.clientProjects)) return;
     }
     const m = opts.gate ? SESSION_PATH_RE.exec(rawUrl) : null;
+    // #78: the session viewer's read-only transcript surface. Answered BEFORE
+    // the gate's `/s/<token>` dispatch (the path shapes don't collide — this
+    // is `/sessions/<token>/transcript`, that is `/s/<token>/...`), and before
+    // plain passthrough so the control-surface path never reaches the LLM
+    // target. No gate configured ⇒ nothing to read ⇒ the same empty shape
+    // (fail-quiet: an operator on a gate-less daemon sees no requests).
+    if (req.method === 'GET' || req.method === 'HEAD') {
+      const tm = TRANSCRIPT_PATH_RE.exec(rawUrl);
+      if (tm) {
+        let token = tm[1] ?? '';
+        try {
+          token = decodeURIComponent(token);
+        } catch {
+          /* malformed %xx: keep the raw token (the arbiter stores it verbatim) */
+        }
+        // Unknown / oversized token ⇒ the empty transcript (fail-quiet). An
+        // oversized token is the arbiter's 400 rule, but on this READ surface
+        // the honest answer is "no recorded requests", not an error — the
+        // viewer is never wedged by a bad handle.
+        const transcript =
+          token && token.length <= 128 && opts.gate
+            ? opts.gate.transcriptFor(token)
+            : { token, requests: [], buckets: new Array<number>(10).fill(0) };
+        const body = JSON.stringify(transcript);
+        res.writeHead(200, {
+          'content-type': 'application/json',
+          'content-length': String(Buffer.byteLength(body)),
+        });
+        res.end(req.method === 'HEAD' ? undefined : body);
+        return;
+      }
+    }
     if (opts.gate && m) {
       // Session traffic: /s/<token>/v1/... → gate, forwarded as /v1/...
       let token = m[1] ?? '';

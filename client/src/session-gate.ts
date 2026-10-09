@@ -233,6 +233,41 @@ export interface SessionHistory {
   tokens?: number;
 }
 
+/**
+ * #78: one line of the router's per-session transcript — what the ROUTER
+ * observed about a single request, NOT the conversation content. `at` is when
+ * the router saw the request (the ring entry; a parked request counts too).
+ * `model` / `tokens` are the router's observed values for the session (the
+ * last model name sniffed from an upstream response echo and the last
+ * total_tokens seen in a streamed usage chunk — the SAME facts the `history`
+ * heartbeat reports). The router does not reconstruct the prompt/response, so
+ * nothing here is a chat reader; it is the router's view.
+ */
+export interface SessionTranscriptRequest {
+  /** epoch-ms the router observed this request (a forwarded OR parked one). */
+  at: number;
+  /** last model name the router sniffed on this session (absent = unseen). */
+  model?: string;
+  /** last total_tokens the router observed streaming on this session (absent = unseen). */
+  tokens?: number;
+}
+
+/**
+ * #78: the router's read-only view of one session's request ring — the shape
+ * the loopback proxy serves at `GET /sessions/<token>/transcript` and the
+ * arbiter forwards. `requests` is newest-first (the ring is stored
+ * oldest-first); `buckets` is the #45 10×60s request counts (oldest→newest,
+ * always 10). An unknown token — or a known token with no recorded traffic —
+ * answers the SAME empty shape (fail-quiet: no ring, no error).
+ */
+export interface SessionTranscript {
+  token: string;
+  /** per-request entries, newest first. */
+  requests: SessionTranscriptRequest[];
+  /** requests/min counts, 60s buckets, oldest→newest, always 10 entries. */
+  buckets: number[];
+}
+
 /** #45: compact request history for the register heartbeat — counts per
  *  60s bucket, oldest→newest, always exactly 10 buckets (10 minutes). */
 function sessionHistory(s: Session, now: number): SessionHistory {
@@ -369,6 +404,30 @@ export class SessionGate {
    */
   pinFor(token: string): SessionPinRow | null {
     return this.sessions.get(token)?.pin ?? null;
+  }
+
+  /**
+   * #78: the router's read-only transcript for one token — the per-request
+   * entries (request time + the router's observed model/tokens) plus the #45
+   * 60s bucket counts. Pure read of the in-memory ring (a restart starts
+   * empty). An unknown token — or a known token with no recorded traffic —
+   * returns the empty shape (fail-quiet): the caller cannot distinguish a
+   * never-seen token from an idle one, and both are simply "no requests".
+   */
+  transcriptFor(token: string): SessionTranscript {
+    const s = this.sessions.get(token);
+    const requests = (s?.ring.length ?? 0)
+      ? [...(s?.ring ?? [])].reverse().map((at) => ({
+          at,
+          ...(s?.model ? { model: s.model } : {}),
+          ...(typeof s?.tokens === 'number' ? { tokens: s.tokens } : {}),
+        }))
+      : [];
+    // Buckets reuse the #45 windowing (60s, 10 buckets, oldest→newest) — the
+    // same counts the `history` heartbeat publishes, so the two surfaces
+    // agree by construction.
+    const buckets = s ? sessionHistory(s, this.now()).rpm : new Array<number>(10).fill(0);
+    return { token, requests, buckets };
   }
 
   /**

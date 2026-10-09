@@ -1019,6 +1019,73 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   });
 
   /**
+   * #78 session viewer: the ROUTER's read-only transcript for one session —
+   * the per-request entries (request time + the model + streamed token total
+   * the router observed) plus the 60s request buckets. The arbiter forwards
+   * to the OWNING client's loopback proxy port (`GET /sessions/<token>/transcript`
+   * there), the same "client-truth" posture as the `history` block: the router
+   * owns the ring, the arbiter only relays it.
+   *
+   * Auth: the sibling /api/sessions posture (a configured token, Bearer or
+   * `?token=`) — the top-level /api guard enforces it before this runs; this
+   * route adds no extra credential. Forward reachability is loopback-only by
+   * design: it only ever fetches the arbiter's own machine (client.ip must be
+   * loopback) because the ring lives at the client's 127.0.0.1 proxy, which no
+   * other host can reach. A forward that cannot be reached (owner unknown,
+   * port unset, client down) answers 502 with the honest reason — it never
+   * invents a transcript.
+   */
+  app.get('/api/sessions/:token/transcript', async (req, reply) => {
+    const token = decodeURIComponent((req.params as { token: string }).token);
+    if (!token.trim()) return reply.code(400).send({ error: 'session token required' });
+    const route = arbiter.clientRouteForSession(token.trim());
+    if (!route || !route.proxy_port) {
+      return reply.code(502).send({
+        error: 'transcript unavailable',
+        hint: 'the session owner is unknown or reports no loopback proxy port',
+      });
+    }
+    const ip = route.ip ?? '';
+    if (!isLoopbackAddress(ip)) {
+      // The ring lives at the client's 127.0.0.1 proxy; a non-loopback owner
+      // is unreachable by construction (and we must not fetch an operator-
+      // supplied remote IP with the operator's token). Fail closed.
+      return reply.code(502).send({
+        error: 'transcript unavailable',
+        hint: 'the session owner is not on this machine (the router ring is loopback-only)',
+      });
+    }
+    let upstream: Response;
+    try {
+      upstream = await fetch(
+        `http://127.0.0.1:${route.proxy_port}/sessions/${encodeURIComponent(token.trim())}/transcript`,
+        { signal: AbortSignal.timeout(4000) },
+      );
+    } catch (err) {
+      return reply.code(502).send({
+        error: 'transcript unavailable',
+        hint: `could not reach the router: ${err instanceof Error ? err.message : err}`,
+      });
+    }
+    if (!upstream.ok) {
+      return reply.code(502).send({
+        error: 'transcript unavailable',
+        hint: `the router answered HTTP ${upstream.status}`,
+      });
+    }
+    const body = (await upstream.json().catch(() => null)) as
+      | { token?: string; requests?: unknown; buckets?: unknown }
+      | null;
+    // Echo the router's shape verbatim (ADD-key discipline: trust the router's
+    // own sanitization at the source). A non-JSON answer degrades to empty.
+    return {
+      token: token.trim(),
+      requests: Array.isArray(body?.requests) ? body.requests : [],
+      buckets: Array.isArray(body?.buckets) ? body.buckets : new Array<number>(10).fill(0),
+    };
+  });
+
+  /**
    * Operator override for a session: { override: "pause" | "force" | null,
    * until?: epoch_ms }. Same shape as the client override (#32). 'pause'
    * asks the router to hold that session's traffic. 404 for an unknown
