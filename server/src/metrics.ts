@@ -74,6 +74,25 @@ export interface EngineSampleLine {
    */
   tokens_in_delta?: number | null;
   tokens_out_delta?: number | null;
+  /**
+   * Load axis (#52 slice 1 — DATA ONLY): the captured engine load reading
+   * for this tick, same key names as the signal block (design doc D5:
+   * "The #51 engine sample line carries the SAME key names. The sample is
+   * where the series lives."). Absent keys = no reading (a failed load
+   * read never fills them with a fake zero); `load_age_s` labels the
+   * reading's age against the `metrics_load_stale_s` window. Display and
+   * sample only — never a verdict input (D4 stays off). ADD keys.
+   */
+  load_source?: string;
+  load_age_s?: number;
+  gpu_util_percent?: number;
+  gpu_mem_used_bytes?: number;
+  gpu_mem_total_bytes?: number;
+  tokens_per_second?: number | null;
+  in_flight?: number;
+  model_loaded?: string;
+  model_quant?: string;
+  omlx_loaded_count?: number;
 }
 
 export interface LeaseOutcomeLine {

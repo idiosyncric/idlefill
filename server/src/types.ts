@@ -110,6 +110,14 @@ export interface ServerConfig {
    * survive. Default 400 (the 30-day acceptance bar, with room).
    */
   metrics_retention_days?: number;
+  /**
+   * Load-axis freshness window (#52 slice 1, D3): seconds after which a
+   * captured load reading is labelled STALE by `load_age_s` (display and
+   * sample only). In this wave it labels age ONLY — it does not veto
+   * anything and the verdict never reads it (the busy veto is D4, not
+   * built). Default 45 (three polls at the 15-second `poll_ms`).
+   */
+  metrics_load_stale_s?: number;
 }
 
 /**
@@ -602,6 +610,23 @@ export interface ActivityEntry {
   model: string;
   req_path: string;
   resp_status_code: number;
+  /**
+   * Per-request token block from the llama-swap activity feed (#52 slice 1,
+   * ADD keys — the wire carried them all along; the type dropped them).
+   * Absent on entries that carry no block (strata-adapted entries, older
+   * engine builds). Never a fake zero: absent stays absent.
+   */
+  tokens?: {
+    cache_tokens?: number;
+    draft_tokens?: number;
+    draft_acc_tokens?: number;
+    input_tokens?: number;
+    output_tokens?: number;
+    prompt_per_second?: number;
+    tokens_per_second?: number;
+  };
+  /** Per-request engine duration in ms (ADD key, absent when the feed omits it). */
+  duration_ms?: number;
 }
 
 export interface LastActivity {
@@ -684,6 +709,45 @@ export interface IdleSignal {
    * fetch that never happened. null when a signal resolves. ADD key.
    */
   no_signal_reason?: string | null;
+
+  // --------------------------------------------------------------------
+  // Load axis (#52 slice 1 — DATA ONLY).
+  //
+  // The collector (server/src/load.ts) reads the engine's own load
+  // surface inside the existing poll tick. This wave CAPTURES only:
+  // every key below is display-and-sample, and NOTHING in this block is
+  // read by the verdict. The `idle`, `idle_for_s`, and degraded fields
+  // above are computed exactly as before, with no input from here (D4:
+  // the llama-swap busy threshold is OFF until the owner sets a number).
+  // Absent = no reading since boot (or no collector for the kind); a
+  // stale reading is never faked and never zero-filled.
+  // ------------------------------------------------------------------
+
+  /** Which load surface produced the reading (design doc D5): `llamaswap-metrics` | `omlx-health` | `strata-metrics`. Absent = no load collector wired for the kind. ADD key. */
+  load_source?: string;
+  /** Seconds since the last successful load read (the `metrics_load_stale_s` window labels it, it does not veto anything yet). Absent = no reading since boot. ADD key. */
+  load_age_s?: number;
+  /** llama-swap `/metrics` GPU utilization gauge (0-100). Absent = no reading. ADD key. */
+  gpu_util_percent?: number;
+  /** llama-swap `/metrics` GPU memory used (bytes). ADD key. */
+  gpu_mem_used_bytes?: number;
+  /** llama-swap `/metrics` GPU memory total (bytes). ADD key. */
+  gpu_mem_total_bytes?: number;
+  /** The newest feed entry's engine-reported rate (llama-swap feed `tokens` block, #52 slice 1). Display and sample only, never a veto input. Absent = no reading. ADD key. */
+  tokens_per_second?: number;
+  /** In-flight generation count. No engine exposes one today (llama-swap: none; strata: one slot, wired in the D4 wave; oMLX: none) — absent when the kind's engine exposes nothing. ADD key. */
+  in_flight?: number;
+  /**
+   * oMLX `/health` identity: the default model name — ABSENT when the
+   * payload names none (design doc D8: the payload names the default,
+   * not the loaded; `loaded_count` 0 means nothing is resident).
+   * ADD key.
+   */
+  model_loaded?: string;
+  /** Best-effort quant identity parsed from `model_loaded` (D5: absent when not parseable). ADD key. */
+  model_quant?: string;
+  /** oMLX `/health` pool residency: models loaded in memory (counts models, NOT requests). Display and sample only. Absent = no reading. ADD key. */
+  omlx_loaded_count?: number;
 }
 
 export type EventKind =

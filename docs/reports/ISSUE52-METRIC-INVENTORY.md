@@ -8,6 +8,16 @@ noted. The full captures sit at the end of this file.
 Companion: `docs/architecture/metrics-sidecar.md` (the design this inventory
 feeds). Map: #51 (the store), #50 (mesh, co-location), #62 (kind adapters).
 
+Status (2026-10-09, slice 1): the CAPTURE half of the design shipped on
+branch `issue-52-capture` — the llama-swap feed `tokens` block +
+`duration_ms` kept (ADD), the llama-swap `/metrics` and oMLX `/health`
+fetches with the D5 ADD keys, `metrics_load_stale_s` (default 45, age
+labelling only). The idle verdict is UNCHANGED (D4 stays off — the owner
+has not set the llama-swap busy threshold). What is still PROPOSED: the
+busy veto, strata `in_flight`, the dashboard load read, `queue_depth`
+values. See `ISSUE52-CAPTURE-REPORT.md` (what shipped vs still
+PROPOSED, the verdict byte-identity proof, the test evidence).
+
 ## The want list
 
 The idle verdict is per engine. Today it fuses an activity feed with a log
