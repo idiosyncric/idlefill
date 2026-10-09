@@ -90,11 +90,18 @@ async function main(): Promise<void> {
   // yields no reading (absent = unset, never a fake zero), and it must
   // not touch the feed-degraded fail-closed plane.
   const loadCollectors = new Map<string, LoadCollector>();
-  const loadCollectorMeta = new Map<string, { provider: ServerProvider; url: string }>();
+  // The collector's row inputs (provider, url, credential): a change to ANY
+  // one rebuilds the collector — including a token the operator sets AFTER
+  // the row exists (the D4 strata auth gap, #52 slice 4): a strata row with
+  // no credential that later gets one must start carrying it on the SAME
+  // tick. The credential rides the meta as '' when absent (absent and ''
+  // are the same input to the collector — neither sends a header).
+  const loadCollectorMeta = new Map<string, { provider: ServerProvider; url: string; auth_token: string }>();
   const loadCollectorFor = (row: ServerConnection): LoadCollector | null => {
     const kind: ServerProvider = row.provider ?? 'llama-swap';
+    const token = row.auth_token ?? '';
     const meta = loadCollectorMeta.get(row.id);
-    const stale = meta && (meta.provider !== kind || meta.url !== row.url);
+    const stale = meta && (meta.provider !== kind || meta.url !== row.url || meta.auth_token !== token);
     if (stale) {
       loadCollectors.delete(row.id);
       loadCollectorMeta.delete(row.id);
@@ -113,7 +120,7 @@ async function main(): Promise<void> {
         llama_swap_busy_gpu_percent: cfg.metrics_llamaswap_busy_gpu_percent,
       });
       loadCollectors.set(row.id, c);
-      loadCollectorMeta.set(row.id, { provider: kind, url: row.url });
+      loadCollectorMeta.set(row.id, { provider: kind, url: row.url, auth_token: token });
     }
     return c;
   };

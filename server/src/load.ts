@@ -75,7 +75,18 @@ export interface LoadSignalView {
   load_source?: string;
   /** The D4 busy predicate on this reading — present only on a FRESH read (the `stale_window_ms` window). Absent = unknown (stale, or the kind has no predicate, or the reading carries no predicate input). */
   load_busy?: boolean;
+  /** Seconds since the last successful load read (labelled against the `stale_window_ms` window, which also bounds the veto: a read older than the window is unknown, D3). Absent = no reading since boot. ADD key. */
   load_age_s?: number;
+  /**
+   * WHY the last load read failed (#52 slice 4, D4 auth gap): the last
+   * FAILED read's operator-readable reason — e.g. a strata row with NO
+   * credential whose `/metrics` answers `authentication_error` (the
+   * predicate can never fire until the operator sets the row's
+   * `auth_token`). CLEARED on the next successful read. Display + sample
+   * only — never a verdict input. Absent = the read is currently good (or
+   * never ran). ADD key.
+   */
+  load_fail_reason?: string;
   gpu_util_percent?: number;
   gpu_mem_used_bytes?: number;
   gpu_mem_total_bytes?: number;
@@ -305,9 +316,25 @@ export class LoadCollector {
   private readonly o: LoadCollectorOpts;
   /** The last good reading; null = no reading since boot. A failed read never wipes it. */
   private reading: LoadReading | null = null;
+  /**
+   * WHY the last load read failed (#52 slice 4, D4 auth gap) — the
+   * operator-readable reason, mirrored on the collector (a sibling of the
+   * last good reading, exactly as `IdleDetector` mirrors `degraded`/
+   * `degradedReason` beside its signals). Set on a FAILED read, CLEARED on
+   * the next SUCCESSFUL read (a success always wins — a transient blip
+   * never lingers past a good tick). Display + sample only — it never
+   * feeds the verdict (D2 rule 3: a dead load source never degrades the
+   * verdict). Null = the read is currently good (or never ran).
+   */
+  private failReason: string | null = null;
 
   constructor(o: LoadCollectorOpts) {
     this.o = o;
+  }
+
+  /** The last FAILED read's named reason, or null (currently good / never ran). */
+  get lastFailReason(): string | null {
+    return this.failReason;
   }
 
   /**
@@ -328,6 +355,16 @@ export class LoadCollector {
    * reading — it must not disturb the tick, the verdict, or the
    * feed-degraded plane.
    *
+   * On a FAILED read the collector records an operator-readable
+   * `lastFailReason` (#52 slice 4 — the D4 strata auth gap): a strata row
+   * with NO row credential whose `/metrics` answers 401 names exactly
+   * what the operator must do (set the row's `auth_token`) instead of
+   * failing silently to `null`. A success CLEARS it (last-success-wins),
+   * so a transient blip never lingers past a good tick. The reason rides
+   * `current()`'s view as `load_fail_reason` (display + sample only —
+   * never a verdict input; a dead load source never degrades the
+   * verdict, D2 rule 3).
+   *
    * `feedTps` is the feed's newest-entry rate from THIS tick's feed
    * fetch (the tick already made that HTTP call; riding it keeps the
    * llama-swap rate from costing a second fetch, D5).
@@ -346,20 +383,33 @@ export class LoadCollector {
     } catch {
       return null; // unreachable / timeout: no reading (the last good one stays)
     }
-    if (!res.ok) return null; // 4xx/5xx: no reading
-    let text: string;
+    // The body is read BEFORE the ok-check so an auth rejection can be
+    // NAMED (a strata 401 is the D4 auth gap, not an opaque failure).
+    let text = '';
     try {
       text = await res.text();
     } catch {
-      return null;
+      /* the body is unavailable; the status is the whole story */
     }
+    if (!res.ok) {
+      // Only an AUTH rejection names a reason (#52 slice 4): that is the
+      // persistent CONFIG gap the operator must fix — a strata row with
+      // no row credential whose /metrics answers 401 can never fire the
+      // D4 predicate, and a silent null hid that. Every other failure
+      // (404, 5xx) stays silent exactly as pre-#52: the last good
+      // reading stays with its age growing, and the verdict plane is
+      // untouched (D2 rule 3).
+      this.failReason = this.authRejectionReason(res.status, text);
+      return null; // 4xx/5xx: no reading
+    }
+    // The endpoint ANSWERED: it accepted the presented credential (or
+    // none was required), so any prior auth rejection is stale.
+    this.failReason = null;
     let reading: LoadReading | null = null;
     try {
       if (this.o.provider === 'omlx') {
         const parsed = parseOmlxHealth(JSON.parse(text));
-        if (parsed) {
-          reading = { ...parsed, load_source: spec.source, read_at: now };
-        }
+        if (parsed) reading = { ...parsed, load_source: spec.source, read_at: now };
       } else if (this.o.provider === 'strata') {
         // The strata /metrics JSON (the feed adapter's own payload): the
         // single in-flight generation state is the D4 busy input. `live`
@@ -392,10 +442,40 @@ export class LoadCollector {
         }
       }
     } catch {
-      return null; // malformed body: no reading, never a fake zero
+      return null; // malformed body: no reading, never a fake zero (silent, pre-#52)
     }
-    if (reading) this.reading = reading;
+    if (reading) {
+      this.reading = reading;
+    }
     return reading;
+  }
+
+  /**
+   * The operator-readable reason for an AUTH-rejected load read (#52
+   * slice 4 — the D4 strata auth gap). A 401/403 from the credential-
+   * gated kinds (strata /metrics, oMLX /health) with NO row credential is
+   * the gap itself — the D4 busy predicate can never fire until the
+   * operator sets the row's `auth_token` — and is named exactly so, with
+   * the engine's own error message riding verbatim when it parses
+   * (strata's `authentication_error`). A rejection WITH a credential
+   * names the wrong/revoked case. Returns null when the read was not an
+   * auth rejection on a gated kind (those stay silent, pre-#52).
+   */
+  private authRejectionReason(status: number, body: string): string | null {
+    const kind = this.o.provider;
+    if ((kind !== 'strata' && kind !== 'omlx') || (status !== 401 && status !== 403)) return null;
+    const path = LoadCollector.specFor(kind)!.path;
+    let msg = '';
+    try {
+      const j = JSON.parse(body) as { error?: { message?: unknown } } & { message?: unknown };
+      msg = String(typeof j.error?.message === 'string' ? j.error.message : typeof j.message === 'string' ? j.message : '');
+    } catch {
+      /* not JSON: the status is the whole story */
+    }
+    const hint = !this.o.auth_token
+      ? `the row carries no credential — set auth_token on this server row (the D4 busy predicate can never fire until it does)`
+      : `the row's credential was rejected — set the correct auth_token`;
+    return `${path} requires a credential (HTTP ${status}${msg ? ': ' + msg : ''}) — ${hint}`;
   }
 
   /**
@@ -414,7 +494,14 @@ export class LoadCollector {
    * top of the feed, not part of it.
    */
   current(now: number): LoadSignalView | null {
-    if (!this.reading) return null;
+    // No good reading: a row that has FAILED its load read still carries a
+    // named reason (the D4 strata auth gap — e.g. a strata row with no
+    // credential whose /metrics answers 401). Publish ONLY that reason —
+    // never load_source / load_age_s / load_busy (there is no reading to
+    // age or veto on), so the operator sees WHY the load axis is dark
+    // instead of a silent absence. A row that never ran (or never failed)
+    // has no reason → null, exactly as pre-#52.
+    if (!this.reading) return this.failReason ? { load_fail_reason: this.failReason } : null;
     const { read_at, strata_live_state, ...rest } = this.reading;
     const ageS = Math.max(0, Math.round((now - read_at) / 1000));
     const view: LoadSignalView = { ...rest, load_age_s: ageS };

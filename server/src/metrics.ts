@@ -96,6 +96,16 @@ export interface EngineSampleLine {
    */
   load_busy?: boolean;
   load_age_s?: number;
+  /**
+   * WHY the last load read failed (#52 slice 4, D4 strata auth gap): the
+   * last FAILED read's operator-readable reason — e.g. a strata row with NO
+   * credential whose `/metrics` answers 401 (the D4 busy predicate can
+   * never fire until the operator sets the row's `auth_token`). Present
+   * when the row has NO good reading; CLEARED on the next successful read.
+   * Display and sample only — never a verdict input. Absent = the read is
+   * currently good (or never ran). ADD key.
+   */
+  load_fail_reason?: string;
   gpu_util_percent?: number;
   gpu_mem_used_bytes?: number;
   gpu_mem_total_bytes?: number;

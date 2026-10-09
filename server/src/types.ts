@@ -860,6 +860,16 @@ export interface IdleSignal {
   load_busy?: boolean;
   /** Seconds since the last successful load read (labelled against the `metrics_load_stale_s` window, which also bounds the veto: a read older than the window is unknown, D3). Absent = no reading since boot. ADD key. */
   load_age_s?: number;
+  /**
+   * WHY the last load read failed (#52 slice 4, D4 strata auth gap): the
+   * last FAILED read's operator-readable reason — e.g. a strata row with NO
+   * credential whose `/metrics` answers 401 (the D4 busy predicate can
+   * never fire until the operator sets the row's `auth_token`). Present
+   * when the row has NO good reading; CLEARED on the next successful read.
+   * Display only — never a verdict input. Absent = the read is currently
+   * good (or never ran). ADD key.
+   */
+  load_fail_reason?: string;
   /** llama-swap `/metrics` GPU utilization gauge (0-100). Absent = no reading. ADD key. */
   gpu_util_percent?: number;
   /** llama-swap `/metrics` GPU memory used (bytes). ADD key. */

@@ -564,3 +564,166 @@ test('the feed body shape: the tokens block rides through as stored (wire → ty
   assert.equal(e.duration_ms, 102908);
   assert.equal(newestFeedTps([e]), 141.41882904412867, 'the tick picks the rate up from the stored entry');
 });
+
+// ---------------------------------------------------------------------------
+// #52 slice 4: the strata auth gap (D4 busy predicate can never fire).
+//
+// The strata feed adapter and the load collector share ONE credential
+// source: the row's `auth_token` (the feed's fetchRawJson and the
+// collector's transport both send `Authorization: Bearer <token>` only
+// when set — the SAME family). The live arbiter's strata rows carry no
+// token, so both the feed and the load read are unauthenticated, strata's
+// /metrics answers 401, and the D4 predicate can never fire. This slice:
+//   - a strata row WITH a credential sends it and parses live.state;
+//   - a strata row WITHOUT one does not crash and reports the named
+//     reason (the operator must set the row's auth_token);
+//   - the D4 predicate then returns true for a fresh 'generating' and
+//     false for 'idle'.
+// The reason is DISPLAY + SAMPLE only — it never feeds the verdict (a
+// dead load source never degrades the verdict, D2 rule 3), so the
+// pre-#52 failure tests (404 → no reading, current() → null) stay green.
+
+/** A strata /metrics body with a generation in flight (D4 busy input). */
+const STRATA_GENERATING = JSON.stringify({
+  time: 1791396000,
+  engine: { model: 'qwen3.8-flash-next-q2_0' },
+  live: { state: 'generating' },
+  requests: [],
+  totals: { since: 1, requests: 42, prompt_tokens: 100, reused: 0, output_tokens: 200 },
+});
+/** A strata /metrics body with the single slot idle. */
+const STRATA_IDLE = JSON.stringify({
+  time: 1791396000,
+  engine: { model: 'qwen3.8-flash-next-q2_0' },
+  live: { state: 'idle' },
+  requests: [],
+  totals: { since: 1, requests: 42, prompt_tokens: 100, reused: 0, output_tokens: 200 },
+});
+/** strata's real 401 body when no/wrong credential is presented. */
+const STRATA_AUTH_ERROR = JSON.stringify({ error: { type: 'authentication_error', message: 'missing or wrong API key' } });
+
+test('strata WITH a credential: the row token rides the Authorization header and live.state parses', async () => {
+  const { transport, calls } = fakeTransport((url) =>
+    url === 'http://10.10.10.6:8080/metrics' ? { ok: true, status: 200, text: STRATA_GENERATING } : { ok: false, status: 404 },
+  );
+  const c = new LoadCollector({
+    url: 'http://10.10.10.6:8080',
+    provider: 'strata',
+    auth_token: 'strata-key-abc',
+    stale_window_ms: 45_000,
+    transport,
+  });
+  const reading = await c.read(T0, null);
+  assert.ok(reading, 'a credentialed strata read resolves a reading');
+  assert.equal(calls[0]?.url, 'http://10.10.10.6:8080/metrics', 'the collector polls /metrics (the feed adapter own payload)');
+  assert.equal(calls[0]?.headers?.authorization, 'Bearer strata-key-abc', 'the row credential rides the SAME header family as the feed fetcher');
+  assert.equal(reading.strata_live_state, 'generating', 'live.state parses verbatim (lower-cased)');
+  assert.equal(reading.in_flight, 1);
+  const view = c.current(T0)!;
+  assert.equal(view.load_source, 'strata-metrics');
+  assert.equal(view.load_busy, true, 'a FRESH generating state fires the D4 busy predicate');
+  assert.equal('load_fail_reason' in view, false, 'a good read never carries a fail reason');
+  assert.equal(c.lastFailReason, null);
+});
+
+test('strata WITHOUT a credential: no crash, the named reason says set the row auth_token (the D4 gap)', async () => {
+  // Inline capturing transport: fakeTransport drops the body on non-ok
+  // responses, but the named reason rides the engine's 401 body
+  // (authentication_error) verbatim.
+  const calls: { url: string; headers?: Record<string, string> }[] = [];
+  const transport = (async (url: string, opts?: { headers?: Record<string, string> }) => {
+    calls.push({ url, headers: opts?.headers });
+    return { status: 401, ok: false, text: async () => STRATA_AUTH_ERROR };
+  }) as never;
+  const c = new LoadCollector({
+    url: 'http://10.10.10.6:8080',
+    provider: 'strata',
+    // NO auth_token — the live arbiter's strata rows are exactly this.
+    stale_window_ms: 45_000,
+    transport,
+  });
+  assert.equal(await c.read(T0, null), null, 'read() resolves null (never throws — the tick is undisturbed)');
+  assert.equal(calls[0]?.headers?.authorization, undefined, 'no credential → no Authorization header (the feed fetcher behaves identically)');
+  // The honest failure surfaces through the collector's named reason —
+  // the operator sees WHY the D4 predicate can never fire.
+  assert.ok(c.lastFailReason, 'the failed read records a named reason');
+  assert.match(c.lastFailReason!, /401/);
+  assert.match(c.lastFailReason!, /missing or wrong API key/, 'the engine own error message rides verbatim');
+  assert.match(c.lastFailReason!, /set auth_token/, 'the operator action is named');
+  assert.match(c.lastFailReason!, /can never fire/);
+  // The reason-only view: a row with no good reading but a named auth
+  // failure publishes ONLY that reason (no fake load_source / load_age_s /
+  // load_busy) — the data-plane view is NOT the pre-#52 silent null, it
+  // names the gap. This is the honest failure the task asks for.
+  const view = c.current(T0)!;
+  assert.equal(view.load_fail_reason, c.lastFailReason);
+  assert.equal(Object.keys(view).length, 1, 'reason-only: no other load keys ride');
+  assert.equal('load_busy' in view, false, 'a dark load axis never vetoes (D2 rule 3)');
+  assert.equal('load_source' in view, false);
+  assert.equal('load_age_s' in view, false);
+  // The reason rides across ticks until a successful read clears it.
+  assert.equal(c.current(T0 + 15_000)!.load_fail_reason, c.lastFailReason);
+});
+
+test('strata D4 predicate: a fresh generating read → load_busy true; a fresh idle read → load_busy false', async () => {
+  // generating → busy (true)
+  const { transport: tBusy } = fakeTransport((url) =>
+    url === 'http://10.10.10.6:8080/metrics' ? { ok: true, status: 200, text: STRATA_GENERATING } : { ok: false, status: 404 },
+  );
+  const cBusy = new LoadCollector({ url: 'http://10.10.10.6:8080', provider: 'strata', auth_token: 'k', stale_window_ms: 45_000, transport: tBusy });
+  await cBusy.read(T0, null);
+  assert.equal(cBusy.current(T0)!.load_busy, true, 'fresh live.state=generating → the D4 predicate is TRUE');
+  // idle → not busy (false)
+  const { transport: tIdle } = fakeTransport((url) =>
+    url === 'http://10.10.10.6:8080/metrics' ? { ok: true, status: 200, text: STRATA_IDLE } : { ok: false, status: 404 },
+  );
+  const cIdle = new LoadCollector({ url: 'http://10.10.10.6:8080', provider: 'strata', auth_token: 'k', stale_window_ms: 45_000, transport: tIdle });
+  await cIdle.read(T0, null);
+  assert.equal(cIdle.current(T0)!.load_busy, false, 'fresh live.state=idle → the D4 predicate is FALSE');
+  assert.equal(cIdle.current(T0)!.in_flight, 0);
+});
+
+test('a 200 strata read with no live.state (data-absent) sets NO fail reason (pre-#52 posture preserved)', async () => {
+  const { transport } = fakeTransport((url) =>
+    url === 'http://10.10.10.6:8080/metrics' ? { ok: true, status: 200, text: '{}' } : { ok: false, status: 404 },
+  );
+  const c = new LoadCollector({ url: 'http://10.10.10.6:8080', provider: 'strata', auth_token: 'k', transport });
+  assert.equal(await c.read(T0, null), null, 'no live.state → no reading (UNKNOWN, never a fake idle)');
+  assert.equal(c.lastFailReason, null, 'a reachable 200 that names no state is data-absent, not a failure → no named reason');
+  assert.equal(c.current(T0), null, 'byte-parity with pre-#52: a data-absent read publishes nothing');
+});
+
+test('a NON-auth failure (404) stays SILENT and the verdict plane is pre-#52 (byte-parity)', async () => {
+  // A 404 is an endpoint problem, not the D4 auth gap: pre-#52 posture
+  // holds — no named reason, current() → null, nothing rides.
+  const { transport } = fakeTransport(() => ({ ok: false, status: 404, text: '' }));
+  const c = new LoadCollector({ url: 'http://10.10.10.6:8080', provider: 'strata', auth_token: 'k', transport });
+  assert.equal(await c.read(T0, null), null);
+  assert.equal(c.lastFailReason, null, 'a 404 is not an auth rejection → no named reason (byte-parity with pre-#52)');
+  assert.equal(c.current(T0), null, 'no good reading → the data-plane view stays null');
+});
+
+test('a successful strata read CLEARS a prior auth-rejection reason (last-success-wins)', async () => {
+  // One collector WITH a credential whose key is temporarily revoked:
+  // tick 1 → 401 (the named reason rides, including the engine words);
+  // tick 2 → the key is restored → 200 → the reason clears and the D4
+  // predicate fires. A prior tick's rejection never lingers past a good
+  // tick.
+  let revoked = true;
+  const { transport } = fakeTransport((url, headers) => {
+    if (revoked) return { ok: false, status: 401, text: STRATA_AUTH_ERROR };
+    return { ok: true, status: 200, text: STRATA_GENERATING };
+  });
+  const c = new LoadCollector({ url: 'http://10.10.10.6:8080', provider: 'strata', auth_token: 'strata-key-abc', stale_window_ms: 45_000, transport });
+  await c.read(T0, null);
+  assert.ok(c.lastFailReason, 'tick 1 (credential rejected) names the reason');
+  assert.match(c.lastFailReason!, /credential was rejected/, 'a rejection WITH a token names the wrong/revoked case');
+  assert.ok(c.current(T0)?.load_fail_reason, 'the reason rides the view while the read fails');
+  revoked = false;
+  const reading = await c.read(T0 + 15_000, null);
+  assert.ok(reading, 'tick 2 (credential restored) resolves a reading');
+  assert.equal(c.lastFailReason, null, 'the successful read clears the reason');
+  const view = c.current(T0 + 15_000)!;
+  assert.equal('load_fail_reason' in view, false, 'the cleared reason no longer rides');
+  assert.equal(view.load_busy, true, 'and the D4 predicate fires on the fresh generating read');
+});
