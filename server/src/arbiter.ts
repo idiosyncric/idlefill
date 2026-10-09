@@ -54,6 +54,7 @@ import { activeLeaseExemptIps, defaultActivityPathFor } from './idle.js';
 import { buildCatalog, modelsProbeUrl, type CatalogEntry, type ModelsFetcher } from './catalog.js';
 import { mintInstanceId } from './mesh.js';
 import { Identity } from './identity.js';
+import { EdgeStore, edgesFileOf } from './edges.js';
 import type {
   ClientKeyRow,
   EngineGroup,
@@ -394,6 +395,14 @@ export class Arbiter {
    * atomic tmp+rename). The private key never touches state.json.
    */
   private identityInstance: Identity | null = null;
+  /**
+   * Mesh edge records (#39 slice 1, D2 locked): the per-edge credentials
+   * — for each paired peer, that peer's ed25519 PUBLIC key and the edge
+   * direction, in a sibling `mesh_edges.json` (0600, atomic tmp+rename).
+   * Never in state.json. A corrupt file degrades to an empty store
+   * (D8 fail-closed: no edge, nothing unlocked).
+   */
+  private edgesStore: EdgeStore | null = null;
   /**
    * Per-server idle detectors, keyed by server_id (the watched server is
    * WATCHED_SERVER_ID). A server row with no detector is fail-closed for
@@ -2685,6 +2694,21 @@ export class Arbiter {
       this.identityInstance = Identity.loadOrCreate(this.cfg.state_file);
     }
     return this.identityInstance;
+  }
+
+  /**
+   * This instance's mesh edge store (#39 slice 1, D2 locked): the
+   * per-edge credentials in a sibling `mesh_edges.json` next to the
+   * state file (0600, atomic tmp+rename, the state-file posture).
+   * Missing file = no edges (the D8 fail-closed default); a corrupt
+   * file degrades to an empty store — the arbiter boots and nothing
+   * is unlocked, never a crash.
+   */
+  edges(): EdgeStore {
+    if (!this.edgesStore) {
+      this.edgesStore = new EdgeStore(edgesFileOf(this.cfg.state_file));
+    }
+    return this.edgesStore;
   }
 
   /** Sum of queue depths across every registered client (the mesh's coarse depth). */

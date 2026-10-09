@@ -19,6 +19,7 @@ import { WebSocketServer } from 'ws';
 import { utcDay, type Arbiter, WATCHED_SERVER_ID } from './arbiter.js';
 import { seriesKeyOf, type MetricsBucket, type MetricsSeries, type MetricsStore } from './metrics.js';
 import { buildMeshSnapshot, type MeshFederation } from './mesh.js';
+import { verifyRequester, type EdgeSignaturePayload } from './edges.js';
 import { isLoopbackAddress } from './catalog.js';
 import type { ClientRecord, CycleStatusRow, ProjectAllocation, QueuePreviewRow, RebuildRunState, ServerConfig, ServerConnection } from './types.js';
 
@@ -308,6 +309,30 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     // token anywhere (including here) is still a 401.
     const isMeshRead = path === '/api/mesh' && req.method === 'GET' && isPeerToken(cfg, token);
     if (isMeshRead) return;
+    // Mesh per-edge plane (#39 slice 1, D8 fail-closed): /api/mesh/detail
+    // and /api/mesh/control-preview are NEVER token-authenticated — the
+    // fleet peer_token cannot reach them, and neither can an admin token
+    // (a local operator reads their own machine via /api/state). The
+    // credential is the requester's ed25519 signature, checked at the
+    // route against the edge record for the claimed instance_id
+    // (server/src/edges.ts). The hook answers every other /api/* as
+    // before; a request with no signature fields still 401s here (the
+    // 403 denial with a named reason is the route's, reached only with a
+    // properly signed envelope).
+    const isEdgeRoute = (path === '/api/mesh/detail' || path === '/api/mesh/control-preview') && req.method === 'GET';
+    if (isEdgeRoute) {
+      const h = req.headers;
+      const idH = h['x-idlefill-instance-id'];
+      const sigH = h['x-idlefill-signature'];
+      const nonceH = h['x-idlefill-nonce'];
+      const tsH = h['x-idlefill-ts'];
+      const hasEnvelope = typeof sigH === 'string' && sigH !== '' && typeof nonceH === 'string' && nonceH !== '';
+      if (!hasEnvelope || typeof idH !== 'string' || idH === '' || typeof tsH !== 'string' || !/^\d+$/.test(tsH)) {
+        await reply.code(401).send({ error: 'unauthorized', hint: 'this route authenticates by ed25519 signature (X-Idlefill-Instance-Id + X-Idlefill-Signature + X-Idlefill-Nonce + X-Idlefill-Ts), not by token' });
+        return;
+      }
+      return;
+    }
     if (!isValidToken(cfg, token)) {
       await reply.code(401).send({ error: 'unauthorized', hint: 'present a valid token (Authorization: Bearer or ?token=)' });
       return;
@@ -1185,6 +1210,144 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       // machine identity only. Absent = unset; never a secret.
       arbiter.fleetId(),
     );
+  });
+
+  // ------------------------------------------------------------------
+  // Mesh per-edge plane (#39 slice 1) — fail-closed posture (D8)
+  //
+  // The credential is the requester's ed25519 signature (#55 D1
+  // substrate): the requesting arbiter signs a canonical payload
+  // { instance_id, path, ts, nonce } with its own private key and
+  // presents it as headers. THIS route verifies it against the peer's
+  // public key stored in the edge record for the claimed instance_id
+  // (server/src/edges.ts). No edge → 403 with a NAMED reason (D8
+  // fail-closed: unpaired peers get neither detail nor control); the
+  // coarse /api/mesh is untouched (the #50 read plane stands alone).
+  //
+  // SLICE 1 SCOPE: the verification path + the denial posture. The
+  // projection bodies below are the D3/D4 shapes the slice-2 waves
+  // (pause/resume/force/clear/reorder + audit) build on — inert until
+  // the ceremony decision lands.
+  // ------------------------------------------------------------------
+
+  /**
+   * Parse the signed envelope from the per-edge route's headers.
+   * The canonical payload binds the route PATH — a signature minted for
+   * /api/mesh/detail cannot be replayed on /api/mesh/control-preview.
+   * null = no usable envelope (the hook 401s before the route runs;
+   * this is the defensive re-parse for the route body).
+   */
+  function edgeEnvelope(req: { url?: string; headers: Record<string, unknown> }): {
+    instanceId: string;
+    payload: EdgeSignaturePayload;
+    signatureB64url: string;
+  } | null {
+    const h = req.headers;
+    const instanceId = h['x-idlefill-instance-id'];
+    const signature = h['x-idlefill-signature'];
+    const nonce = h['x-idlefill-nonce'];
+    const ts = h['x-idlefill-ts'];
+    if (typeof instanceId !== 'string' || instanceId === '' || typeof signature !== 'string' || signature === '' || typeof nonce !== 'string' || nonce === '' || typeof ts !== 'string') return null;
+    const tsN = Number.parseInt(ts, 10);
+    if (!Number.isFinite(tsN) || tsN < 0) return null;
+    const id = instanceId.slice(0, 64);
+    const path = (req.url ?? '').split('?')[0] ?? '';
+    return {
+      instanceId: id,
+      payload: { instance_id: id, path, ts: tsN, nonce: nonce.slice(0, 64) },
+      signatureB64url: signature,
+    };
+  }
+
+  /** The D8 fail-closed denial: 403, reason NAMED (never a bare 403). */
+  function edgeDenial(reply: FastifyReply, reason: string, hint: string) {
+    return reply.code(403).send({ error: 'edge_denied', reason, hint });
+  }
+
+  type EdgeDenialReason = 'missing_instance_id' | 'unknown_instance_id' | 'bad_signature';
+
+  function edgeDenialForVerdict(reply: FastifyReply, v: { ok: false; reason: EdgeDenialReason }) {
+    const hints: Record<EdgeDenialReason, string> = {
+      missing_instance_id: 'the request does not claim an instance_id',
+      unknown_instance_id: 'no paired edge exists for this instance_id — the coarse read plane (GET /api/mesh) is the unpaired surface',
+      bad_signature: 'the signature does not verify under the stored peer public key',
+    };
+    return edgeDenial(reply, v.reason, hints[v.reason]);
+  }
+
+  /**
+   * GET /api/mesh/detail (#39 D3 — slice 1: the fail-closed half). The
+   * detailed queue projection a paired edge reads beyond the coarse
+   * snapshot. Auth: the per-edge signature (hook + route check). D5:
+   * only a `controls_me` edge admits the request (pairing A to B stores
+   * controls_me=true on B's record for A — the reverse direction is
+   * denied, the operator pairs B to A explicitly). D8: no edge for the
+   * requester → 403 `unknown_instance_id`. The coarse plane is
+   * unaffected: an unpaired peer still reads depths from /api/mesh and
+   * never sees job ids or titles here.
+   */
+  app.get('/api/mesh/detail', async (req, reply) => {
+    const env = edgeEnvelope(req);
+    if (!env) return reply.code(401).send({ error: 'unauthorized', hint: 'signature envelope required (X-Idlefill-Instance-Id/Signature/Nonce/Ts)' });
+    const v = verifyRequester(arbiter.edges(), env.instanceId, env.payload, env.signatureB64url);
+    if (!v.ok) return edgeDenialForVerdict(reply, v);
+    if (v.edge.direction !== 'controls_me') {
+      return edgeDenial(reply, 'direction_denied', `the edge for ${v.edge.peer_instance_id} is ${v.edge.direction} — this machine is the controlled side only for a controls_me edge (D5)`);
+    }
+    // D3: the target's LOCAL clients and their queue projections, bounded
+    // by the registration-time sanitizer (≤100 preview rows, capped
+    // fields — the stored rows are already sanitized; the slice re-caps
+    // as the defense for future writers). No transitivity (a paired peer
+    // sees this machine's local queue, never this machine's view of any
+    // other peer), no payloads (queue_preview carries metadata only).
+    const s = arbiter['store'].state;
+    const now = Date.now();
+    const clients = s.clients.map((c) => ({
+      name: c.name,
+      online: c.last_seen !== undefined && now - c.last_seen < 90_000,
+      projects: (c.projects ?? []).map((p) => ({
+        name: p.name,
+        queue_depth: p.queue_depth,
+        queue_preview: (p.queue_preview ?? []).slice(0, 100),
+      })),
+    }));
+    return { instance_id: arbiter.instanceId(), ts: now, clients };
+  });
+
+  /**
+   * GET /api/mesh/control-preview (#39 D4 — slice 1: the read-only
+   * posture). What a paired edge will be able to relay once slice 2
+   * lands: the action set (named, inert — there is no
+   * POST /api/mesh/control route yet) and the target's CURRENT override
+   * posture per client (what pause/force would compose against). Same
+   * auth + D5 + D8 posture as /api/mesh/detail. Inert by construction:
+   * nothing here mutates the target — the relayed actions wait on the
+   * ceremony decision.
+   */
+  app.get('/api/mesh/control-preview', async (req, reply) => {
+    const env = edgeEnvelope(req);
+    if (!env) return reply.code(401).send({ error: 'unauthorized', hint: 'signature envelope required (X-Idlefill-Instance-Id/Signature/Nonce/Ts)' });
+    const v = verifyRequester(arbiter.edges(), env.instanceId, env.payload, env.signatureB64url);
+    if (!v.ok) return edgeDenialForVerdict(reply, v);
+    if (v.edge.direction !== 'controls_me') {
+      return edgeDenial(reply, 'direction_denied', `the edge for ${v.edge.peer_instance_id} is ${v.edge.direction} — this machine is the controlled side only for a controls_me edge (D5)`);
+    }
+    const s = arbiter['store'].state;
+    // The current override posture per client (what a relayed
+    // pause/resume/force/clear would compose against) — client names
+    // ride the anonymous /api/state already; no new secret surface.
+    const clients = s.clients.map((c) => {
+      const ov = s.overrides[c.client_id];
+      return { name: c.name, override: ov ? ov.override : null };
+    });
+    return {
+      instance_id: arbiter.instanceId(),
+      ts: Date.now(),
+      // The D4 action set, NAMED (slice 2 builds the relay). Absent on
+      // no-edge — the 403 above is the unpaired answer.
+      actions: ['pause', 'resume', 'force', 'clear', 'reorder'],
+      clients,
+    };
   });
 
   // ------------------------------------------------------------------
