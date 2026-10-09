@@ -1,11 +1,12 @@
-# GRILL REPORT — fleet service: identity, roster, pairing — five decisions locked, two left to the owner
+# GRILL REPORT — fleet service: identity, roster, pairing — all seven decisions locked
 
 **Doc:** `docs/architecture/fleet-service.md` (updated. It was
-all-PROPOSED). D1-D7 in the mesh.md format. D1, D2, D5, D6, D7 are now
-LOCKED with the trade-off that decided each. D3 and D4 stay PROPOSED
-with the owner's choices named precisely. No src, config, or test file
-touched. Type: wayfinder:grilling. Source: Forgejo issue #55.
-Citations re-verified against HEAD `65767fa` on 2026-10-09.
+all-PROPOSED). D1-D7 in the mesh.md format. D1, D2, D5, D6, D7 were
+LOCKED at grill time with the trade-off that decided each; D3 and D4
+stayed PROPOSED with the owner's choices named precisely — both closed
+by the owner on 2026-10-09 (Decisions below). No src, config, or test
+file touched at grill time. Type: wayfinder:grilling. Source: Forgejo
+issue #55. Citations re-verified against HEAD `65767fa` on 2026-10-09.
 
 ## What landed
 
@@ -102,16 +103,19 @@ LOCKED (the trade-off decided it):
   `middleware-local-ip-range`, no published ports, tailnet-only reach.
   Decided by: urza already hosts the ingress and the LE cert.
 
-PROPOSED (the owner must choose):
+PROPOSED at grill time, LOCKED by the owner 2026-10-09 (issue #55, each
+recommendation accepted):
 
-- D3: heartbeat cadence (no number in the draft. The existing tick is
-  15 s). Control-action staleness ceiling (the draft proposes 24 h).
-  Roster pull cadence on the arbiter side.
-- D4: pairing shape (a) request/approve or (b) one-time code (the draft
-  recommends (b) for the personal fleet). Edge directionality
-  (directional or symmetric. The draft recommends directional).
+- D3: heartbeat cadence — 60 s (`fleet_heartbeat_ms`, shipped default).
+  Control-action staleness ceiling — 24 h (`CONTROL_STALE_MS`, shipped).
+  Roster pull cadence on the arbiter side — 15 s, the poll tick
+  (`fleet_roster_pull_ms`, shipped default).
+- D4: pairing shape — (b), the one-time code (the same owner lock that
+  settled pairing.md, `0d2f07f`; built `0762372` + `7b80621`). Edge
+  directionality — directional (unpair deletes exactly one direction).
 
-Carried over (open questions 1-5 of the original draft):
+Carried over (open questions 1-5 of the original draft — still open,
+operational, not decision-gated):
 
 1. Who can mint an enrollment token.
 2. Key rotation: automatic or operator-triggered.

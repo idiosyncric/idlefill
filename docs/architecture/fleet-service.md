@@ -1,10 +1,19 @@
-# Fleet service — identity, roster, pairing (grilling, 2026-10-04. Grilled 2026-10-09)
+# Fleet service — identity, roster, pairing (grilling, 2026-10-04. Grill complete 2026-10-09)
 
 Companion to `docs/architecture/mesh.md` (#50, locked). This doc grills the
-original proposal against the code read on disk at HEAD `65767fa`. The
-decisions below are LOCKED where the trade-off decided them, PROPOSED where
-the owner must choose. Nothing here is built. Citations re-verified against
-HEAD `65767fa` on 2026-10-09.
+original proposal against the code read on disk at HEAD `65767fa`.
+
+Status: LOCKED — D1..D7 are all locked. The grill ran 2026-10-09 against
+HEAD `65767fa`; the owner closed the last PROPOSED decisions (D3 cadences +
+control staleness ceiling, D4 pairing shape + edge directionality) on
+2026-10-09 (issue #55), accepting each recommendation. D4 was already
+settled by the same owner decision that locked `docs/architecture/pairing.md`
+(`0d2f07f`). Built since the grill: slices 1-11 on main — the arbiter
+identity substrate, the `fleet/` service (enrollment, roster, heartbeat,
+pairing), the roster pull and merge, arbiter enrollment, heartbeat, and
+the arbiter-side edge fill. The remaining unbuilt step is the D7
+deployment on urza. Original citations verified at HEAD `65767fa`; shipped
+citations verified at `0d2f07f`.
 
 ## Why a separate service
 
@@ -160,9 +169,9 @@ token is single-use and short-TTL, so a leaked token expires before it is
 abusable. Server-side generation would put the private key on the wire once
 at setup, and it would live in the service's storage permanently.
 
-## D3 — Roster and presence (PROPOSED)
+## D3 — Roster and presence (LOCKED)
 
-Mechanics (locked shape, values open):
+Mechanics (locked shape and values):
 
 - Each instance heartbeats its current URLs (tailnet IPv4/IPv6, any
   published route) + its coarse presence to the service on a cadence.
@@ -174,24 +183,37 @@ Mechanics (locked shape, values open):
   as the offline/no-service mode — idlefill must work with zero fleet
   service (also the open-source posture: no hard dependency).
 
-What the owner must choose:
+Decisions (owner, 2026-10-09, issue #55 — each recommendation accepted,
+values shipped as defaults):
 
-1. **Heartbeat cadence.** The original draft names no number. The existing
-   poll tick is 15 s (`server/src/config.ts:35`). A heartbeat every 15 s
-   is fine for a handful of machines but is chatty. A heartbeat every 60 s
-   is quieter but slower to notice a moved address. Pick the cadence.
-2. **Staleness ceiling for CONTROL actions.** Reads can tolerate staleness.
-   A control action against a machine that left the fleet must fail. The
-   original draft proposes 24 h. Confirm or change the ceiling.
-3. **Roster pull cadence on the arbiter side.** How often does an arbiter
-   re-pull `GET /roster`? Same question as the heartbeat, from the other
-   end. If the roster is pulled on the existing 15 s tick, a moved address
-   is picked up within 15 s. If it is pulled less often, the pick-up is
-   slower.
+1. **Heartbeat cadence: 60 s.** Shipped as `fleet_heartbeat_ms` (default
+   60000, `server/src/config.ts:77`), riding the existing poll tick behind
+   an interval gate (`server/src/mesh.ts:757-763`, slice 8) — no second
+   network loop. A live proof at HEAD `321ef7d` wrote a real roster row
+   (`urls`, `presence`, `last_seen`) with nine single-use nonces consumed.
+2. **Control-action staleness ceiling: 24 h.** Shipped as
+   `CONTROL_STALE_MS` (`fleet/src/store.ts:49`). Reads tolerate any age
+   with the age surfaced (`PEER_STALE_MS = 90_000` renders peers offline);
+   a CONTROL action against an instance that has missed a day of
+   heartbeats refuses. Enforcement rides the control plane as it lands
+   (#39's write verbs).
+3. **Roster pull cadence on the arbiter: 15 s.** Shipped as
+   `fleet_roster_pull_ms` (default 15000, `server/src/config.ts:68`), the
+   existing poll tick (`server/src/mesh.ts:607-610`, slice 5). A moved
+   tailnet address is picked up within one tick, and slice 9 reconciles
+   url sets per `instance_id` so the peer map follows the machine.
 
-## D4 — Pairing ceremony (PROPOSED, the #39 dependency)
+The trade-off that decided it: the read plane already bounds staleness at
+`PEER_STALE_MS` (90 s), so a faster heartbeat buys nothing the mesh can
+see; 60 s is the quietest cadence that still notices a moved address
+inside a minute. Pulling the roster on the existing 15 s tick adds no
+loop and no new failure surface. 24 h for control is the draft value —
+generous enough that a laptop closed for a weekend is not an incident,
+tight enough that a machine abandoned for a month cannot be controlled.
 
-Two candidate shapes:
+## D4 — Pairing ceremony (LOCKED, the #39 dependency — settled)
+
+Two candidate shapes (the grill's record; the decision follows):
 
 - **(a) Request/approve.** A asks the service for an edge to B. The
   service notifies B. The operator of B approves (desktop app, CLI, or the
@@ -207,16 +229,28 @@ says "after pairing A → B, A can pause/resume/reorder B's queue" and
 "unpairing revokes immediately". Directional edges mean unpairing one
 direction does not silently revoke the other.
 
-What the owner must choose:
+Decisions (owner, 2026-10-09 — the same decision that locked
+`docs/architecture/pairing.md`, commit `0d2f07f`, issue #39):
 
-1. **Shape (a) or (b).** The original draft recommends (b) for the personal
-   fleet — the operator is on both ends, so an approval round-trip adds a
-   notification path that does not exist yet. (a) is the SaaS shape
-   (approving someone else's machine). Record it as the future variant.
-   Do not build it now. Confirm (b) now, or choose (a).
-2. **Directional or symmetric edges.** The original draft recommends
-   directional. Confirm, or choose symmetric (unpairing revokes both
-   directions at once).
+1. **Shape (b): the one-time code.** B mints (`POST /pair/code`, binds to
+   B's authenticated `instance_id`, hashed, single-use, 5 min TTL), A
+   redeems (`POST /pair/redeem`, signer is the controller `from`, minter
+   is the controlled end `to`). Shipped: fleet side in slice 6
+   (`0762372`), ceremony refusals hardened in slice 11 (`55a6c1b`),
+   arbiter-side redeem + local edge record in slice 10 (`7b80621`).
+   (a) request/approve stays recorded as the SaaS variant — do not build
+   it until the notification path exists.
+2. **Directional edges.** `from` is the controller, `to` is the
+   controlled end. `POST /pair/unpair` deletes exactly one direction,
+   callable by either end; the other direction survives (slice 6, tested
+   one-direction). Matches pairing.md D5/D6.
+
+The trade-off that decided it: the operator is on both ends of a personal
+fleet, so an approval round-trip would add a notification path that does
+not exist — the code is paste-able in one step. Directional edges keep
+unpairing honest: "unpairing revokes immediately" (#39 acceptance) holds
+per direction, and revoking A's control over B never silently revokes
+B's over A.
 
 ## D5 — Human login: the seam, not the feature (LOCKED)
 
@@ -538,25 +572,39 @@ exclusive and fail-closed.
 
 ## Open questions to settle before code
 
+The grill is done: every decision is LOCKED. Questions 6-10 (the named
+owner choices under D3 and D4) were closed by the owner on 2026-10-09,
+issue #55. Questions 1-5 stay open as operational choices — none gates a
+decision; they gate first deployment.
+
 1. Enrollment token: who can mint one? (Today: whoever holds the
    operator's shell. With a login: the account owner.)
 2. Key rotation: automatic on a cadence, or operator-triggered only?
+   (pairing.md Q3, closed for the control plane 2026-10-09:
+   operator-triggered, re-pairing as the rotation recovery.)
 3. Replay window for signed requests: how much clock skew does the
    tailnet actually show? Measure before picking the number.
 4. Does the service hold the update channel too (today: Forgejo
    releases), or does that stay where it is?
 5. Name of the thing. `fleetlink` is a placeholder.
-6. D3 heartbeat cadence (owner choice 1 above).
-7. D3 control-action staleness ceiling (owner choice 2 above).
-8. D3 roster pull cadence on the arbiter side (owner choice 3 above).
-9. D4 pairing shape (a) or (b) (owner choice 1 above).
-10. D4 directional or symmetric edges (owner choice 2 above).
+6. ~~D3 heartbeat cadence~~ — LOCKED by the owner: 60 s
+   (`fleet_heartbeat_ms`, `server/src/config.ts:77`).
+7. ~~D3 control-action staleness ceiling~~ — LOCKED by the owner: 24 h
+   (`CONTROL_STALE_MS`, `fleet/src/store.ts:49`).
+8. ~~D3 roster pull cadence on the arbiter side~~ — LOCKED by the owner:
+   15 s (`fleet_roster_pull_ms`, `server/src/config.ts:68`).
+9. ~~D4 pairing shape (a) or (b)~~ — LOCKED by the owner: (b), the
+   one-time code (`0d2f07f`, shipped `0762372` + `7b80621`).
+10. ~~D4 directional or symmetric edges~~ — LOCKED by the owner:
+    directional (unpair deletes exactly one direction).
 
 ## Sequencing
 
 - This issue BLOCKS #39's pairing ceremony (there is no key substrate
   until it exists) and unblocks a real multi-machine mesh (no static
-  config per peer).
+  config per peer). SETTLED 2026-10-09: the ceremony is LOCKED
+  (`docs/architecture/pairing.md`) and built on this substrate
+  (#55 slices 1, 6, 10, 11).
 - It does NOT block #51 (metrics store, per-machine) or #53 (dev
   cycles, single machine).
 - The read plane as built stays valid: it is the fallback mode and the

@@ -43,11 +43,11 @@ import { createHash, createPublicKey, randomBytes, verify } from 'node:crypto';
 // Named defaults only. The service locks no value.
 // ---------------------------------------------------------------------------
 
-/** PROPOSED: the instance heartbeat cadence (D3 owner choice 1). 60 s. */
+/** LOCKED (owner, 2026-10-09): the instance heartbeat cadence (D3 choice 1). 60 s. */
 export const HEARTBEAT_CADENCE_MS = 60_000;
-/** PROPOSED: the staleness ceiling for CONTROL actions (D3 owner choice 2). 24 h. */
+/** LOCKED (owner, 2026-10-09): the staleness ceiling for CONTROL actions (D3 choice 2). 24 h. */
 export const CONTROL_STALE_MS = 24 * 3_600_000;
-/** PROPOSED: the arbiter-side roster pull cadence (D3 owner choice 3). 15 s (the poll tick). */
+/** LOCKED (owner, 2026-10-09): the arbiter-side roster pull cadence (D3 choice 3). 15 s (the poll tick). */
 export const ROSTER_PULL_CADENCE_MS = 15_000;
 /** PROPOSED: how long a consumed nonce is kept before pruning (replay window proxy). 5 min. */
 export const NONCE_TTL_MS = 5 * 60_000;
