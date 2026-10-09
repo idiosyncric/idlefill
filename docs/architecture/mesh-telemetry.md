@@ -38,7 +38,7 @@ build wave is filed. Nothing here is built.
   (`server/src/api.ts:304-307`). The fleet `peer_token` does NOT unlock this
   route (`server/src/api.ts:296`, and re-proven live in the grill report).
 - `GET /api/mesh` serves the coarse snapshot
-  (`server/src/api.ts:1076-1095`). The shape is `MeshSnapshot`
+  (`server/src/api.ts:1143-1156`). The shape is `MeshSnapshot`
   (`server/src/mesh.ts:37-59`): `instance_id`, `name`, `ts`, `version`
   (optional), `servers[]` with `name`, `idle`, `idle_for_s`, `degraded` only,
   plus `queue_depth`, `sessions`, `active_leases`. No models. No metrics. No
