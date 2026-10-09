@@ -186,7 +186,36 @@ async function main(): Promise<void> {
   // poll cadence. Ephemeral — never written to state.json. No peers
   // configured = the module stays inert (the /api/mesh route still
   // answers with this instance's own snapshot for peers that list us).
-  const mesh = new MeshFederation(cfg, makeRealMeshFetcher());
+  //
+  // Edge fill (#55 D4, the pairing ceremony — PROPOSED wire): the roster
+  // publishes each instance's directed edges; the federation writes the
+  // LOCAL side's edge record into mesh_edges.json (the last-known-keys
+  // posture). The writer is ADD-ONLY: an edge record this machine already
+  // holds for the peer is the operator's local truth (pairing.md D6: the
+  // enforcement point is the local side) and is never rewritten by the
+  // roster — rotation is the explicit local re-pair (open question 3).
+  // Absent fleet_url = no roster pull = no fill (byte-for-byte the
+  // pre-ceremony posture).
+  const mesh = new MeshFederation(cfg, makeRealMeshFetcher(), {
+    localInstanceId: () => arbiter.instanceId(),
+    edgeFiller: (localId, edge, peerKey, peerName, direction) => {
+      // The caller of the filler is this machine; the peer is the OTHER
+      // end of the directed edge (the roster dedupe already skipped
+      // self-edges).
+      const peer = edge.to === localId ? edge.from : edge.to;
+      if (peer === localId) return; // defensive: never form a self-edge
+      const edges = arbiter.edges();
+      if (edges.get(peer)) return; // ADD-only: the local record wins
+      edges.upsert({
+        peer_instance_id: peer,
+        peer_public_key: peerKey,
+        ...(peerName ? { peer_name: peerName } : {}),
+        direction,
+        created_at: Date.now(),
+      });
+      arbiter.logMeshEdgeFormed(peer, direction);
+    },
+  });
   // Roster pull seam (#55 D3, PROPOSED): fleet_url set = the peer set is
   // also pulled from the fleet service's GET /roster on the PROPOSED
   // interval (fleet_roster_pull_ms, default 15 s). fleet_url absent =

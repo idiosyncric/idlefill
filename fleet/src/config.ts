@@ -21,6 +21,8 @@ export interface FleetConfig {
   db_file: string;
   /** Enrollment token TTL in ms (D2 LOCKED: 15 min default, configurable). */
   token_ttl_ms: number;
+  /** Pairing code TTL in ms (D4 shape (b), PROPOSED: 5 min default, configurable). */
+  pair_code_ttl_ms: number;
 }
 
 export const DEFAULTS: FleetConfig = {
@@ -28,6 +30,8 @@ export const DEFAULTS: FleetConfig = {
   db_file: process.env.FLEET_DB || './fleet.db',
   // D2 LOCKED: a one-time enrollment token is valid for 15 minutes.
   token_ttl_ms: 15 * 60_000,
+  // D4 shape (b) PROPOSED: a pairing code is valid for 5 minutes.
+  pair_code_ttl_ms: 5 * 60_000,
 };
 
 /** Coerce a raw (partial) config object into a full FleetConfig, applying defaults per field. */
@@ -35,11 +39,13 @@ export function applyDefaults(raw: Partial<FleetConfig> | null | undefined): Fle
   const r = raw ?? {};
   const listen = num(r.listen, DEFAULTS.listen);
   const tokenTtl = num(r.token_ttl_ms, DEFAULTS.token_ttl_ms);
+  const pairCodeTtl = num(r.pair_code_ttl_ms, DEFAULTS.pair_code_ttl_ms);
   return {
     listen: listen > 0 && listen < 65536 ? listen : DEFAULTS.listen,
     db_file: str(r.db_file, DEFAULTS.db_file),
-    // A non-positive TTL is nonsense — fall back to the 15 min default.
+    // A non-positive TTL is nonsense — fall back to the default.
     token_ttl_ms: tokenTtl > 0 ? tokenTtl : DEFAULTS.token_ttl_ms,
+    pair_code_ttl_ms: pairCodeTtl > 0 ? pairCodeTtl : DEFAULTS.pair_code_ttl_ms,
   };
 }
 

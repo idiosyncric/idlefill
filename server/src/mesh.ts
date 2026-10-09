@@ -30,6 +30,7 @@
 
 import { randomBytes } from 'node:crypto';
 import type { ServerConfig } from './types.js';
+import type { EdgeRecord } from './edges.js';
 
 /** Peer liveness window — the 90s client-liveness precedent, reused. */
 export const PEER_STALE_MS = 90_000;
@@ -45,6 +46,8 @@ const MAX_NAME = 64;
 /** Hard caps on a fleet ROSTER (untrusted input, same discipline). */
 const MAX_ROSTER_ROWS = 100;
 const MAX_URLS_PER_ROW = 16;
+/** Max directed edges per roster row (bounded, untrusted input). */
+const MAX_EDGES_PER_ROW = 64;
 
 /**
  * The coarse snapshot one arbiter publishes at GET /api/mesh and pulls
@@ -114,6 +117,14 @@ export interface RosterRow {
   public_key: string;
   urls: string[];
   last_seen: number | null;
+  /**
+   * The directed edges this instance takes part in (the `edges` ADD key,
+   * #55 D4 — fleet-service.md roster response `{from, to}`). ADD key:
+   * absent on a pre-ceremony roster = no edges (an old service keeps
+   * working byte-for-byte). Untrusted input: bounded + validated like
+   * the rest of the row; a malformed edge is dropped individually.
+   */
+  edges: RosterEdgeRow[];
 }
 
 /**
@@ -121,6 +132,38 @@ export interface RosterRow {
  * throws on any failure (a failed pull is a no-op — the Service-down rule).
  */
 export type RosterFetcher = (fleetUrl: string, now: number) => Promise<unknown>;
+
+/**
+ * A directed roster edge (the `edges` ADD key on a roster row —
+ * fleet-service.md roster response: `{from, to}`). Untrusted input:
+ * both ends are exact, length-bounded identities; the direction is
+ * carried as-is (it is a policy fact, not a secret).
+ */
+export interface RosterEdgeRow {
+  /** The controlling instance (A in "A pairs to B"). */
+  from: string;
+  /** The controlled instance (B). */
+  to: string;
+}
+
+/**
+ * The local edge-record writer (#39 substrate, #55 D4 fill seam).
+ * Given the roster's directed edge for the LOCAL instance, the arbiter
+ * upserts the LOCAL side's `mesh_edges.json` record — the last-known-keys
+ * posture (fleet-service.md Service-down rule 1: peers keep working with
+ * last-known keys; a roster row carries the peer's public key). The
+ * writer is the seam so mesh.ts stays dependency-light: the real writer
+ * wraps `EdgeStore.upsert` (+ the `mesh_edge_formed` event) in index.ts;
+ * tests pass a recorder. The writer NEVER throws a way out of the pull:
+ * the caller wraps it in the same never-throw posture as the fetch.
+ */
+export type EdgeFiller = (
+  localInstanceId: string,
+  edge: RosterEdgeRow,
+  peerPublicKey: string,
+  peerName: string | undefined,
+  direction: 'controls_me' | 'i_control',
+) => void;
 
 /** Default (real) roster fetcher: GET {fleetUrl}/roster.
  *  NOTE (#55 D3, PROPOSED seam): the fleet service's `GET /roster`
@@ -171,7 +214,26 @@ export function sanitizeRoster(raw: unknown): RosterRow[] {
       }
     }
     if (urls.length === 0) continue; // a row with no usable url cannot be pulled from
-    out.push({ instance_id: rawId, name, public_key, urls, last_seen });
+    // The `edges` ADD key (#55 D4): the directed edges this row's
+    // instance takes part in. Untrusted input, same discipline as urls:
+    // bounded count, strings exact + length-capped, a malformed edge
+    // dropped individually (never a row drop — the row's peer facts are
+    // still usable). Absent / non-array = no edges (pre-ceremony roster).
+    const edges: RosterEdgeRow[] = [];
+    if (Array.isArray(ro.edges)) {
+      for (const e of ro.edges.slice(0, MAX_EDGES_PER_ROW)) {
+        if (!e || typeof e !== 'object' || Array.isArray(e)) continue;
+        const eo = e as Record<string, unknown>;
+        const from = typeof eo.from === 'string' ? eo.from.trim() : '';
+        const to = typeof eo.to === 'string' ? eo.to.trim() : '';
+        // Identity, exact: over-long ends are hostile, drop the edge.
+        if (from === '' || to === '' || from.length > 64 || to.length > 64) continue;
+        if (from === to) continue; // a self-edge is not a pairing
+        if (edges.some((x) => x.from === from && x.to === to)) continue;
+        edges.push({ from, to });
+      }
+    }
+    out.push({ instance_id: rawId, name, public_key, urls, last_seen, edges });
   }
   return out;
 }
@@ -187,16 +249,32 @@ interface PeerEntry {
   rosterOrigin?: boolean;
 }
 
+/** Optional federation wiring (all absent = byte-for-byte the old behavior). */
+export interface FederationOptions {
+  /** The LOCAL instance id (for the roster edge fill). Absent = no fill. */
+  localInstanceId?: () => string;
+  /** The local edge-record writer (#55 D4 fill seam). Absent = no fill. */
+  edgeFiller?: EdgeFiller;
+}
+
 export class MeshFederation {
   private readonly cfg: ServerConfig;
   private readonly fetcher: MeshFetcher;
+  private readonly localInstanceId?: () => string;
+  private readonly edgeFiller?: EdgeFiller;
   private readonly peers = new Map<string, PeerEntry>();
   /** When a roster pull is due next (epoch-ms). 0 = never armed (no fleet_url). */
   private nextRosterPullAt = 0;
+  /** (peer, key) pairs already filled into the local edge store since
+   *  boot — the roster pull runs every 15 s; the edge file is rewritten
+   *  only when a NEW (peer, key) pair arrives, never on every pull. */
+  private readonly filledEdges = new Set<string>();
 
-  constructor(cfg: ServerConfig, fetcher: MeshFetcher) {
+  constructor(cfg: ServerConfig, fetcher: MeshFetcher, opts: FederationOptions = {}) {
     this.cfg = cfg;
     this.fetcher = fetcher;
+    this.localInstanceId = opts.localInstanceId;
+    this.edgeFiller = opts.edgeFiller;
     for (const p of cfg.mesh_peers ?? []) {
       const url = String(p?.url ?? '').trim().replace(/\/+$/, '');
       if (!url || url === 'self') continue;
@@ -264,6 +342,69 @@ export class MeshFederation {
           snapshot: null,
           rosterOrigin: true,
         });
+      }
+    }
+    // Edge fill (the pairing ceremony, #55 D4 shape (b) — PROPOSED wire):
+    // the roster publishes each instance's directed edges as an ADD key.
+    // The LOCAL instance writes the LOCAL side's edge record from the
+    // roster — the last-known-keys posture (fleet-service.md Service-down
+    // rule 1: a peer keeps working with the locally-stored public key).
+    // The peer's public key comes from the PEER'S OWN roster row (a row's
+    // `public_key` is that row's instance's key, never the other edge
+    // end's). Fail-closed: no usable row for the peer end = no record
+    // written, never a crash. The writer is the seam (FederationOptions):
+    // the real one (index.ts) is ADD-only on mesh_edges.json — a record
+    // this machine already holds for the peer is the operator's truth
+    // (pairing.md D6 enforcement point) and is never rewritten by the
+    // roster; re-pairing after a key rotation is the explicit local
+    // action (pairing.md open question 3). Absent local id or filler =
+    // no fill (byte-for-byte the pre-ceremony pull).
+    if (this.edgeFiller && this.localInstanceId) {
+      let localId = '';
+      try {
+        localId = this.localInstanceId();
+      } catch {
+        localId = '';
+      }
+      if (localId) {
+        const rowById = new Map<string, RosterRow>();
+        for (const row of rows) {
+          if (!rowById.has(row.instance_id)) rowById.set(row.instance_id, row);
+        }
+        // Dedupe the directed edge (it rides on BOTH ends' rows).
+        const seen = new Set<string>();
+        for (const row of rows) {
+          for (const edge of row.edges) {
+            if (edge.from === edge.to) continue; // a self-edge is never formed
+            if (edge.to !== localId && edge.from !== localId) continue; // not my edge
+            const dedupeKey = `${edge.from}\u0000${edge.to}`;
+            if (seen.has(dedupeKey)) continue;
+            seen.add(dedupeKey);
+            const peer = edge.to === localId ? edge.from : edge.to;
+            const direction: 'controls_me' | 'i_control' = edge.to === localId ? 'controls_me' : 'i_control';
+            const peerRow = rowById.get(peer);
+            const peerKey = peerRow && typeof peerRow.public_key === 'string' ? peerRow.public_key : '';
+            // A usable ed25519 SPKI key is 59 base64url chars; the edge
+            // store admits up to 64 (its bounded cap). Anything else is
+            // not a key — skip (fail-closed: no record, no crash).
+            if (peerKey === '' || peerKey.length > 64) continue;
+            // Process-lifetime dedupe: the roster is re-pulled every
+            // interval; a (peer, key) pair already handed to the writer
+            // since boot is not handed again (the writer's own ADD-only
+            // check is the authoritative rule; this keeps the hot path
+            // from re-touching the store every 15 s).
+            const fillKey = `${peer}\u0000${peerKey}`;
+            if (this.filledEdges.has(fillKey)) continue;
+            this.filledEdges.add(fillKey);
+            try {
+              this.edgeFiller(localId, edge, peerKey, peerRow?.name || undefined, direction);
+            } catch {
+              // A writer failure (a malformed record the store refused)
+              // is a no-op for this edge — never a crash (the pull's
+              // never-throw posture).
+            }
+          }
+        }
       }
     }
   }

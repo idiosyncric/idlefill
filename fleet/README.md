@@ -1,6 +1,7 @@
 # fleet
 
-The idlefill fleet service. Enrollment + roster only (#55 slice 3).
+The idlefill fleet service. Enrollment + roster + the pairing ceremony
+(#55 slices 3 + 6, D4 shape (b)).
 
 It answers enrollment and roster queries. It never sits in the data
 path. A peer pulls `GET /roster`, then pulls the arbiter directly over
@@ -31,10 +32,43 @@ canonical `{instance_id, path, ts, nonce}` envelope
 (`server/src/edges.ts`). Two planes, two shapes. A helper written for
 one fails closed on the other: safe, but not obvious.
 - `GET /roster?instance_id&nonce&signature` — the full fleet. Each
-  row: `{instance_id, name, public_key, urls[], last_seen}`.
+  row: `{instance_id, name, public_key, urls[], last_seen, edges[]}`.
+  `edges` is an ADD key (the pairing ceremony, D4): the directed edges
+  the row's instance takes part in, `{from, to}` — `from` controls
+  `to`. Absent on a pre-ceremony service = no edges.
 
 `urls` and `presence` are ADD keys: absent means keep the stored
 value.
+
+### Pairing ceremony (D4, shape (b) — PROPOSED)
+
+One-time code, directional edges, the initiator is the controller
+(pairing.md D5; fleet-service.md D4's recommended form for the personal
+fleet). All three routes authenticate with a signed nonce like
+`/heartbeat`; the authenticated `instance_id` is authoritative.
+
+- `POST /pair/code` — B mints a one-time pairing code. Body: optional
+  `target_name` (a display hint for A, never stored). Response:
+  `{code, ttl_s}` (PROPOSED TTL 5 min, `pair_code_ttl_ms`). The code is
+  single-use, stored hashed, plaintext shown once — the enrollment
+  token's exact posture.
+- `POST /pair/redeem` — A redeems B's code. Body: `{code}`. Response:
+  `{edge: {from: A, to: B}, peer_public_key, peer_name}` — the
+  CONTROLLER's side gets the controlled peer's public key to write its
+  local edge record. Named denials (400): `invalid_code` / `code_used`
+  / `code_expired` / `self_pair` (a machine cannot pair to itself).
+- `POST /pair/unpair` — an edge end removes the directed edge. Body:
+  `{edge: {from, to}}`. Directional: the reverse direction is a
+  separate edge. 404 `unknown_edge` when the named direction is not
+  (or no longer) recorded.
+
+The service is the DIRECTORY, never the relay: it records the edge and
+publishes it in both rosters. After that, A and B talk directly — the
+mesh control relay (`POST /api/mesh/control`, #39) authenticates each
+side against its own locally-stored edge record. A machine that pulls
+the roster fills its local `mesh_edges.json` record from the roster
+(last-known-keys posture — the service-down rule survives; a service
+outage freezes edge formation, never breaks an existing pairing).
 
 ## Run
 
@@ -58,12 +92,14 @@ npm run dev
 
 Config: `FLEET_CONFIG` env (a JSON string) or `config.json` next to
 the entry point. Keys: `listen` (8789), `db_file` (`./fleet.db`),
-`token_ttl_ms` (900000). The db file is local state, never committed.
+`token_ttl_ms` (900000), `pair_code_ttl_ms` (300000 — PROPOSED). The db
+file is local state, never committed.
 
 ## Not built here
 
-Pairing (D4: the owner picks shape (a) or (b) and edge direction).
-Deployment (D7: urza routing, the `fleet.samwarth.com` host, the tailnet
-posture). The three PROPOSED D3 cadence values: heartbeat 60 s,
+Deployment (D7: urza routing, the `fleet.samwarth.com` host, the
+tailnet posture). The three PROPOSED D3 cadence values: heartbeat 60 s,
 control-staleness 24 h, roster pull 15 s — named defaults in
-`src/store.ts`, marked PROPOSED.
+`src/store.ts`, marked PROPOSED. Key rotation (the recovery path is
+re-pairing: unpair + re-pair mints a fresh edge; a rotated peer key
+refreshes on the next roster pull's re-pair — pairing.md open question 3).

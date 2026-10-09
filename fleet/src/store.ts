@@ -1,12 +1,12 @@
 /**
- * Fleet service storage (#55 slice 3).
+ * Fleet service storage (#55 slice 3 + slice 6, the pairing ceremony).
  *
  * D6 LOCKED (docs/architecture/fleet-service.md): SQLite, a file not a
  * server. The driver is `node:sqlite` (DatabaseSync) — a runtime
  * built-in on node v26 (the repo's runtime), so no new dependency and no
  * database server. The file is the store.
  *
- * What this slice stores:
+ * What this file stores:
  *   - instances: instance_id, fleet_id, name, public_key, credential hash,
  *     urls (JSON), presence, last_seen.
  *   - tokens: enrollment tokens, HASHED (sha256) at rest. A token is
@@ -15,10 +15,22 @@
  *     never committed.
  *   - nonces: single-use signed-nonce auth (D2 step 3). A nonce is
  *     consumed on first use. A replayed nonce is a 401.
+ *   - pair_codes: one-time pairing codes (D4 shape (b)), HASHED at rest,
+ *     single-use + TTL, minted by the MINTING instance (B). A code binds
+ *     to B's instance_id at mint time; redeeming it from A (a DIFFERENT
+ *     instance) forms the directed edge A → B. The plaintext code is
+ *     shown to the operator once — never stored, never committed.
+ *   - edges: the directed edges (D4 directional, pairing.md D5):
+ *     `from` controls `to`. The roster publishes each instance's edges
+ *     so every instance can fill its LOCAL edge records (last-known-keys,
+ *     fleet-service.md Service-down rule 1).
  *
- * What this slice does NOT store: pairing edges (D4 — the owner's shape
- * decision is pending), key-rotation history, audit. The schema leaves
- * room for all three without a migration of this slice's tables.
+ * What this file does NOT store: key-rotation history, audit.
+ *
+ * The control plane is a DIRECTORY, never a relay (mesh.md D1): it
+ * records the edge and publishes it in the rosters. Each side then talks
+ * directly, authenticated by signed requests against the edge record's
+ * stored PUBLIC key — the service never sits between the two arbiters.
  *
  * Wire posture: every wire key is an ADD key. Absent = unset.
  */
@@ -68,6 +80,20 @@ CREATE TABLE IF NOT EXISTS nonces (
   instance_id TEXT NOT NULL,
   issued_at INTEGER NOT NULL,
   PRIMARY KEY (nonce, instance_id)
+);
+CREATE TABLE IF NOT EXISTS pair_codes (
+  code_hash TEXT PRIMARY KEY,
+  minter_instance_id TEXT NOT NULL,
+  fleet_id TEXT NOT NULL DEFAULT 'home',
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  used_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS edges (
+  from_instance_id TEXT NOT NULL,
+  to_instance_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (from_instance_id, to_instance_id)
 );
 `;
 
@@ -288,6 +314,13 @@ export function heartbeat(
   return Number(res.changes) === 1;
 }
 
+export interface RosterEdge {
+  /** The controlling instance (A in "A pairs to B"). */
+  from: string;
+  /** The controlled instance (B). */
+  to: string;
+}
+
 export interface RosterEntry {
   instance_id: string;
   name: string;
@@ -295,6 +328,15 @@ export interface RosterEntry {
   urls: string[];
   /** Epoch-ms of the last heartbeat. Null until the first heartbeat. */
   last_seen: number | null;
+  /**
+   * The directed edges this instance takes part in (D4, PROPOSED wire
+   * key — fleet-service.md roster response: `"edges": [{from, to}]`).
+   * ADD key: absent = unset on an old service; the puller's sanitizer
+   * treats a missing field as no edges. Both directions of an edge ride
+   * on BOTH instances' rows, so each side can fill its LOCAL edge
+   * record on the roster pull (the last-known-keys posture).
+   */
+  edges: RosterEdge[];
 }
 
 /** The full roster (a PULL — the service never pushes, never relays). */
@@ -302,12 +344,20 @@ export function roster(db: DatabaseSync): RosterEntry[] {
   const rows = db
     .prepare('SELECT instance_id, name, public_key, urls, last_seen FROM instances ORDER BY instance_id')
     .all() as { instance_id: string; name: string; public_key: string; urls: string; last_seen: number | null }[];
+  const edgeRows = db
+    .prepare('SELECT from_instance_id, to_instance_id FROM edges ORDER BY from_instance_id, to_instance_id')
+    .all() as { from_instance_id: string; to_instance_id: string }[];
   return rows.map((r) => ({
     instance_id: r.instance_id,
     name: r.name,
     public_key: r.public_key,
     urls: parseUrls(r.urls),
     last_seen: typeof r.last_seen === 'number' ? r.last_seen : null,
+    // Both directions ride on both rows (ADD key): the minter B sees the
+    // edge as `to: B`, the redeemer A sees it as `from: A`.
+    edges: edgeRows
+      .filter((e) => e.from_instance_id === r.instance_id || e.to_instance_id === r.instance_id)
+      .map((e) => ({ from: e.from_instance_id, to: e.to_instance_id })),
   }));
 }
 
@@ -356,4 +406,123 @@ export function sanitizePresence(v: unknown): Presence | null {
   if (typeof v !== 'string') return null;
   const t = v.trim();
   return (PRESENCE_VALUES as readonly string[]).includes(t) ? (t as Presence) : null;
+}
+
+// ---------------------------------------------------------------------------
+// Pairing ceremony (D4 shape (b) — PROPOSED, fleet-service.md +
+// pairing.md: one-time code, directional edges, the initiator is the
+// controller). The service records the edge and publishes it in the
+// rosters — it never relays anything between the two arbiters (D1).
+// ---------------------------------------------------------------------------
+
+/** PROPOSED: how long a pairing code stays redeemable. 5 min (shorter
+ *  than the enrollment token: a code is minted seconds before it is
+ *  redeemed, on the tailnet, by the same operator). */
+export const PAIR_CODE_TTL_MS = 5 * 60_000;
+
+export interface MintedPairCode {
+  /** The plaintext code. Shown to the operator once. Never stored. */
+  code: string;
+  /** Epoch-ms when the code stops being redeemable. */
+  expires_at: number;
+}
+
+/**
+ * Mint a pairing code (D4 shape (b), `POST /pair/code`, called by B).
+ * The code binds to B's instance_id at mint time; B's instance must
+ * exist (a not-yet-enrolled minter cannot mint). Stored hashed, like
+ * the enrollment token: single-use, TTL, plaintext shown once.
+ */
+export function mintPairCode(db: DatabaseSync, minterInstanceId: string, ttlMs: number, now = Date.now()): MintedPairCode {
+  const row = db.prepare('SELECT fleet_id FROM instances WHERE instance_id = ?').get(minterInstanceId) as
+    | { fleet_id: string }
+    | undefined;
+  const fleetId = row?.fleet_id ?? DEFAULT_FLEET_ID;
+  const code = `pair_${randomBytes(16).toString('base64url')}`;
+  const expires_at = now + ttlMs;
+  db.prepare(
+    'INSERT INTO pair_codes (code_hash, minter_instance_id, fleet_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?)',
+  ).run(sha256(code), minterInstanceId, fleetId, now, expires_at);
+  return { code, expires_at };
+}
+
+export type RedeemPairCodeResult =
+  | { ok: true; edge: RosterEdge; peer_public_key: string; peer_name: string }
+  | { ok: false; error: 'invalid_code' | 'code_used' | 'code_expired' | 'self_pair' };
+
+/**
+ * Redeem a pairing code (D4 shape (b), `POST /pair/redeem`, called by A).
+ *
+ * The caller's authenticated instance_id is the CONTROLLER (`from`);
+ * the code's minter is the CONTROLLED instance (`to`) — pairing A to B
+ * makes A the controller of B (pairing.md D5; the service-side
+ * directional semantics of #55 D4). The edge row is INSERTed idempotently
+ * (re-pairing the same A → B is a no-op, not a duplicate) and the code
+ * is consumed single-use + TTL, exactly like the enrollment token.
+ *
+ * `self_pair` (redeeming one's own code) is a named denial, not an
+ * error: the operator minted on the wrong machine, and the service must
+ * not form a self-edge (A cannot control A through the ceremony).
+ */
+export function redeemPairCode(db: DatabaseSync, code: string, redeemerInstanceId: string, now = Date.now()): RedeemPairCodeResult {
+  const h = sha256(code);
+  const row = db
+    .prepare('SELECT minter_instance_id, expires_at, used_at FROM pair_codes WHERE code_hash = ?')
+    .get(h) as { minter_instance_id: string; expires_at: number; used_at: number | null } | undefined;
+  if (!row) return { ok: false, error: 'invalid_code' };
+  if (row.used_at !== null) return { ok: false, error: 'code_used' };
+  if (now >= row.expires_at) return { ok: false, error: 'code_expired' };
+  if (row.minter_instance_id === redeemerInstanceId) return { ok: false, error: 'self_pair' };
+  const res = db.prepare('UPDATE pair_codes SET used_at = ? WHERE code_hash = ? AND used_at IS NULL').run(now, h);
+  if (Number(res.changes) !== 1) return { ok: false, error: 'code_used' };
+  // The minter must be enrolled (a code minted for a deleted instance
+  // cannot form an edge — a deleted row has no public key to publish).
+  const peer = db
+    .prepare('SELECT public_key, name FROM instances WHERE instance_id = ?')
+    .get(row.minter_instance_id) as { public_key: string; name: string } | undefined;
+  if (!peer) return { ok: false, error: 'invalid_code' };
+  // Idempotent: the same directed edge re-forms as a no-op (rotation is
+  // unpair + re-pair; a re-pair without the unpair is harmless).
+  db.prepare(
+    'INSERT INTO edges (from_instance_id, to_instance_id, created_at) VALUES (?, ?, ?) ON CONFLICT (from_instance_id, to_instance_id) DO NOTHING',
+  ).run(redeemerInstanceId, row.minter_instance_id, now);
+  // The redeem response carries the peer's public key so A can write
+  // its LOCAL edge record immediately (pairing.md D1: verification is
+  // against the stored peer public key) — the next roster pull would
+  // carry it too; this is the same data, returned inline.
+  return { ok: true, edge: { from: redeemerInstanceId, to: row.minter_instance_id }, peer_public_key: peer.public_key, peer_name: peer.name };
+}
+
+export type UnpairEdgeResult = { ok: boolean; existed: boolean };
+
+/**
+ * Remove a directed edge (D4, `POST /pair/unpair`). The caller's
+ * authenticated instance_id must be one of the edge's ends — an
+ * instance can only unpair an edge it takes part in. Directional
+ * semantics (pairing.md D5): unpairing A → B does NOT touch B → A;
+ * the reverse direction is a separate edge the operator formed
+ * separately and unpairs separately.
+ *
+ * The service-side deletion is the DIRECTORY update. The enforcement
+ * point is the controlled side (pairing.md D6): the target's LOCAL
+ * edge record is deleted by its own operator (`POST /api/mesh/unpair`),
+ * and the next roster pull confirms the edge is gone. The service
+ * never pushes (D1: a directory, not a pipe).
+ */
+export function unpairEdge(db: DatabaseSync, callerInstanceId: string, from: string, to: string): UnpairEdgeResult {
+  const mine = callerInstanceId === from || callerInstanceId === to;
+  const row = db.prepare('SELECT 1 AS x FROM edges WHERE from_instance_id = ? AND to_instance_id = ?').get(from, to);
+  if (!mine || !row) return { ok: false, existed: false };
+  db.prepare('DELETE FROM edges WHERE from_instance_id = ? AND to_instance_id = ?').run(from, to);
+  return { ok: true, existed: true };
+}
+
+/** The edges a given instance takes part in (either direction). */
+export function edgesFor(db: DatabaseSync, instanceId: string): RosterEdge[] {
+  const rows = db
+    .prepare(
+      'SELECT from_instance_id, to_instance_id FROM edges WHERE from_instance_id = ? OR to_instance_id = ? ORDER BY from_instance_id, to_instance_id',
+    )
+    .all(instanceId, instanceId) as { from_instance_id: string; to_instance_id: string }[];
+  return rows.map((r) => ({ from: r.from_instance_id, to: r.to_instance_id }));
 }

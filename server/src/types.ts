@@ -920,6 +920,17 @@ export type EventKind =
    */
   | 'mesh_edge_unpaired'
   /**
+   * Mesh edge formation audit (#55 D4, the pairing ceremony): a directed
+   * edge was written to the LOCAL edge store — either by the roster edge
+   * fill (the last-known-keys posture: the fleet service published the
+   * edge and this machine filled its local record on the roster pull)
+   * or by an operator minting the record locally. Detail carries the
+   * peer instance_id + direction from the local side's perspective
+   * (`controls_me` / `i_control`). The private key never rides this
+   * event (the public key already rides the roster/snapshot).
+   */
+  | 'mesh_edge_formed'
+  /**
    * Scheduled queue rebuild (issue #3): the client's rebuild loop ran since
    * the last heartbeat and reported fresh run state. The arbiter derives the
    * event from the registration payload (no new API surface) so the operator
