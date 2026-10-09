@@ -17,7 +17,7 @@ import type { ActivityFetcher } from './idle.js';
 import type { LoadSignalView } from './load.js';
 import { FeedDeltaTracker, MetricsStore, HOUR_MS, instrumentArbiterForMetrics } from './metrics.js';
 import { CounterDeltaTracker, OmlxUsageReaders } from './omlx.js';
-import { MeshFederation, makeRealMeshFetcher } from './mesh.js';
+import { MeshFederation, makeRealMeshFetcher, makeRealRosterFetcher } from './mesh.js';
 import { StateStore } from './state.js';
 import type { ActivityEntry, EngineCounters, RequestsSource, ServerConnection, ServerProvider } from './types.js';
 
@@ -187,6 +187,13 @@ async function main(): Promise<void> {
   // configured = the module stays inert (the /api/mesh route still
   // answers with this instance's own snapshot for peers that list us).
   const mesh = new MeshFederation(cfg, makeRealMeshFetcher());
+  // Roster pull seam (#55 D3, PROPOSED): fleet_url set = the peer set is
+  // also pulled from the fleet service's GET /roster on the PROPOSED
+  // interval (fleet_roster_pull_ms, default 15 s). fleet_url absent =
+  // pullRoster is a no-op and the peer set is the static mesh_peers
+  // config, byte-for-byte. The service-down rule holds inside pullRoster:
+  // a failed pull never touches the last-known peer set.
+  const rosterFetcher = makeRealRosterFetcher();
 
   // Persisted operator settings re-hydrate onto the live config objects:
   //  - project rows (pause state + per-project grant-knob overrides) replace
@@ -361,6 +368,11 @@ async function main(): Promise<void> {
         metrics.recordLeaseEnd(r.lease, { now: Date.now() });
       }
       const now = Date.now();
+      // Roster pull (#55 D3, PROPOSED): before the mesh refresh, so a
+      // freshly pulled roster peer is pulled in the SAME tick. Never throws
+      // (service down = the last-known peer set stands). fleet_url absent =
+      // a no-op. (pullRoster throttles to one pull per fleet_roster_pull_ms.)
+      await mesh.pullRoster(rosterFetcher, now);
       // Mesh pull (#50): refresh peer snapshots on the SAME poll cadence.
       // (The #50 report said "refresh rides the existing tickOnce" — it
       // never actually did: mesh.refresh had no production caller, so the

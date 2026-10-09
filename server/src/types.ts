@@ -71,6 +71,20 @@ export interface ServerConfig {
    * no secret — a display label, never a credential.
    */
   fleet_id?: string;
+  /**
+   * Fleet service base URL (#55 D3, PROPOSED — docs/architecture/fleet-service.md).
+   * The arbiter pulls `GET /roster` from it and merges the roster rows into
+   * the mesh peer set. Absent/empty = the pull never happens: the peer set
+   * is the static `mesh_peers` config, byte-for-byte unchanged.
+   */
+  fleet_url?: string;
+  /**
+   * Roster pull interval in ms (#55 D3 owner choice 3, PROPOSED — the value
+   * is the owner's to pick). Default 15 s: the existing poll tick. A pull
+   * happens at most once per interval (never a faster loop). Only read
+   * when `fleet_url` is set.
+   */
+  fleet_roster_pull_ms?: number;
   /** Glob of NInfer req-*.jsonl logs. Empty string disables the log-mtime signal. */
   log_glob: string;
   idle_seconds: number;
