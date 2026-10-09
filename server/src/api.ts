@@ -57,10 +57,13 @@ export function isValidToken(cfg: ServerConfig, token: string | null | undefined
 }
 
 /**
- * Mesh read-plane auth (#50 D2): the fleet peer_token is read-only and
- * scoped to GET /api/mesh ONLY. It never unlocks any other /api/* route,
+ * Mesh read-plane auth (#50 D2, widened exactly once by #79 D4): the fleet
+ * peer_token is read-only and scoped to GET /api/mesh and the SERVE side of
+ * GET /api/metrics/remote ONLY. It never unlocks any other /api/* route,
  * and local admin tokens always work on /api/mesh (the operator's own
- * surfaces read the same endpoint).
+ * surfaces read the same endpoint) — the remote-metrics route is the one
+ * exception: it 401s an admin token on the SERVE side and a peer_token on
+ * the PULL side (the pairing lives at the route, #79 D4).
  */
 export function isPeerToken(cfg: ServerConfig, token: string | null | undefined): boolean {
   if (!token || typeof token !== 'string') return false;
@@ -334,6 +337,16 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     // token anywhere (including here) is still a 401.
     const isMeshRead = path === '/api/mesh' && req.method === 'GET' && isPeerToken(cfg, token);
     if (isMeshRead) return;
+    // Cross-mesh telemetry (#79 D4): GET /api/metrics/remote passes the hook
+    // on EITHER credential — the pairing is enforced at the route. The
+    // fleet peer_token unlocks the SERVE side (a peer reading this
+    // machine's store); a local admin token unlocks the PULL side (the
+    // dashboard expanding a peer row; the arbiter then hops with the
+    // peer_token). It is never anonymous, and a wrong token anywhere is
+    // still a 401 (it falls through to the strict check below).
+    const isMetricsRemote =
+      path === '/api/metrics/remote' && req.method === 'GET' && (isPeerToken(cfg, token) || isValidToken(cfg, token));
+    if (isMetricsRemote) return;
     // Mesh per-edge plane (#39 slice 1, D8 fail-closed): /api/mesh/detail
     // and /api/mesh/control-preview are NEVER token-authenticated — the
     // fleet peer_token cannot reach them, and neither can an admin token
@@ -1730,6 +1743,129 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       series: [...byKey.entries()].map(([key, points]) => ({ key, points })),
       truncated,
     };
+  });
+
+  // ------------------------------------------------------------------
+  // Cross-mesh telemetry — the remote range read (#79 D2/D3/D4)
+  // ------------------------------------------------------------------
+
+  /**
+   * One route, two modes (docs/architecture/mesh-telemetry.md):
+   *
+   * SERVE (no `peer` param): answer the LOCAL store to a pulling peer.
+   * Unlocked ONLY by the fleet peer_token — never anonymous, never a local
+   * admin token (the D4 posture; the mirror of the /api/mesh scoping). The
+   * param contract, 400 discipline, 2,000-point OLDEST-trim cap and the
+   * raw-window clamp are EXACTLY the local GET /api/metrics route's, and
+   * the body mirrors it, plus the `peer` ADD key (this store's instance).
+   *
+   * PULL (`peer=<instance_id>`): the operator's own dashboard surface.
+   * Unlocked ONLY by the local admin token (the dashboard holds it; the
+   * peer_token stays with the arbiter, D4). The arbiter hops to the
+   * target peer with the peer_token, pulls the range ON DEMAND (never on
+   * the tick, D3), and answers the sanitized peer lines with the
+   * `peer`/`pulled_at`/`stale` ADD keys. A cache hit inside
+   * `mesh_metrics_cache_s` rides `stale: true`; a failed fetch drops the
+   * cache line and 502s — a render gap, no fake zeros; the row then
+   * renders offline under the existing PEER_STALE_MS rule. Remote lines
+   * are NEVER persisted: not in state.json, not in the local store.
+   */
+  app.get('/api/metrics/remote', async (req, reply) => {
+    const q = (typeof req.query === 'object' && req.query !== null ? req.query : {}) as Record<string, unknown>;
+    const token = bearer(req);
+    const peerId = typeof q.peer === 'string' ? q.peer.trim() : '';
+
+    // Param contract — the local route's, mirrored exactly (D2).
+    const series = q.series;
+    if (series !== 'engine' && series !== 'lease' && series !== 'session') {
+      return reply.code(400).send({ error: 'series must be engine, lease, or session' });
+    }
+    const bucket = q.bucket === undefined ? 'hour' : q.bucket;
+    if (bucket !== 'hour' && bucket !== 'raw') {
+      return reply.code(400).send({ error: 'bucket must be hour or raw' });
+    }
+    const now = Date.now();
+    const WEEK_MS = 7 * 86_400_000;
+    const from = typeof q.from === 'string' || typeof q.from === 'number' ? Number(q.from) : now - WEEK_MS;
+    const to = typeof q.to === 'string' || typeof q.to === 'number' ? Number(q.to) : now;
+    if (!Number.isFinite(from) || !Number.isFinite(to)) {
+      return reply.code(400).send({ error: 'from and to must be epoch-ms numbers' });
+    }
+    if (from > to) return reply.code(400).send({ error: 'from must be <= to' });
+    if (typeof q.key !== 'undefined' && typeof q.key !== 'string') {
+      return reply.code(400).send({ error: 'key must be a string' });
+    }
+    const key = typeof q.key === 'string' && q.key !== '' ? q.key : undefined;
+
+    if (peerId === '') {
+      // --- SERVE mode: the peer_token plane only (admin + anonymous 401) ---
+      if (!isPeerToken(cfg, token)) {
+        return reply.code(401).send({ error: 'the remote store read requires the fleet peer_token' });
+      }
+      if (!metrics) return reply.code(501).send({ error: 'metrics store not wired' });
+      const lines = metrics.readRange({
+        series: series as MetricsSeries,
+        ...(key !== undefined ? { key } : {}),
+        from,
+        to,
+        bucket: bucket as MetricsBucket,
+        now,
+      });
+      // 2,000-point cap: trim the OLDEST, keep the newest — same as local.
+      const MAX_POINTS = 2000;
+      const truncated = lines.length > MAX_POINTS;
+      const kept = truncated ? lines.slice(lines.length - MAX_POINTS) : lines;
+      const byKey = new Map<string, Record<string, unknown>[]>();
+      for (const l of kept) {
+        const k = seriesKeyOf(l);
+        let arr = byKey.get(k);
+        if (!arr) {
+          arr = [];
+          byKey.set(k, arr);
+        }
+        arr.push(l as unknown as Record<string, unknown>);
+      }
+      return {
+        series: [...byKey.entries()].map(([k, points]) => ({ key: k, points })),
+        truncated,
+        // ADD key: which instance this store belongs to (attribution, not merge).
+        peer: arbiter.instanceId(),
+      };
+    }
+
+    // --- PULL mode: the operator's admin plane only (peer_token 401s) ---
+    if (!isValidToken(cfg, token)) {
+      return reply.code(401).send({ error: 'a remote metrics pull requires a local admin token' });
+    }
+    if (!mesh) return reply.code(501).send({ error: 'mesh not wired' });
+    if (peerId.length > 64) return reply.code(400).send({ error: 'peer must be an instance_id (64 chars max)' });
+    if (!mesh.peerUrlFor(peerId)) {
+      // Not a known peer (never fetched, removed, or a typo): a named gap,
+      // not a fetch failure. The row itself still renders offline under the
+      // PEER_STALE_MS rule when no snapshot was ever pulled.
+      return reply.code(404).send({ error: 'unknown peer instance_id', peer: peerId });
+    }
+    try {
+      const pulled = await mesh.pullMetrics(
+        peerId,
+        { series: series as MetricsSeries, ...(key !== undefined ? { key } : {}), from, to, bucket: bucket as MetricsBucket },
+        now,
+      );
+      return {
+        series: pulled.answer.series,
+        truncated: pulled.answer.truncated,
+        // ADD keys (the wire-keys section): the owning peer, the puller's
+        // fetch clock, and the cache-hit label. Absent = unset elsewhere;
+        // never a merge, never a fleet-wide sum on the wire.
+        peer: peerId,
+        pulled_at: pulled.pulledAt,
+        stale: pulled.stale,
+      };
+    } catch {
+      // The cache line is already dropped (pullMetrics). A render gap —
+      // the row renders offline under PEER_STALE_MS; no fake zeros.
+      return reply.code(502).send({ error: 'peer metrics fetch failed', peer: peerId });
+    }
   });
 
   // ------------------------------------------------------------------

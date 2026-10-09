@@ -1,3 +1,4 @@
+import { useState } from "react";
 import {
   Card,
   CardHeader,
@@ -6,8 +7,10 @@ import {
   CardContent,
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { Sparkline } from "@/components/Sparkline";
 import { liveWord, type StateWord } from "@/lib/format";
-import type { MeshPeer, StateSnapshot } from "@/lib/api";
+import { buildRemoteRows, type RemoteRow } from "@/lib/remote-metrics";
+import { getRemoteMetrics, type MeshPeer, type StateSnapshot } from "@/lib/api";
 
 const TONE: Record<string, string> = {
   ok: "text-ok",
@@ -24,7 +27,15 @@ const TONE: Record<string, string> = {
 // ids, titles, URLs, or payloads. The local machine is the rest of this
 // page, never a row here. Read-only: the write plane is the paired control
 // of #39, not this surface.
+//
+// #79/#86: each row gains ONE read-only expand — the remote range read. It
+// pulls that peer's engine + session series THROUGH this arbiter (never to
+// a peer origin, D3), on demand (no background pull), and renders the
+// #52/#57 Usage sparkline vocabulary. ADD-only: the collapsed rows render
+// exactly as before; a failed pull is a render gap, never a fake zero.
 // ---------------------------------------------------------------------------
+
+const REMOTE_WINDOW_MS = 7 * 86_400_000; // the 7-day default, local parity (D2)
 
 export function Machines({ st }: { st: StateSnapshot | null }) {
   const peers = st?.mesh?.peers ?? [];
@@ -115,9 +126,95 @@ function PeerCard({ p }: { p: MeshPeer }) {
         )}
       </CardContent>
 
+      <RemoteExpand p={p} />
+
       <div className="border-t border-border px-3 py-1.5 text-[11px] text-dim">
         <code className="truncate" title="the peer's mesh url">{p.url}</code>
       </div>
     </Card>
+  );
+}
+
+/**
+ * The one expand per peer row (#79 D6, ADD-only). Collapsed = the page
+ * renders exactly as before. On open it range-reads the peer's engine +
+ * session series THROUGH this arbiter (D3) and renders the Usage
+ * sparkline vocabulary. Never on the poll tick — this fetch happens only
+ * when the operator opens the row. A failed pull is a named gap; an
+ * in-TTL cache hit rides the `stale` label.
+ */
+function RemoteExpand({ p }: { p: MeshPeer }) {
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [rows, setRows] = useState<RemoteRow[] | null>(null);
+  const [meta, setMeta] = useState<{ stale: boolean; pulledAt: number; truncated: boolean } | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  const pull = async (id: string) => {
+    setLoading(true);
+    setErr(null);
+    try {
+      const now = Date.now();
+      const from = now - REMOTE_WINDOW_MS;
+      const [eng, ses] = await Promise.all([
+        getRemoteMetrics(id, "engine", from, now),
+        getRemoteMetrics(id, "session", from, now),
+      ]);
+      setRows(buildRemoteRows(eng.series, ses.series));
+      setMeta({ stale: eng.stale || ses.stale, pulledAt: Math.max(eng.pulled_at, ses.pulled_at), truncated: eng.truncated || ses.truncated });
+    } catch (e) {
+      setRows(null);
+      setMeta(null);
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const toggle = () => {
+    const next = !open;
+    setOpen(next);
+    if (next && p.instance_id && rows === null && !loading && err === null) void pull(p.instance_id);
+  };
+
+  return (
+    <div className="border-t border-border">
+      <button
+        type="button"
+        onClick={toggle}
+        disabled={!p.instance_id}
+        title={p.instance_id ? "pull this peer's series through the local arbiter (on demand)" : "no instance id yet — the first snapshot pull is needed"}
+        className="w-full px-3 py-1.5 text-left text-[11px] text-dim hover:text-foreground disabled:opacity-50"
+      >
+        {open ? "▾ hide peer metrics" : "▸ peer metrics"}
+        <span className="ml-2 normal-case text-[10px] opacity-70">req/hr · tokens/hr · sessions (7 d)</span>
+      </button>
+      {open && (
+        <div className="flex flex-col gap-1 px-3 pb-2">
+          {loading && <div className="text-[11px] text-dim">pulling…</div>}
+          {err && (
+            <div className="text-[11px] text-err" title="the fetch failed: the row renders offline under the 90 s stale rule — no fake zeros">
+              pull failed: {err}
+            </div>
+          )}
+          {!loading && !err && rows && rows.length === 0 && (
+            <div className="text-[11px] text-dim">no series lines in the window — the peer's store is empty here</div>
+          )}
+          {!loading && meta && (
+            <div className="text-[10px] text-dim">
+              {meta.stale ? "cached" : "live"} · pulled {Math.max(0, Math.round((Date.now() - meta.pulledAt) / 1000))}s ago
+              {meta.truncated && <span title="the 2,000-point cap trimmed the oldest"> · truncated</span>}
+            </div>
+          )}
+          {!loading && rows && rows.map((r, i) => (
+            <div key={`${r.label}-${i}`} className="flex items-center gap-2 text-[11px]">
+              <span className="w-36 min-w-0 truncate" title={r.title}>{r.label}</span>
+              <Sparkline values={r.values} stroke={r.stroke} title={r.title} />
+              <span className="w-14 text-right font-semibold">{r.valueText}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }

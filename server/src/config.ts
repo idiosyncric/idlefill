@@ -44,6 +44,10 @@ export const DEFAULTS: Omit<ServerConfig, 'state_file'> & {
   // Metrics retention store (#51 D5).
   metrics_raw_window_hours: 48,
   metrics_retention_days: 400,
+  // Cross-mesh telemetry (#79 D3): the ephemeral remote-pull cache TTL in
+  // seconds. 60 = the locked default; 0 disables the cache (pull live on
+  // every expand). In-memory only — never persisted anywhere.
+  mesh_metrics_cache_s: 60,
   // Load-axis freshness window (#52 slice 1, D3): three polls at the
   // 15-second poll_ms.
   metrics_load_stale_s: 45,
@@ -213,6 +217,13 @@ export function applyDefaults(raw: Partial<ServerConfig> | null | undefined): Se
     // retention in days. Non-positive/garbage falls back to the default.
     metrics_raw_window_hours: num(r.metrics_raw_window_hours, DEFAULTS.metrics_raw_window_hours ?? 48),
     metrics_retention_days: num(r.metrics_retention_days, DEFAULTS.metrics_retention_days ?? 400),
+    // Cross-mesh telemetry (#79 D3): the pull-cache TTL in seconds. 0 is a
+    // LEGAL value (disable the cache, pull live); negative/garbage falls
+    // back to the 60 s default.
+    mesh_metrics_cache_s: (() => {
+      const v = num(r.mesh_metrics_cache_s, DEFAULTS.mesh_metrics_cache_s ?? 60);
+      return v >= 0 ? v : (DEFAULTS.mesh_metrics_cache_s ?? 60);
+    })(),
     // Load-axis freshness window (#52 slice 1, D3): bounds the veto.
     // Non-positive/garbage falls back to the default (45 s) — a
     // window of -1 s is nonsense (same guard as rawWindowHours).

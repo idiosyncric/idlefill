@@ -479,6 +479,35 @@ export function getEngineMetrics(serverId: string, from: number, to: number): Pr
   })();
 }
 
+/**
+ * #79: the peer-row expand's range read (#86). The dashboard NEVER talks
+ * to a peer origin (the D3 posture): it asks THIS arbiter, which hops to
+ * the peer with the fleet peer_token the dashboard never sees. This is the
+ * pull side — the local admin token surface (the peer_token 401s here).
+ * Points are the PEER's own store lines, keyed as the peer named them
+ * (attribution, not merge). `stale` = a puller cache hit inside
+ * `mesh_metrics_cache_s`; `pulled_at` = the fetch clock.
+ */
+export type RemoteMetricsBody = {
+  series: { key: string; points: Record<string, unknown>[] }[];
+  truncated: boolean;
+  peer: string;
+  pulled_at: number;
+  stale: boolean;
+};
+
+export async function getRemoteMetrics(
+  peer: string,
+  series: "engine" | "lease" | "session",
+  from: number,
+  to: number,
+): Promise<RemoteMetricsBody> {
+  const t = apiToken();
+  const auth = t ? `&token=${encodeURIComponent(t)}` : "";
+  const url = `/api/metrics/remote?peer=${encodeURIComponent(peer)}&series=${series}&bucket=hour&from=${from}&to=${to}${auth}`;
+  return json(await fetch(url, { cache: "no-store" }));
+}
+
 // The authoring read (token-gated; the 5s state poll never calls this).
 export async function getAliases(): Promise<AliasRow[]> {
   const body = await json<{ aliases: AliasRow[] }>(await fetch(`/api/aliases${qsToken()}`, { cache: "no-store" }));

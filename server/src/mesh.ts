@@ -31,6 +31,7 @@
 import { randomBytes } from 'node:crypto';
 import { FleetClient, enrollmentFileOf, type FleetClientConfig } from './fleet-client.js';
 import { Identity } from './identity.js';
+import type { MetricsBucket, MetricsSeries } from './metrics.js';
 import type { ServerConfig } from './types.js';
 import type { EdgeRecord } from './edges.js';
 
@@ -52,6 +53,23 @@ export const HEARTBEAT_MS = 60_000;
  *  discipline as cleanPreview/cleanStats on the registration path). */
 const MAX_SERVERS = 20;
 const MAX_NAME = 64;
+/** Hard caps on a REMOTE METRICS answer (#79 D2, untrusted input — same
+ *  discipline as sanitizeSnapshot): the answer mirrors the local route's
+ *  2,000-point cap; key names ride the MAX_NAME pattern. */
+const MAX_SERIES_KEYS = 64;
+const MAX_POINTS_PER_KEY = 2_000;
+/** Cap on any string value inside one remote point (the store's own lines
+ *  never approach this; anything longer is hostile or broken — drop the
+ *  point). 512 > the longest honest field (paths, model names, reasons). */
+const MAX_POINT_STR_LEN = 512;
+/** Bound on the ephemeral pull cache (one entry per (url, series, key,
+ *  bucket, from, to) requested since boot; oldest evicted first). */
+const MAX_METRICS_CACHE_ENTRIES = 64;
+
+/** #79 D3: the PROPOSED pull-cache TTL default (config
+ *  `mesh_metrics_cache_s`; 0 disables the cache — pull live every time). */
+export const METRICS_CACHE_S = 60;
+
 /** Hard caps on a fleet ROSTER (untrusted input, same discipline). */
 const MAX_ROSTER_ROWS = 100;
 const MAX_URLS_PER_ROW = 16;
@@ -110,10 +128,87 @@ export interface PeerView {
   error?: string;
   /** The last snapshot pulled (null = never succeeded). */
   snapshot: MeshSnapshot | null;
+  /**
+   * #79 D3: facts about this peer's EPHEMERAL remote-metrics pull cache —
+   * an ADD key, present only after the first successful remote metrics
+   * pull. The cache itself lives ONLY here in memory: the entries never
+   * ride `state.json` and never enter the local metrics store (the
+   * non-persistence clause, mesh.md D1 applied to metrics). The view
+   * counts entries and the last pull clock; it never carries a line.
+   */
+  metrics_cache?: { entries: number; last_pulled_at: number };
 }
 
 /** Fetch one peer's /api/mesh snapshot. Injectable for tests; throws on any failure. */
 export type MeshFetcher = (url: string, token: string) => Promise<unknown>;
+
+/**
+ * #79 D2: the sanitized shape of a peer's `GET /api/metrics/remote` answer.
+ * It mirrors the local `/api/metrics` response (series key + raw store
+ * lines + the truncated flag) — the lines ride as the peer named them (the
+ * attribution rule: no renaming, no merge). Display-only: a remote line
+ * NEVER feeds routing, the store, or a decision.
+ */
+export interface RemoteMetricsAnswer {
+  series: { key: string; points: Record<string, unknown>[] }[];
+  truncated: boolean;
+}
+
+/** Fetch one peer's /api/metrics/remote range. Injectable; throws on failure. */
+export type RemoteMetricsFetcher = (url: string, token: string) => Promise<unknown>;
+
+/**
+ * Validate + cap a REMOTE metrics answer (untrusted input — the same
+ * discipline as sanitizeSnapshot, #79 grill report "trust boundary"). A
+ * malformed envelope yields null (the pull is a failure, not a poison).
+ * Garbage POINTS are dropped individually (a render gap, never a crash):
+ * each must carry the line `kind` the pull ASKED for (`series`+`bucket` —
+ * the #51 store's own kind discipline, so an honest peer's bytes always
+ * pass and an off-kind line is hostile or broken), a finite epoch-ms `ts`,
+ * and no absurdly long string value. Key names are length-capped (MAX_NAME
+ * pattern), key COUNT and per-key POINTS are capped (the 2,000-point cap,
+ * mirrored).
+ */
+export function sanitizeRemoteMetrics(
+  raw: unknown,
+  expect: { series: MetricsSeries; bucket: MetricsBucket },
+): RemoteMetricsAnswer | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  if (!Array.isArray(r.series)) return null;
+  const wantKind = expect.bucket === 'hour' ? `${expect.series}_hour` : expect.series;
+  const out: RemoteMetricsAnswer = {
+    series: [],
+    truncated: typeof r.truncated === 'boolean' ? r.truncated : false,
+  };
+  for (const s of r.series.slice(0, MAX_SERIES_KEYS)) {
+    if (!s || typeof s !== 'object' || Array.isArray(s)) continue;
+    const so = s as Record<string, unknown>;
+    const key = typeof so.key === 'string' && so.key.trim() !== '' ? so.key.slice(0, MAX_NAME) : '';
+    if (key === '') continue;
+    if (out.series.some((x) => x.key === key)) continue; // a duplicate key is noise, not a second truth
+    const points: Record<string, unknown>[] = [];
+    if (Array.isArray(so.points)) {
+      for (const p of so.points.slice(0, MAX_POINTS_PER_KEY)) {
+        if (!p || typeof p !== 'object' || Array.isArray(p)) continue;
+        const po = p as Record<string, unknown>;
+        if (typeof po.ts !== 'number' || !Number.isFinite(po.ts) || po.ts < 0 || po.ts > 8.64e15) continue;
+        if (po.kind !== wantKind) continue; // off-kind line: not the series that was asked for
+        let usable = true;
+        for (const v of Object.values(po)) {
+          if (typeof v === 'string' && v.length > MAX_POINT_STR_LEN) {
+            usable = false;
+            break;
+          }
+        }
+        if (!usable) continue;
+        points.push(po);
+      }
+    }
+    out.series.push({ key, points });
+  }
+  return out;
+}
 
 /**
  * One row of the fleet roster (the shape `GET /roster` returns per
@@ -443,6 +538,8 @@ export interface FederationOptions {
    *  including the local one. Absent = no self-detection (a self-row merges
    *  like any other row). */
   localPublicKey?: () => string;
+  /** The remote-metrics fetcher (#79 D2). Absent = `makeRealRemoteMetricsFetcher`. */
+  remoteMetricsFetcher?: RemoteMetricsFetcher;
 }
 
 export class MeshFederation {
@@ -452,7 +549,17 @@ export class MeshFederation {
   private readonly edgeFiller?: EdgeFiller;
   private readonly heartbeatSender?: HeartbeatSender;
   private readonly localPublicKey?: () => string;
+  private readonly remoteFetcher: RemoteMetricsFetcher;
   private readonly peers = new Map<string, PeerEntry>();
+  /**
+   * The EPHEMERAL remote-metrics pull cache (#79 D3): one entry per
+   * (peer url, series, key, bucket, from, to). In memory ONLY — never
+   * written to `state.json`, never appended to the local metrics store.
+   * A failed fetch drops the entry. A restart clears it.
+   */
+  private readonly metricsCache = new Map<string, { fetchedAt: number; answer: RemoteMetricsAnswer }>();
+  /** url -> clock of the last SUCCESSFUL remote metrics pull (view-only). */
+  private readonly lastMetricsPullAt = new Map<string, number>();
   /** When a roster pull is due next (epoch-ms). 0 = never armed (no fleet_url). */
   private nextRosterPullAt = 0;
   /** When a fleet heartbeat is due next (epoch-ms). 0 = never armed
@@ -470,6 +577,7 @@ export class MeshFederation {
     this.edgeFiller = opts.edgeFiller;
     this.heartbeatSender = opts.heartbeatSender;
     this.localPublicKey = opts.localPublicKey;
+    this.remoteFetcher = opts.remoteMetricsFetcher ?? makeRealRemoteMetricsFetcher();
     for (const p of cfg.mesh_peers ?? []) {
       const url = String(p?.url ?? '').trim().replace(/\/+$/, '');
       if (!url || url === 'self') continue;
@@ -708,7 +816,94 @@ export class MeshFederation {
       fetch_age_s: p.lastOk === null ? null : Math.max(0, Math.round((now - p.lastOk) / 1000)),
       ...(p.lastError ? { error: p.lastError } : {}),
       snapshot: p.snapshot,
+      // #79 D3: the EPHEMERAL remote-metrics cache view for this peer —
+      // ADD key, absent until the first successful pull. Counts only: no
+      // line ever rides the view (the non-persistence clause, and the
+      // coarse-by-construction rule for what /api/state carries).
+      ...(this.metricsCache.size > 0 && this.cacheEntriesFor(p.url) > 0
+        ? { metrics_cache: { entries: this.cacheEntriesFor(p.url), last_pulled_at: this.lastMetricsPullAt.get(p.url) ?? now } }
+        : {}),
     }));
+  }
+
+  /**
+   * #79 D2: the url of a KNOWN peer by observed instance_id (null =
+   * unknown). The id, not the url, is the peer identity (slice-9 rule) —
+   * the dashboard expands a row by id and the arbiter resolves the hop.
+   */
+  peerUrlFor(instanceId: string): string | null {
+    for (const p of this.peers.values()) {
+      if (p.instanceId !== null && p.instanceId === instanceId) return p.url;
+    }
+    return null;
+  }
+
+  /**
+   * #79 D2/D3: the on-demand remote range pull. NEVER on the 15 s tick —
+   * only when the operator expands a peer row. The answer passes through
+   * `sanitizeRemoteMetrics` (untrusted input): a failed or malformed
+   * fetch DROPS the cache line and throws (the row renders offline under
+   * the PEER_STALE_MS rule; a render gap, no fake zero, no poisoned
+   * cache). A cache hit inside `mesh_metrics_cache_s` (default 60 s, 0
+   * disables) answers with the ORIGINAL fetch clock and stale = true.
+   * Nothing here is ever persisted: the cache is in-memory only, cleared
+   * by a restart, never written to state.json, never appended to the
+   * local metrics store.
+   */
+  async pullMetrics(
+    instanceId: string,
+    q: { series: MetricsSeries; key?: string; from: number; to: number; bucket: MetricsBucket },
+    now: number,
+  ): Promise<{ answer: RemoteMetricsAnswer; pulledAt: number; stale: boolean }> {
+    const url = this.peerUrlFor(instanceId);
+    if (!url) throw new Error(`unknown peer instance_id: ${instanceId.slice(0, 64)}`);
+    const rawTtl = this.cfg.mesh_metrics_cache_s;
+    const ttlS = rawTtl === undefined || !Number.isFinite(rawTtl) ? METRICS_CACHE_S : Math.max(0, rawTtl);
+    const cacheKey = `${url}|${q.series}|${q.key ?? ''}|${q.bucket}|${q.from}|${q.to}`;
+    if (ttlS > 0) {
+      const hit = this.metricsCache.get(cacheKey);
+      if (hit && now - hit.fetchedAt < ttlS * 1000) {
+        return { answer: hit.answer, pulledAt: hit.fetchedAt, stale: true };
+      }
+    }
+    const qs = new URLSearchParams({ series: q.series, from: String(q.from), to: String(q.to), bucket: q.bucket });
+    if (q.key) qs.set('key', q.key);
+    let answer: RemoteMetricsAnswer | null = null;
+    try {
+      answer = sanitizeRemoteMetrics(
+        await this.remoteFetcher(`${url}/api/metrics/remote?${qs.toString()}`, this.cfg.peer_token ?? ''),
+        { series: q.series, bucket: q.bucket },
+      );
+    } catch {
+      answer = null; // unreachable / 401 / timeout: one failed render, never a throw out of the route
+    }
+    if (!answer) {
+      this.metricsCache.delete(cacheKey); // failure drops the line (never a stale ghost)
+      throw new Error('peer metrics fetch failed');
+    }
+    if (this.metricsCache.size >= MAX_METRICS_CACHE_ENTRIES) {
+      let oldestKey = '';
+      let oldest = Infinity;
+      for (const [k, e] of this.metricsCache) {
+        if (e.fetchedAt < oldest) {
+          oldest = e.fetchedAt;
+          oldestKey = k;
+        }
+      }
+      if (oldestKey !== '') this.metricsCache.delete(oldestKey);
+    }
+    this.metricsCache.set(cacheKey, { fetchedAt: now, answer });
+    this.lastMetricsPullAt.set(url, now);
+    return { answer, pulledAt: now, stale: false };
+  }
+
+  /** Cache-entry count for one peer url (the view counts, never the lines). */
+  private cacheEntriesFor(url: string): number {
+    let n = 0;
+    for (const k of this.metricsCache.keys()) {
+      if (k.startsWith(`${url}|`)) n++;
+    }
+    return n;
   }
 }
 
@@ -817,6 +1012,23 @@ export function makeRealMeshFetcher(timeoutMs = 10_000): MeshFetcher {
       signal: AbortSignal.timeout(timeoutMs),
     });
     if (!res.ok) throw new Error(`mesh fetch HTTP ${res.status}`);
+    return await res.json();
+  };
+}
+
+/**
+ * #79 D2/D4: the real remote-metrics fetcher — GET {peer}/api/metrics/remote
+ * with the fleet peer_token (the ONLY credential that opens the peer's
+ * serve side). The token never leaves the arbiter; the dashboard never
+ * sees it.
+ */
+export function makeRealRemoteMetricsFetcher(timeoutMs = 10_000): RemoteMetricsFetcher {
+  return async (url, token) => {
+    const res = await fetch(url, {
+      headers: token ? { authorization: `Bearer ${token}` } : {},
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) throw new Error(`remote metrics fetch HTTP ${res.status}`);
     return await res.json();
   };
 }

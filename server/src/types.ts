@@ -186,6 +186,13 @@ export interface ServerConfig {
    */
   metrics_retention_days?: number;
   /**
+   * Cross-mesh telemetry (#79 D3): the TTL, in seconds, of the EPHEMERAL
+   * remote-metrics pull cache on the PULLER side. Default 60; 0 disables
+   * the cache (pull live every expand). In-memory only — the cache never
+   * touches state.json and never enters the local metrics store.
+   */
+  mesh_metrics_cache_s?: number;
+  /**
    * Load-axis freshness window (#52 slice 1, D3): seconds after which a
    * captured load reading is stale. A stale reading is UNKNOWN (D2 rule 2):
    * it never vetoes and never supports. Default 45 (three polls at the
