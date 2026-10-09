@@ -24,6 +24,12 @@ only, no fastify).
 - `POST /heartbeat` — body `{instance_id, nonce, signature, urls[],
   presence}`. The instance signs the nonce with its ed25519 key. A bad
   signature or a replayed nonce is a 401.
+
+**Payload shape, read carefully.** The fleet service signs the bare
+nonce string (`fleet/src/store.ts:252`). The mesh edge plane signs a
+canonical `{instance_id, path, ts, nonce}` envelope
+(`server/src/edges.ts`). Two planes, two shapes. A helper written for
+one fails closed on the other: safe, but not obvious.
 - `GET /roster?instance_id&nonce&signature` — the full fleet. Each
   row: `{instance_id, name, public_key, urls[], last_seen}`.
 
