@@ -12,7 +12,7 @@
  * row has no credential → the collector names the gap (lastFailReason)
  * and the D4 predicate can never fire.
  */
-import { LoadCollector } from '../src/load.js';
+import { LoadCollector } from '../server/src/load.js';
 
 const ROW = {
   id: 'srv-f1c85327', // the live arbiter's strata row (from /api/state)
