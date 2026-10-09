@@ -132,6 +132,8 @@ export type ClientRow = {
   proxy_port?: number;
   aggregate_port?: number;
   daemon_behind?: boolean;
+  /** The client's local Hermes profile roster (#80); absent on old clients / no Hermes home. */
+  agent_roster?: AgentRosterRow[];
   projects: {
     name: string;
     model: string;
@@ -276,6 +278,22 @@ export type AgentEndpoint = {
   url: string;
   /** The default model the mint hand-off bakes into the config (the highest-priority alias, else the first bare name, else null). */
   model?: string | null;
+};
+
+// ---------------------------------------------------------------------------
+// Agent roster (#80): the LOCAL machine's Hermes profiles + per-profile
+// idlefill posture, published on the register heartbeat and echoed on
+// /api/state (each client row) + served by GET /api/agent-roster. The
+// dashboard joins these rows to the minted agent keys by EXACT
+// profile-name = key-label match (never fuzzy). `posture`: `adopted`
+// routes through idlefill; `external`/`unset` route elsewhere / have no
+// config. Absent on a client without a Hermes home (the roster card hides).
+// ---------------------------------------------------------------------------
+export type AgentRosterRow = {
+  profile: string;
+  posture: "adopted" | "external" | "unset";
+  provider?: string;
+  base_url?: string;
 };
 
 export type MeshPeerServer = {
@@ -435,6 +453,21 @@ export async function getAgentEndpoints(): Promise<AgentEndpoint[]> {
     await fetch(`/api/agent-endpoints${qsToken()}`, { cache: "no-store" }),
   );
   return body.endpoints ?? [];
+}
+
+// The local machine's Hermes profile roster (#80). Token-gated like the
+// other authoring reads; the route omits `roster` when no loopback client is
+// online or it reported none — the view hides the roster card then (it never
+// shows an empty list).
+export async function getAgentRoster(): Promise<{ client?: string; roster: AgentRosterRow[] }> {
+  try {
+    const body = await json<{ client?: string; roster?: AgentRosterRow[] }>(
+      await fetch(`/api/agent-roster${qsToken()}`, { cache: "no-store" }),
+    );
+    return { client: body.client, roster: body.roster ?? [] };
+  } catch {
+    return { roster: [] };
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -73,6 +73,7 @@ import { startAggregateRouter, type AggregateAliasEntry, type AggregateCatalogEn
 import { SessionGate, type SessionStateRow } from './session-gate.js';
 import { resolveVersion } from './version.js';
 import { resolveRevision } from './revision.js';
+import { scanHermesProfiles, type AgentRosterRow } from './agent-roster.js';
 
 const clientDir = dirname(fileURLToPath(import.meta.url));
 
@@ -1250,6 +1251,22 @@ export class ClientDaemon {
     // also feeds the register body below exactly once).
     const behind = this.daemonBehind();
     const logTail = typeof this.log.tail === 'function' ? this.log.tail() : undefined;
+    // Agent roster (#80): the profiles of THIS machine's Hermes home, with
+    // the per-profile idlefill posture, re-scanned on every heartbeat (the
+    // 20s cadence is well inside the issue's 30s staleness floor; the
+    // profiles dir does not churn). ADD-key: a machine without a Hermes
+    // home (the Linux daemons) omits the key — the roster pane hides rather
+    // than showing an empty list. The posture discriminator uses the
+    // daemon's OWN configured aggregate port (the value it reports as
+    // `aggregate_port`); aggregate_port=0 (disabled) can never classify a
+    // profile adopted. Best-effort: an I/O hiccup omits the key this tick,
+    // never breaks the heartbeat.
+    let roster: AgentRosterRow[] | undefined;
+    try {
+      roster = scanHermesProfiles(this.cfg.aggregate_port);
+    } catch {
+      roster = undefined;
+    }
     const { status, body } = await api<{ client_id: string; created?: boolean }>(this.cfg, 'POST', '/api/clients/register', {
       name: this.cfg.client_name,
       ip: this.cfg.ip || undefined,
@@ -1291,6 +1308,11 @@ export class ClientDaemon {
       // aggregate listener never came up (or aggregate_port=0) reports
       // nothing, and the Add-agent flow says so instead of guessing.
       ...(this.aggregate ? { aggregate_port: this.aggregate.port } : {}),
+      // Agent roster (#80): the local Hermes profiles + per-profile posture,
+      // re-scanned each heartbeat. ADD-key: an old arbiter ignores it; a
+      // daemon without a Hermes home (or with aggregate_port=0) omits it —
+      // the roster pane hides rather than showing an empty list.
+      ...(roster ? { agent_roster: roster } : {}),
       // Code-staleness verdict (#61 step 3 A1): the client is the ONLY
       // process holding both facts — the boot revision it loaded code from
       // and the live HEAD of the same checkout (it runs FROM that tree).

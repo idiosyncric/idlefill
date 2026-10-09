@@ -5,6 +5,7 @@ import {
   CardContent,
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import {
   Dialog,
@@ -26,10 +27,12 @@ import {
   apiToken,
   getAgentKeys,
   getAgentEndpoints,
+  getAgentRoster,
   mintAgentKey,
   revokeAgentKey,
   type AgentEndpoint,
   type AgentKeyRow,
+  type AgentRosterRow,
 } from "@/lib/api";
 import { ago } from "@/lib/format";
 
@@ -97,15 +100,23 @@ function configBlock(url: string, model: string): string {
 export function Agents({ st }: { st: StateSnapshotLike | null }) {
   const [keys, setKeys] = React.useState<AgentKeyRow[]>([]);
   const [endpoints, setEndpoints] = React.useState<AgentEndpoint[]>([]);
+  // The local Hermes profile roster (#80): `null` = not fetched yet / no
+  // token (roster card hidden); `[]` = the route answered with no roster
+  // (no online loopback client, or a daemon without a Hermes home) → the
+  // card is hidden too (never an empty list); a non-empty array renders.
+  const [roster, setRoster] = React.useState<AgentRosterRow[] | null>(null);
   const [modal, setModal] = React.useState(false);
+  // Label pre-fill for the EXISTING mint dialog (#72): set when an unadopted
+  // roster row's "mint key" is clicked; the dialog seeds its label field.
+  const [prefillLabel, setPrefillLabel] = React.useState("");
   const [armedId, setArmedId] = React.useState<string | null>(null);
   const now = st?.now ?? Date.now();
 
   const hasToken = apiToken() !== null;
 
-  // The authoring read pair: token-gated (no token → no request leaves the
-  // page); a non-200 keeps the rows in hand (drop-don't-wipe). 30s cadence,
-  // like the Models pane.
+  // The authoring read pair + the roster: token-gated (no token → no request
+  // leaves the page); a non-200 keeps the rows in hand (drop-don't-wipe).
+  // 30s cadence, like the Models pane.
   const refresh = React.useCallback(async () => {
     if (!apiToken()) return;
     try {
@@ -117,6 +128,12 @@ export function Agents({ st }: { st: StateSnapshotLike | null }) {
       setEndpoints(await getAgentEndpoints());
     } catch {
       /* the modal re-picks from the last good list */
+    }
+    try {
+      const r = await getAgentRoster();
+      setRoster(r.roster);
+    } catch {
+      /* the roster keeps its last good rows */
     }
   }, []);
 
@@ -155,6 +172,7 @@ export function Agents({ st }: { st: StateSnapshotLike | null }) {
               toast.error("needs the arbiter API token — paste it in the header first");
               return;
             }
+            setPrefillLabel("");
             setModal(true);
           }}
           title="mint an idlefill agent key for one agent (Hermes profile, OpenAI client)"
@@ -162,6 +180,10 @@ export function Agents({ st }: { st: StateSnapshotLike | null }) {
           + new agent key
         </Button>
       </div>
+
+      {hasToken && roster && roster.length > 0 && (
+        <RosterCard roster={roster} keys={keys} onMint={(name) => { setPrefillLabel(name); setModal(true); }} />
+      )}
 
       {!hasToken ? (
         <Card className="py-4 shadow-none">
@@ -198,13 +220,91 @@ export function Agents({ st }: { st: StateSnapshotLike | null }) {
         </Card>
       )}
 
-      <MintDialog open={modal} onOpenChange={setModal} endpoints={endpoints} />
+      <MintDialog open={modal} onOpenChange={setModal} endpoints={endpoints} prefillLabel={prefillLabel} />
     </section>
   );
 }
 
 // The minimal state shape the view needs (only for the ages).
 type StateSnapshotLike = { now: number };
+
+// ---------------------------------------------------------------------------
+// The local Hermes profile roster (#80): a read-only "profiles on this
+// machine" list above the agent-key list (same card family, no new route).
+// Join to minted keys by EXACT profile-name = key-label match only — never
+// fuzzy. Posture tag is exception-only (the other surfaces' style): `adopted`
+// shows the exception "routes through idlefill"; `external`/`unset` show the
+// unadopted variant. A minted key whose label exactly matches a profile name
+// tags that row `key minted`; an unadopted row offers a `mint key` action that
+// opens the EXISTING mint dialog with the label pre-filled (zero new routes).
+// ---------------------------------------------------------------------------
+function RosterCard({
+  roster,
+  keys,
+  onMint,
+}: {
+  roster: AgentRosterRow[];
+  keys: AgentKeyRow[];
+  onMint: (profile: string) => void;
+}) {
+  const adopted = roster.filter((r) => r.posture === "adopted").length;
+  // Exact label match only — the label is the one human-chosen fact of a minted
+  // row; the #72 hand-off intends it to carry the profile name. Never fuzzy.
+  const mintedLabels = new Set(keys.map((k) => k.label));
+  return (
+    <Card className="mb-4 py-0 shadow-none">
+      <CardContent className="flex flex-col">
+        <div className="flex items-center gap-2 border-b border-border px-3 py-2 text-[11px] text-dim">
+          <span className="font-semibold uppercase tracking-wide">profiles on this machine</span>
+          <span className="ml-auto">{adopted} of {roster.length} profiles adopted</span>
+        </div>
+        <div className="flex flex-col gap-1 px-3 py-2">
+          {roster.map((r) => {
+            const minted = mintedLabels.has(r.profile);
+            return (
+              <div key={r.profile} className="flex items-center gap-2 text-[12px]">
+                <span className="min-w-0 truncate font-semibold" title={r.base_url ?? r.profile}>
+                  {r.profile}
+                </span>
+                {r.posture === "adopted" && (
+                  <Badge variant="outline" className="h-4 rounded-pill px-1.5 py-0 text-[10px] font-normal text-accent">
+                    routes through idlefill
+                  </Badge>
+                )}
+                {r.posture === "external" && (
+                  <Badge variant="outline" className="h-4 rounded-pill px-1.5 py-0 text-[10px] font-normal text-dim">
+                    elsewhere
+                  </Badge>
+                )}
+                {r.posture === "unset" && (
+                  <Badge variant="outline" className="h-4 rounded-pill px-1.5 py-0 text-[10px] font-normal text-dim">
+                    no config
+                  </Badge>
+                )}
+                {minted && (
+                  <Badge variant="outline" className="h-4 rounded-pill px-1.5 py-0 text-[10px] font-normal text-dim">
+                    key minted
+                  </Badge>
+                )}
+                {r.posture !== "adopted" && !minted && (
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    className="ml-auto h-6 px-2 text-[11px]"
+                    onClick={() => onMint(r.profile)}
+                    title="open the mint dialog with this profile name pre-filled as the key label"
+                  >
+                    mint key
+                  </Button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
 
 // The mint dialog. Phase 1: label + machine pick. Phase 2 (minted): the
 // ONE-TIME hand-off block — the plaintext rides the in-memory state only;
@@ -213,10 +313,13 @@ function MintDialog({
   open,
   onOpenChange,
   endpoints,
+  prefillLabel,
 }: {
   open: boolean;
   onOpenChange: (o: boolean) => void;
   endpoints: AgentEndpoint[];
+  /** The roster row that opened this dialog (if any) — pre-fills the label. */
+  prefillLabel?: string;
 }) {
   const [label, setLabel] = React.useState("");
   const [epIndex, setEpIndex] = React.useState<string>("0");
@@ -228,7 +331,10 @@ function MintDialog({
 
   React.useEffect(() => {
     if (!open) return;
-    setLabel("");
+    // Seed the label from the roster row that opened the dialog (the #80
+    // "mint key" pre-fill) — a fresh mint from the header button leaves it
+    // blank (prefillLabel cleared by the caller before setModal(true)).
+    setLabel(prefillLabel ?? "");
     setEpIndex(endpoints.length === 1 ? "0" : "0");
     setErr(null);
     setMinted(null);
