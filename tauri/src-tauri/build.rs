@@ -20,6 +20,10 @@ fn main() {
             "relaunch_arbiter_cmd",
             "glance_state",
             "glance_action",
+            // The signed updater channel (#75, D6: GUI-triggered — these
+            // are the only updater IPC the settings window reaches).
+            "update_check",
+            "update_install",
         ]),
     ))
     .expect("tired of reading tauri build errors? run `tauri dev`")

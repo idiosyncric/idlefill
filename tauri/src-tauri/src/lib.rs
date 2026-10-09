@@ -10,6 +10,12 @@ mod deeplink;
 mod glance;
 mod lifecycle;
 mod token;
+// The signed updater channel's pure contract (the D3/D5/D6 rules the
+// settings view, scripts/release.sh, and the TS dry-run harness all
+// mirror) is the shell's public updater plane: `latest_json` builds the
+// manifest, `is_sig_b64` guards the `.sig` field, `status_line` renders
+// the verdict, `check_verdict` pins the D5 compare.
+pub mod updater;
 
 use glance::Conn;
 use serde::Serialize;
@@ -19,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_deep_link::DeepLinkExt;
 
 /// The build marker (D7): baked at compile time from
@@ -589,6 +595,55 @@ fn relaunch_arbiter_cmd(app: AppHandle) -> SettingsSnapshot {
     snapshot(&app)
 }
 
+// ---------------------------------------------------------------------------
+// the signed updater channel (issue #75, docs/architecture/shell-updater.md)
+// ---------------------------------------------------------------------------
+// D6 LOCKED: exception-only and GUI-triggered. These two commands are the
+// ONLY entry points to the updater — no check at launch, no timer, no
+// watchdog. D4: an empty `plugins.updater.pubkey` means the channel is
+// inert (a clean result, not an error): the commands refuse before any
+// feed request, so a keyless build never touches the network.
+
+/// The settings "Check for updates…" verb (the D6 trigger). Resolves to
+/// the state the view renders — Inert when the channel is off, so the
+/// view's meta line carries the owner-step hint.
+#[tauri::command]
+async fn update_check(app: AppHandle) -> updater::UpdateState {
+    updater::check(&app).await
+}
+
+/// The "Install and restart" verb. The settings row renders ONLY in the
+/// Available state (D6 exception-only, like the arbiter rows), so this
+/// is reached with a found update; the install replaces the app bundle
+/// and relaunches it (the relaunch path D6 checks against the D1
+/// tray-keepalive by acceptance). `on_progress` is a chunked IPC event
+/// to the settings window (the status line during the download).
+#[tauri::command]
+async fn update_install(app: AppHandle) -> Result<(), String> {
+    let win = app.get_webview_window(SETTINGS_LABEL);
+    let mut done: u64 = 0;
+    let app2 = app.clone();
+    let result = updater::install(&app, move |chunk, total| {
+        done = done.saturating_add(chunk);
+        if let Some(w) = app2.get_webview_window(SETTINGS_LABEL) {
+            let _ = w.emit_to(
+                "settings",
+                "updater-progress",
+                json!({ "done": done, "total": total }),
+            );
+        }
+    })
+    .await;
+    if let Some(w) = win {
+        let _ = w.emit_to(
+            "settings",
+            "updater-progress",
+            json!({ "done": done, "total": null, "finished": true }),
+        );
+    }
+    result
+}
+
 /// The glance's render source: the pure specs projected to JSON. The
 /// glance HTML never recomputes anything (the "rows render from the
 /// spec" rule the Swift harnesses pinned).
@@ -799,6 +854,17 @@ pub fn build() -> tauri::Result<()> {
             }
         }))
         .plugin(tauri_plugin_deep_link::init())
+        // The signed updater channel (#75): the plugin needs no key to
+        // register (its setup stores the config verbatim — verified in
+        // tauri-plugin-updater 2.13.2 Builder::build), so registration
+        // is free on every build. USE is gated: the commands refuse
+        // before any feed request when `plugins.updater.pubkey` is
+        // empty (the committed key-free posture, D4). The JS API
+        // commands it registers (check/download/install) are NOT
+        // granted to any window in capabilities/default.json — the
+        // settings verbs (update_check / update_install) are the only
+        // IPC the channel exposes.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(shared)
         // Window events: close-to-tray for the main window (D1:
         // CloseRequested -> prevent_close + hide, webview_window.rs:1643 /
@@ -839,7 +905,9 @@ pub fn build() -> tauri::Result<()> {
             set_daemon,
             relaunch_arbiter_cmd,
             glance_state,
-            glance_action
+            glance_action,
+            update_check,
+            update_install
         ])
         .setup(move |app| {
             build_main_window(app)?;

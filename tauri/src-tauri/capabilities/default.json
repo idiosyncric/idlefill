@@ -11,6 +11,8 @@
     "allow-relaunch-arbiter-cmd",
     "allow-glance-state",
     "allow-glance-action",
+    "allow-update-check",
+    "allow-update-install",
     "pilot:default",
     "mcp-bridge:default"
   ]

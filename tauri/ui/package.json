@@ -7,7 +7,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test --test-timeout=20000 --test-force-exit test/updater-manifest.test.ts"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.9.0",

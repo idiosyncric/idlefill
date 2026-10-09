@@ -26,6 +26,12 @@
       "desktop": {
         "schemes": ["idlefill"]
       }
+    },
+    "updater": {
+      "endpoints": [
+        "https://git.samwarth.com/sam/idlefill/releases/download/latest/latest.json"
+      ],
+      "pubkey": ""
     }
   }
 }
