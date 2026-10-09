@@ -200,8 +200,13 @@ export function createApp(opts: { dbFile: string; tokenTtlMs: number; pairCodeTt
       // hint for A and is never stored.
       // -----------------------------------------------------------------
       if (path === '/pair/code' && req.method === 'POST') {
-        const { code, expires_at } = mintPairCode(db, authInstanceId, opts.pairCodeTtlMs ?? 5 * 60_000, now());
-        return send(res, 200, { code, ttl_s: Math.round((expires_at - now()) / 1000) });
+        const r = mintPairCode(db, authInstanceId, opts.pairCodeTtlMs ?? 5 * 60_000, now());
+        if (!r.ok) {
+          // The auth layer already 401s an unknown signer; this is the
+          // defence-in-depth guard (a ghost id can never mint a code).
+          return send(res, 400, { error: r.error });
+        }
+        return send(res, 200, { code: r.code, ttl_s: Math.round((r.expires_at - now()) / 1000) });
       }
 
       // -----------------------------------------------------------------
