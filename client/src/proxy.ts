@@ -33,6 +33,25 @@ import { handleSessionControl, type SessionControlOpts } from './session-control
  */
 const TRANSCRIPT_PATH_RE = /^\/sessions\/([^/]+)\/transcript$/;
 
+/**
+ * #42 slice 2: the plugin's loopback contract — the daemon-side half of
+ * what `plugins/hermes-idlefill` calls (ISSUE42-PLUGIN-REPORT.md):
+ *
+ *   POST /gate/heartbeat  {session_id, token?}  → 200 (idempotent bind)
+ *   GET  /gate/state?session_id=...[&token=...] → {state, position?}
+ *
+ * Path shapes cannot collide with anything else on this bind:
+ *   - `/s/<token>/...` (SESSION_PATH_RE) requires the `/s/` segment, so a
+ *     `/gate/...` path is never mistaken for session traffic and never
+ *     enters the gate's request path;
+ *   - the control surfaces (`/sessions/...`, `/client/projects`) have
+ *     other first segments too.
+ * The gate answers these — the proxy only parses and forwards (the token
+ * NEVER leaves the gate: state bodies carry state + position only).
+ */
+const GATE_HEARTBEAT_PATH = '/gate/heartbeat';
+const GATE_STATE_PATH = '/gate/state';
+
 export interface ProxyLogEntry {
   ts: number;
   method: string;
@@ -214,6 +233,96 @@ export function startLlmProxy(opts: {
         u = new URL('http://127.0.0.1/');
       }
       if (handleSessionControl(req, res, u, opts.sessionControl)) return;
+    }
+    // #42 slice 2: the plugin's gate surface — answered BEFORE the
+    // transcript / gate / passthrough paths so a plugin call can never
+    // be mistaken for session traffic or reach the LLM target. Both
+    // routes need the gate: absent (gate-less daemon) ⇒ the paths fall
+    // through to the pre-slice behavior (plain passthrough) untouched.
+    if (opts.gate && (rawUrl === GATE_HEARTBEAT_PATH || rawUrl === GATE_STATE_PATH || rawUrl.startsWith(GATE_STATE_PATH + '?'))) {
+      try {
+        const gate = opts.gate;
+        const u42 = new URL(rawUrl, 'http://127.0.0.1');
+        if (rawUrl === GATE_HEARTBEAT_PATH) {
+          // POST only (the bind is a state change; a GET here would 405,
+          // so a mistaken fetch is visible). The body is small and
+          // bounded (16 KB — a plugin heartbeat is two short strings);
+          // oversized or malformed payloads fail QUIET at the bind
+          // (200, nothing learned) — a bad heartbeat never errors and
+          // never wedges the plugin (fail-open).
+          if (req.method !== 'POST') {
+            res.writeHead(405, { 'content-type': 'application/json', allow: 'POST' });
+            res.end(JSON.stringify({ error: 'method not allowed' }));
+            return;
+          }
+          // The body is small and bounded (16 KB — a plugin heartbeat is
+          // two short strings). Oversized or malformed payloads fail
+          // QUIET at the bind (200, nothing learned): a bad heartbeat
+          // never errors and never wedges the plugin (fail-open).
+          const rawParts: Buffer[] = [];
+          let total = 0;
+          let oversize = false;
+          let finished = false;
+          const payload: { session_id?: unknown; token?: unknown } = {};
+          const finish = (): void => {
+            if (finished) return;
+            finished = true;
+            if (!oversize) {
+              const text = Buffer.concat(rawParts).toString('utf8');
+              if (text.length > 0) {
+                try {
+                  const p = JSON.parse(text);
+                  if (p && typeof p === 'object' && !Array.isArray(p)) {
+                    payload.session_id = p.session_id;
+                    payload.token = p.token;
+                  }
+                } catch {
+                  /* malformed body: fail-quiet at the bind (200, no bind) */
+                }
+              }
+            }
+            res.end(); // 200 (idempotent — the plugin's contract shape)
+            gate.heartbeatSession(payload.session_id, payload.token);
+          };
+          req.on('data', (c: Buffer) => {
+            total += c.length;
+            if (total > 16 * 1024) {
+              oversize = true;
+              return;
+            }
+            rawParts.push(c);
+          });
+          req.on('end', finish);
+          req.on('error', finish);
+          return;
+        }
+        // GET /gate/state?session_id=...[&token=...] — the plugin's state
+        // read. The gate resolves the token (explicit param, else the
+        // learned id→token index) and reports its REAL state; an unknown
+        // id stays 'armed' (never a hold). The body is state + position
+        // only — the token never appears in it.
+        if (req.method !== 'GET' && req.method !== 'HEAD') {
+          res.writeHead(405, { 'content-type': 'application/json', allow: 'GET, HEAD' });
+          res.end(JSON.stringify({ error: 'method not allowed' }));
+          return;
+        }
+        const sessionId = u42.searchParams.get('session_id') ?? undefined;
+        const tokenParam = u42.searchParams.get('token') ?? undefined;
+        const body = JSON.stringify(gate.gateStateForSession(sessionId, tokenParam));
+        res.writeHead(200, {
+          'content-type': 'application/json',
+          'content-length': String(Buffer.byteLength(body)),
+        });
+        res.end(req.method === 'HEAD' ? undefined : body);
+        return;
+      } catch {
+        // A parse failure at this surface must never wedge the plugin —
+        // answer armed (fail-quiet) and move on.
+        const fb = JSON.stringify({ state: 'armed' });
+        res.writeHead(200, { 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(fb)) });
+        res.end(fb);
+        return;
+      }
     }
     const m = opts.gate ? SESSION_PATH_RE.exec(rawUrl) : null;
     // #78: the session viewer's read-only transcript surface. Answered BEFORE
