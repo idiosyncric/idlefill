@@ -162,7 +162,10 @@ pub fn status_line(state: &UpdateState, progress: Option<&DownloadProgress>) -> 
                     _ => format!("downloading {v} — {} bytes", p.done),
                 }
             }
-            None => format!("update {} available", state.version.as_deref().unwrap_or("?")),
+            None => format!(
+                "update {} available",
+                state.version.as_deref().unwrap_or("?")
+            ),
         },
         UpdateStatus::Error => format!(
             "check failed — {}",
@@ -222,9 +225,7 @@ pub async fn install(
     if !channel_configured(app) {
         return Err("updater off — no signing key configured".into());
     }
-    let updater = app
-        .updater()
-        .map_err(|e| format!("updater init: {e}"))?;
+    let updater = app.updater().map_err(|e| format!("updater init: {e}"))?;
     let update = match updater.check().await {
         Ok(Some(u)) => u,
         Ok(None) => return Err("no update found on the feed".into()),
@@ -309,7 +310,10 @@ pub fn latest_json(
     if let Some(n) = notes {
         obj.insert("notes".into(), json!(n));
     }
-    obj.insert("platforms".into(), serde_json::Value::Object(platforms_json));
+    obj.insert(
+        "platforms".into(),
+        serde_json::Value::Object(platforms_json),
+    );
     Ok(serde_json::Value::Object(obj))
 }
 
@@ -334,9 +338,18 @@ mod tests {
     #[test]
     fn check_verdict_newer_only() {
         let installed = Version::new(1, 0, 0);
-        assert_eq!(check_verdict(&installed, &Version::new(1, 0, 1)), UpdateStatus::Available);
-        assert_eq!(check_verdict(&installed, &Version::new(1, 0, 0)), UpdateStatus::None);
-        assert_eq!(check_verdict(&installed, &Version::new(0, 9, 9)), UpdateStatus::None);
+        assert_eq!(
+            check_verdict(&installed, &Version::new(1, 0, 1)),
+            UpdateStatus::Available
+        );
+        assert_eq!(
+            check_verdict(&installed, &Version::new(1, 0, 0)),
+            UpdateStatus::None
+        );
+        assert_eq!(
+            check_verdict(&installed, &Version::new(0, 9, 9)),
+            UpdateStatus::None
+        );
     }
 
     // The status line is the pure spec: each state has exactly one
@@ -352,12 +365,18 @@ mod tests {
             status_line(&UpdateState::available("1.0.3"), None),
             "update 1.0.3 available"
         );
-        let p = Some(&DownloadProgress { done: 4096, total: Some(8192) });
+        let p = Some(&DownloadProgress {
+            done: 4096,
+            total: Some(8192),
+        });
         assert_eq!(
             status_line(&UpdateState::available("1.0.3"), p),
             "downloading 1.0.3 — 4096 / 8192 bytes"
         );
-        let p = Some(&DownloadProgress { done: 4096, total: None });
+        let p = Some(&DownloadProgress {
+            done: 4096,
+            total: None,
+        });
         assert_eq!(
             status_line(&UpdateState::available("1.0.3"), p),
             "downloading 1.0.3 — 4096 bytes"
@@ -403,8 +422,16 @@ mod tests {
                 | c.get(2).copied().unwrap_or(0) as u32;
             out.push(A[(v >> 18) as usize & 63] as char);
             out.push(A[(v >> 12) as usize & 63] as char);
-            out.push(if c.len() > 1 { A[(v >> 6) as usize & 63] as char } else { '=' });
-            out.push(if c.len() > 2 { A[v as usize & 63] as char } else { '=' });
+            out.push(if c.len() > 1 {
+                A[(v >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            out.push(if c.len() > 2 {
+                A[v as usize & 63] as char
+            } else {
+                '='
+            });
         }
         out
     }
@@ -412,8 +439,13 @@ mod tests {
     // The leading `v` is stripped (the tag v3 -> 1.0.3 mapping).
     #[test]
     fn latest_json_strips_leading_v() {
-        let v = latest_json("v1.0.3", &[("darwin-aarch64", "https://x/Idlefill.app.tar.gz", "sig")], None, None)
-            .expect("valid");
+        let v = latest_json(
+            "v1.0.3",
+            &[("darwin-aarch64", "https://x/Idlefill.app.tar.gz", "sig")],
+            None,
+            None,
+        )
+        .expect("valid");
         assert_eq!(v["version"], "1.0.3");
         assert!(v.get("pub_date").is_none());
         assert!(v.get("notes").is_none());
@@ -425,15 +457,45 @@ mod tests {
     #[test]
     fn latest_json_rejects_bad_inputs() {
         let bad_sig = "dX50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkK";
-        assert!(latest_json("not-semver", &[("darwin-aarch64", "https://x/y", bad_sig)], None, None).is_err());
+        assert!(latest_json(
+            "not-semver",
+            &[("darwin-aarch64", "https://x/y", bad_sig)],
+            None,
+            None
+        )
+        .is_err());
         assert!(latest_json("1.0.0", &[], None, None).is_err());
         assert!(latest_json("1.0.3", &[("", "https://x/y", bad_sig)], None, None).is_err());
         assert!(latest_json("1.0.3", &[("darwin-aarch64", "", bad_sig)], None, None).is_err());
-        assert!(latest_json("1.0.3", &[("darwin-aarch64", "https://x/y", "")], None, None).is_err());
+        assert!(latest_json(
+            "1.0.3",
+            &[("darwin-aarch64", "https://x/y", "")],
+            None,
+            None
+        )
+        .is_err());
         // A PATH and a URL are not base64 .sig content (the '/' rule).
-        assert!(latest_json("1.0.3", &[("darwin-aarch64", "https://x/y", "~/keys/sig.txt")], None, None).is_err());
-        assert!(latest_json("1.0.3", &[("darwin-aarch64", "https://x/y", "https://x/sig")], None, None).is_err());
+        assert!(latest_json(
+            "1.0.3",
+            &[("darwin-aarch64", "https://x/y", "~/keys/sig.txt")],
+            None,
+            None
+        )
+        .is_err());
+        assert!(latest_json(
+            "1.0.3",
+            &[("darwin-aarch64", "https://x/y", "https://x/sig")],
+            None,
+            None
+        )
+        .is_err());
         // A multi-line .sig pasted raw (unencoded) is rejected.
-        assert!(latest_json("1.0.3", &[("darwin-aarch64", "https://x/y", "line1\nline2")], None, None).is_err());
+        assert!(latest_json(
+            "1.0.3",
+            &[("darwin-aarch64", "https://x/y", "line1\nline2")],
+            None,
+            None
+        )
+        .is_err());
     }
 }
