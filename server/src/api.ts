@@ -1554,6 +1554,76 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
    * The `revokeClientKey` precedent: immediate local deletion of the key
    * row plus an event log entry, no remote propagation.
    */
+  /**
+   * POST /api/mesh/pair/code (#55 D4 — slice 10). Mint a one-time pairing
+   * code a peer can redeem. THIS machine becomes the CONTROLLED end of the
+   * edge that gets formed (pairing.md D5: the redeemer is the controller).
+   * The plaintext code is returned once and never stored locally; the
+   * operator hands it to the peer over the tailnet (fleet-service D7).
+   * Auth: the local ADMIN plane (a valid api_token) — like /api/mesh/unpair,
+   * this is the operator's own machine. 400 when the fleet plane is not
+   * configured (pairing is inert without it); 502 when the fleet service
+   * refuses the mint.
+   */
+  app.post('/api/mesh/pair/code', async (req, reply) => {
+    const pairing = arbiter.pairing();
+    if (!pairing.configured) {
+      return reply.code(400).send({
+        error: 'fleet_not_configured',
+        hint: 'pairing needs fleet_url + fleet_enrollment_token (see docs/architecture/fleet-service.md D2)',
+      });
+    }
+    const r = await pairing.mintCodeForPeer();
+    if (!r) {
+      return reply.code(502).send({ error: 'pairing_code_failed', hint: 'the fleet service refused the mint (unreachable, or the enrollment credential is stale)' });
+    }
+    return { ok: true, code: r.code, ttl_s: r.ttl_s, instance_id: arbiter.instanceId() };
+  });
+
+  /**
+   * POST /api/mesh/pair (#55 D4 — slice 10). Redeem a peer's pairing code:
+   * THIS machine becomes the CONTROLLER of the minter, and the peer's
+   * public key is written to the LOCAL `mesh_edges.json` with direction
+   * `i_control` (pairing.md D5, LOCKED). Idempotent: the store keys by peer
+   * id, so redeeming the same peer twice writes one record.
+   *
+   * Auth: the local ADMIN plane (a valid api_token). Body: `{ code }`.
+   * Every failure is NAMED (the fleet service's own reason strings pass
+   * through): 400 for `invalid_body` / `code_used` / `code_expired` /
+   * `self_pair` / `fleet_not_configured`, 401 for `bad_signature` /
+   * `unknown_instance` / `nonce_replayed`, 502 for a transport failure.
+   * On success the next `GET /api/mesh/detail` / `POST /api/mesh/control`
+   * from that peer stops answering 403 `unknown_instance_id`.
+   */
+  app.post('/api/mesh/pair', async (req, reply) => {
+    const pairing = arbiter.pairing();
+    if (!pairing.configured) {
+      return reply.code(400).send({
+        error: 'fleet_not_configured',
+        hint: 'pairing needs fleet_url + fleet_enrollment_token (see docs/architecture/fleet-service.md D2)',
+      });
+    }
+    const body = (req.body ?? {}) as { code?: unknown };
+    const code = typeof body.code === 'string' ? body.code.trim() : '';
+    if (code === '' || code.length > 128) {
+      return reply.code(400).send({ error: 'bad_code', hint: 'body must carry the pairing code the peer minted' });
+    }
+    const r = await pairing.pairWithCode(code);
+    if (!r.ok) {
+      const authReasons = new Set(['bad_signature', 'unknown_instance', 'nonce_replayed']);
+      const status = authReasons.has(r.error ?? '') ? 401 : 400;
+      return reply.code(status).send({ error: r.error, hint: 'the fleet service refused the redeem' });
+    }
+    arbiter.logMeshEdgeFormed(r.peer_instance_id!, r.direction!);
+    return {
+      ok: true,
+      paired_with: r.peer_instance_id,
+      peer_name: r.peer_name,
+      direction: r.direction,
+      already_recorded: r.already_recorded,
+    };
+  });
+
   app.post('/api/mesh/unpair', async (req, reply) => {
     const body = (req.body ?? {}) as { instance_id?: unknown };
     const id = typeof body.instance_id === 'string' ? body.instance_id.trim() : '';
@@ -1562,6 +1632,9 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     }
     const edges = arbiter.edges();
     const existed = edges.get(id) !== null;
+    // Capture the direction BEFORE the delete: it tells us which end of
+    // the directed edge this machine is (pairing.md D5).
+    const priorDirection = existed ? edges.get(id)!.direction : null;
     const removed = edges.remove(id);
     // The D6 audit: immediate local deletion + an event log entry (the
     // `revokeClientKey` precedent). A named admin-plane event — the unpair
@@ -1572,7 +1645,22 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       st.trim();
       st.save();
     }
-    return { ok: true, instance_id: id, existed, removed };
+    // Root-cause fix (slice 10): local deletion alone is defeated by the
+    // next roster pull — the fleet directory still carries the edge, and
+    // after a restart the roster `edgeFiller` re-writes the record the
+    // operator just removed. When the fleet plane is configured, drop the
+    // directed edge there too so the revocation sticks. Fail-quiet: a
+    // service-side failure never blocks the local revocation (the
+    // enforcement point is local, pairing.md D6).
+    let service_removed = false;
+    const pairing = arbiter.pairing();
+    if (pairing.configured && existed && priorDirection) {
+      const localId = arbiter.instanceId();
+      const from = priorDirection === 'i_control' ? localId : id;
+      const to = priorDirection === 'i_control' ? id : localId;
+      service_removed = await pairing.unpairOnService(from, to);
+    }
+    return { ok: true, instance_id: id, existed, removed, service_removed };
   });
 
   // ------------------------------------------------------------------

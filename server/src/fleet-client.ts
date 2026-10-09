@@ -33,8 +33,18 @@
  * concern — the arbiter's live urls come from its own config; the
  * cadence rides the mesh federation tick, server/src/mesh.ts
  * `sendHeartbeat`, #55 D3 slice 8: `heartbeatOnce` is the transport,
- * the tick owns the interval), pairing (D4), key rotation, or
- * deployment (D7).
+ * the tick owns the interval), key rotation, or deployment (D7).
+ *
+ * Pairing (D4, slice 10): the ceremony TRANSPORT lives here too —
+ * `mintPairCode()` (this instance becomes the CONTROLLED end of an edge
+ * a peer will redeem) and `redeemPairCode(code)` (this instance becomes
+ * the CONTROLLER of the code's minter). `redeemAndRecordEdge` is the
+ * wiring: a successful redeem writes the peer's public key into the
+ * LOCAL `mesh_edges.json` (server/src/edges.ts `EdgeStore.upsert`, the
+ * #39 D2 posture) with the direction pairing.md D5 defines for this
+ * orientation, so the per-edge routes stop denying with
+ * `unknown_instance_id`. The service is the directory, never the pipe:
+ * after the redeem, the two arbiters talk directly (mesh.md D1).
  *
  * Deps: `node:crypto` + `node:fs` + `node:path` only (D7:
  * dependency-free Node). No new dependency.
@@ -341,6 +351,119 @@ export class FleetClient {
       return await res.json();
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * Mint a one-time pairing code for a peer to redeem (D4, slice 10).
+   * THIS instance is the minter, so it becomes the CONTROLLED end of the
+   * edge that gets formed (pairing.md D5: the redeemer is the controller).
+   * The plaintext code is returned once and never stored here — handing it
+   * to the peer is the operator's job (the tailnet is the trust boundary,
+   * fleet-service D7). Fail-quiet: null on any transport or HTTP failure.
+   */
+  async mintPairCode(): Promise<{ code: string; ttl_s: number } | null> {
+    if (!this.enrolled) return null;
+    const nonce = randomNonce();
+    const signature = Buffer.from(this.identity.sign(new TextEncoder().encode(nonce))).toString('base64url');
+    const base = this.cfg.fleet_url.replace(/\/+$/, '');
+    let res: Response;
+    try {
+      res = await fetch(`${base}/pair/code`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ instance_id: this.session!.instance_id, nonce, signature }),
+        signal: AbortSignal.timeout(10_000),
+      });
+    } catch (err) {
+      console.error(`[fleet] pair code mint failed (${err instanceof Error ? err.message : String(err)})`);
+      return null;
+    }
+    if (!res.ok) {
+      console.error(`[fleet] pair code mint HTTP ${res.status}`);
+      return null;
+    }
+    try {
+      const body = (await res.json()) as Record<string, unknown>;
+      const code = typeof body.code === 'string' ? body.code : '';
+      if (code === '') return null;
+      return { code, ttl_s: typeof body.ttl_s === 'number' ? body.ttl_s : 300 };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Redeem a peer's pairing code (D4, slice 10). THIS instance is the
+   * signer, so it becomes the CONTROLLER (`from`) of the minter (`to`) —
+   * pairing.md D5, directional. The response carries the peer's PUBLIC key
+   * so the local edge record can be written immediately (pairing.md D1:
+   * the target verifies the requester against the stored peer public key).
+   * Never throws: a named `{ ok: false, error }` on transport or 4xx.
+   */
+  async redeemPairCode(
+    code: string,
+  ): Promise<
+    | { ok: true; edge: { from: string; to: string }; peer_public_key: string; peer_name?: string }
+    | { ok: false; error: string }
+  > {
+    if (!this.enrolled) return { ok: false, error: 'not_enrolled' };
+    if (typeof code !== 'string' || code.trim() === '') return { ok: false, error: 'invalid_body' };
+    const nonce = randomNonce();
+    const signature = Buffer.from(this.identity.sign(new TextEncoder().encode(nonce))).toString('base64url');
+    const base = this.cfg.fleet_url.replace(/\/+$/, '');
+    let res: Response;
+    try {
+      res = await fetch(`${base}/pair/redeem`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ instance_id: this.session!.instance_id, nonce, signature, code }),
+        signal: AbortSignal.timeout(10_000),
+      });
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+    let body: Record<string, unknown>;
+    try {
+      body = (await res.json()) as Record<string, unknown>;
+    } catch {
+      return { ok: false, error: `redeem HTTP ${res.status} (non-JSON body)` };
+    }
+    if (!res.ok) return { ok: false, error: typeof body.error === 'string' ? body.error : `HTTP ${res.status}` };
+    const edge = body.edge as Record<string, unknown> | undefined;
+    const peerKey = typeof body.peer_public_key === 'string' ? body.peer_public_key : '';
+    if (!edge || typeof edge.from !== 'string' || typeof edge.to !== 'string' || peerKey === '') {
+      return { ok: false, error: 'malformed_redeem_response' };
+    }
+    return {
+      ok: true,
+      edge: { from: edge.from, to: edge.to },
+      peer_public_key: peerKey,
+      peer_name: typeof body.peer_name === 'string' ? body.peer_name : undefined,
+    };
+  }
+
+  /**
+   * Remove a directed edge on the service side (D4, D6). Local deletion is
+   * the enforcement point (the controlled side removes its own record); this
+   * keeps the fleet directory honest. Fail-quiet: false on any failure.
+   */
+  async unpairEdge(from: string, to: string): Promise<boolean> {
+    if (!this.enrolled) return false;
+    const nonce = randomNonce();
+    const signature = Buffer.from(this.identity.sign(new TextEncoder().encode(nonce))).toString('base64url');
+    const base = this.cfg.fleet_url.replace(/\/+$/, '');
+    try {
+      const res = await fetch(`${base}/pair/unpair`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ instance_id: this.session!.instance_id, nonce, signature, edge: { from, to } }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      return res.ok;
+    } catch (err) {
+      console.error(`[fleet] unpair failed (${err instanceof Error ? err.message : String(err)})`);
+      return false;
     }
   }
 }

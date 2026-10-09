@@ -194,7 +194,10 @@ async function main(): Promise<void> {
   // configured = the module stays inert (the /api/mesh route still
   // answers with this instance's own snapshot for peers that list us).
   const mesh = new MeshFederation(cfg, makeRealMeshFetcher(), {
-    localInstanceId: () => arbiter.instanceId(),
+    // The roster rows and the ceremony carry the FLEET-issued ids, not the
+    // locally-minted mesh id. The edge fill compares against the fleet id,
+    // so it must be the fleet one (arbiter.fleetInstanceId()).
+    localInstanceId: () => arbiter.fleetInstanceId() ?? arbiter.instanceId(),
     // Fleet heartbeat (#55 D3, slice 8): the arbiter publishes its OWN live
     // urls (cfg.fleet_own_urls — the operator's reachability declaration) +
     // coarse presence ('online') to the fleet service on the PROPOSED 60 s
