@@ -6,6 +6,9 @@ data/
 server/config.json
 client/config.json
 client/logs/
+fleet/config.json
+fleet/*.db
+fleet/*.db-*
 .DS_Store
 *.tsbuildinfo
 .wt/
