@@ -44,6 +44,27 @@ export type GlanceState = {
   relaunch: boolean;
 };
 
+/* The signed updater channel's state (lib.rs updater::UpdateState —
+   serde camelCase). `inert` = the channel is off by configuration
+   (tauri.conf.json plugins.updater.pubkey empty — the committed
+   key-free posture, #75 D4): the check never runs, and the view
+   renders the owner-step hint. `available` carries `version` (the
+   feed's SemVer, 1.0.<N> — D5). */
+export type UpdateState = {
+  status: "inert" | "none" | "available" | "error";
+  version: string | null;
+  message: string | null;
+};
+
+/* One on_chunk tick from the install download (lib.rs update_install's
+   updater-progress event). `total` is the Content-Length — null for a
+   chunked body (no fake percentage, the line shows the running total). */
+export type UpdateProgress = {
+  done: number;
+  total: number | null;
+  finished?: boolean;
+};
+
 /* The verbs the capability file grants to the local windows only
    (capabilities/default.json: windows ["settings","glance"], no remote
    block — the arbiter page has NO IPC reach, the D4-shape lock). */
@@ -54,4 +75,12 @@ export const ipc = {
   relaunchArbiter: () => invoke<SettingsSnapshot>("relaunch_arbiter_cmd"),
   glanceState: () => invoke<GlanceState>("glance_state"),
   glanceAction: (id: string) => invoke("glance_action", { id }),
+  // The signed updater channel (#75, D6: GUI-triggered — these are the
+  // only updater verbs, there is no check at launch and no timer).
+  // `update_check` resolves to the state the view renders (inert when
+  // the channel is off by configuration, D4). `update_install`
+  // downloads + installs; the progress rides the updater-progress
+  // event, not this call.
+  updateCheck: () => invoke<UpdateState>("update_check"),
+  updateInstall: () => invoke<void>("update_install"),
 };

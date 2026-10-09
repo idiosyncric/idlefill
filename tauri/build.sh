@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # Build the idlefill Tauri shell (issue #70, decision doc
-# docs/architecture/tauri-cutover.md D7/D8). The marker comes from the
-# environment and the binary proves its own origin. No signing identity,
-# no notarization, no install step here (Q-b LOCKED: no update plane —
-# every install is a build from a checkout).
+# docs/architecture/tauri-cutover.md D7/D8; the signed updater channel
+# is issue #75, docs/architecture/shell-updater.md). The marker comes
+# from the environment and the binary proves its own origin.
+# No install step here.
+#
+# The KEYLESS default (the checkout build, `./update.sh`): NO updater
+# artifacts, NO signing (D4 LOCKED: `createUpdaterArtifacts` is set on
+# the release pass ONLY, never committed — a committed `true` would
+# fail every keyless build).
 #
 #   output: src-tauri/target/release/bundle/macos/Idlefill.app
 #
@@ -14,6 +19,16 @@
 #   IDLEFILL_BUILD_MARKER -> baked into the binary via option_env!
 #                         (the __DESKTOP_BUILD__ analog). Default `dev`.
 #                         `idlefill --version` prints `idlefill <marker>`.
+#   IDLEFILL_UPDATER_ARTIFACTS -> (release pass ONLY, #75) when set to 1,
+#                         merge `bundle.createUpdaterArtifacts: true`
+#                         into TAURI_CONFIG. The tauri CLI then emits the
+#                         updater bundle (Idlefill.app.tar.gz) and, when
+#                         TAURI_SIGNING_PRIVATE_KEY is set + the config's
+#                         plugins.updater.pubkey is non-empty, signs it
+#                         (Idlefill.app.tar.gz.sig). A keyless build with
+#                         this flag on still builds the bundle but the
+#                         signing step is skipped (the .sig is absent —
+#                         the release pass fails closed on that).
 #
 # Flags:
 #   --debug -> build the DEBUG profile. The dev-tooling plugins
@@ -47,9 +62,21 @@ python3 "$HERE/make-tray-icon.py" "$SRC/icons/tray-icon.rgba"
 export IDLEFILL_BUILD_MARKER="$MARKER"
 # Version override through tauri's config-merge env (tauri-utils
 # config.rs merges this JSON patch over tauri.conf.json at build time).
-export TAURI_CONFIG="$(python3 - "$VERSION" <<'PY'
+# The release pass (#75) adds `bundle.createUpdaterArtifacts: true` to the
+# SAME patch — D4 LOCKED: the flag is set on the release pass only, never
+# committed (a committed `true` would fail every keyless checkout build).
+# json_patch::merge deep-merges, so this patch coexists with the committed
+# bundle block (it only adds createUpdaterArtifacts).
+UPDATER=0
+if [ "${IDLEFILL_UPDATER_ARTIFACTS:-0}" = "1" ]; then
+  UPDATER=1
+fi
+export TAURI_CONFIG="$(python3 - "$VERSION" "$UPDATER" <<'PY'
 import json, sys
-print(json.dumps({"version": sys.argv[1]}))
+patch = {"version": sys.argv[1]}
+if sys.argv[2] == "1":
+    patch["bundle"] = {"createUpdaterArtifacts": True}
+print(json.dumps(patch))
 PY
 )"
 # The tauri CLI is the sole build entry (ISSUE69-GRILL-REPORT: the spike
