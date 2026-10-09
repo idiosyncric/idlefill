@@ -1,0 +1,20 @@
+{
+  "name": "idlefill-fleet",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "idlefill fleet service: instance enrollment + roster (control plane, never a relay)",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "test": "tsx --test --test-timeout=20000 --test-force-exit test/enroll.test.ts"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0"
+  }
+}

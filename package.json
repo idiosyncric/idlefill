@@ -10,7 +10,8 @@
     "adapters/career-ops",
     "adapters/noop",
     "tauri/ui",
-    "dashboard"
+    "dashboard",
+    "fleet"
   ],
   "scripts": {
     "test": "npm test --workspaces --if-present",
