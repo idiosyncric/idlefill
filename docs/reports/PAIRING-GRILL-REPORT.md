@@ -165,7 +165,8 @@ private 48 DER / 64 base64url, signature 64 bytes.
   the target verifies against the peer's public key stored in the edge
   record. The manual shared 256-bit code is REJECTED. No hub, no PKI.
   The edge-formation ceremony is #55 D4's (shape (b) one-time code,
-  directional edges, recommended).
+  directional edges — confirmed by the owner 2026-10-09, built in #55
+  slices 6 + 10).
 - D2 (LOCKED): the credential lives in `mesh_edges.json` (mode 0600, sibling
   of the state file), never in `state.json`. The edge record carries the
   peer's PUBLIC key, not a shared secret. Persistent across restarts.
@@ -188,25 +189,20 @@ private 48 DER / 64 base64url, signature 64 bytes.
 - D8 (LOCKED): no pairing = fail-closed. The coarse read plane only.
   Detail and control both require the per-edge credential.
 
-## Open questions (owner input)
+## Open questions — RESOLVED by the owner, 2026-10-09 (issue #39)
 
 The substrate question (former Q1) is closed by D1, and the ceremony
-surface (former Q4) is #55 D4's and is inherited. Three questions remain,
-each with a recommended answer.
+surface (former Q4) is #55 D4's and is inherited (settled as shape (b),
+one-time code, directional edges, and built in #55 slices 6 + 10). The
+three questions below were answered by the owner on 2026-10-09, each
+recommendation accepted. `docs/architecture/pairing.md` carries the full
+lock.
 
-1. Exact field set of `GET /api/mesh/detail`: queue projection only, or
-   plus the target's session rows?
-   Recommend: queue projection only. D3 already locks the boundary
-   (payload-free, target-local, no transitivity); session rows drag in the
-   #41-#48 session surface for no gain this wave.
-2. `reorder` wire shape: a full queue order (a job-id list) or a
-   promote/demote of one job?
-   Recommend: promote/demote of one job. A bounded scheduling action that
-   fits the "scheduling posture" blast-radius bound; a full-order rewrite
-   is a bigger primitive for the same goal.
-3. Edge lifetime and key rotation: permanent until unpaired (the default),
-   or an expiry/rotation schedule? And is re-pairing the recovery when a
-   peer's keypair rotates (#55)?
-   Recommend: permanent until unpaired, operator-triggered key rotation,
-   re-pair as the rotation recovery. Matches the single-operator posture
-   and #55 D2's wiped-machine recovery.
+1. `GET /api/mesh/detail` field set: the queue projection only, no
+   session rows. That is the shipped behavior.
+2. `reorder` wire shape: a promote/demote of one job, not a full job-id
+   order. The verb currently 405s `reorder_deferred`; the primitive is
+   the remaining build item.
+3. Edge lifetime: permanent until unpaired, operator-triggered key
+   rotation, re-pairing as the rotation recovery. D6's unpair-then-
+   re-pair stands.

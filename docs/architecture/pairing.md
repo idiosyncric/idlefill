@@ -7,6 +7,15 @@ posture when no pairing exists. The discovery half (presence + queue
 depths, zero pairing) is the #50 read plane and is already built
 (commit `71b4e5d`). Do not re-litigate it here.
 
+Status: LOCKED — D1..D8 are locked, and the owner closed the three Open
+questions on 2026-10-09 (issue #39) by accepting each recommendation. The
+one external dependency, #55 D4, is settled: shape (b), the service-mediated
+one-time code, with directional edges; it shipped in #55 slice 6
+(`0762372`, fleet side) and slice 10 (`7b80621`, arbiter side). The only
+decision-gated build item left is the `reorder` write, whose wire shape the
+owner settled as promote/demote of one job (it currently answers 405
+`reorder_deferred`).
+
 ## Inherited from mesh.md (LOCKED, unchanged)
 
 These clauses of `docs/architecture/mesh.md` stay byte-for-byte and are
@@ -98,16 +107,19 @@ independently of #55 D1. It needs the local per-instance keypair first.
 That gate is small: a keypair mint at first boot plus `identity.json`. It
 is not the full fleet service.
 
-What this doc still needs from #55 (see the dependency order below):
+What this doc depends on from #55 (see the dependency order below):
 
-- #55 D1 (LOCKED): the per-instance ed25519 keypair. The local substrate.
-- #55 D4 (PROPOSED, `fleet-service.md:192-219`): the edge-formation
-  ceremony. The one-time exchange of the peer's public key plus the edge
-  direction. This doc does not re-open #55 D4's shape choice (a)
-  request/approve vs (b) one-time code, or its directional vs symmetric
-  edge choice. It inherits both. This doc's D5 (directional, the
-  initiator is the controller) aligns with #55 D4's directional
-  recommendation.
+- #55 D1 (LOCKED, BUILT `09ed730`): the per-instance ed25519 keypair. The
+  local substrate.
+- #55 D4 (SETTLED by the owner 2026-10-09, `fleet-service.md:192-219`):
+  the edge-formation ceremony. The one-time exchange of the peer's public
+  key plus the edge direction. The owner confirmed shape (b) — the
+  service-mediated one-time code — and directional edges; both shipped in
+  #55 slice 6 (`0762372`, the service side: `/pair/code`, `/pair/redeem`,
+  `/pair/unpair`) and slice 10 (`7b80621`, the arbiter side:
+  `POST /api/mesh/pair/code`, `POST /api/mesh/pair`). This doc inherits
+  both and does not re-open either. This doc's D5 (directional, the
+  initiator is the controller) aligns with #55 D4.
 
 ## D2 — Where the credential lives: a sibling edge file, never the state file (LOCKED)
 
@@ -189,6 +201,10 @@ rows, because it owns them.**
   `pause`/`resume`/`force`/`clear` reuse the existing override semantics
   (`setClientOverride`, `setSessionOverride`). `reorder` is a new
   relayed action that reorders the target's queue order.
+- The owner settled the `reorder` wire shape on 2026-10-09: a
+  promote/demote of one job, not a full queue order. Until that primitive
+  lands the verb answers 405 `reorder_deferred`
+  (`server/src/api.ts:1479-1486`); the rest of the action set has shipped.
 - The requester never touches the target's state directly. It sends an
   intent and the target applies it. This keeps "each arbiter is the
   single source of truth for its own machine."
@@ -285,11 +301,13 @@ Rejected: pairing as an optional nicety where detail is best-effort. The
 acceptance states that unpaired peers see no job ids or titles. Fail
 closed.
 
-## Wire keys (ADD-key posture, not built)
+## Wire keys (ADD-key posture, shipped)
 
-This doc names the wire keys a build wave would add. None is implemented
-here. Every change is additive. No existing route is renamed, and
-`/api/state` gains no keys.
+This doc names the wire keys the build wave added. They shipped in #39
+slice 1 (`f6a460e`), slice 2 (`cb63b25`), and the acceptance close
+(`23f16a7`), with one decision-gated exception: the `reorder` write
+(currently 405 `reorder_deferred`, shape settled in D4). Every change is
+additive. No existing route is renamed, and `/api/state` gains no keys.
 
 - New routes (all ADD, owned by this doc):
   - `POST /api/mesh/unpair` (local admin). Removes the local edge.
@@ -298,10 +316,13 @@ here. Every change is additive. No existing route is renamed, and
     detailed projection (D3).
   - `POST /api/mesh/control` (per-edge credential, `controls_me`).
     Relays a control action (D4). Body carries `action`, and, by action,
-    `client`, `session_token`, `until`, or `order`.
+    `client`, `session_token`, or `until`; the `reorder` body key lands
+    with the settled promote/demote primitive.
 - The edge-formation ceremony (`pair`/`accept` in this doc's former D1)
-  is owned by #55 D4. The service-mediated one-time code (shape (b)) is
-  the recommended form. This doc does not re-open that choice.
+  is owned by #55 D4 and shipped as shape (b): `POST /api/mesh/pair/code`
+  and `POST /api/mesh/pair` on the arbiter admin plane (slice 10), backed
+  by `/pair/code`, `/pair/redeem`, and `/pair/unpair` on the fleet
+  service (slice 6). The owner settled the shape on 2026-10-09.
 - New file (not wire): `mesh_edges.json`, mode 0600. Edge records carry
   `peer_instance_id`, `peer_public_key`, `peer_name`, `controls_me`,
   `created_ts`. The private key never enters this file (it is in
@@ -349,19 +370,25 @@ order:
 - **Wave 0 — the mesh read plane (#50).** BUILT (commit `71b4e5d`).
   Presence and queue depths ride `GET /api/mesh` with zero pairing. The
   base.
-- **Wave 1 — #55 D1 (LOCKED).** The per-instance ed25519 keypair in
-  `identity.json` (0600, atomic tmp+rename). The local substrate. Small,
-  per machine, no service. REQUIRED before any #39 relay route.
-- **Wave 2 — #55 D4 (PROPOSED).** The edge-formation ceremony. The
-  one-time exchange of the peer's public key plus the edge direction. It
-  fills the local edge record (`mesh_edges.json`). The service-mediated
-  one-time code (shape (b)) is the recommended form. The operator
-  confirms shape (b) and directional edges.
-- **Wave 3 — the #39 relay.** `GET /api/mesh/detail` (D3),
+- **Wave 1 — #55 D1 (LOCKED, BUILT `09ed730`).** The per-instance
+  ed25519 keypair in `identity.json` (0600, atomic tmp+rename). The local
+  substrate. Small, per machine, no service. Built before the relay
+  routes, as required.
+- **Wave 2 — #55 D4 (SETTLED by the owner 2026-10-09, BUILT).** The
+  edge-formation ceremony. The one-time exchange of the peer's public key
+  plus the edge direction. It fills the local edge record
+  (`mesh_edges.json`). The owner confirmed the service-mediated one-time
+  code (shape (b)) and directional edges; built in #55 slice 6
+  (`0762372`, service side) and slice 10 (`7b80621`, arbiter side, with
+  the roster-driven edge fill writing the controlled side's record).
+- **Wave 3 — the #39 relay (BUILT `f6a460e` + `cb63b25`, acceptance
+  pinned `23f16a7`).** `GET /api/mesh/detail` (D3),
   `POST /api/mesh/control` (D4), the direction policy (D5),
   `POST /api/mesh/unpair` (D6), the `mesh_control` audit (D7), and the
-  fail-closed posture (D8). Substrate-agnostic. It verifies the
-  requester's signature against the stored peer public key.
+  fail-closed posture (D8). Substrate-agnostic: it verifies the
+  requester's signature against the stored peer public key. Open build
+  item: the `reorder` write (405 `reorder_deferred`), whose wire shape
+  the owner settled as a promote/demote of one job.
 
 What can ship independently:
 
@@ -375,33 +402,24 @@ What can ship independently:
   the locally-stored peer public key. No live roster pull is required
   (the last-known-keys posture).
 
-## Open questions (owner input)
+## Open questions — RESOLVED by the owner, 2026-10-09 (issue #39)
 
 The substrate question (former Q1) is closed by this doc's D1: the
 handshake rides #55's locked per-instance ed25519 keypair. The ceremony
-surface (former Q4) is #55 D4's and is inherited, not re-opened here.
-Three questions remain for the owner. Each carries a recommended answer.
+surface (former Q4) is #55 D4's and is inherited, not re-opened here;
+the owner settled it as shape (b) with directional edges, and it is
+built. The three questions below were settled by the owner on 2026-10-09
+with each recommendation accepted.
 
-1. Exact field set of `GET /api/mesh/detail`: the queue projection only,
-   or the queue projection plus the target's session rows?
-   Recommend: the queue projection only. Reason: D3 already locks the
-   boundary (payload-free, target-local, no transitivity), and the queue
-   projection is exactly what a local dashboard reader sees. Session rows
-   drag in the #41-#48 session surface and widen the secret exposure for
-   no gain in this wave.
-2. `reorder` wire shape: a full queue order (a job-id list), or a
-   promote or demote of one job?
-   Recommend: a promote or demote of one job. Reason: it is a bounded
-   scheduling action that fits D4's "scheduling posture" blast-radius
-   bound and needs a small new primitive. A full-order rewrite is a
-   bigger write and a bigger primitive for the same goal.
-3. Edge lifetime and key rotation: is an edge permanent until unpaired
-   (this doc's default), or does it carry an expiry or rotation schedule?
-   And if the peer's keypair rotates (#55), is re-pairing the recovery
-   path?
-   Recommend: permanent until unpaired, with operator-triggered key
-   rotation and re-pairing as the rotation recovery. Reason: the
-   single-operator posture needs no automatic expiry, and D6 already
-   makes unpair the revocation path. If a peer's keypair rotates, the
-   stored public key is stale and re-pairing refreshes it. That is a
-   one-command recovery, matching #55 D2's wiped-machine recovery.
+1. Exact field set of `GET /api/mesh/detail`: the queue projection only.
+   No session rows. D3's locked boundary stands (payload-free,
+   target-local, no transitivity); the session surface (#41-#48) stays
+   out of the peer projection. This is the shipped behavior.
+2. `reorder` wire shape: a promote/demote of one job, not a full job-id
+   order. Bounded to D4's "scheduling posture" blast radius. The verb
+   currently 405s `reorder_deferred`; the promote/demote primitive is the
+   remaining build item.
+3. Edge lifetime: permanent until unpaired, no expiry or rotation
+   schedule. Key rotation is operator-triggered; re-pairing is the
+   recovery when a peer's keypair rotates (#55 D2's one-command
+   posture). D6's unpair-then-re-pair stands as the rotation path.
