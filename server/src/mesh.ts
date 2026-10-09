@@ -29,6 +29,8 @@
  */
 
 import { randomBytes } from 'node:crypto';
+import { FleetClient, enrollmentFileOf, type FleetClientConfig } from './fleet-client.js';
+import { Identity } from './identity.js';
 import type { ServerConfig } from './types.js';
 import type { EdgeRecord } from './edges.js';
 
@@ -128,8 +130,9 @@ export interface RosterRow {
 }
 
 /**
- * Fetch the fleet roster: `GET {fleetUrl}/roster`. Injectable for tests;
- * throws on any failure (a failed pull is a no-op — the Service-down rule).
+ * Fetch the fleet roster: `GET {fleetUrl}/roster` (auth: a signed nonce —
+ * see `makeSignedRosterFetcher`). Injectable for tests; throws on any
+ * failure (a failed pull is a no-op — the Service-down rule).
  */
 export type RosterFetcher = (fleetUrl: string, now: number) => Promise<unknown>;
 
@@ -165,20 +168,95 @@ export type EdgeFiller = (
   direction: 'controls_me' | 'i_control',
 ) => void;
 
-/** Default (real) roster fetcher: GET {fleetUrl}/roster.
- *  NOTE (#55 D3, PROPOSED seam): the fleet service's `GET /roster`
- *  authenticates with a signed server nonce (D2 step 3). The production
- *  call path that mints + signs the nonce lands with the enrollment slice
- *  (the arbiter-side D2 client). Until then this fetcher is the SEAM:
- *  `fleet_url` unset = no pull; when wired, this is where the signed
- *  request goes. */
-export function makeRealRosterFetcher(timeoutMs = 10_000): RosterFetcher {
-  return async (fleetUrl, _now) => {
-    const base = fleetUrl.replace(/\/+$/, '');
-    const res = await fetch(`${base}/roster`, { signal: AbortSignal.timeout(timeoutMs) });
-    if (!res.ok) throw new Error(`roster fetch HTTP ${res.status}`);
-    return await res.json();
+/**
+ * The signed roster fetcher (#55 D2 + D3, slice 7): the production
+ * replacement for the pre-slice-5 plain fetch. Enrolls ONCE (a one-time
+ * token + the instance public key + a name -> a persisted session
+ * credential in the sibling `fleet_enrollment.json`, the #55 D2
+ * posture: 0600, atomic tmp+rename, never in state.json), then mints +
+ * signs a fresh nonce with the arbiter's ed25519 key (node:crypto only)
+ * for every roster pull (D2 step 3: no shared fleet secret ever exists).
+ *
+ * Failure posture (the Service-down rule): a failed enroll or pull
+ * throws — and `pullRoster` swallows it exactly as today (the last-known
+ * peer set stands byte-for-byte). A 401 on the roster means the
+ * credential no longer validates: recovery is a re-enrollment with a
+ * fresh operator token (wiped-machine recovery, D2), not a crash.
+ *
+ * Injectable seams (tests): `enroll` / `signedRoster` replace the
+ * `FleetClient` call path without a network; the default is the real
+ * `FleetClient` bound to the #55 D1 identity.
+ */
+export interface SignedRosterOpts {
+  /** The enrollment file path (default: `enrollmentFileOf(stateFile)`). */
+  file?: string;
+  /** Replaces the enroll call (tests): returns {ok, instance_id, credential, error?}. */
+  enroll?: () => Promise<{ ok: boolean; instance_id?: string; credential?: string; error?: string }>;
+  /** Replaces the signed roster call (tests): returns the raw envelope or null. */
+  signedRoster?: () => Promise<unknown | null>;
+}
+
+export function makeSignedRosterFetcher(
+  cfg: ServerConfig,
+  identity: Identity,
+  opts: SignedRosterOpts = {},
+): RosterFetcher {
+  const base = cfg.fleet_url!.replace(/\/+$/, '');
+  const file = opts.file ?? enrollmentFileOf(cfg.state_file);
+  const clientCfg: FleetClientConfig = {
+    fleet_url: base,
+    fleet_enrollment_token: cfg.fleet_enrollment_token ?? '',
+    // The enrollment name: the mesh display name, falling back to the
+    // config's server_name, then the hostname (the fleet roster row is a
+    // display label, never a secret).
+    name: cfg.mesh_name || cfg.server_name || 'arbiter',
   };
+  const client = new FleetClient(file, clientCfg, identity);
+  const enroll = opts.enroll ?? (() => client.ensureEnrolled());
+  const signed =
+    opts.signedRoster ??
+    (async () => {
+      // A persisted credential makes this a no-op; a missing credential
+      // attempts the enroll first (idempotent — already spent = a no-op).
+      void (await client.ensureEnrolled()).ok;
+      return client.signedRoster();
+    });
+  return async (_fleetUrl, _now) => {
+    // Enroll once (idempotent — a persisted credential skips the spend);
+    // a failed enroll throws so pullRoster takes the no-op path.
+    const r = await enroll();
+    if (!r.ok || r.instance_id === undefined || r.credential === undefined) {
+      throw new Error(`fleet enroll: ${r.error ?? 'unknown error'}`);
+    }
+    const raw = await signed();
+    if (raw === null) throw new Error('fleet roster pull failed (service down or 401 — see [fleet] log line)');
+    return raw;
+  };
+}
+
+/**
+ * Build the production roster fetcher for a live config (#55 D3 + D2,
+ * slice 7): the SIGNED fetcher when `fleet_url` AND `fleet_instance_id`
+ * AND `fleet_enrollment_token` are all present; otherwise a no-op
+ * fetcher — the pull stays fail-quiet exactly as pre-slice-5 (the
+ * Service-down rule: the last-known peer set stands byte-for-byte, no
+ * crash, no enroll attempt, no credential file touched).
+ *
+ * The `fleet_instance_id` key is the declaration seam: "this instance has
+ * a fleet identity" (its ed25519 keypair is the #55 D1 `identity.json`).
+ * The fleet-issued id + credential persist in `fleet_enrollment.json`
+ * after the first successful enroll — that file, not config, is the
+ * source of truth for the signed calls.
+ */
+export function buildRosterFetcher(cfg: ServerConfig, identity: Identity): RosterFetcher {
+  if (!cfg.fleet_url || !cfg.fleet_instance_id || !cfg.fleet_enrollment_token) {
+    // Any of the three absent = the signed pull is inert. The fetcher
+    // never runs (pullRoster is also gated on fleet_url alone for
+    // backward-compatible tests) — and if it ever is called, it throws
+    // into pullRoster's catch: a no-op, byte-for-byte, exactly today.
+    return () => Promise.reject(new Error('fleet roster pull: not enrolled (fleet_url / fleet_instance_id / fleet_enrollment_token incomplete)'));
+  }
+  return makeSignedRosterFetcher(cfg, identity);
 }
 
 /**

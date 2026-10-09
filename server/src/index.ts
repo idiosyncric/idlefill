@@ -17,7 +17,7 @@ import type { ActivityFetcher } from './idle.js';
 import type { LoadSignalView } from './load.js';
 import { FeedDeltaTracker, MetricsStore, HOUR_MS, instrumentArbiterForMetrics } from './metrics.js';
 import { CounterDeltaTracker, OmlxUsageReaders } from './omlx.js';
-import { MeshFederation, makeRealMeshFetcher, makeRealRosterFetcher } from './mesh.js';
+import { buildRosterFetcher, MeshFederation, makeRealMeshFetcher } from './mesh.js';
 import { StateStore } from './state.js';
 import type { ActivityEntry, EngineCounters, RequestsSource, ServerConnection, ServerProvider } from './types.js';
 
@@ -186,16 +186,6 @@ async function main(): Promise<void> {
   // poll cadence. Ephemeral — never written to state.json. No peers
   // configured = the module stays inert (the /api/mesh route still
   // answers with this instance's own snapshot for peers that list us).
-  //
-  // Edge fill (#55 D4, the pairing ceremony — PROPOSED wire): the roster
-  // publishes each instance's directed edges; the federation writes the
-  // LOCAL side's edge record into mesh_edges.json (the last-known-keys
-  // posture). The writer is ADD-ONLY: an edge record this machine already
-  // holds for the peer is the operator's local truth (pairing.md D6: the
-  // enforcement point is the local side) and is never rewritten by the
-  // roster — rotation is the explicit local re-pair (open question 3).
-  // Absent fleet_url = no roster pull = no fill (byte-for-byte the
-  // pre-ceremony posture).
   const mesh = new MeshFederation(cfg, makeRealMeshFetcher(), {
     localInstanceId: () => arbiter.instanceId(),
     edgeFiller: (localId, edge, peerKey, peerName, direction) => {
@@ -216,13 +206,17 @@ async function main(): Promise<void> {
       arbiter.logMeshEdgeFormed(peer, direction);
     },
   });
-  // Roster pull seam (#55 D3, PROPOSED): fleet_url set = the peer set is
-  // also pulled from the fleet service's GET /roster on the PROPOSED
-  // interval (fleet_roster_pull_ms, default 15 s). fleet_url absent =
-  // pullRoster is a no-op and the peer set is the static mesh_peers
-  // config, byte-for-byte. The service-down rule holds inside pullRoster:
-  // a failed pull never touches the last-known peer set.
-  const rosterFetcher = makeRealRosterFetcher();
+  // Roster pull (#55 D3 + D2, slice 7): the SIGNED fetcher — the arbiter
+  // enrolls once (one-time token + ed25519 public key + name -> a session
+  // credential persisted in the sibling fleet_enrollment.json, 0600, the
+  // #55 D2 posture) and signs a fresh nonce per pull (node:crypto only).
+  // ALL of fleet_url / fleet_instance_id / fleet_enrollment_token present
+  // = the signed pull; any one absent = the pull is a no-op, byte-for-byte,
+  // exactly pre-slice-5 (the Service-down rule; a failed enroll/pull is
+  // swallowed by pullRoster, the last-known set stands). The #55 D1
+  // identity (identity.json) signs; its public key is the one enrolled with
+  // the fleet (the arbiter never invents an instance id).
+  const rosterFetcher = buildRosterFetcher(cfg, arbiter.identity());
 
   // Persisted operator settings re-hydrate onto the live config objects:
   //  - project rows (pause state + per-project grant-knob overrides) replace

@@ -19,7 +19,10 @@
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { createPublicKey, generateKeyPairSync, randomBytes, verify } from 'node:crypto';
 import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
+import { createServer, type Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildApi, attachWebSocket } from '../src/api.js';
@@ -34,12 +37,15 @@ import {
   sanitizeSnapshot,
   sanitizeRoster,
   mintInstanceId,
+  buildRosterFetcher,
   type MeshFetcher,
   type MeshSnapshot,
   type RosterFetcher,
   type RosterEdgeRow,
   type EdgeFiller,
 } from '../src/mesh.js';
+import { FleetClient, enrollmentFileOf, loadEnrollment, enrollmentFileMode } from '../src/fleet-client.js';
+import { Identity } from '../src/identity.js';
 import type { ServerConfig } from '../src/types.js';
 
 const T0 = Date.parse('2026-10-04T12:00:00Z');
@@ -780,7 +786,7 @@ test('roster: ROSTER_PULL_MS is the PROPOSED default (15 s, the poll tick)', () 
 });
 
 // ---------------------------------------------------------------------------
-// Roster edge fill (#55 D4, the pairing ceremony — PROPOSED wire)
+<// Roster edge fill (#55 D4, the pairing ceremony — PROPOSED wire)
 //
 // The roster publishes each instance's directed edges as an ADD key; the
 // local instance writes the LOCAL side's edge record (last-known-keys).
@@ -999,4 +1005,303 @@ test('edge fill: an EMPTY local instance id disables the fill (no crash)', async
   });
   await m.pullRoster(async () => edgeEnvelope(), T0);
   assert.equal(calls.length, 0, 'no local id = no fill');
+
+// Fleet enrollment + signed roster pull (#55 D2 + D3, slice 7)
+//
+// The seam is closed: `buildRosterFetcher` returns the SIGNED fetcher when
+// fleet_url + fleet_instance_id + fleet_enrollment_token are all present
+// (enroll once → persisted credential in fleet_enrollment.json → a signed
+// nonce per pull); any one absent = the pull is a no-op, byte-for-byte,
+// exactly pre-slice-5 (the Service-down rule). The stub below is a REAL
+// node:http server implementing the slice-3 wire contract with real
+// ed25519 verification — a second real HTTP peer, not a mock.
+// ---------------------------------------------------------------------------
+
+const STUB_PEER_URL = 'http://stub-peer:8787';
+
+class StubFleet {
+  private server: Server | null = null;
+  base = '';
+  instances = new Map<
+    string,
+    { instance_id: string; name: string; public_key: string; credential: string; urls: string[]; presence: string | null; last_seen: number | null }
+  >();
+  private tokens = new Map<string, { used: boolean }>();
+  private noncesSeen = new Set<string>();
+  enrollCount = 0;
+  heartbeatCount = 0;
+  rosterPulls: { instance_id: string }[] = [];
+
+  mintToken(): string {
+    const t = `flt_${randomBytes(12).toString('base64url')}`;
+    this.tokens.set(t, { used: false });
+    return t;
+  }
+  tokenUsed(t: string): boolean {
+    return this.tokens.get(t)?.used === true;
+  }
+  /** Simulate a fleet re-deploy: the instance store is wiped (a stored credential goes stale). */
+  resetInstances(): void {
+    this.instances.clear();
+  }
+  /** Seed a pre-enrolled peer (the roster's other machines). */
+  seed(name: string, urls: string[]): void {
+    const { publicKey } = generateKeyPairSync('ed25519');
+    const id = `m-stub${randomBytes(8).toString('hex')}`;
+    this.instances.set(id, {
+      instance_id: id,
+      name,
+      public_key: publicKey.export({ type: 'spki', format: 'der' }).toString('base64url'),
+      credential: `cred-${randomBytes(8).toString('hex')}`,
+      urls,
+      presence: 'online',
+      last_seen: T0,
+    });
+  }
+
+  async start(): Promise<string> {
+    const server = createServer(async (req, res) => {
+      const u = new URL(req.url ?? '/', 'http://stub');
+      const send = (code: number, body: Record<string, unknown>) => {
+        res.writeHead(code, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(body));
+      };
+      const readAll = async (): Promise<Buffer> => {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        return Buffer.concat(chunks);
+      };
+      try {
+        if (u.pathname === '/token' && req.method === 'POST') {
+          return send(200, { token: this.mintToken() });
+        }
+        if (u.pathname === '/enroll' && req.method === 'POST') {
+          const raw = JSON.parse((await readAll()).toString('utf-8') || '{}') as Record<string, unknown>;
+          const token = typeof raw.token === 'string' ? raw.token : '';
+          const pk = typeof raw.public_key === 'string' ? raw.public_key : '';
+          const name = typeof raw.name === 'string' ? raw.name.trim() : '';
+          const t = this.tokens.get(token);
+          if (!t || t.used) return send(401, { error: t?.used ? 'token_used' : 'invalid_token' });
+          if (name === '' || name.length > 64) return send(400, { error: 'invalid_name' });
+          let validKey = false;
+          try {
+            validKey = createPublicKey({ key: Buffer.from(pk, 'base64url'), type: 'spki', format: 'der' }).asymmetricKeyType === 'ed25519';
+          } catch {
+            validKey = false;
+          }
+          if (!validKey) return send(400, { error: 'invalid_public_key' });
+          t.used = true;
+          this.enrollCount++;
+          const instance_id = `m-${randomBytes(8).toString('hex')}`;
+          const credential = randomBytes(32).toString('base64url');
+          this.instances.set(instance_id, { instance_id, name, public_key: pk, credential, urls: [], presence: null, last_seen: null });
+          return send(200, { instance_id, credential, nonce: randomBytes(16).toString('base64url') });
+        }
+        // Signed-nonce auth — the same named denials as the real service.
+        let instance_id = '';
+        let nonce = '';
+        let signature = '';
+        let body: Record<string, unknown> = {};
+        if (req.method === 'GET') {
+          instance_id = u.searchParams.get('instance_id') ?? '';
+          nonce = u.searchParams.get('nonce') ?? '';
+          signature = u.searchParams.get('signature') ?? '';
+        } else {
+          const raw = (await readAll()).toString('utf-8');
+          try {
+            body = JSON.parse(raw || '{}');
+          } catch {
+            body = {};
+          }
+          instance_id = typeof body.instance_id === 'string' ? body.instance_id : '';
+          nonce = typeof body.nonce === 'string' ? body.nonce : '';
+          signature = typeof body.signature === 'string' ? body.signature : '';
+        }
+        if (!instance_id || !nonce || !signature) return send(401, { error: 'missing_auth' });
+        const inst = this.instances.get(instance_id);
+        if (!inst) return send(401, { error: 'unknown_instance' });
+        let valid = false;
+        try {
+          const pub = createPublicKey({ key: Buffer.from(inst.public_key, 'base64url'), type: 'spki', format: 'der' });
+          valid = verify(null, new TextEncoder().encode(nonce), pub, Buffer.from(signature, 'base64url'));
+        } catch {
+          valid = false;
+        }
+        if (!valid) return send(401, { error: 'bad_signature' });
+        const key = `${instance_id}\u0000${nonce}`;
+        if (this.noncesSeen.has(key)) return send(401, { error: 'nonce_replayed' });
+        this.noncesSeen.add(key);
+        if (u.pathname === '/roster' && req.method === 'GET') {
+          this.rosterPulls.push({ instance_id });
+          return send(200, {
+            instances: [...this.instances.values()].map((i) => ({
+              instance_id: i.instance_id,
+              name: i.name,
+              public_key: i.public_key,
+              urls: i.urls,
+              last_seen: i.last_seen,
+            })),
+          });
+        }
+        if (u.pathname === '/heartbeat' && req.method === 'POST') {
+          this.heartbeatCount++;
+          const urls = Array.isArray(body.urls) ? (body.urls.filter((x): x is string => typeof x === 'string') as string[]) : null;
+          if (urls) inst.urls = urls.slice(0, 16);
+          const presence = typeof body.presence === 'string' ? body.presence : null;
+          if (presence) inst.presence = presence;
+          inst.last_seen = Date.now();
+          return send(200, { ok: true });
+        }
+        return send(404, { error: 'not_found' });
+      } catch (err) {
+        return send(500, { error: err instanceof Error ? err.message : String(err) });
+      }
+    });
+    this.server = server;
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', () => {
+        const a = server.address() as AddressInfo;
+        this.base = `http://127.0.0.1:${a.port}`;
+        resolve();
+      });
+    });
+    return this.base;
+  }
+
+  close(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const s = this.server;
+      if (!s) return resolve();
+      s.closeAllConnections?.();
+      s.close((e) => (e ? reject(e) : resolve()));
+    });
+  }
+}
+
+test('slice 7: no fleet_url = the signed pull is inert (no pull, no enroll, peer set byte-for-byte)', async () => {
+  const dir = await mkTmp();
+  const identity = Identity.mint(); // in-memory only — no file side-effects
+  const cfg = baseCfg(dir, { mesh_peers: [{ url: PEER_URL, name: 'lab box' }] });
+  assert.equal(cfg.fleet_url, undefined, 'precondition: no fleet_url');
+  const fetcher = buildRosterFetcher(cfg, identity);
+  const mesh = new MeshFederation(cfg, async () => snap());
+  await mesh.pullRoster(fetcher, T0);
+  await mesh.pullRoster(fetcher, T0 + 2 * ROSTER_PULL_MS);
+  assert.deepEqual(mesh.view(T0).map((v) => v.url), [PEER_URL], 'the static peer set stands, byte-for-byte');
+  assert.ok(!existsSync(enrollmentFileOf(cfg.state_file)), 'no fleet_enrollment.json — no enroll was attempted');
+});
+
+test('slice 7: fleet_url but no instance identity = no pull, no crash, byte-for-byte', async () => {
+  const dir = await mkTmp();
+  const identity = Identity.mint();
+  // fleet_url present, identity + token absent (the owner has not
+  // provisioned the fleet — the common pre-provisioning state).
+  const cfg = baseCfg(dir, { mesh_peers: [{ url: PEER_URL, name: 'lab box' }], fleet_url: 'http://fleet.example:8789' });
+  const fetcher = buildRosterFetcher(cfg, identity);
+  const mesh = new MeshFederation(cfg, async () => snap());
+  // The fetcher rejects (not enrolled) — pullRoster swallows it exactly
+  // like a service-down failure: a no-op, never a crash.
+  await mesh.pullRoster(fetcher, T0);
+  assert.deepEqual(mesh.view(T0).map((v) => v.url), [PEER_URL], 'the static peer set stands');
+  assert.ok(!existsSync(enrollmentFileOf(cfg.state_file)), 'no credential file was written');
+  // The read plane still works after the swallowed failure.
+  await mesh.refresh(T0);
+  assert.equal(mesh.view(T0)[0]!.online, true, 'no crash — the mesh read plane is untouched');
+  // Variant: identity declared but the token absent is also inert.
+  const cfg2 = baseCfg(dir, { mesh_peers: [{ url: PEER_URL }], fleet_url: 'http://fleet.example:8789', fleet_instance_id: 'declared-seam' });
+  const mesh2 = new MeshFederation(cfg2, async () => snap());
+  await mesh2.pullRoster(buildRosterFetcher(cfg2, identity), T0);
+  assert.deepEqual(mesh2.view(T0).map((v) => v.url), [PEER_URL], 'the identity-only variant is a no-op too');
+  assert.ok(!existsSync(enrollmentFileOf(cfg2.state_file)), 'still no credential file');
+});
+
+test('slice 7: a signed client against a stub fleet service enrolls + pulls rows (real HTTP, real crypto)', async () => {
+  const stub = new StubFleet();
+  const base = await stub.start();
+  stub.seed('stub-peer', [STUB_PEER_URL]); // a pre-enrolled peer the roster lists
+  const dir = await mkTmp();
+  const identity = Identity.loadOrCreate(join(dir, 'state.json'));
+  const token = stub.mintToken();
+  const cfg = baseCfg(dir, {
+    mesh_peers: [{ url: PEER_URL, name: 'lab box' }],
+    fleet_url: base,
+    fleet_instance_id: 'declared-seam',
+    fleet_enrollment_token: token,
+    mesh_name: 'home-arbiter',
+  });
+  const fetcher = buildRosterFetcher(cfg, identity);
+  const mesh = new MeshFederation(cfg, async () => snap());
+  await mesh.pullRoster(fetcher, T0);
+
+  // Enroll: exactly once, with the token + the arbiter's ed25519 public key.
+  assert.equal(stub.enrollCount, 1, 'one enroll (the token is single-use)');
+  assert.equal(stub.tokenUsed(token), true, 'the token was consumed');
+  const arb = [...stub.instances.values()].find((i) => i.public_key === identity.publicKeyB64url);
+  assert.ok(arb, 'the arbiter enrolled with its #55 D1 public key');
+  assert.equal(arb.name, 'home-arbiter', 'the enrollment name is the mesh display name');
+  assert.match(arb.instance_id as string, /^m-[0-9a-f]{16}$/, 'the fleet issued an instance id');
+  // The credential persisted to the sibling file (the #39 D2 posture).
+  const file = enrollmentFileOf(cfg.state_file);
+  assert.ok(existsSync(file), 'fleet_enrollment.json was persisted');
+  assert.equal(enrollmentFileMode(file), 0o600, 'owner-only (0600)');
+  const rec = loadEnrollment(file);
+  assert.equal(rec?.instance_id, arb.instance_id, 'the persisted id matches the service');
+  assert.equal(rec?.credential, arb.credential, 'the persisted credential matches the service');
+  // The signed roster pull returned rows and the seeded row merged in (ADD-only).
+  assert.equal(stub.rosterPulls.length, 1, 'one signed roster pull');
+  assert.equal(stub.rosterPulls[0]!.instance_id, arb.instance_id, 'the pull authenticated as the enrolled instance');
+  const seed = [...stub.instances.values()].find((i) => i.name === 'stub-peer')!;
+  const urls = mesh.view(T0).map((v) => v.url).sort();
+  assert.deepEqual(urls, [PEER_URL, STUB_PEER_URL], 'the roster row merged as a peer');
+  const row = mesh.view(T0).find((v) => v.url === STUB_PEER_URL)!;
+  assert.equal(row.instance_id, seed.instance_id, 'the roster identity rides the row');
+  // Throttled tick: no re-enroll, no extra pull (the persisted credential
+  // is reused; the interval gate stands).
+  await mesh.pullRoster(fetcher, T0 + 1000);
+  assert.equal(stub.enrollCount, 1, 'no re-enroll inside the interval');
+  assert.equal(stub.rosterPulls.length, 1, 'no second pull inside the interval');
+  // Past the interval: re-pulls, still signed, still accepted; the peer
+  // set is stable (ADD-only, no churn).
+  await mesh.pullRoster(fetcher, T0 + ROSTER_PULL_MS);
+  assert.equal(stub.rosterPulls.length, 2, 'the interval elapsed: the signed pull happens again');
+  assert.deepEqual(mesh.view(T0 + ROSTER_PULL_MS).map((v) => v.url).sort(), [PEER_URL, STUB_PEER_URL]);
+  await stub.close();
+});
+
+test('slice 7: a stale credential re-enrolls (D2 recovery: fleet reset → wiped file + fresh token)', async () => {
+  const stub = new StubFleet();
+  const base = await stub.start();
+  const dir = await mkTmp();
+  const identity = Identity.loadOrCreate(join(dir, 'state.json'));
+  // First enrollment — a live credential.
+  const token1 = stub.mintToken();
+  const file = enrollmentFileOf(join(dir, 'state.json'));
+  const c1 = new FleetClient(file, { fleet_url: base, fleet_enrollment_token: token1, name: 'urza' }, identity);
+  const enr1 = await c1.ensureEnrolled();
+  assert.equal(enr1.ok, true, 'the first enrollment succeeds');
+  assert.ok(existsSync(file), 'the credential is persisted');
+  // The fleet re-deploys (instance store wiped): the stored credential is
+  // STALE — the service knows no such instance. The pull is fail-quiet.
+  stub.resetInstances();
+  assert.equal(await c1.signedRoster(), null, 'a stale credential is a 401 → no-op (no crash)');
+  // D2 recovery (wiped machine): the credential file goes, the operator
+  // issues a fresh token. The client re-enrolls with the SAME identity
+  // (the ed25519 keypair is unchanged — it is the machine's truth).
+  rmSync(file, { force: true });
+  const token2 = stub.mintToken();
+  const c2 = new FleetClient(file, { fleet_url: base, fleet_enrollment_token: token2, name: 'urza' }, identity);
+  assert.equal(c2.enrolled, false, 'the wiped file means the client is unenrolled');
+  const enr2 = await c2.ensureEnrolled();
+  assert.equal(enr2.ok, true, 'the fresh token re-enrolls');
+  assert.match(enr2.instance_id as string, /^m-[0-9a-f]{16}$/, 'the fleet re-issues an id');
+  assert.notEqual(enr2.credential, enr1.credential, 'a new credential (the old one is invalid)');
+  const rec2 = loadEnrollment(file);
+  assert.equal(rec2?.instance_id, enr2.instance_id, 'the re-enrolled credential is persisted');
+  assert.equal(rec2?.credential, enr2.credential);
+  // And the re-enrolled identity can pull the roster again.
+  const rows = (await c2.signedRoster()) as { instances: { instance_id: string }[] };
+  assert.ok(rows.instances.some((i) => i.instance_id === enr2.instance_id), 'the re-enrolled instance is in the roster');
+  await stub.close();
+>
 });
