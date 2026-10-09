@@ -256,6 +256,15 @@ function serverView(arbiter: Arbiter, cfg: ServerConfig, now: number) {
       model_source: probed !== null ? 'probed' : 'declared',
       probed_at: arbiter.probedAt(row.id),
       models: inventory.map((m) => ({ name: m, running: runningModels.has(m), queued: queuedByModel.get(m) ?? 0 })),
+      // Engine-group plane (docs/architecture/engine-health-routing.md D3/D5):
+      // which group (if any) this row belongs to + its live ENGAGED marker
+      // (an active lease or an active session holds an engine slot here). ADD
+      // keys — the group list itself rides `GET /api/engine-groups`, these are
+      // the per-row display facts for the InferenceServers group picker + the
+      // live ENGAGED dot.
+      group_id: arbiter.groupOf(row.id)?.group_id ?? null,
+      max_concurrent: arbiter.groupOf(row.id)?.max_concurrent ?? null,
+      engaged: arbiter.rowEngaged(row.id, now),
     };
   });
 }
@@ -886,6 +895,45 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   });
 
   // ------------------------------------------------------------------
+  // Engine groups (docs/architecture/engine-health-routing.md D3/D5)
+  // ------------------------------------------------------------------
+
+  /**
+   * GET /api/engine-groups: the stored groups, verbatim (a group carries no
+   * secret by construction — server_id slugs + a number), so nothing strips.
+   */
+  app.get('/api/engine-groups', async () => {
+    return { groups: arbiter.engineGroups() };
+  });
+
+  /**
+   * POST /api/engine-groups: the group write route — the alias authoring
+   * posture applied to groups (whole-entry validation, 400 told not
+   * swallowed, one `engine_group_updated` event, 0600 save). Body:
+   * { group_id, name?, server_ids?, max_concurrent?, delete? }. The response
+   * echoes the STORED group. An unknown delete is a 404.
+   */
+  app.post('/api/engine-groups', async (req, reply) => {
+    const body = (req.body ?? {}) as {
+      group_id?: unknown;
+      name?: unknown;
+      server_ids?: unknown;
+      max_concurrent?: unknown;
+      delete?: unknown;
+    };
+    const res = arbiter.putEngineGroup(body);
+    if (!res.ok) {
+      return reply.code(res.reason === 'unknown_group' ? 404 : 400).send({ error: res.reason ?? 'invalid' });
+    }
+    return {
+      ok: true,
+      created: res.created === true,
+      deleted: res.deleted === true,
+      ...(res.group ? { group: res.group } : {}),
+    };
+  });
+
+  // ------------------------------------------------------------------
   // Sessions (router-self-registered interactive traffic — #32/#33)
   // ------------------------------------------------------------------
 
@@ -1177,6 +1225,12 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       // (amendment discipline). The credential NEVER rides here either —
       // auth_set only, same write-only posture (#60 B).
       model_aliases: arbiter.modelAliases(),
+      // Engine groups (docs/architecture/engine-health-routing.md D3): the
+      // stored group plane, verbatim (a group carries no secret — server_id
+      // slugs + a number). ADD-key SIBLING of `model_aliases`, on the same
+      // /api/state poll the dashboard already pulls (single-poll posture, D4).
+      // The per-row group/engaged facts ride `servers[]` (serverView).
+      engine_groups: arbiter.engineGroups(),
       // Dashboard color scheme (#68): the persisted theme map, the ADD key.
       // Anonymous-readable — cosmetic values only (pure hex colors, no token
       // or secret). Absent when unset (the dashboard falls back to its :root

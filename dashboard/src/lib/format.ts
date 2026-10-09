@@ -42,6 +42,17 @@ export function liveWord(signal: { idle: boolean; degraded?: boolean } | null, r
   return { label: "Busy", tone: "warn", note: "grants blocked" };
 }
 
+// The routing-health word (engine-health-routing.md D5 display): the liveness
+// axis, shown beside the idle word so the operator sees which one a routing
+// decision used. The arbiter decided it — `probed` = the /v1/models probe
+// answered this tick (green), `declared` = the probe never answered (red, the
+// row's declared list stands). The idle word is a separate axis and stays as
+// is (it is the activity word, not this one).
+export function probeWord(source: "probed" | "declared"): StateWord {
+  if (source === "probed") return { label: "probed", tone: "ok", note: "the /v1/models probe answered this tick — the routing green" };
+  return { label: "declared", tone: "err", note: "the /v1/models probe never answered — the declared list stands (routing red)" };
+}
+
 export const PROVIDER_CHOICES: [string, string][] = [
   ["llama-swap", "llama-swap (activity feed)"],
   ["strata", "strata (/metrics counters — works remote)"],

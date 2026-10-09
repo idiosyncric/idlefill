@@ -23,6 +23,7 @@ export function emptyState(): ArbiterState {
   return {
     servers: [],
     model_aliases: {},
+    engine_groups: {},
     client_keys: [],
     projects: [],
     clients: [],
@@ -98,6 +99,11 @@ export class StateStore {
         // Tolerate state files from before the model-alias plane (#66 D1)
         // existed.
         model_aliases: raw.model_aliases && typeof raw.model_aliases === 'object' ? raw.model_aliases : base.model_aliases,
+        // Tolerate state files from before the engine-group plane (same-host
+        // mutual exclusion, docs/architecture/engine-health-routing.md D3)
+        // existed. The `session_pins` pattern: a missing or malformed key
+        // yields the empty map, never a rejection.
+        engine_groups: raw.engine_groups && typeof raw.engine_groups === 'object' ? raw.engine_groups : base.engine_groups,
         // Tolerate state files from before the agent-key plane (#68)
         // existed.
         client_keys: Array.isArray(raw.client_keys) ? raw.client_keys : base.client_keys,

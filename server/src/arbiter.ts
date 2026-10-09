@@ -55,6 +55,7 @@ import { buildCatalog, modelsProbeUrl, type CatalogEntry, type ModelsFetcher } f
 import { mintInstanceId } from './mesh.js';
 import type {
   ClientKeyRow,
+  EngineGroup,
   IdleSignal,
   JobResultRow,
   JobThrottle,
@@ -83,6 +84,14 @@ export interface ModelAliasEntry {
   /** The winner pair's engine-OWN model id the router splices into the body. */
   engine_model: string;
   catalog_source: 'probed' | 'declared';
+  /**
+   * Health-ordered fall-through (docs/architecture/engine-health-routing.md
+   * D2): TRUE when the published winner is NOT the stored pin — the pin is
+   * dead (or group-blocked) and traffic moved to the next-best option.
+   * ADD-key, absent on every entry that resolves to its pin (the router
+   * ignores the key; the dashboard renders "re-routed from <pin>").
+   */
+  fallback?: boolean;
 }
 
 /**
@@ -223,6 +232,7 @@ function cleanReportedHistory(
 export type LeaseRejectionReason =
   | 'not_idle'
   | 'busy'
+  | 'group_busy'
   | 'project_paused'
   | 'budget_exhausted'
   | 'unknown_project'
@@ -731,6 +741,23 @@ export class Arbiter {
     const activeHere = active.filter((l) => leaseServerId(l) === serverId);
     if (activeHere.length >= maxLeases) return { ok: false, reason: 'busy' };
 
+    // Engine-group cap (docs/architecture/engine-health-routing.md D3):
+    // a grant on a row in group G is admitted only when the count of ACTIVE
+    // LEASES across ALL rows of G is below the group's `max_concurrent`
+    // (default 1 = at most one background job across the whole host — the
+    // same-host mutual exclusion the owner named). The check joins the
+    // per-server evaluation as one more per-server condition. No group (or a
+    // single-member group) = byte-for-byte unchanged, and the per-server
+    // cap above already bounds that case.
+    const grp = this.groupOf(serverId);
+    if (grp && grp.server_ids.length > 1) {
+      const cap = Number.isFinite(grp.max_concurrent) && grp.max_concurrent > 0
+        ? Math.floor(grp.max_concurrent)
+        : 1;
+      const activeInGroup = active.filter((l) => grp.server_ids.includes(leaseServerId(l)));
+      if (activeInGroup.length >= cap) return { ok: false, reason: 'group_busy' };
+    }
+
     const used = this.projectTokensOut(params.project, utcDay(now));
     if (used >= project.daily_token_cap) return { ok: false, reason: 'budget_exhausted' };
 
@@ -983,8 +1010,9 @@ export class Arbiter {
     // alias pass uses stays byte-for-byte.
     for (const [id, names] of probed) this.lastProbed.set(id, names);
     // #66 D2: the alias pass runs in THIS cycle over the SAME probe map —
-    // per-pair confirmation, winner resolution, the published block.
-    this.buildAliasBlock(rows, probed);
+    // per-pair confirmation, the D2 health-ordered winner chain (the `now`
+    // feeds the D3 group engaged check), the published block.
+    this.buildAliasBlock(rows, probed, nowMs);
     return this.catalogPublished;
   }
 
@@ -998,6 +1026,50 @@ export class Arbiter {
   // ------------------------------------------------------------------
 
   /**
+   * Engine groups (docs/architecture/engine-health-routing.md D3): the
+   * group (if any) a row belongs to. A row is in at most one group, so a
+   * linear scan over the stored groups is the whole lookup.
+   */
+  groupOf(serverId: string): EngineGroup | null {
+    const groups = this.store.state.engine_groups;
+    if (!groups) return null;
+    for (const g of Object.values(groups)) {
+      if (Array.isArray(g?.server_ids) && g.server_ids.includes(serverId)) return g;
+    }
+    return null;
+  }
+
+  /**
+   * A row is ENGAGED (D3) when the arbiter observes an active inference on
+   * it: an ACTIVE LEASE names it, OR a session row points at it with gate
+   * state 'active' (a parked 'queued' session consumes no engine slot and is
+   * NOT engaged). Both feeds are already stored arbiter state.
+   */
+  rowEngaged(serverId: string, now: number): boolean {
+    if (this.activeLeases(now).some((l) => leaseServerId(l) === serverId)) return true;
+    return this.store.state.sessions.some(
+      (sess) => leaseServerId(sess) === serverId && sess.gate?.state === 'active',
+    );
+  }
+
+  /**
+   * The D3 chain filter input: TRUE when a row in `serverId`'s group OTHER
+   * than `serverId` is ENGAGED. The chain's steps 1-2 use this — a candidate
+   * is eligible only when no OTHER row in its group is engaged. Step 3/4
+   * never consult it. A row with no group (or a single-member group) has no
+   * peer, so this is always false and the path is byte-for-byte unchanged.
+   */
+  private groupEngagedPeer(serverId: string, now: number): boolean {
+    const g = this.groupOf(serverId);
+    if (!g || g.server_ids.length === 0) return false;
+    for (const peer of g.server_ids) {
+      if (peer === serverId) continue;
+      if (this.rowEngaged(peer, now)) return true;
+    }
+    return false;
+  }
+
+  /**
    * #66 D2/D3: per-pair confirmation against the same probe map, winner
    * selection (D4), and the resolved `model_aliases` publish block.
    *
@@ -1009,9 +1081,23 @@ export class Arbiter {
    *   for the tick. The alias itself never drops — stored pairs stand,
    *   publish filters. All pairs dead = the alias is not published at all
    *   that tick (exception-only, never a silent half-name).
-   * - Winner (D4): the stored `pinned_server_id` when it matches a
-   *   surviving pair; a dead/absent pin falls through to the FIRST
-   *   surviving pair. The router never recomputes it.
+   * - Winner (D4, AMENDED by docs/architecture/engine-health-routing.md
+   *   D2): the health-ordered chain over the surviving pairs, in order —
+   *   (1) the pinned pair when it survives AND its row is healthy this tick
+   *   AND its group has no engaged peer; (2) the FIRST non-pinned pair
+   *   (insertion order) whose row is healthy this tick and whose group has
+   *   no engaged peer — the pin is dead or group-blocked, traffic moves to
+   *   the next-best option in the operator's declared priority; (3) the
+   *   pinned pair when it survives but its row is not healthy (every healthy
+   *   option is gone — the pin still names the engine; honest degradation,
+   *   no silent re-pin); (4) the first surviving pair (no pin applies —
+   *   absent or its pair dropped; today's fall-through). Steps 1-2 consult
+   *   the D3 group filter; steps 3-4 NEVER do (mutual exclusion is a
+   *   preference between live options, never a veto on the only option).
+   *   The chain never unpublishes an alias today publishes: when at least
+   *   one pair survives (a probe failure keeps a pair a survivor), the alias
+   *   still publishes, possibly from a different row. The `fallback` ADD-key
+   *   is TRUE when the published winner is not the stored pin.
    * - Publish-path sanitizers are drop-don't-reject (D1): a malformed name,
    *   id, or row reference drops the entry for the tick, never rejects the
    *   stored row.
@@ -1019,7 +1105,7 @@ export class Arbiter {
    * The per-tick pair verdicts also land in `aliasPairStates` for the
    * dashboard read (`GET /api/aliases`) — exception-only markers.
    */
-  private buildAliasBlock(rows: readonly ServerConnection[], probed: ReadonlyMap<string, string[]>): void {
+  private buildAliasBlock(rows: readonly ServerConnection[], probed: ReadonlyMap<string, string[]>, now: number): void {
     const byId = new Map(rows.map((r) => [r.id, r]));
     const out: ModelAliasEntry[] = [];
     const pairStates = new Map<string, { server_id: string; model: string; source: 'probed' | 'declared' | 'dropped' }[]>();
@@ -1056,7 +1142,24 @@ export class Arbiter {
       pairStates.set(name, states);
       if (survivors.length === 0) continue; // all pairs dead this tick: not offered, not routed
       const pin = typeof row?.pinned_server_id === 'string' ? row.pinned_server_id : '';
-      const winner = survivors.find((p) => p.server_id === pin) ?? survivors[0]!;
+      // D2 health-ordered chain (docs/architecture/engine-health-routing.md).
+      // A row is HEALTHY this tick when the probe answered for it (`probed`
+      // present); the D3 group filter (steps 1-2 only) asks whether another
+      // row in the same group is ENGAGED.
+      const healthy = (sid: string) => probed.has(sid);
+      const peerFree = (sid: string) => !this.groupEngagedPeer(sid, now);
+      const pinned = pin !== '' ? survivors.find((p) => p.server_id === pin) : undefined;
+      // Step 1: the pin, when it survives AND is healthy AND its group is free.
+      const step1 = pinned && healthy(pinned.server_id) && peerFree(pinned.server_id) ? pinned : undefined;
+      // Step 2: the first non-pinned healthy, group-free pair (the next-best
+      // option in the operator's declared priority — the 21:41 fix).
+      const step2 = !step1
+        ? survivors.find((p) => p.server_id !== pin && healthy(p.server_id) && peerFree(p.server_id))
+        : undefined;
+      // Step 3: the pin when it survives but is not healthy (honest degrade).
+      const step3 = !step1 && !step2 && pinned ? pinned : undefined;
+      // Step 4: the first survivor (no pin applies — today's fall-through).
+      const winner = step1 ?? step2 ?? step3 ?? survivors[0]!;
       const srv = byId.get(winner.server_id)!;
       if (typeof srv.url !== 'string' || srv.url.trim() === '') continue;
       out.push({
@@ -1066,6 +1169,11 @@ export class Arbiter {
         auth_set: srv.auth_token !== undefined && srv.auth_token !== '',
         engine_model: winner.model,
         catalog_source: winner.source,
+        // D2 ADD-key: present (true) only when a stored pin exists and the
+        // published winner is not it (re-routed). Absent on every pin-matched
+        // and pinless entry — the router ignores the key, the dashboard reads
+        // it.
+        ...(pin !== '' && winner.server_id !== pin ? { fallback: true } : {}),
       });
     }
     this.aliasPublished = out;
@@ -1081,6 +1189,15 @@ export class Arbiter {
    */
   modelAliases(): ModelAliasEntry[] {
     return this.aliasPublished;
+  }
+
+  /**
+   * The stored engine groups (docs/architecture/engine-health-routing.md
+   * D3) for the dashboard read (`GET /api/engine-groups`) — verbatim (a
+   * group carries no secret by construction). Ephemeral like `aliasRows`.
+   */
+  engineGroups(): EngineGroup[] {
+    return Object.values(this.store.state.engine_groups ?? {});
   }
 
   /**
@@ -1216,6 +1333,114 @@ export class Arbiter {
     this.store.trim();
     this.store.save();
     return { ok: true, created: false, alias: existing };
+  }
+
+  /**
+   * Engine-group write (docs/architecture/engine-health-routing.md D3/D5) —
+   * the alias authoring posture applied to groups: whole-entry validation,
+   * 400 told not swallowed, one `engine_group_updated` event, state saved
+   * with the existing 0600 posture. Body: `{ group_id, name?,
+   * server_ids?, max_concurrent?, delete? }`.
+   *
+   * Rules: `group_id` is the ALIAS_NAME class (the sanitizer class of alias
+   * names). `server_ids` must be a NON-EMPTY array of KNOWN row ids, with no
+   * duplicate inside the group. A row belongs to AT MOST one group — if any
+   * member is already claimed by another group the write is a 400 (told).
+   * `max_concurrent` (owner decision 2026-10-08: configurable per group)
+   * must be a positive integer when present; absent = the default 1. A
+   * single-member group is accepted (a no-op cap; it survives a row
+   * re-add without a rewrite). `delete: true` of an unknown group is a 404.
+   */
+  putEngineGroup(input: {
+    group_id?: unknown;
+    name?: unknown;
+    server_ids?: unknown;
+    max_concurrent?: unknown;
+    delete?: unknown;
+  }): { ok: boolean; reason?: string; created?: boolean; deleted?: boolean; group?: EngineGroup } {
+    const s = this.store.state;
+    const key = typeof input.group_id === 'string' ? input.group_id.trim() : '';
+    if (!ALIAS_NAME_RE.test(key)) {
+      return { ok: false, reason: 'group_id must be printable and at most 128 chars' };
+    }
+    if (input.delete === true) {
+      if (!s.engine_groups[key]) return { ok: false, reason: 'unknown_group' };
+      delete s.engine_groups[key];
+      this.store.appendEvent({ kind: 'engine_group_removed', detail: key });
+      this.store.trim();
+      this.store.save();
+      return { ok: true, deleted: true };
+    }
+    const existing = s.engine_groups[key];
+    const hasMembers = input.server_ids !== undefined;
+    const hasCap = input.max_concurrent !== undefined;
+    if (!hasMembers && !hasCap) {
+      return {
+        ok: false,
+        reason: existing
+          ? 'nothing to update (provide server_ids or max_concurrent, or delete: true)'
+          : 'server_ids required (non-empty)',
+      };
+    }
+    let members: string[] | undefined;
+    if (hasMembers) {
+      if (!Array.isArray(input.server_ids)) return { ok: false, reason: 'server_ids must be an array' };
+      if (input.server_ids.length === 0) return { ok: false, reason: 'server_ids must not be empty' };
+      const rowIds = new Set(s.servers.map((r) => r.id));
+      const seen = new Set<string>();
+      members = [];
+      for (const sid of input.server_ids) {
+        const id = typeof sid === 'string' ? sid.trim() : '';
+        if (!ALIAS_NAME_RE.test(id)) return { ok: false, reason: 'server_id must be printable and at most 128 chars' };
+        if (!rowIds.has(id)) return { ok: false, reason: `unknown server_id: ${id}` };
+        if (seen.has(id)) return { ok: false, reason: `duplicate server_id: ${id} appears twice` };
+        seen.add(id);
+        members.push(id);
+      }
+    }
+    // One group per row (D3): a member already claimed by ANOTHER group is a
+    // 400 at write time (told, not swallowed). The group's own current
+    // members are exempt (re-writing the same set is a no-op, not a
+    // violation).
+    const claimedElsewhere = (sid: string) =>
+      Object.values(s.engine_groups).some(
+        (g) => g.group_id !== key && Array.isArray(g.server_ids) && g.server_ids.includes(sid),
+      );
+    if (members) {
+      const dup = members.find((sid) => claimedElsewhere(sid));
+      if (dup) return { ok: false, reason: `server ${dup} already belongs to another group` };
+    }
+    let maxConcurrent: number | undefined;
+    if (hasCap) {
+      if (typeof input.max_concurrent !== 'number' || !Number.isInteger(input.max_concurrent) || input.max_concurrent < 1) {
+        return { ok: false, reason: 'max_concurrent must be a positive integer' };
+      }
+      maxConcurrent = input.max_concurrent;
+    }
+    const nowMs = Date.now();
+    if (!existing) {
+      if (!members) return { ok: false, reason: 'server_ids required (non-empty)' };
+      const row: EngineGroup = {
+        group_id: key,
+        ...(typeof input.name === 'string' && input.name.trim() !== '' ? { name: input.name.trim() } : {}),
+        server_ids: members,
+        max_concurrent: maxConcurrent ?? 1,
+        updated_at: nowMs,
+      };
+      s.engine_groups[key] = row;
+      this.store.appendEvent({ kind: 'engine_group_updated', detail: `${key} (${members.length} member(s))` });
+      this.store.trim();
+      this.store.save();
+      return { ok: true, created: true, group: row };
+    }
+    if (members) existing.server_ids = members;
+    if (maxConcurrent !== undefined) existing.max_concurrent = maxConcurrent;
+    if (typeof input.name === 'string' && input.name.trim() !== '') existing.name = input.name.trim();
+    existing.updated_at = nowMs;
+    this.store.appendEvent({ kind: 'engine_group_updated', detail: key });
+    this.store.trim();
+    this.store.save();
+    return { ok: true, created: false, group: existing };
   }
 
   /**

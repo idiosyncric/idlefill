@@ -674,6 +674,13 @@ export type EventKind =
   | 'model_alias_removed'
   | 'model_alias_reordered'
   /**
+   * Engine groups (docs/architecture/engine-health-routing.md D3/D5): an
+   * operator group write (upsert) and a group removal. Detail carries the
+   * `group_id`. A group carries no secret, so nothing is redacted.
+   */
+  | 'engine_group_updated'
+  | 'engine_group_removed'
+  /**
    * Agent keys (#68): an operator mint (detail carries the label, NEVER
    * the plaintext) and a revoke (detail carries id + label).
    */
@@ -743,6 +750,31 @@ export interface ModelAlias {
   alias: string; // the name the catalog publishes
   pairs: ModelAliasPair[]; // insertion order = default pin order
   pinned_server_id?: string; // the winner the drag writes; absent = first pair
+  updated_at: number;
+}
+
+/**
+ * One operator-declared engine group (same-host mutual exclusion)
+ * (docs/architecture/engine-health-routing.md D3). A CROSS-ROW entity like
+ * an alias: it lives at the top of the state file, beside `servers`, and a
+ * row belongs to AT MOST one group (enforced at write time). The group
+ * carries NO secret — `server_id` slugs + a number only — so the write-only
+ * token posture is untouched by construction.
+ */
+export interface EngineGroup {
+  /** Stable slug (the sanitizer class of alias names); the write handle. */
+  group_id: string;
+  /** Display label. Absent = the group renders by its `group_id`. */
+  name?: string;
+  /** Member rows. A row belongs to at most one group (write-time 400). */
+  server_ids: string[];
+  /**
+   * Group-wide admission cap for the lease plane. Default 1 = hard mutual
+   * exclusion (at most one background job across the whole group/host).
+   * Configurable per group (owner decision 2026-10-08); absent = 1.
+   */
+  max_concurrent: number;
+  /** Epoch-ms of the last write (the audit/echo, like `ModelAlias`). */
   updated_at: number;
 }
 
@@ -827,6 +859,15 @@ export interface ArbiterState {
    * construction.
    */
   model_aliases: Record<string, ModelAlias>;
+  /**
+   * Operator-declared engine groups (same-host mutual exclusion,
+   * docs/architecture/engine-health-routing.md D3), keyed by `group_id`.
+   * ADD-key sibling of `model_aliases` — a state file from before the plane
+   * carries none (the state loader tolerates the missing key, the
+   * `session_pins` pattern). A row belongs to at most one group (write-time
+   * 400). A group carries NO secret by construction.
+   */
+  engine_groups: Record<string, EngineGroup>;
   /**
    * Idlefill-issued AGENT keys (#68), keyed by nothing — an array like
    * `servers`, id is the handle. ADD-key: state files from before #68

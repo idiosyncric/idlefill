@@ -36,6 +36,10 @@ export type ServerRow = {
   peers?: string[];
   configured_at?: number;
   updated_at?: number;
+  // Engine-group plane (D3). Absent on an arbiter that predates the plane.
+  group_id?: string | null;
+  max_concurrent?: number | null;
+  engaged?: boolean;
 };
 
 export type ClientOverride = {
@@ -228,6 +232,21 @@ export type ModelAliasEntry = {
   auth_set: boolean;
   engine_model: string;
   catalog_source: "probed" | "declared";
+  // D2 (engine-health-routing.md): the winner is NOT the stored pin — the pin
+  // is dead (or group-blocked) and traffic moved to the next-best option.
+  // Absent on every pin-matched and pinless entry.
+  fallback?: boolean;
+};
+
+// One operator-declared engine group (same-host mutual exclusion, D3).
+// A CROSS-ROW entity: member rows + a group-wide admission cap (default 1).
+// Carries NO secret — server_id slugs + a number only.
+export type EngineGroup = {
+  group_id: string;
+  name?: string;
+  server_ids: string[];
+  max_concurrent: number;
+  updated_at: number;
 };
 
 // The stored authoring row (token-gated GET /api/aliases).
@@ -309,6 +328,9 @@ export type StateSnapshot = {
   projects: ProjectRow[];
   catalog: CatalogEntry[];
   model_aliases: ModelAliasEntry[];
+  // Engine groups (D3). Absent on an arbiter that predates the plane — the
+  // shape contract keeps every later-added key optional.
+  engine_groups?: EngineGroup[];
   throttled_jobs: ThrottledJob[];
   mesh?: { instance_id: string; peers: MeshPeer[] };
   /** The operator-tuned color scheme (#68). Absent until set. */
@@ -537,6 +559,24 @@ export async function putAlias(body: {
   order?: string[];
 }) {
   return json(await fetch(`/api/aliases${qsToken()}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  }));
+}
+
+// Engine-group write (D3/D5): the alias authoring posture applied to groups.
+// { group_id, name?, server_ids?, max_concurrent?, delete? } — upsert, cap /
+// member re-write, or removal. A 404 is a delete of an unknown group; every
+// other refusal is a 400 with the reason.
+export async function putEngineGroup(body: {
+  group_id?: string;
+  name?: string;
+  server_ids?: string[];
+  max_concurrent?: number;
+  delete?: boolean;
+}): Promise<{ ok: boolean; created?: boolean; deleted?: boolean; group?: EngineGroup }> {
+  return json(await fetch(`/api/engine-groups${qsToken()}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),

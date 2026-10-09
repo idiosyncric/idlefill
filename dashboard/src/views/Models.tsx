@@ -32,10 +32,11 @@ import {
   getAliases,
   putAlias,
   type AliasRow,
+  type ModelAliasEntry,
   type ServerRow,
   type StateSnapshot,
 } from "@/lib/api";
-import { ago } from "@/lib/format";
+import { ago, probeWord } from "@/lib/format";
 
 // ---------------------------------------------------------------------------
 // Models — the operator-declared model aliases (#66). One card per alias:
@@ -175,6 +176,7 @@ export function Models({ st }: { st: StateSnapshot | null }) {
                 a={a}
                 index={i}
                 total={aliases.length}
+                published={st?.model_aliases.find((m) => m.name === a.alias) ?? null}
                 onMove={(dir) => move(i, dir)}
                 srvName={srvName}
                 now={st?.now ?? Date.now()}
@@ -230,6 +232,7 @@ function AliasCard({
   a,
   index,
   total,
+  published,
   onMove,
   srvName,
   now,
@@ -238,6 +241,11 @@ function AliasCard({
   a: AliasRow;
   index: number;
   total: number;
+  // The arbiter's RESOLVED winner for this tick (the published model_aliases
+  // entry joined by name). It is the routing truth — the stored pin when the
+  // pin is healthy and group-free, else the next-best option (fallback).
+  // Null until the first state poll lands.
+  published: ModelAliasEntry | null;
   onMove: (dir: -1 | 1) => void;
   srvName: (id: string) => string;
   now: number;
@@ -247,6 +255,25 @@ function AliasCard({
   const winnerPair = a.pairs.find((p) => p.server_id === winnerId) ?? a.pairs[0];
   const winnerIsPin = a.pinned_server_id !== undefined;
   const isDefault = index === 0 && total > 0;
+
+  // The effective winner: the arbiter's RESOLVED winner once the state poll
+  // has landed (the routing truth — the pin when healthy and group-free, else
+  // the next-best option), else the stored pin's pair (the pre-poll display,
+  // the row the server would resolve). `source` is the routing-health axis:
+  // 'probed' = green, 'declared' = red (the probe never answered this tick).
+  const eff = published
+    ? {
+        server_id: published.server_id,
+        model: published.engine_model,
+        source: published.catalog_source,
+      }
+    : winnerPair
+      ? {
+          server_id: winnerPair.server_id,
+          model: winnerPair.model,
+          source: (winnerPair.source === "probed" ? "probed" : "declared") as "probed" | "declared",
+        }
+      : null;
 
   const pin = async (server_id: string | null) => {
     if (!apiToken()) {
@@ -352,12 +379,25 @@ function AliasCard({
 
         <div className="flex items-center gap-2 text-[12px]">
           <span className="text-[11px] text-dim">winner</span>
-          {winnerPair ? (
+          {eff ? (
             <>
-              <span className="font-semibold">{srvName(winnerPair.server_id)}</span>
-              <code className="min-w-0 truncate text-[11px] text-dim">{winnerPair.model}</code>
-              {winnerIsPin && <Badge variant="outline" className="rounded-pill border-accent/50 px-1.5 py-0 text-[10px] font-normal text-accent">pinned</Badge>}
-              {!winnerIsPin && <span className="text-[10px] text-dim">first pair</span>}
+              <span className="font-semibold">{srvName(eff.server_id)}</span>
+              <code className="min-w-0 truncate text-[11px] text-dim">{eff.model}</code>
+              <span
+                className={`size-1.5 shrink-0 rounded-full ${eff.source === "probed" ? "bg-ok" : "bg-err"}`}
+                title={probeWord(eff.source).note}
+              />
+              {published?.fallback && (
+                <Badge variant="outline" className="rounded-pill border-err/50 px-1.5 py-0 text-[10px] font-normal text-err" title="the pin is dead (or group-blocked) — traffic moved to the next-best option">
+                  re-routed from {srvName(a.pinned_server_id ?? "")}
+                </Badge>
+              )}
+              {!published?.fallback && a.pinned_server_id === eff.server_id && (
+                <Badge variant="outline" className="rounded-pill border-accent/50 px-1.5 py-0 text-[10px] font-normal text-accent">
+                  pinned
+                </Badge>
+              )}
+              {!published && !winnerIsPin && <span className="text-[10px] text-dim">first pair</span>}
             </>
           ) : (
             <span className="text-dim">none</span>
