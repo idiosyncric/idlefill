@@ -44,6 +44,9 @@ export const DEFAULTS: Omit<ServerConfig, 'state_file'> & {
   // Metrics retention store (#51 D5).
   metrics_raw_window_hours: 48,
   metrics_retention_days: 400,
+  // Load-axis freshness window (#52 slice 1, D3): three polls at the
+  // 15-second poll_ms.
+  metrics_load_stale_s: 45,
 };
 
 /** Coerce a raw (partial) config object into a full ServerConfig, applying defaults per field. */
@@ -119,6 +122,13 @@ export function applyDefaults(raw: Partial<ServerConfig> | null | undefined): Se
     // retention in days. Non-positive/garbage falls back to the default.
     metrics_raw_window_hours: num(r.metrics_raw_window_hours, DEFAULTS.metrics_raw_window_hours ?? 48),
     metrics_retention_days: num(r.metrics_retention_days, DEFAULTS.metrics_retention_days ?? 400),
+    // Load-axis freshness window (#52 slice 1, D3): labels `load_age_s`
+    // only. Non-positive/garbage falls back to the default (45 s) — a
+    // window of -1 s is nonsense (same guard as rawWindowHours).
+    metrics_load_stale_s: (() => {
+      const v = num(r.metrics_load_stale_s, DEFAULTS.metrics_load_stale_s ?? 45);
+      return v > 0 ? v : (DEFAULTS.metrics_load_stale_s ?? 45);
+    })(),
   };
 }
 

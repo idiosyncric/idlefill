@@ -11,8 +11,10 @@ import { buildApi, attachWebSocket } from './api.js';
 import { Arbiter, leaseServerId, WATCHED_SERVER_ID } from './arbiter.js';
 import { loadConfig } from './config.js';
 import { IdleDetector, makeActivityFetcherFor, makeRealActivityFetcher, makeRealLogMtimeSource } from './idle.js';
+import { LoadCollector, newestFeedTps } from './load.js';
 import { makeRealModelsFetcher } from './catalog.js';
 import type { ActivityFetcher } from './idle.js';
+import type { LoadSignalView } from './load.js';
 import { FeedDeltaTracker, MetricsStore, HOUR_MS, instrumentArbiterForMetrics } from './metrics.js';
 import { CounterDeltaTracker, OmlxUsageReaders } from './omlx.js';
 import { MeshFederation, makeRealMeshFetcher } from './mesh.js';
@@ -64,15 +66,74 @@ async function main(): Promise<void> {
   // One wrapped fetch per provider kind (#60 B, #62): the kind selects the
   // PARSE (llama-swap feed contract vs strata /metrics); the transport,
   // the credential header, and the delta observers are shared.
+  /** The feed rates captured this tick (cleared at the top of each tick). */
+  const feedTpsThisTick = new Map<string, number | null>();
   const fetchByKind = (row: ServerConnection): ActivityFetcher => {
     const counters = (c: EngineCounters) => counterDelta.observe(row.id, c);
     const base = makeActivityFetcherFor(row.provider, row.provider === 'strata' ? counters : undefined);
     return async (url: string, auth?: string): Promise<ActivityEntry[]> => {
       const entries = await base(url, auth);
       feedDelta.observe(url, entries);
+      // #52 slice 1 (DATA ONLY): capture the feed's newest-entry engine
+      // rate when it rides the wire. Display + sample only — never a
+      // verdict input. Strata-adapted entries carry no tokens block, so
+      // this is a no-op for that kind.
+      if ((row.provider ?? 'llama-swap') !== 'strata') {
+        feedTpsThisTick.set(row.id, newestFeedTps(entries));
+      }
       return entries;
     };
   };
+  // #52 slice 1 (DATA ONLY): one load collector per engine row (D1: a
+  // module of the fused arbiter). Reads the kind's load surface inside
+  // the existing poll tick. NEVER feeds the verdict — a failed load read
+  // yields no reading (absent = unset, never a fake zero), and it must
+  // not touch the feed-degraded fail-closed plane.
+  const loadCollectors = new Map<string, LoadCollector>();
+  const loadCollectorMeta = new Map<string, { provider: ServerProvider; url: string }>();
+  const loadCollectorFor = (row: ServerConnection): LoadCollector | null => {
+    const kind: ServerProvider = row.provider ?? 'llama-swap';
+    // The D4 wave wires strata's live.state; this slice captures
+    // llama-swap /metrics and oMLX /health only.
+    if (kind === 'strata') return null;
+    const meta = loadCollectorMeta.get(row.id);
+    const stale = meta && (meta.provider !== kind || meta.url !== row.url);
+    if (stale) {
+      loadCollectors.delete(row.id);
+      loadCollectorMeta.delete(row.id);
+    }
+    let c = loadCollectors.get(row.id);
+    if (!c) {
+      c = new LoadCollector({
+        url: row.url,
+        provider: kind,
+        ...(row.auth_token ? { auth_token: row.auth_token } : {}),
+      });
+      loadCollectors.set(row.id, c);
+      loadCollectorMeta.set(row.id, { provider: kind, url: row.url });
+    }
+    return c;
+  };
+  /**
+   * One load read per engine row per tick (#52 slice 1). Runs AFTER the
+   * feed polls (arbiter.tick) so the tick's own feed rate can ride along
+   * with no extra HTTP call (D5). Never throws: a collector's failure is
+   * an empty reading, and the load axis must not disturb the verdict.
+   */
+  const loadRead = async (now: number) => {
+    for (const row of store.state.servers) {
+      const c = loadCollectorFor(row);
+      if (!c) continue;
+      try {
+        await c.read(now, feedTpsThisTick.get(row.id) ?? null);
+      } catch {
+        /* load reads never throw; a failure is an absent reading */
+      }
+    }
+  };
+  /** The row's captured load reading at `now`, or null (no keys ride). */
+  const loadView = (row: ServerConnection, now: number): LoadSignalView | null =>
+    loadCollectors.get(row.id)?.current(now) ?? null;
 
   // Per-engine idle watching (#38): one detector per declared server row.
   // The watched server keeps the config's log_glob; other rows use their
@@ -208,6 +269,12 @@ async function main(): Promise<void> {
       const win = metrics.takeWindow(row.id);
       const activeLeases = arbiter.activeLeases(now).filter((l) => leaseServerId(l) === row.id).length;
       const activeSessions = store.state.sessions.filter((sess) => leaseServerId(sess) === row.id).length;
+      // #52 slice 1 (DATA ONLY): the captured load reading rides the
+      // sample line (design doc D6: the same appendEngineSample sink,
+      // D5: the SAME key names as the signal block). A failed load read
+      // rides as absent keys — never a fake zero — and the sample's
+      // idle/degraded fields are the UNTOUCHED verdict.
+      const load = loadView(row, now);
       metrics.appendEngineSample({
         ts: now,
         kind: 'engine',
@@ -223,6 +290,7 @@ async function main(): Promise<void> {
         active_sessions: activeSessions,
         requests_source,
         ...(tokens_in_delta !== undefined ? { tokens_in_delta, tokens_out_delta } : {}),
+        ...(load ? { ...load } : {}),
       });
     }
   };
@@ -250,7 +318,15 @@ async function main(): Promise<void> {
 
   const tickOnce = async () => {
     try {
+      // #52 slice 1 (DATA ONLY): one load read per row on the SAME poll
+      // cadence. Clear the per-tick feed-rate capture BEFORE the feed
+      // polls (arbiter.tick fills it), then run the load reads AFTER
+      // them so the feed's own rate rides along (no extra HTTP call, D5).
+      // A load read's failure is an absent reading — it never throws
+      // here and must not disturb the verdict.
+      feedTpsThisTick.clear();
       const { revoked } = await arbiter.tick();
+      await loadRead(Date.now());
       // Catalog probe (#64 D4): per-row credentialed GET /v1/models on
       // the SAME poll tick. probeCatalog never throws (a blocked row keeps
       // its declared list); the result publishes through arbiter.catalog()
