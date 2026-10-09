@@ -158,6 +158,103 @@ export function verifyRequester(store: EdgeStore, instanceId: string | null | un
 }
 
 /**
+ * Accepted clock-skew window for the signed `ts` (PROPOSED value — the
+ * pairing doc locks the ts check itself as a replay defense, but the
+ * window width is a PROPOSED constant, not a LOCKED clause). The signed
+ * ts must be within ±`EDGE_TS_SKEW_MS` of the target clock, or the
+ * request is stale (rejected as `stale_ts`). 15 minutes: wide enough
+ * that a drifting tailnet machine never loses a legitimate control
+ * action, narrow enough that a captured signature dies within the hour
+ * (the nonce store below bounds the live window to the last seen
+ * nonces, so the skew window only sets the FRESHNESS bound).
+ */
+export const EDGE_TS_SKEW_MS = 15 * 60 * 1000;
+
+/** The bound on the recently-seen nonce store (per requester id). */
+const NONCE_STORE_CAP = 256;
+
+/**
+ * Bounded, in-memory store of recently-seen (instance_id, nonce) pairs —
+ * the replay defense for the single-use nonce that rides the signed
+ * payload (slice 1 bound the field into the signature; slice 2
+ * enforces it).
+ *
+ * In-memory by construction (D2): the edge file persists the CREDENTIAL
+ * (the peer's public key); the nonce history is ephemeral anti-replay
+ * state, the same class as the peer snapshot that never touches disk.
+ * A restart clears it — the target clock window (EDGE_TS_SKEW_MS) still
+ * bounds the exposure: a captured signature cannot be replayed after
+ * its ts falls out of the skew window even on a fresh store.
+ *
+ * Bounded two ways, so memory is capped regardless of traffic:
+ *   - per requester id: at most `NONCE_STORE_CAP` nonces (FIFO by
+ *     recency — the oldest entry drops first);
+ *   - total: entries are pruned by the skew window on every `seen`
+ *     call, so an id with no recent traffic cannot accumulate.
+ *
+ * `seen(id, nonce, ts)` answers whether this (id, nonce) was seen
+ * within the fresh window AND records it (one call, one decision, so
+ * the check-and-record is atomic against itself). A `ts` outside the
+ * skew window is STALE, not a replay: it is neither recorded nor
+ * counted (a stale request cannot fill the store and starve a fresh
+ * one — the denial is the route's `stale_ts`).
+ */
+export class NonceReplayStore {
+  /** id -> nonce -> first-seen ts (insertion order = recency order). */
+  private readonly byId = new Map<string, Map<string, number>>();
+
+  /** Whether `id` used `nonce` within the fresh window. */
+  has(id: string, nonce: string): boolean {
+    const m = this.byId.get(id);
+    return m ? m.has(nonce) : false;
+  }
+
+  /**
+   * Decide (fresh? replay?) and record, in one call. `ts` is the signed
+   * epoch-ms; the caller passes the target clock (`now`).
+   *   - `stale`: ts outside ±EDGE_TS_SKEW_MS (recorded nothing);
+   *   - `replay`: the nonce is already in the store;
+   *   - `fresh`: not seen — the nonce is now recorded (FIFO-evicted
+   *     past `NONCE_STORE_CAP`) and the entry's ts is stored for the
+   *     next window prune.
+   */
+  seen(id: string, nonce: string, ts: number, now: number): 'fresh' | 'replay' | 'stale' {
+    if (!Number.isFinite(ts) || Math.abs(now - ts) > EDGE_TS_SKEW_MS) return 'stale';
+    this.prune(now);
+    let m = this.byId.get(id);
+    if (!m) {
+      m = new Map();
+      this.byId.set(id, m);
+    }
+    if (m.has(nonce)) return 'replay';
+    // FIFO by recency: drop the oldest entry at the cap.
+    if (m.size >= NONCE_STORE_CAP) {
+      const oldest = m.keys().next().value;
+      if (oldest !== undefined) m.delete(oldest);
+    }
+    m.set(nonce, ts);
+    return 'fresh';
+  }
+
+  /** Drop entries whose recorded ts has aged out of the skew window. */
+  private prune(now: number): void {
+    for (const [id, m] of this.byId) {
+      for (const [nonce, ts] of m) {
+        if (!Number.isFinite(ts) || Math.abs(now - ts) > EDGE_TS_SKEW_MS) m.delete(nonce);
+      }
+      if (m.size === 0) this.byId.delete(id);
+    }
+  }
+
+  /** The count of remembered (id, nonce) entries (diagnostics/tests). */
+  get size(): number {
+    let n = 0;
+    for (const m of this.byId.values()) n += m.size;
+    return n;
+  }
+}
+
+/**
  * The persisted edge store.
  *
  * Load-tolerant (the state-file posture): a missing file loads empty

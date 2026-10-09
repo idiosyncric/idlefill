@@ -1854,6 +1854,28 @@ export class Arbiter {
   }
 
   /**
+   * Append the D7 audit event for a relayed control action (#39 slice 2).
+   * The event lives in the TARGET's log (the machine whose state changed)
+   * and carries the requesting `instance_id` as the `source_instance_id`
+   * ADD key. The arbiter is the single place that touches `store.events`
+   * with a mesh identity — the route never appends directly. Persists,
+   * like every other event write.
+   */
+  logMeshControl(sourceInstanceId: string, action: string, target: string): void {
+    // D7 audit: the source rides an ADD key (marked PROPOSED in the
+    // pairing.md D7 wire note; the kind + detail are LOCKED). Bounded
+    // like every stored string.
+    const src = sourceInstanceId.slice(0, 64);
+    this.store.appendEvent({
+      kind: 'mesh_control',
+      detail: `${action}: ${target}`,
+      source_instance_id: src,
+    });
+    this.store.trim();
+    this.store.save();
+  }
+
+  /**
    * #67 acceptance fix: WHICH alias a session's model belongs to. The
    * router sniffs `history.model` from the RESPONSE — for an alias
    * session that is the winner pair's ENGINE id, never the alias name

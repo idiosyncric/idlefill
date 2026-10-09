@@ -151,7 +151,7 @@ export class StateStore {
     }
   }
 
-  appendEvent(e: { kind: ArbiterState['events'][number]['kind']; project?: string; lease_id?: string; detail?: string }): void {
+  appendEvent(e: { kind: ArbiterState['events'][number]['kind']; project?: string; lease_id?: string; detail?: string; source_instance_id?: string }): void {
     this.state.events.push({ ts: Date.now(), ...e });
   }
 

@@ -19,7 +19,7 @@ import { WebSocketServer } from 'ws';
 import { utcDay, type Arbiter, WATCHED_SERVER_ID } from './arbiter.js';
 import { seriesKeyOf, type MetricsBucket, type MetricsSeries, type MetricsStore } from './metrics.js';
 import { buildMeshSnapshot, type MeshFederation } from './mesh.js';
-import { verifyRequester, type EdgeSignaturePayload } from './edges.js';
+import { verifyRequester, NonceReplayStore, EDGE_TS_SKEW_MS, type EdgeSignaturePayload } from './edges.js';
 import { isLoopbackAddress } from './catalog.js';
 import type { LoadSignalView } from './load.js';
 import type { ClientRecord, CycleStatusRow, ProjectAllocation, QueuePreviewRow, RebuildRunState, ServerConfig, ServerConnection } from './types.js';
@@ -299,6 +299,12 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   const app = fastify({ logger: false });
   app.decorate('idlefill', { arbiter, cfg, publicDir });
 
+  // The per-edge nonce replay store (#39 slice 2): bounded, in-memory,
+  // shared by every per-edge route in this app (one arbiter = one store).
+  // Ephemeral by construction (D2): a restart clears it, and the signed-ts
+  // skew window keeps a captured signature dead once its ts ages out.
+  const nonceReplay = new NonceReplayStore();
+
   // --- auth guard for /api/* (except the documented public read paths) ---
   app.addHook('onRequest', async (req, reply) => {
     // req.url carries the query string (e.g. "/api/state?limit=10") — strip it
@@ -334,7 +340,9 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     // before; a request with no signature fields still 401s here (the
     // 403 denial with a named reason is the route's, reached only with a
     // properly signed envelope).
-    const isEdgeRoute = (path === '/api/mesh/detail' || path === '/api/mesh/control-preview') && req.method === 'GET';
+    const isEdgeRoute =
+      ((path === '/api/mesh/detail' || path === '/api/mesh/control-preview') && req.method === 'GET') ||
+      (path === '/api/mesh/control' && req.method === 'POST');
     if (isEdgeRoute) {
       const h = req.headers;
       const idH = h['x-idlefill-instance-id'];
@@ -1291,6 +1299,27 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   }
 
   /**
+   * The one-time nonce + ts admission (slice 2 replay defense), on top of
+   * the verified signature. The nonce is single-use per requester id
+   * (NonceReplayStore, bounded in-memory) and the signed ts must be
+   * inside the accepted skew window (EDGE_TS_SKEW_MS, PROPOSED width).
+   * A REJECTED request records nothing (the nonce stays spendable on a
+   * retry; the signature is what binds it to one id/path).
+   */
+  function edgeAdmission(instanceId: string, ts: number, nonce: string, reply: FastifyReply): boolean {
+    const v = nonceReplay.seen(instanceId, nonce, ts, Date.now());
+    if (v === 'stale') {
+      edgeDenial(reply, 'stale_ts', `the signed ts is outside the accepted skew window (±${EDGE_TS_SKEW_MS / 60000} min)`);
+      return false;
+    }
+    if (v === 'replay') {
+      edgeDenial(reply, 'nonce_replayed', 'this nonce was already seen — the signed payload is single-use');
+      return false;
+    }
+    return true;
+  }
+
+  /**
    * GET /api/mesh/detail (#39 D3 — slice 1: the fail-closed half). The
    * detailed queue projection a paired edge reads beyond the coarse
    * snapshot. Auth: the per-edge signature (hook + route check). D5:
@@ -1309,6 +1338,9 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     if (v.edge.direction !== 'controls_me') {
       return edgeDenial(reply, 'direction_denied', `the edge for ${v.edge.peer_instance_id} is ${v.edge.direction} — this machine is the controlled side only for a controls_me edge (D5)`);
     }
+    // Slice 2 replay defense: the signed ts must be fresh and the nonce
+    // single-use (same posture the control route enforces below).
+    if (!edgeAdmission(env.instanceId, env.payload.ts, env.payload.nonce, reply)) return;
     // D3: the target's LOCAL clients and their queue projections, bounded
     // by the registration-time sanitizer (≤100 preview rows, capped
     // fields — the stored rows are already sanitized; the slice re-caps
@@ -1347,6 +1379,8 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     if (v.edge.direction !== 'controls_me') {
       return edgeDenial(reply, 'direction_denied', `the edge for ${v.edge.peer_instance_id} is ${v.edge.direction} — this machine is the controlled side only for a controls_me edge (D5)`);
     }
+    // Slice 2 replay defense (same posture as the detail route above).
+    if (!edgeAdmission(env.instanceId, env.payload.ts, env.payload.nonce, reply)) return;
     const s = arbiter['store'].state;
     // The current override posture per client (what a relayed
     // pause/resume/force/clear would compose against) — client names
@@ -1363,6 +1397,178 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       actions: ['pause', 'resume', 'force', 'clear', 'reorder'],
       clients,
     };
+  });
+
+  /**
+   * POST /api/mesh/control (#39 D4 — slice 2: the relay). A paired edge
+   * relays a control action and the TARGET applies it to its OWN client or
+   * session row (it owns the row — the requester never touches the
+   * target's state directly). Auth chain (each step fail-closed, named):
+   *   1. signature envelope (hook) + signature under the stored peer
+   *      public key (verifyRequester) — no edge → 403 `unknown_instance_id`
+   *      (D8), bad signature → 403 `bad_signature`;
+   *   2. D5: only a `controls_me` edge relays control — a reverse
+   *      (`i_control`) edge is 403 `direction_denied`;
+   *   3. slice 2 replay defense: the signed ts must be fresh
+   *      (±EDGE_TS_SKEW_MS, PROPOSED width) and the nonce single-use
+   *      (NonceReplayStore) — 403 `stale_ts` / `nonce_replayed`;
+   *   4. the action itself: a body with `action` (pause/resume/force/
+   *      clear/reorder) + the target row it hits — 400 on a malformed
+   *      body, 404-equivalent (named 400) on an unknown row.
+   *
+   * pause/force/clear map onto the existing override verbs
+   * (setClientOverride / setSessionOverride — the same semantics the
+   * operator's own override routes use, so a relayed pause composes
+   * against the same row as a local pause). `resume` is an alias of
+   * clear for the relay wire: it lifts the posture a relayed pause set.
+   * `reorder` is the queue-order action; see the route body — the wire
+   * shape for it is the owner's open question (promote/demote one job
+   * vs a full order), so the relay carries the action set and defers
+   * the reorder WRITE (405 `reorder_deferred`): the relay is
+   * ceremony-agnostic, and the reorder primitive's shape is a separate
+   * decision this slice must not prejudge.
+   *
+   * Audit (D7): every APPLIED action appends a `mesh_control` event to
+   * the TARGET's log carrying the requester's `source_instance_id` ADD
+   * key — the target is the machine whose state changed.
+   *
+   * The ceremony is OUT of scope: how this edge was formed (request/
+   * approve vs one-time code) is #55 D4 and not built here. The relay
+   * works identically under any ceremony — it only reads the stored edge
+   * record and the signed envelope.
+   */
+  app.post('/api/mesh/control', async (req, reply) => {
+    const env = edgeEnvelope(req);
+    if (!env) return reply.code(401).send({ error: 'unauthorized', hint: 'signature envelope required (X-Idlefill-Instance-Id/Signature/Nonce/Ts)' });
+    const v = verifyRequester(arbiter.edges(), env.instanceId, env.payload, env.signatureB64url);
+    if (!v.ok) return edgeDenialForVerdict(reply, v);
+    if (v.edge.direction !== 'controls_me') {
+      return edgeDenial(reply, 'direction_denied', `the edge for ${v.edge.peer_instance_id} is ${v.edge.direction} — this machine is the controlled side only for a controls_me edge (D5)`);
+    }
+    if (!edgeAdmission(env.instanceId, env.payload.ts, env.payload.nonce, reply)) return;
+
+    const body = (req.body ?? {}) as {
+      action?: unknown;
+      client?: unknown;
+      session_token?: unknown;
+      until?: unknown;
+      order?: unknown;
+    };
+    const action = typeof body.action === 'string' ? body.action.trim() : '';
+    const ACTIONS = new Set(['pause', 'resume', 'force', 'clear', 'reorder']);
+    if (!ACTIONS.has(action)) {
+      return reply.code(400).send({ error: 'bad_action', hint: 'action must be one of: pause, resume, force, clear, reorder' });
+    }
+    if (action === 'reorder') {
+      // D4 names reorder in the action set; its wire shape (promote/demote
+      // one job vs a full queue order) is the owner's open question. The
+      // relay does NOT prejudge it: the action is named and denied with a
+      // named reason, the other four verbs work as-is.
+      return reply.code(405).send({
+        error: 'reorder_deferred',
+        hint: 'the reorder wire shape is an owner decision (promote/demote vs full order) — the relay carries the action set, the write lands with the decision',
+      });
+    }
+    // The target row: a client by name or client_id, or a session by token.
+    // The requester names the row; the target resolves it against its OWN
+    // rows (it owns the row — this is the fail-closed boundary).
+    const s = arbiter['store'].state;
+    const clientRef = typeof body.client === 'string' ? body.client.trim() : '';
+    const sessTok = typeof body.session_token === 'string' ? body.session_token.trim() : '';
+    if (clientRef === '' && sessTok === '') {
+      return reply.code(400).send({ error: 'target_required', hint: 'body must name the target row: client (name or client_id) or session_token' });
+    }
+    if (clientRef !== '' && sessTok !== '') {
+      return reply.code(400).send({ error: 'ambiguous_target', hint: 'body must name exactly one target row: client OR session_token' });
+    }
+    const until =
+      body.until === undefined || body.until === null
+        ? undefined
+        : typeof body.until === 'number' && Number.isFinite(body.until)
+          ? body.until
+          : typeof body.until === 'string' && /^\d+$/.test(body.until)
+            ? Number.parseInt(body.until, 10)
+            : NaN;
+    if (body.until !== undefined && body.until !== null && !Number.isFinite(until)) {
+      return reply.code(400).send({ error: 'bad_until', hint: 'until must be an epoch-ms number (absent = no expiry)' });
+    }
+    // resume is the relay alias for clear (lift the pause/force posture).
+    const ov: 'pause' | 'force' | null = action === 'pause' ? 'pause' : action === 'force' ? 'force' : null;
+
+    let res: { ok: boolean; reason?: string; override?: { override: string; until: number | null } | null; client_name?: string };
+    let targetLabel: string;
+    if (clientRef !== '') {
+      const client = s.clients.find((c) => c.client_id === clientRef || c.name === clientRef);
+      if (!client) {
+        return reply.code(400).send({ error: 'unknown_target', reason: 'unknown_client', hint: 'the named client is not a row on this machine' });
+      }
+      res = arbiter.setClientOverride(client.client_id, ov, until);
+      targetLabel = client.name;
+    } else {
+      const sess = s.sessions.find((x) => x.token === sessTok);
+      if (!sess) {
+        return reply.code(400).send({ error: 'unknown_target', reason: 'unknown_session', hint: 'the named session token is not a row on this machine' });
+      }
+      res = arbiter.setSessionOverride(sessTok, ov, until);
+      targetLabel = sessTok;
+    }
+    if (!res.ok) {
+      // A named arbiter refusal (e.g. until_must_be_in_the_future): the
+      // action was NOT applied — no audit, no 200.
+      return reply.code(400).send({ error: res.reason ?? 'action_refused', hint: `the target refused the action: ${res.reason ?? 'no reason given'}` });
+    }
+    // D7 audit: the target's log carries the action + the requester's id.
+    arbiter.logMeshControl(env.instanceId, action, targetLabel);
+    return {
+      ok: true,
+      action,
+      target: targetLabel,
+      override: res.override?.override ?? null,
+      until: res.override?.until ?? null,
+      source_instance_id: env.instanceId,
+    };
+  });
+
+  /**
+   * POST /api/mesh/unpair (#39 D6 — slice 2: the admin revocation). The
+   * operator removes THIS machine's edge record for a controller: the next
+   * control or detail request from that controller presents a signature
+   * for its instance_id, finds no edge, and is 403. Immediate local
+   * deletion — no propagation, no hub (D6). The controller removes its own
+   * edge separately (the operator does that on the controller; this route
+   * touches only this machine's record).
+   *
+   * Auth: the local ADMIN plane (a valid api_token). This is the operator's
+   * own machine — the signature envelope is NOT the credential here (an
+   * operator revoking a pairing does not present the pairing's signature,
+   * and a peer cannot reach this route: the per-edge routes are the
+   * signature plane, this is the admin plane). Body: `{ instance_id }`
+   * (the controller's id, as stored on this machine). 400 on a missing id;
+   * 404-equivalent (named) when no edge exists for that id (nothing to
+   * remove — idempotent-safe: the operator can re-run it).
+   *
+   * The `revokeClientKey` precedent: immediate local deletion of the key
+   * row plus an event log entry, no remote propagation.
+   */
+  app.post('/api/mesh/unpair', async (req, reply) => {
+    const body = (req.body ?? {}) as { instance_id?: unknown };
+    const id = typeof body.instance_id === 'string' ? body.instance_id.trim() : '';
+    if (id === '' || id.length > 64) {
+      return reply.code(400).send({ error: 'bad_instance_id', hint: 'body must carry the controller instance_id (≤64 chars)' });
+    }
+    const edges = arbiter.edges();
+    const existed = edges.get(id) !== null;
+    const removed = edges.remove(id);
+    // The D6 audit: immediate local deletion + an event log entry (the
+    // `revokeClientKey` precedent). A named admin-plane event — the unpair
+    // carries no requester signature, so no source_instance_id.
+    if (removed) {
+      const st = arbiter['store'];
+      st.appendEvent({ kind: 'mesh_edge_unpaired', detail: id });
+      st.trim();
+      st.save();
+    }
+    return { ok: true, instance_id: id, existed, removed };
   });
 
   // ------------------------------------------------------------------

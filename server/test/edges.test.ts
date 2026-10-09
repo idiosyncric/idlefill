@@ -398,7 +398,7 @@ test('with a real edge: a genuine signature unlocks detail + control-preview (D5
     { name: 'career-ops', model: 'Qwen3.8-27B', estimated_seconds: 900, queue_depth: 3, queue_preview: [{ job_id: 'job-1', title: 'Apply to Acme', company: 'Acme', score: 0.9, attempts: 0 }, { job_id: 'job-2', title: 'Research Zeta', company: 'Zeta', score: 0.7, attempts: 1 }] },
   ]);
 
-  const detail = signHeaders(peer, id, '/api/mesh/detail', T0, NONCE);
+  const detail = signHeaders(peer, id, '/api/mesh/detail', Date.now(), NONCE + '-a');
   const r1 = await fetch(`${base}/api/mesh/detail`, { headers: detail });
   assert.equal(r1.status, 200, 'a valid signature under the stored public key is admitted');
   const b1 = (await r1.json()) as { instance_id: string; clients: { name: string; projects: { name: string; queue_depth: number; queue_preview: { job_id: string; title: string }[] }[] }[] };
@@ -410,7 +410,7 @@ test('with a real edge: a genuine signature unlocks detail + control-preview (D5
   assert.deepEqual(p?.queue_preview.map((x) => x.job_id), ['job-1', 'job-2'], 'queue DETAIL crosses (job ids + titles) — the coarse plane never carries it');
   assert.equal(p?.queue_preview[0]?.title, 'Apply to Acme');
 
-  const preview = signHeaders(peer, id, '/api/mesh/control-preview', T0, NONCE);
+  const preview = signHeaders(peer, id, '/api/mesh/control-preview', Date.now(), NONCE + '-b');
   const r2 = await fetch(`${base}/api/mesh/control-preview`, { headers: preview });
   assert.equal(r2.status, 200, 'control-preview admits the same edge');
   const b2 = (await r2.json()) as { instance_id: string; actions: string[]; clients: { name: string; override: string | null }[] };
@@ -446,7 +446,7 @@ test('D6: removing the edge denies the next request immediately (no propagation)
   const peer = Identity.mint();
   const id = 'm-revoked-peer';
   arbiter.edges().upsert({ peer_instance_id: id, peer_public_key: peer.publicKeyB64url, direction: 'controls_me', created_at: T0 });
-  const h = signHeaders(peer, id, '/api/mesh/detail', T0, NONCE);
+  const h = signHeaders(peer, id, '/api/mesh/detail', Date.now(), NONCE + '-d6');
   assert.equal((await fetch(`${base}/api/mesh/detail`, { headers: h })).status, 200, 'admitted while the edge exists');
   assert.equal(arbiter.edges().remove(id), true);
   const r = await fetch(`${base}/api/mesh/detail`, { headers: h });
