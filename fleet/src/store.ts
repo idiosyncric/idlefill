@@ -420,35 +420,42 @@ export function sanitizePresence(v: unknown): Presence | null {
  *  redeemed, on the tailnet, by the same operator). */
 export const PAIR_CODE_TTL_MS = 5 * 60_000;
 
-export interface MintedPairCode {
-  /** The plaintext code. Shown to the operator once. Never stored. */
-  code: string;
-  /** Epoch-ms when the code stops being redeemable. */
-  expires_at: number;
-}
-
 /**
  * Mint a pairing code (D4 shape (b), `POST /pair/code`, called by B).
- * The code binds to B's instance_id at mint time; B's instance must
- * exist (a not-yet-enrolled minter cannot mint). Stored hashed, like
- * the enrollment token: single-use, TTL, plaintext shown once.
+ * The code binds to B's instance_id at mint time; B's instance MUST
+ * exist — a code bound to a ghost id is a code that can never form an
+ * edge, so minting a code for an unknown instance is a NAMED refusal,
+ * not a silent default to 'home'. Stored hashed, like the enrollment
+ * token: single-use, TTL, plaintext shown once.
  */
-export function mintPairCode(db: DatabaseSync, minterInstanceId: string, ttlMs: number, now = Date.now()): MintedPairCode {
+export type MintPairCodeResult =
+  | { ok: true; code: string; expires_at: number }
+  | { ok: false; error: 'unknown_minter' };
+
+export function mintPairCode(db: DatabaseSync, minterInstanceId: string, ttlMs: number, now = Date.now()): MintPairCodeResult {
   const row = db.prepare('SELECT fleet_id FROM instances WHERE instance_id = ?').get(minterInstanceId) as
     | { fleet_id: string }
     | undefined;
-  const fleetId = row?.fleet_id ?? DEFAULT_FLEET_ID;
+  if (!row) return { ok: false, error: 'unknown_minter' };
+  // A non-positive TTL is nonsense: a code that expires the instant it
+  // is minted can only ever answer `code_expired`. Fall back to the
+  // PROPOSED default (the config layer already guards this; a direct
+  // store caller gets the same posture).
+  const ttl = Number.isFinite(ttlMs) && ttlMs > 0 ? ttlMs : PAIR_CODE_TTL_MS;
   const code = `pair_${randomBytes(16).toString('base64url')}`;
-  const expires_at = now + ttlMs;
+  const expires_at = now + ttl;
   db.prepare(
     'INSERT INTO pair_codes (code_hash, minter_instance_id, fleet_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?)',
-  ).run(sha256(code), minterInstanceId, fleetId, now, expires_at);
-  return { code, expires_at };
+  ).run(sha256(code), minterInstanceId, row.fleet_id, now, expires_at);
+  return { ok: true, code, expires_at };
 }
 
 export type RedeemPairCodeResult =
   | { ok: true; edge: RosterEdge; peer_public_key: string; peer_name: string }
-  | { ok: false; error: 'invalid_code' | 'code_used' | 'code_expired' | 'self_pair' };
+  | {
+      ok: false;
+      error: 'invalid_code' | 'code_used' | 'code_expired' | 'self_pair' | 'unknown_redeemer' | 'unknown_minter';
+    };
 
 /**
  * Redeem a pairing code (D4 shape (b), `POST /pair/redeem`, called by A).
@@ -460,9 +467,16 @@ export type RedeemPairCodeResult =
  * (re-pairing the same A → B is a no-op, not a duplicate) and the code
  * is consumed single-use + TTL, exactly like the enrollment token.
  *
- * `self_pair` (redeeming one's own code) is a named denial, not an
- * error: the operator minted on the wrong machine, and the service must
- * not form a self-edge (A cannot control A through the ceremony).
+ * Every refusal is NAMED and NONE of them burns the code: the
+ * single-use UPDATE is the LAST step, so a refused attempt (expired,
+ * a wrong redeemer, a ghost minter) leaves the code redeemable by its
+ * intended pair. `self_pair` (redeeming one's own code) is a named
+ * denial, not an error: the operator minted on the wrong machine, and
+ * the service must not form a self-edge (A cannot control A through
+ * the ceremony). A redeemer that is not a fleet instance at all is
+ * `unknown_redeemer` — the HTTP auth layer already 401s that case
+ * (`unknown_instance`), and the store repeats the check so the
+ * ceremony's refusals are complete by name at every layer.
  */
 export function redeemPairCode(db: DatabaseSync, code: string, redeemerInstanceId: string, now = Date.now()): RedeemPairCodeResult {
   const h = sha256(code);
@@ -470,17 +484,25 @@ export function redeemPairCode(db: DatabaseSync, code: string, redeemerInstanceI
     .prepare('SELECT minter_instance_id, expires_at, used_at FROM pair_codes WHERE code_hash = ?')
     .get(h) as { minter_instance_id: string; expires_at: number; used_at: number | null } | undefined;
   if (!row) return { ok: false, error: 'invalid_code' };
+  // The redeemer must be a fleet instance: a forged or stale id cannot
+  // become the controller of anything.
+  const redeemer = db
+    .prepare('SELECT 1 AS x FROM instances WHERE instance_id = ?')
+    .get(redeemerInstanceId);
+  if (!redeemer) return { ok: false, error: 'unknown_redeemer' };
+  if (row.minter_instance_id === redeemerInstanceId) return { ok: false, error: 'self_pair' };
   if (row.used_at !== null) return { ok: false, error: 'code_used' };
   if (now >= row.expires_at) return { ok: false, error: 'code_expired' };
-  if (row.minter_instance_id === redeemerInstanceId) return { ok: false, error: 'self_pair' };
-  const res = db.prepare('UPDATE pair_codes SET used_at = ? WHERE code_hash = ? AND used_at IS NULL').run(now, h);
-  if (Number(res.changes) !== 1) return { ok: false, error: 'code_used' };
   // The minter must be enrolled (a code minted for a deleted instance
   // cannot form an edge — a deleted row has no public key to publish).
+  // Checked BEFORE consuming: a ghost minter must not silently burn an
+  // operator's one-time code.
   const peer = db
     .prepare('SELECT public_key, name FROM instances WHERE instance_id = ?')
     .get(row.minter_instance_id) as { public_key: string; name: string } | undefined;
-  if (!peer) return { ok: false, error: 'invalid_code' };
+  if (!peer) return { ok: false, error: 'unknown_minter' };
+  const res = db.prepare('UPDATE pair_codes SET used_at = ? WHERE code_hash = ? AND used_at IS NULL').run(now, h);
+  if (Number(res.changes) !== 1) return { ok: false, error: 'code_used' };
   // Idempotent: the same directed edge re-forms as a no-op (rotation is
   // unpair + re-pair; a re-pair without the unpair is harmless).
   db.prepare(
@@ -493,10 +515,11 @@ export function redeemPairCode(db: DatabaseSync, code: string, redeemerInstanceI
   return { ok: true, edge: { from: redeemerInstanceId, to: row.minter_instance_id }, peer_public_key: peer.public_key, peer_name: peer.name };
 }
 
-export type UnpairEdgeResult = { ok: boolean; existed: boolean };
+export type DropEdgeResult = { ok: boolean; existed: boolean };
 
 /**
- * Remove a directed edge (D4, `POST /pair/unpair`). The caller's
+ * Remove a directed edge (D4, `POST /pair/unpair` — the ceremony's
+ * `drop_edge`). The caller's
  * authenticated instance_id must be one of the edge's ends — an
  * instance can only unpair an edge it takes part in. Directional
  * semantics (pairing.md D5): unpairing A → B does NOT touch B → A;
@@ -509,7 +532,7 @@ export type UnpairEdgeResult = { ok: boolean; existed: boolean };
  * and the next roster pull confirms the edge is gone. The service
  * never pushes (D1: a directory, not a pipe).
  */
-export function unpairEdge(db: DatabaseSync, callerInstanceId: string, from: string, to: string): UnpairEdgeResult {
+export function unpairEdge(db: DatabaseSync, callerInstanceId: string, from: string, to: string): DropEdgeResult {
   const mine = callerInstanceId === from || callerInstanceId === to;
   const row = db.prepare('SELECT 1 AS x FROM edges WHERE from_instance_id = ? AND to_instance_id = ?').get(from, to);
   if (!mine || !row) return { ok: false, existed: false };

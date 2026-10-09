@@ -1668,7 +1668,14 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     let service_removed = false;
     const pairing = arbiter.pairing();
     if (pairing.configured && existed && priorDirection) {
-      const localId = arbiter.instanceId();
+      // Slice 11: the fleet directory keys edges by the FLEET-issued id
+      // (the same namespace the roster rows and the ceremony use, see
+      // server/src/index.ts `localInstanceId`). Using the locally-minted
+      // mesh id here names an edge the directory never holds, so
+      // `unpairEdge` answers `unknown_edge`, the service keeps the edge,
+      // and the next roster pull re-creates the record the operator just
+      // deleted — the revocation silently does not stick.
+      const localId = arbiter.fleetInstanceId() ?? arbiter.instanceId();
       const from = priorDirection === 'i_control' ? localId : id;
       const to = priorDirection === 'i_control' ? id : localId;
       service_removed = await pairing.unpairOnService(from, to);

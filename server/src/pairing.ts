@@ -32,6 +32,7 @@
  */
 
 import type { ServerConfig } from './types.js';
+import os from 'node:os';
 import { EdgeStore, type EdgeDirection } from './edges.js';
 import { enrollmentFileOf, FleetClient } from './fleet-client.js';
 import type { Identity } from './identity.js';
@@ -181,7 +182,7 @@ export class PairingClient {
 /** A stable default fleet display name when the operator set none. */
 function osName(): string {
   try {
-    return require('node:os').hostname();
+    return os.hostname();
   } catch {
     return 'arbiter';
   }
