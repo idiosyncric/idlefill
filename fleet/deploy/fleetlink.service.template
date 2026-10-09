@@ -1,0 +1,56 @@
+# idlefill fleet service — Linux systemd unit template (#55 slice 4, D7)
+#
+# Mirrors deploy/systemd/idlefill-client.service.template semantics:
+#   KeepAlive{SuccessfulExit=false}  ->  Restart=on-failure
+#       (a crash or signal death restarts; a clean exit(0) does not)
+#   ThrottleInterval=30              ->  RestartSec=30
+#   RunAtLoad                        ->  WantedBy=default.target (on login)
+#   launchd logs to files            ->  journald (`journalctl --user -u fleetlink`)
+#
+# USER UNIT (default): runs as the logged-in user, no sudo, with
+# `loginctl enable-linger <user>` so it starts at boot and survives logout
+# (the launchd LaunchAgent analogue). The installer renders this file to
+# ~/.config/systemd/user/fleetlink.service.
+#
+# Placeholders (the installer substitutes; never ship @-tokens live):
+#   @REPO@   absolute repo checkout path
+#   @NPATH@  bin dir holding node/npx (from `command -v npx`)
+#
+# The service runs from the working tree exactly like the macOS launchd
+# agent and the client user unit: tsx fleet/src/index.ts.
+#
+# D7 (docs/architecture/fleet-service.md): control plane, never a relay.
+# No published ports. Tailnet-only reach. The config (listen, db_file,
+# token_ttl_ms) is read from the host's gitignored fleet/config.json — the
+# unit carries NO secret and NO live db path. The db file (D6) is a host
+# volume, never the repo checkout.
+#
+# A SYSTEM unit variant is deliberately NOT shipped: it needs root, a
+# dedicated service user, and re-derives every path; the user unit covers
+# the posture without sudo. If urza ever needs the system flavor, copy
+# this file to /etc/systemd/system/ without the --user flags and set
+# User= — but do not install it from the repo's installer (it refuses).
+
+[Unit]
+Description=idlefill fleet service (enrollment + roster; control plane, never a relay)
+Documentation=https://git.samwarth.com/sam/idlefill
+# No network targets: network-online.target is a SYSTEM target and does not
+# exist in the user manager. The service tolerates being reached only over
+# the tailnet, so ordering against the network is both impossible here and
+# unnecessary.
+
+[Service]
+Type=simple
+WorkingDirectory=@REPO@/fleet
+ExecStart=@NPATH@/npx tsx @REPO@/fleet/src/index.ts
+Environment=PATH=@NPATH@:/usr/local/bin:/usr/bin:/bin
+Environment=NODE_ENV=production
+Restart=on-failure
+RestartSec=30
+# Keep stdout out of the pty-less default; journald captures either way.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fleetlink
+
+[Install]
+WantedBy=default.target
