@@ -711,6 +711,42 @@ export async function writeLocalProjects(port: number, projects: LocalProjectEnt
   return body.restart_required === true;
 }
 
+// #84: the Hermes-gateway connector surface (same loopback + edit-token
+// posture). GET never carries key VALUES — only which profiles store one.
+export interface HermesGatewayStatus {
+  enabled: boolean;
+  env_switch: boolean;
+  base_url: string;
+  profiles: string[];
+  key_file: string;
+  gateway: { reachable: boolean; version?: string; ledger_size?: number } | null;
+  stored_profiles: string[];
+}
+
+export async function readLocalHermesGateway(port: number): Promise<HermesGatewayStatus> {
+  const res = await fetch(`http://127.0.0.1:${port}/client/hermes-gateway`, {
+    headers: { [EDIT_HEADER]: apiToken() ?? "" },
+    cache: "no-store",
+  });
+  const body = (await res.json().catch(() => ({}))) as Partial<HermesGatewayStatus> & { error?: string };
+  if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
+  return body as HermesGatewayStatus;
+}
+
+export async function writeLocalHermesGateway(
+  port: number,
+  body: { enabled?: boolean; keys?: Record<string, string | null> },
+): Promise<{ restart_required: boolean; stored_profiles: string[] }> {
+  const res = await fetch(`http://127.0.0.1:${port}/client/hermes-gateway`, {
+    method: "PUT",
+    headers: { "content-type": "application/json", [EDIT_HEADER]: apiToken() ?? "" },
+    body: JSON.stringify(body),
+  });
+  const parsed = (await res.json().catch(() => ({}))) as { restart_required?: boolean; stored_profiles?: string[]; error?: string };
+  if (!res.ok) throw new Error(parsed.error ?? `HTTP ${res.status}`);
+  return { restart_required: parsed.restart_required === true, stored_profiles: parsed.stored_profiles ?? [] };
+}
+
 // Assembled at runtime: the write-path redactor mangles token-like dotted
 // literals. The header is the client proxy's edit credential.
 const EDIT_HEADER = ["x-idlefill", "edit"].join("-");

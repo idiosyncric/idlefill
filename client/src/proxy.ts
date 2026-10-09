@@ -23,6 +23,7 @@ import type { AddressInfo } from 'node:net';
 import { SESSION_PATH_RE, type SessionGate } from './session-gate.js';
 import { handleClientProjects, type ClientProjectsOpts } from './client-projects.js';
 import { handleSessionControl, type SessionControlOpts } from './session-control.js';
+import { handleClientHermes, type ClientHermesOpts } from './client-hermes.js';
 
 /**
  * #78: `GET /sessions/<token>/transcript` — the read-only surface for the
@@ -105,6 +106,13 @@ export function startLlmProxy(opts: {
    * path never reaches the LLM target).
    */
   sessionControl?: SessionControlOpts;
+  /**
+   * #84: the Hermes-gateway connector surface. When set, GET/PUT
+   * `/client/hermes-gateway` are answered ON THIS SAME loopback server
+   * (guarded Host/Origin/token inside handleClientHermes). Absent = the
+   * path falls to plain passthrough exactly as before.
+   */
+  clientHermes?: ClientHermesOpts;
 }): LlmProxy {
   const target = new URL(opts.target);
   const log: ProxyLogEntry[] = [];
@@ -220,6 +228,18 @@ export function startLlmProxy(opts: {
         u = new URL('http://127.0.0.1/');
       }
       if (handleClientProjects(req, res, u, opts.clientProjects)) return;
+    }
+    // #84: the Hermes-gateway connector surface (same loopback bind,
+    // answered BEFORE passthrough — a connector write can never reach the
+    // LLM target). Absent ⇒ the path falls through untouched.
+    if (opts.clientHermes) {
+      let u84: URL;
+      try {
+        u84 = new URL(rawUrl, 'http://127.0.0.1');
+      } catch {
+        u84 = new URL('http://127.0.0.1/');
+      }
+      if (handleClientHermes(req, res, u84, opts.clientHermes)) return;
     }
     // #46: the session-control surface (POST /sessions/<token>/release).
     // Answered BEFORE the transcript / gate / passthrough paths so the

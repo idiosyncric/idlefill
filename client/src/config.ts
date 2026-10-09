@@ -190,6 +190,16 @@ export interface ClientConfig {
    * one. ADD-key: optional, so hand-built ClientConfig fixtures stay valid.
    */
   config_path?: string;
+  /**
+   * #84: the Hermes Gateway API connector block (issue #73's surfaces, now
+   * config-file-addressable alongside the env switch). The loader passes
+   * the raw object through VERBATIM — `resolveHermesGatewayConfig` owns
+   * every key's semantics (enabled, base_url, profiles, key_file, key_env,
+   * poll_seconds, timeout_ms), sanitizing each with its own default. ADD
+   * key: optional, so hand-built ClientConfig fixtures stay valid; absent
+   * = the connector stays env-switch-only (the pre-#84 posture).
+   */
+  hermes_gateway?: Record<string, unknown>;
 }
 
 const DEFAULTS = {
@@ -323,6 +333,12 @@ export function loadClientConfig(
     state_dir: resolve(clientPkgDir, 'data'),
     state_file: resolve(clientPkgDir, 'data', 'idlefill-client-state.json'),
     ...(configPath ? { config_path: resolve(configPath) } : {}),
+    // #84: the hermes_gateway block passes through VERBATIM (a plain
+    // object only) — resolveHermesGatewayConfig sanitizes every member
+    // with its own default, so the loader never interprets it.
+    ...(r.hermes_gateway && typeof r.hermes_gateway === 'object' && !Array.isArray(r.hermes_gateway)
+      ? { hermes_gateway: r.hermes_gateway as Record<string, unknown> }
+      : {}),
   };
 }
 

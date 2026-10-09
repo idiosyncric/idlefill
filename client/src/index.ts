@@ -72,7 +72,7 @@ import { loadClientConfig, type ClientConfig, type ClientProjectConfig, type Sch
 import { startLlmProxy, waitProxyReady, type LlmProxy } from './proxy.js';
 import { startAggregateRouter, type AggregateAliasEntry, type AggregateCatalogEntry, type AggregateRouter, type ServerKeyRow } from './aggregate.js';
 import { SessionGate, type SessionStateRow } from './session-gate.js';
-import { HermesGatewayConnector, resolveHermesGatewayConfig } from './hermes-gateway.js';
+import { HermesGatewayConnector, resolveHermesGatewayConfig, type HermesGatewayConfig } from './hermes-gateway.js';
 import { resolveVersion } from './version.js';
 import { resolveRevision } from './revision.js';
 import { scanHermesProfiles, type AgentRosterRow } from './agent-roster.js';
@@ -1109,6 +1109,12 @@ export class ClientDaemon {
    * disabled ⇒ it publishes nothing (see the constructor).
    */
   private hermesGateway: HermesGatewayConnector | null = null;
+  /** #84: the resolved connector config (kept even when disabled — the
+   *  /client/hermes-gateway surface reports base_url/profiles/key_file from
+   *  it). Resolved at boot; a config write needs a restart to change it. */
+  private hermesGwCfg: HermesGatewayConfig | null = null;
+  /** #84: effective connector enablement (env switch OR config block). */
+  private hermesEnabled = false;
   /** Set by the gate to wake the poll loop early (on-demand /api/state). */
   private stateWake = false;
   private ws: WebSocket | null = null;
@@ -1137,25 +1143,42 @@ export class ClientDaemon {
     };
     this.checkExecutorScript();
     // #73: the Hermes Gateway API connector (the observed complement to
-    // the gate). ENABLEMENT IS OPT-IN PER MACHINE — this host runs the
-    // Hermes Gateway API: IDLEFILL_HERMES_GATEWAY=1 (env-only; the config
-    // loader drops unknown keys, so the switch cannot ride config.json,
-    // and config.ts is the frozen surface of the parallel #47 work).
-    // Unset ⇒ the connector is not constructed ⇒ the register heartbeat
-    // bodies stay byte-for-byte the pre-#73 shape (strictest fail-quiet).
+    // the gate). ENABLEMENT IS OPT-IN PER MACHINE — historically
+    // env-only (IDLEFILL_HERMES_GATEWAY=1: the config loader dropped
+    // unknown keys, and config.ts was the frozen surface of the parallel
+    // #47 work). #84 lifted that: the loader now passes a
+    // `hermes_gateway` block through, so the Settings card can persist
+    // `hermes_gateway.enabled: true` in config.json. env ON or block
+    // enabled ⇒ constructed; env ON wins over an explicit block false
+    // (the shell surface stays the stronger manual override). Neither ⇒
+    // the connector is not constructed ⇒ the register heartbeat bodies
+    // stay byte-for-byte the pre-#73 shape (strictest fail-quiet).
     // Set ⇒ the daemon is the fetcher (the gateway is loopback-only,
     // reachable only from THIS machine) and the facts ride the register
     // heartbeat (the ADD-key precedent). base_url honours
     // IDLEFILL_HERMES_GATEWAY_URL (test seam / non-default port) before
-    // the Hermes default.
+    // the Hermes default. The resolved config is kept EITHER way (the
+    // /client/hermes-gateway surface reports base_url/profiles/key_file
+    // without the connector existing) — resolving reads no secrets into
+    // any published surface.
+    const gwBlock =
+      this.cfg.hermes_gateway && typeof this.cfg.hermes_gateway === 'object' && !Array.isArray(this.cfg.hermes_gateway)
+        ? this.cfg.hermes_gateway
+        : {};
     const gwSwitch = (process.env.IDLEFILL_HERMES_GATEWAY ?? '').trim().toLowerCase();
-    if (gwSwitch === '1' || gwSwitch === 'true' || gwSwitch === 'yes') {
-      const gwCfg = resolveHermesGatewayConfig(
-        { ...(process.env.IDLEFILL_HERMES_GATEWAY_URL ? { base_url: process.env.IDLEFILL_HERMES_GATEWAY_URL } : {}) },
-        process.env,
-        homedir(),
-      );
-      this.hermesGateway = new HermesGatewayConnector(gwCfg, {
+    const gwEnvOn = gwSwitch === '1' || gwSwitch === 'true' || gwSwitch === 'yes';
+    this.hermesGwCfg = resolveHermesGatewayConfig(
+      {
+        ...gwBlock,
+        ...(process.env.IDLEFILL_HERMES_GATEWAY_URL ? { base_url: process.env.IDLEFILL_HERMES_GATEWAY_URL } : {}),
+        ...(gwEnvOn ? { enabled: true } : {}),
+      },
+      process.env,
+      homedir(),
+    );
+    this.hermesEnabled = gwEnvOn || gwBlock.enabled === true;
+    if (this.hermesEnabled) {
+      this.hermesGateway = new HermesGatewayConnector(this.hermesGwCfg, {
         log: (m) => this.log.info(m),
       });
     }
@@ -1913,6 +1936,29 @@ export class ClientDaemon {
       // pasting holds. No config FILE (env-config launch) = routes answer
       // 503 rather than inventing a file to write.
       clientProjects: { token: this.cfg.token, configPath: this.cfg.config_path ?? null },
+      // #84: the Hermes-gateway connector surface — GET answers the boot
+      // posture + which profiles carry a key (NEVER the values), PUT
+      // persists the enable flag (config.json block) and the per-profile
+      // keys (0600 key file). Restart stays a launchd action, same promise.
+      clientHermes: {
+        token: this.cfg.token,
+        configPath: this.cfg.config_path ?? null,
+        status: () => {
+          const cfg = this.hermesGwCfg;
+          const snap = this.hermesGateway?.snapshot();
+          const sw = (process.env.IDLEFILL_HERMES_GATEWAY ?? '').trim().toLowerCase();
+          return {
+            enabled: this.hermesEnabled,
+            env_switch: sw === '1' || sw === 'true' || sw === 'yes',
+            base_url: cfg?.base_url ?? '',
+            profiles: cfg?.profiles ?? [],
+            key_file: cfg?.key_file ?? '',
+            gateway: snap
+              ? { reachable: snap.reachable, ...(snap.version ? { version: snap.version } : {}), ledger_size: this.hermesGateway?.ledgerSize }
+              : null,
+          };
+        },
+      },
       // #46: the true-pause interrupt half — POST /sessions/<token>/release
       // on this SAME loopback bind answers a paused/over-capacity
       // session's parked holds with the retryable 503 + Retry-After (the
