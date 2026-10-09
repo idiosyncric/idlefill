@@ -509,10 +509,69 @@ test('(h) a session row owned by ANOTHER client is not adopted (fleet)', async (
     { token: 'tokMine', client_name: 'urza' },
     { token: 'tokOld' },
   ]);
-  gate.heartbeat(); // what the daemon tick does for adopted rows
+  // #76 follow-up: adopted rows with no local traffic are DROPPED on the
+  // daemon tick, not re-registered. The re-registration refreshed the
+  // arbiter row's last_seen every 10s, so the 1h stale sweep (which keys
+  // on last_seen) could never fire and dead rows stayed in the Sessions
+  // list forever (the 22-rows bug; a gateway restart just re-adopted them).
+  gate.heartbeat();
   await new Promise((r) => setTimeout(r, 100));
-  assert.deepEqual(registered.sort(), ['tokMine', 'tokOld'], 'foreign-owned row never registered; own + ownerless adopted');
+  assert.equal(registered.length, 0, 'adopted-but-idle rows are not re-registered');
   assert.equal(gate.snapshot('tokMac'), null, 'foreign row never enters local tracking');
+
+  // An operator decision on the row re-engages it (the pause must be
+  // tracked). A foreign row with a pause is still not adopted.
+  gate.onStatePoll([
+    { token: 'tokMac', client_name: 'mac-sam', override: { override: 'pause' } },
+    { token: 'tokMine', client_name: 'urza', override: { override: 'pause' } },
+    { token: 'tokOld' },
+  ]);
+  gate.heartbeat();
+  await new Promise((r) => setTimeout(r, 100));
+  assert.deepEqual(registered, ['tokMine'], 'operator state re-engages an adopted row; the foreign row is still not adopted');
+});
+
+test('#76 follow-up: a token with no live local state is dropped; the poll does not re-adopt it; traffic and operator state re-engage', async () => {
+  const clock = { t: 300_000_000 };
+  const { gate, calls } = makeGate({ maxActive: 1, now: () => clock.t });
+  const { proxy, up } = await harness({ gate });
+  gate.onStatePoll([]); // arbiter reachable
+
+  // One request, then silence: the ring entry goes cold.
+  const resP = postChat(proxy.base_url, '/s/drop1/v1/chat/completions');
+  await waitFor(() => up.hits.length === 1, 3000, 'forwarded');
+  up.release(1);
+  assert.equal((await resP).status, 200);
+  await waitFor(() => calls.some((c) => c.token === 'drop1'), 3000, 'first-sight register');
+
+  // The ring is older than the 10m window: the daemon tick drops the token.
+  // Its heartbeat only kept the arbiter row's last_seen fresh — the 1h
+  // stale sweep (keyed on last_seen) could never fire while it ran.
+  clock.t += 11 * 60_000;
+  gate.heartbeat();
+  assert.equal(gate.snapshot('drop1'), null, 'the dropped token leaves local tracking');
+
+  // The row still exists at the arbiter (the sweep has not run yet), but
+  // the tombstone stops the poll from re-adopting it: no re-registration.
+  gate.onStatePoll([{ token: 'drop1' }]);
+  gate.heartbeat();
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(calls.length, 1, 'a dropped token is not re-adopted by the poll alone');
+
+  // A fresh request re-engages the token (idempotent at the arbiter).
+  clock.t += 60_000;
+  const res2P = postChat(proxy.base_url, '/s/drop1/v1/chat/completions');
+  await waitFor(() => up.hits.length === 2, 3000, 'forwarded again');
+  up.release(1);
+  assert.equal((await res2P).status, 200);
+  await waitFor(() => calls.filter((c) => c.token === 'drop1').length >= 2, 3000, 'traffic re-engages the token');
+
+  // An operator decision on the row re-engages it (the pause is tracked).
+  gate.onStatePoll([{ token: 'drop1', override: { override: 'pause' } }]);
+  clock.t += 10_001; // past the register throttle
+  gate.heartbeat();
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(calls.filter((c) => c.token === 'drop1').length, 3, 'operator state re-engages the dropped token');
 });
 
 // ---------------------------------------------------------------------------
@@ -828,16 +887,29 @@ test('#76 last_activity on the wire: the newest REQUEST time, never the heartbea
   const hb2 = calls.filter((c) => c.token === 'lact1').at(-1)!;
   assert.equal(hb2.lastActivity, 200_010_001, 'the newer request instant wins');
 
-  // A poll-adopted token (the arbiter reports a row the router never saw —
-  // no local ring, e.g. after a daemon restart) reports undefined on its
-  // heartbeat. The daemon OMITS last_activity (ADD-key posture): the
-  // arbiter keeps its stored value — the row ages out on its own instead of
-  // being re-pinned to "now" every 10s (a Date.now() fallback would be the
-  // same bug via the re-adoption path).
+  // #76 follow-up: a poll-adopted token the router never saw (no local ring,
+  // e.g. after a daemon restart) has NO live local state, so the daemon DROPS
+  // it instead of re-registering it. The re-registration refreshed the row's
+  // last_seen every 10s, so the 1h stale sweep (keyed on last_seen) could
+  // never fire — the 22-rows bug. Dropped: the row's stored last_activity
+  // ages out and the sweep retires it (a gateway restart just re-adopts and
+  // re-drops it — it never re-arms last_seen again).
   gate.onStatePoll([{ token: 'lact2' }]);
+  clock.t += 10_001;
   gate.heartbeat();
-  await waitFor(() => calls.some((c) => c.token === 'lact2'), 3000, 'adopted session heartbeat');
-  const adopted = calls.filter((c) => c.token === 'lact2').at(-1)!;
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(calls.filter((c) => c.token === 'lact2').length, 0, 'a ring-less adopted token is dropped, not re-registered');
+
+  // But an adopted token carrying operator state (a pause) must be tracked:
+  // it is KEPT and heartbeated. Its register OMITS last_activity (ADD-key:
+  // no local ring ⇒ undefined), so the arbiter keeps the stored value — the
+  // row is never re-pinned to "now" (a Date.now() fallback would be the same
+  // bug via the re-adoption path).
+  gate.onStatePoll([{ token: 'lact3', override: { override: 'pause' } }]);
+  clock.t += 10_001;
+  gate.heartbeat();
+  await waitFor(() => calls.some((c) => c.token === 'lact3'), 3000, 'adopted token with operator state is tracked');
+  const adopted = calls.filter((c) => c.token === 'lact3').at(-1)!;
   assert.equal(adopted.lastActivity, undefined, 'no local ring ⇒ undefined (last_activity omitted, the stored time stands)');
 });
 

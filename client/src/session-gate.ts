@@ -215,6 +215,14 @@ interface Session {
 /** #45: cap on the in-memory request ring (a restart starts empty). */
 const RING_MAX = 240;
 
+/** #76 follow-up: request-recency horizon that keeps a session tracked.
+ *  Same window as the #45 history buckets. Older than this with no
+ *  in-flight/queued requests and no operator state ⇒ the gate drops the
+ *  token: its heartbeat only kept the arbiter row's `last_seen` fresh,
+ *  so the arbiter's 1h stale sweep could never fire and dead rows
+ *  (probe tokens, old chats) stayed in the Sessions list forever. */
+const RING_TTL_MS = 600_000;
+
 /** #45: the `history` ADD-key shape published on the register heartbeat. */
 export interface SessionHistory {
   /** requests/min counts, 60s buckets, oldest→newest, always 10 entries. */
@@ -317,6 +325,12 @@ export class SessionGate {
   private released = false;
   private lastRefreshAt = 0;
   private readonly heartbeatMs: number;
+  /** #76 follow-up: tokens the gate dropped (no live local state). The
+   *  per-row poll path skips a tombstoned token unless the arbiter row
+   *  carries fresh operator state (pause/force/pin). A request for the
+   *  token (touch) clears the tombstone — the token re-registers on its
+   *  own first-sight path. In-memory; a restart starts empty. */
+  private readonly dropped = new Set<string>();
 
   constructor(private readonly deps: SessionGateDeps) {
     this.heartbeatMs = deps.heartbeatMs ?? 10_000;
@@ -435,6 +449,13 @@ export class SessionGate {
 
   /** First-sight bookkeeping: create the row + throttled registration. */
   private touch(token: string, sessionId?: string): Session {
+    // #76 follow-up: traffic is the re-engagement. A dropped token gets a
+    // fresh row + its own first-sight register (the arbiter is idempotent
+    // on the token — no data loss).
+    if (this.dropped.has(token)) {
+      this.dropped.delete(token);
+      this.log(`session ${token} re-engaged after drop (fresh request)`);
+    }
     let s = this.sessions.get(token);
     const fresh = !s;
     if (!s) {
@@ -515,8 +536,30 @@ export class SessionGate {
   /** Daemon tick: refresh every known session's registration (throttled). */
   heartbeat(): void {
     if (this.released) return;
-    for (const s of this.sessions.values()) {
-      if (this.now() - s.lastRegisterAttempt >= this.heartbeatMs) void this.register(s);
+    const now = this.now();
+    for (const s of [...this.sessions.values()]) {
+      // #76 follow-up: retire what has no live local state. A stale ring
+      // (nothing within RING_TTL_MS), no in-flight/queued request, and no
+      // operator state (pause/force/pin) ⇒ the token is noise. The
+      // heartbeat only kept the arbiter row's last_seen fresh, so the
+      // arbiter's 1h stale sweep could never fire and dead rows (probe
+      // tokens, old chats) stayed in the Sessions list forever. Dropped:
+      // the row stops being refreshed, the sweep retires it, and the
+      // tombstone keeps the poll from re-adopting it. Traffic (touch) or a
+      // fresh operator state re-engages it (the token is idempotent at the
+      // arbiter). Operator state is always kept: a paused token still
+      // needs the pause tracked, and a parked session's request keeps
+      // holding its queue position.
+      const recentRing = s.ring.length > 0 && now - (s.ring.at(-1) ?? 0) < RING_TTL_MS;
+      if (!recentRing && s.inflight === 0 && s.holds.length === 0 && s.override === null && !s.pin) {
+        const lastRing = s.ring.at(-1);
+        const idleNote = lastRing !== undefined ? ` no local traffic for ${Math.round((now - lastRing) / 60000)}m` : ' no local traffic since adoption';
+        this.sessions.delete(s.token);
+        this.dropped.add(s.token);
+        this.log(`session ${s.token} dropped (${idleNote}, no operator state) — the arbiter's stale sweep retires the row`);
+        continue;
+      }
+      if (now - s.lastRegisterAttempt >= this.heartbeatMs) void this.register(s);
     }
   }
 
@@ -762,8 +805,20 @@ export class SessionGate {
       // no owner (pre-#50 arbiter, fixtures) keep the old behavior.
       if (row.client_name && this.deps.clientName && row.client_name !== this.deps.clientName) continue;
       seen.add(row.token);
-      const s = this.ensure(row.token);
+      // #76 follow-up: a token the gate dropped (no live local state) is
+      // NOT re-adopted by the poll alone — re-adopting would re-arm the
+      // heartbeat and keep the arbiter row's last_seen fresh forever. A
+      // fresh operator decision on the row (pause/force/pin) re-engages
+      // it (the operator state must be tracked); traffic re-engages via
+      // touch().
       const ov = normalizeOverride(row.override?.override);
+      const pin = normalizePinRow(row.engine_pin);
+      if (this.dropped.has(row.token) && !ov && !pin) continue;
+      if (this.dropped.has(row.token)) {
+        this.dropped.delete(row.token);
+        this.log(`session ${row.token} re-engaged after drop (operator state on the arbiter row)`);
+      }
+      const s = this.ensure(row.token);
       if (ov !== s.override) {
         this.log(`session ${s.token} override: ${s.override ?? 'none'} → ${ov ?? 'none'}`);
         s.override = ov;
@@ -777,7 +832,6 @@ export class SessionGate {
       // order. A newly-arriving pin does not release anything by itself
       // (a pinned session still waits for its slot exactly like before;
       // the admission then resolves to the pinned row).
-      const pin = normalizePinRow(row.engine_pin);
       const had = s.pin?.server_id ?? null;
       const next = pin?.server_id ?? null;
       // #67 acceptance fix: the splice key rides SEPARATELY from the
