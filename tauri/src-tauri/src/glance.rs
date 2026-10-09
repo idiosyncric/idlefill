@@ -310,6 +310,142 @@ pub fn conn_from_http(status: Option<u16>, fetch_ok: bool) -> Conn {
     }
 }
 
+/// One inference-server load row (#59): the arbiter's `servers[]` row
+/// (serverView in server/src/api.ts) projected to its compact readout —
+/// the name, the per-model load FACTS (running = the row's `models[]`
+/// entries with `running: true`; queued = their `queued` totals), the
+/// idle readout (signal `idle_for_s`, null when no activity is
+/// provable), and the degraded marker (Exception-Only).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ServerRow {
+    pub name: String,
+    pub running: usize,
+    pub queued: usize,
+    /// "idle 90s" / "idle 10m" — None when the signal carries no
+    /// `idle_for_s` (never an idle countdown, fail-closed like #62).
+    pub idle_readout: Option<String>,
+    /// The degraded marker (Exception-Only, None when healthy):
+    /// `Some(true)` = the signal reports degraded, `Some(false)` =
+    /// signal-less (no detector / no signal resolved — never a fake
+    /// zero), None = healthy.
+    pub degraded: Option<bool>,
+}
+
+/// Project the arbiter's `servers[]` rows (the serverView rows that
+/// ride GET /api/state) into glance load readouts. Rows without a
+/// `name` do not render (no readout to name); an empty / absent
+/// `servers` yields no rows (the section renders nothing —
+/// Exception-Only). `models` absent = no models (running 0, queued 0).
+pub fn project_server_loads(payload: &Value) -> Vec<ServerRow> {
+    let servers = payload
+        .get("servers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    servers
+        .iter()
+        .filter_map(|s| {
+            let name = s
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|n| !n.is_empty())?
+                .to_string();
+            let (running, queued) = s
+                .get("models")
+                .and_then(Value::as_array)
+                .map(|ms| {
+                    let running = ms
+                        .iter()
+                        .filter(|m| m.get("running").and_then(Value::as_bool) == Some(true))
+                        .count();
+                    let queued = ms
+                        .iter()
+                        .filter_map(|m| m.get("queued").and_then(Value::as_u64))
+                        .fold(0u64, |a, q| a.saturating_add(q))
+                        as usize;
+                    (running, queued)
+                })
+                .unwrap_or((0, 0));
+            let signal = s.get("signal").filter(|v| !v.is_null());
+            // Three states, never a fake zero: degraded (Some(true)),
+            // signal-less (Some(false): no detector, or a signal that
+            // cannot yet prove activity), healthy (None).
+            let degraded = match signal {
+                None => Some(false),
+                Some(sig) => {
+                    if sig
+                        .get("degraded")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        Some(true)
+                    } else if sig.get("idle_for_s").is_none() {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                }
+            };
+            let idle_readout = signal
+                .and_then(|sig| sig.get("idle_for_s"))
+                .and_then(Value::as_i64)
+                .filter(|s| *s >= 0)
+                .map(idle_readout);
+            Some(ServerRow {
+                name,
+                running,
+                queued,
+                idle_readout,
+                degraded,
+            })
+        })
+        .collect()
+}
+
+/// The idle countdown word: `idle 90s`, `idle 10m 30s` (whole minutes
+/// omitted when zero). The seconds are the arbiter's `idle_for_s`
+/// verbatim — the shell never re-derives the verdict.
+pub fn idle_readout(idle_for_s: i64) -> String {
+    let m = idle_for_s / 60;
+    let s = idle_for_s % 60;
+    if m > 0 && s > 0 {
+        format!("idle {m}m {s}s")
+    } else if m > 0 {
+        format!("idle {m}m")
+    } else {
+        format!("idle {s}s")
+    }
+}
+
+/// The row's display lines (Exception-Only): the degraded marker is
+/// its own line (red in the view); a load FACT line renders ONLY for
+/// non-zero running/queued; a healthy, load-less row renders nothing
+/// beyond its name.
+pub fn server_load_lines(row: &ServerRow) -> (Option<String>, Option<String>) {
+    let (head, status) = match row.degraded {
+        Some(true) => (None, Some("degraded".into())),
+        Some(false) => (None, Some("no signal".into())),
+        None => {
+            let mut parts: Vec<String> = Vec::new();
+            if row.running > 0 {
+                parts.push(format!("{} running", row.running));
+            }
+            if row.queued > 0 {
+                parts.push(format!("{} queued", row.queued));
+            }
+            (
+                if parts.is_empty() {
+                    None
+                } else {
+                    Some(parts.join(" · "))
+                },
+                None,
+            )
+        }
+    };
+    (head, status)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,5 +682,98 @@ mod tests {
         // signals that handoff with Off ("stopped" never renders from
         // here; the caller overwrites the word from the payload).
         assert_eq!(conn_from_http(Some(200), true), Conn::Off);
+    }
+
+    // #59: the inference-server load readout (the arbiter's servers[]
+    // rows, serverView in server/src/api.ts).
+    #[test]
+    fn server_load_running_queued_and_degraded_rows() {
+        let p = json!({"servers": [
+            {
+                "name": "strata-urza",
+                "signal": {"degraded": false, "idle_for_s": 90},
+                "models": [
+                    {"name": "a", "running": true, "queued": 0},
+                    {"name": "b", "running": false, "queued": 2},
+                    {"name": "c", "running": true, "queued": 1}
+                ]
+            },
+            {
+                "name": "omlx",
+                "signal": {"degraded": true, "degraded_reason": "activity fetch failed",
+                           "idle_for_s": null},
+                "models": [{"name": "q", "running": false, "queued": 1}]
+            },
+            {
+                "name": "scanbot",
+                "signal": {"degraded": false, "idle_for_s": 630},
+                "models": []
+            }
+        ]});
+        let rows = project_server_loads(&p);
+        assert_eq!(rows.len(), 3);
+        // running/queued ride the models[] facts verbatim.
+        assert_eq!(rows[0].name, "strata-urza");
+        assert_eq!(rows[0].running, 2);
+        assert_eq!(rows[0].queued, 3);
+        assert_eq!(rows[0].idle_readout.as_deref(), Some("idle 1m 30s"));
+        assert_eq!(rows[0].degraded, None); // healthy — no marker
+                                            // the degraded marker is Exception-Only (its own line, red in
+                                            // the view); the load facts stay on the row's data, not the line.
+        assert_eq!(rows[1].degraded, Some(true));
+        assert_eq!(rows[1].idle_readout, None); // null never fakes idle
+        assert_eq!(rows[1].queued, 1);
+        // load-less healthy row: no facts line, no marker.
+        assert_eq!(rows[2].degraded, None);
+        assert_eq!(rows[2].idle_readout.as_deref(), Some("idle 10m 30s"));
+        assert_eq!(
+            server_load_lines(&rows[0]),
+            (Some("2 running · 3 queued".into()), None)
+        );
+        assert_eq!(server_load_lines(&rows[1]), (None, Some("degraded".into())));
+        assert_eq!(server_load_lines(&rows[2]), (None, None));
+    }
+
+    #[test]
+    fn server_load_signalless_row_never_fakes_a_zero() {
+        // No detector yet (signal: null) -> the dim "no signal" line,
+        // never an idle countdown or a fake zero load.
+        let p = json!({"servers": [
+            {"name": "feedless", "signal": null,
+             "models": [{"name": "m", "running": false, "queued": 0}]},
+            // A signal with NO idle_for_s (activity not yet provable)
+            // is signal-less too — the fail-closed posture (#62).
+            {"name": "noprobe", "signal": {"degraded": false},
+             "models": []}
+        ]});
+        let rows = project_server_loads(&p);
+        assert_eq!(rows.len(), 2);
+        for r in &rows {
+            assert_eq!(r.degraded, Some(false), "{:?}", r.name);
+            assert_eq!(r.idle_readout, None, "{:?}", r.name);
+        }
+        assert_eq!(
+            server_load_lines(&rows[0]),
+            (None, Some("no signal".into()))
+        );
+        assert_eq!(
+            server_load_lines(&rows[1]),
+            (None, Some("no signal".into()))
+        );
+    }
+
+    #[test]
+    fn server_load_empty_or_absent_servers_render_nothing() {
+        let rows = project_server_loads(&json!({"servers": []}));
+        assert!(rows.is_empty()); // the section renders no rows at all
+        assert!(project_server_loads(&json!({})).is_empty()); // no key
+        assert!(project_server_loads(&json!(null)).is_empty());
+    }
+
+    #[test]
+    fn idle_readout_omits_whole_units_when_zero() {
+        assert_eq!(idle_readout(45), "idle 45s");
+        assert_eq!(idle_readout(60), "idle 1m");
+        assert_eq!(idle_readout(390), "idle 6m 30s");
     }
 }

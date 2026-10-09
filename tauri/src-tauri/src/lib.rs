@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_deep_link::DeepLinkExt;
 
 /// The build marker (D7): baked at compile time from
@@ -54,6 +54,10 @@ struct GlanceState {
     daemon_running: bool,
     sessions: Vec<glance::SessionRow>,
     sessions_count: Option<String>,
+    /// The inference-server load readouts (#59): the arbiter's
+    /// `servers[]` rows projected by the pure spec — Exception-Only,
+    /// empty = the section renders nothing.
+    server_loads: Vec<glance::ServerRow>,
 }
 
 pub struct Shared {
@@ -315,6 +319,16 @@ fn toggle_glance(app: &AppHandle) {
             // hand-written NSPopover-anchor substitute, D1 cost (1)).
             let _ = w.set_position(PhysicalPosition::new(x - 240.0, y + 24.0));
         }
+        // #59: the load section is Exception-Only (no servers, no row) —
+        // size the fixed window to what the specs project. Height =
+        // base 220 (status + sessions + the three action buttons) + 34
+        // per load row, capped at 340; re-applied while the window is
+        // open so a row landing between ticks fits.
+        if w.is_visible().unwrap_or(false) {
+            let n = shared.glance.lock().unwrap().server_loads.len();
+            let h = (220.0 + 34.0 * n as f64).min(340.0);
+            let _ = w.set_size(PhysicalSize::new(280.0, h));
+        }
     }
 }
 
@@ -431,11 +445,13 @@ fn poll_glance(app: &AppHandle) {
             let running = glance::daemon_running(&v, client_name.as_deref(), now);
             let sessions = glance::project_sessions(&v, now);
             let count = glance::sessions_count_line(&sessions);
+            let server_loads = glance::project_server_loads(&v);
             let mut g = shared.glance.lock().unwrap();
             g.conn = word;
             g.daemon_running = running;
             g.sessions = sessions;
             g.sessions_count = count;
+            g.server_loads = server_loads;
         }
         Err(e) => {
             // The same HTTP-status -> Conn mapping the menubar poll uses:
@@ -593,6 +609,24 @@ fn glance_state(app: AppHandle) -> Value {
             .collect::<Vec<_>>(),
         "rows": glance::glance_action_rows(),
         "relaunch": glance::relaunch_row_present(l.arbiter_loaded, l.arbiter_running),
+        // #59: the inference-server load readouts. The tone rides the
+        // verdict: a DEGRADED row is red (text-err); "no signal" and the
+        // healthy load facts are dim (text-dim) — amber is reserved for
+        // the operator-actionable, and a loadless row is neither.
+        "serverLoads": g
+            .server_loads
+            .iter()
+            .map(|r| {
+                let (head, status) = glance::server_load_lines(r);
+                json!({
+                    "name": r.name,
+                    "line": head,
+                    "status": status,
+                    "tone": if r.degraded == Some(true) { "err" } else { "dim" },
+                    "idle": r.idle_readout,
+                })
+            })
+            .collect::<Vec<_>>(),
     })
 }
 
