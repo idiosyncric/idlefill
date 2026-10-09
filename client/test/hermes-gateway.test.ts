@@ -13,6 +13,9 @@
  *          null rides)
  *        - health gate: gateway down ⇒ unreachable, no meta, no crash
  *        - auth posture: 401 ⇒ reachable but no rows (last-known stands)
+ *        - #83: listed-out delegate children enrich via bounded
+ *          single-session lookups (exact-id route stub, 404 posture,
+ *          throttle + attempt cap, zero extra requests while down)
  *        - runs control: dispatch → status/steer/stop/approval verbs on
  *          the STUB, and the scope law — a control verb for a run this
  *          process did not dispatch is refused WITHOUT an HTTP request.
@@ -43,6 +46,7 @@ import {
   mergeHermesMeta,
   mergeLedgerRows,
   ledgerPath,
+  sessionPath,
   type GatewaySessionRow,
   type HermesSessionMeta,
 } from '../src/hermes-gateway.js';
@@ -67,6 +71,11 @@ interface FakeGatewayOpts {
   /** #81: force page N (0-based) of the default ledger to fail (HTTP 500),
    *  proving a mid-pagination failure leaves the earlier pages merged. */
   failDefaultPage?: number;
+  /** #83: canned single-session answers per profile — `GET
+   *  .../api/sessions/{id}` serves `{object:'hermes.session', session:{…}}`
+   *  for these ids and 404s every other id. A row here models a delegate
+   *  child deliberately absent from the listing. */
+  singleSessions?: Record<string, Record<string, GatewaySessionRow>>;
   /** Respond with 401 to authed ledger reads when the key does not match. */
   expectKeys?: Record<string, string>;
   /** Runs stub state: verb recording + canned responses. */
@@ -132,6 +141,19 @@ function startFakeGateway(opts: FakeGatewayOpts = {}): Promise<FakeGateway> {
         }
         const rows = profile === 'default' ? (opts.defaultRows ?? []) : (opts.profileRows?.[profile] ?? []);
         return send(200, { object: 'list', data: rows, limit: 200, offset: 0, has_more: false });
+      }
+      // #83: single-session read (authed) — resolves ANY exact id, the
+      // listed-out delegate children included (the live route's posture).
+      const sm = url.pathname.match(/^\/(?:p\/([^/]+)\/)?api\/sessions\/([^/]+)$/);
+      if (req.method === 'GET' && sm) {
+        const profile = sm[1] ?? 'default';
+        const expected = opts.expectKeys?.[profile];
+        if (expected && (req.headers.authorization ?? '') !== `Bearer ${expected}`) {
+          return send(401, { error: { code: 'gateway_auth_failed' } });
+        }
+        const row = opts.singleSessions?.[profile]?.[decodeURIComponent(sm[2] ?? '')];
+        if (!row) return send(404, { error: { code: 'session_not_found' } });
+        return send(200, { object: 'hermes.session', session: row });
       }
       // Runs (the stub answers the seam's verbs).
       const runsState = opts.runsState;
@@ -290,6 +312,9 @@ test('ledgerPath: default = home ledger, a named profile = the /p/<profile> mirr
   assert.equal(ledgerPath('default'), '/api/sessions');
   assert.equal(ledgerPath('web-dev'), '/p/web-dev/api/sessions');
   assert.equal(ledgerPath('m365-admin'), '/p/m365-admin/api/sessions');
+  // #83: the exact-id route, same profile-mirror rule, id URL-escaped.
+  assert.equal(sessionPath('default', '20261009_093346_a15145'), '/api/sessions/20261009_093346_a15145');
+  assert.equal(sessionPath('web-dev', 'a b/c'), '/p/web-dev/api/sessions/a%20b%2Fc');
 });
 
 // ---------------------------------------------------------------------------
@@ -508,6 +533,119 @@ test('#82 eviction: an outage does not age the ledger', async () => {
   assert.ok(c.metaFor('e1'), 'down rounds did not count toward the grace window');
   await c.poll(); // 20th reachable round without it
   assert.equal(c.metaFor('e1'), undefined, 'dropped once GRACE REACHABLE rounds pass');
+});
+
+// ---------------------------------------------------------------------------
+// #83: child-session enrichment — bounded single-session lookups on misses
+// ---------------------------------------------------------------------------
+
+const CHILD_ROW: GatewaySessionRow = {
+  id: '20261009_093346_a15145',
+  title: 'delegate: subagent run',
+  model: 'Qwen3.8-27B',
+  message_count: 9,
+  input_tokens: 2100,
+  output_tokens: 640,
+  last_active: 1760004000,
+  is_internal_child: true,
+};
+
+const singleReqs = (gw: FakeGateway, id: string) =>
+  gw.requests.filter((r) => r.method === 'GET' && /\/api\/sessions\/[^/]+$/.test(r.path) && r.path.endsWith(`/${id}`));
+
+test('#83 connector: a listed-out child enriches via a bounded single-session lookup', async () => {
+  const gw = await startFakeGateway({
+    health: { status: 200, version: '0.21.6' },
+    defaultRows: [ROW_A],
+    profileRows: { 'web-dev': [{ id: 'prow', title: 'profile row', message_count: 1 }] },
+    // The child row is resolvable ONLY through the web-dev profile's route
+    // (the gate header carries the id, never the profile — the probe walks
+    // keyed profiles; the default route 404s it, web-dev answers).
+    singleSessions: { 'web-dev': { [CHILD_ROW.id as string]: CHILD_ROW } },
+  });
+  cleanup.push(() => gw.close());
+  const c = new HermesGatewayConnector(gwCfg(gw.base));
+  await c.poll();
+  // First heartbeat answer: still NOTHING (the lookup is fire-and-forget;
+  // the miss publish is byte-for-byte the pre-#83 posture).
+  assert.equal(c.metaFor(CHILD_ROW.id as string), undefined, 'the miss publishes absent, then probes');
+  await waitFor(() => c.metaFor(CHILD_ROW.id as string) !== undefined, 3000, 'the single-session lookup to land');
+  const meta = c.metaFor(CHILD_ROW.id as string);
+  assert.equal(meta?.title, 'delegate: subagent run', 'the child enriches from the exact-id route');
+  assert.equal(meta?.input_tokens, 2100);
+  assert.ok(!('is_internal_child' in (meta as object)), 'the published meta shape is unchanged (safe-keys only)');
+  // Probe order + per-profile keys: default first (404), then web-dev (hit).
+  const reqs = singleReqs(gw, CHILD_ROW.id as string);
+  assert.deepEqual(reqs.map((r) => r.path), ['/api/sessions/20261009_093346_a15145', '/p/web-dev/api/sessions/20261009_093346_a15145']);
+  assert.equal(reqs[1]?.auth, 'Bearer profile-key', 'the single route rides the SAME per-profile key discipline');
+  // Later heartbeats join the merged row — NO further probes.
+  for (let i = 0; i < 5; i++) assert.ok(c.metaFor(CHILD_ROW.id as string));
+  assert.equal(singleReqs(gw, CHILD_ROW.id as string).length, 2, 'a HIT stops the walk and never re-probes');
+});
+
+test('#83 connector: 404 posture + throttle — no flood, capped attempts', async () => {
+  const gw = await startFakeGateway({
+    health: { status: 200, version: '0.21.6' },
+    defaultRows: [ROW_A],
+    // No singleSessions: EVERY exact-id read 404s (the live posture for an
+    // id no profile owns).
+  });
+  cleanup.push(() => gw.close());
+  let t = 60_000; // clear the poll cadence gate (lastPollAt starts at 0)
+  const c = new HermesGatewayConnector(gwCfg(gw.base), { now: () => t });
+  await c.poll();
+  // One heartbeat burst: 10 miss-lookups, ONE probe per keyed profile.
+  for (let i = 0; i < 10; i++) assert.equal(c.metaFor('ghost-9'), undefined);
+  await waitFor(() => singleReqs(gw, 'ghost-9').length >= 2, 3000, 'the first probe pair (default + web-dev)');
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(singleReqs(gw, 'ghost-9').length, 2, 'two keyed profiles ⇒ exactly 2 requests, not 10');
+  // Same clock: the retry window has not passed — later heartbeats add nothing.
+  for (let i = 0; i < 20; i++) assert.equal(c.metaFor('ghost-9'), undefined);
+  assert.equal(singleReqs(gw, 'ghost-9').length, 2, 'the retry window throttles the heartbeat cadence (10s ticks)');
+  // Past the retry window: one more round (attempt 2), then the cap holds.
+  t += 301_000;
+  assert.equal(c.metaFor('ghost-9'), undefined);
+  await waitFor(() => singleReqs(gw, 'ghost-9').length >= 4, 3000, 'the second (final) attempt pair');
+  t += 301_000;
+  for (let i = 0; i < 5; i++) assert.equal(c.metaFor('ghost-9'), undefined);
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(singleReqs(gw, 'ghost-9').length, 4, 'SINGLE_MAX_ATTEMPTS × 2 profiles = 4 requests EVER');
+});
+
+test('#83 connector: unreachable / unkeyed ⇒ ZERO single-route requests (fail-open stands)', async () => {
+  const gw = await startFakeGateway({ health: null, singleSessions: { default: { [CHILD_ROW.id as string]: CHILD_ROW } } });
+  cleanup.push(() => gw.close());
+  const c = new HermesGatewayConnector(gwCfg(gw.base));
+  await c.poll(); // gateway down
+  for (let i = 0; i < 5; i++) assert.equal(c.metaFor(CHILD_ROW.id as string), undefined);
+  assert.equal(singleReqs(gw, CHILD_ROW.id as string).length, 0, 'down ⇒ no lookups scheduled, ever');
+  // Up but NO keys at all: the probe walk skips every unkeyed profile.
+  const gw2 = await startFakeGateway({
+    health: { status: 200, version: '0.21.6' },
+    singleSessions: { default: { [CHILD_ROW.id as string]: CHILD_ROW } },
+  });
+  cleanup.push(() => gw2.close());
+  const c2 = new HermesGatewayConnector(gwCfg(gw2.base, { key: undefined, profileKeys: new Map() }));
+  await c2.poll();
+  assert.deepEqual(c2.snapshot(), { version: '0.21.6', reachable: true });
+  for (let i = 0; i < 5; i++) assert.equal(c2.metaFor(CHILD_ROW.id as string), undefined);
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(singleReqs(gw2, CHILD_ROW.id as string).length, 0, 'reachable + unkeyed ⇒ nothing is addressable, no requests');
+});
+
+test('#83 connector: a single-route 401 on one profile keeps probing the next', async () => {
+  const gw = await startFakeGateway({
+    health: { status: 200, version: '0.21.6' },
+    defaultRows: [],
+    expectKeys: { default: 'not-the-connectors-key' }, // default 401s every authed read
+    singleSessions: { 'web-dev': { [CHILD_ROW.id as string]: CHILD_ROW } },
+  });
+  cleanup.push(() => gw.close());
+  const c = new HermesGatewayConnector(gwCfg(gw.base));
+  await c.poll();
+  assert.equal(c.metaFor(CHILD_ROW.id as string), undefined);
+  await waitFor(() => c.metaFor(CHILD_ROW.id as string) !== undefined, 3000, 'the web-dev hit after the default 401');
+  assert.equal(c.metaFor(CHILD_ROW.id as string)?.title, 'delegate: subagent run');
 });
 
 test('config resolution: defaults, explicit list wins, disabled, key file', () => {
@@ -806,6 +944,51 @@ test('enrichment on the wire (switch on, gateway up): hermes_meta + host facts r
       3000,
       'the host facts on the client heartbeat',
     );
+  } finally {
+    await daemon.stop();
+    await arb.close();
+    await up.close();
+    rmSync(dir, { recursive: true, force: true });
+    restoreGwEnv();
+  }
+});
+
+test('#83 enrichment on the wire (listed-out child): the miss probes, a later heartbeat carries hermes_meta', async () => {
+  // The listing carries NOTHING for the child (the live `_delegate_from`
+  // exclusion); only the exact-id route can answer for it.
+  const gw = await startFakeGateway({
+    health: { status: 200, version: '0.21.6' },
+    defaultRows: [],
+    singleSessions: { default: { [CHILD_ROW.id as string]: CHILD_ROW } },
+  });
+  cleanup.push(() => gw.close());
+  setGwEnv({ IDLEFILL_HERMES_GATEWAY: '1', IDLEFILL_HERMES_GATEWAY_URL: gw.base, IDLEFILL_HERMES_GATEWAY_KEY: 'test-key' });
+  const up = await startHeldUpstream();
+  const { daemon, arb, dir } = await bootDaemon(up.url);
+  try {
+    await waitFor(() => daemon.hermesConnector?.snapshot()?.reachable === true, 3000, 'the first gateway poll round');
+    const resP = fetch(`${daemon.proxyUrl}/s/tok83/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-hermes-session-id': CHILD_ROW.id as string },
+      body: JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    await waitFor(() => up.hits.length === 1, 3000, 'the upstream hit');
+    up.release();
+    await resP;
+    // The gate's register heartbeat is a 10s window (traffic-first, then
+    // the tick): the lookup lands fast, the NEXT heartbeat carries it.
+    await waitFor(
+      () => arb.sessionRegisters.some((b) => b.token === 'tok83' && b.hermes_meta),
+      15_000,
+      'the child enrichment riding a later heartbeat',
+    );
+    const metaBody = arb.sessionRegisters.find((b) => b.token === 'tok83' && b.hermes_meta)!;
+    assert.equal(metaBody.session_id, CHILD_ROW.id, 'the join key is the captured child session id');
+    const meta = metaBody.hermes_meta as { title: string };
+    assert.equal(meta.title, 'delegate: subagent run', 'the child title rides the heartbeat via the single-session route');
+    // The probe hit the exact-id route (not `include_children` on the listing).
+    assert.ok(gw.requests.some((r) => r.path === `/api/sessions/${CHILD_ROW.id}`));
+    assert.ok(!gw.requests.some((r) => r.query.includes('include_children')), 'the listing is never widened');
   } finally {
     await daemon.stop();
     await arb.close();

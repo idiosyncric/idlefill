@@ -19,6 +19,10 @@
  *      merged facts ride the existing register-heartbeat ADD-key pattern
  *      as ONE new key, `hermes_meta`: ABSENT = unset (the key is omitted,
  *      the arbiter keeps its stored value — never a fake zero).
+ *      #83 complement: delegate/subagent children (`model_config.
+ *      _delegate_from`) are DELIBERATELY absent from that listing, so a
+ *      ledger miss schedules ONE bounded `GET .../api/sessions/{id}` probe
+ *      (throttled, capped attempts, keyed profiles only, never while down).
  *
  *   B. HOST FACTS — `GET /v1/health` (unauthenticated) answers
  *      `{status, version}`. The daemon publishes `hermes_version` +
@@ -164,6 +168,28 @@ const LEDGER_MAX_PAGES = 5;
 const LEDGER_EVICTION_GRACE_ROUNDS = 20;
 const LEDGER_MAX_ENTRIES = 5000;
 
+/**
+ * #83: a session whose `model_config._delegate_from` is set (a `delegate_task`
+ * subagent, a desktop agent-close child) is DELIBERATELY absent from the
+ * default `GET /api/sessions` listing (`_session_filter_where` excludes those
+ * rows unless `include_children` — which the API never passes), so the gate's
+ * captured `X-Hermes-Session-Id` joins against nothing in the ledger and
+ * `hermes_meta` stays absent. The single-session route (`GET
+ * .../api/sessions/{id}`, capability `session`, per-profile Bearer) resolves
+ * ANY exact id — children included (`_get_existing_session_or_404` →
+ * `db.get_session`; `_session_response` publishes the same safe-keys the
+ * listing row carries, plus `is_internal_child`). So a ledger MISS schedules
+ * ONE bounded per-id lookup: at most `SINGLE_MAX_ATTEMPTS` per id, at least
+ * `SINGLE_RETRY_MS` apart, only while the gateway is reachable and the
+ * profile has a key, deduped by the in-flight set. The attempts bookkeeping
+ * itself is capped (oldest record dropped) so a hostile id stream cannot
+ * grow it. Fail-open unchanged: nothing is scheduled while unreachable /
+ * unkeyed / disabled — a down gateway still sees zero extra requests.
+ */
+const SINGLE_MAX_ATTEMPTS = 2;
+const SINGLE_RETRY_MS = 300_000;
+const SINGLE_TRACKED_MAX = 1000;
+
 /** Expand a leading `~` against the OS home (test seam via `home`). */
 function expandHome(p: string, home: string): string {
   return p === '~' || p.startsWith('~/') ? join(home, p.slice(2)) : p;
@@ -266,6 +292,20 @@ export function ledgerPath(profile: string): string {
   return profile === 'default' ? '/api/sessions' : `/p/${encodeURIComponent(profile)}/api/sessions`;
 }
 
+/** #83: the URL path for ONE session by exact id (the `session` capability —
+ *  resolves children the listing hides, per-profile mirror included). */
+export function sessionPath(profile: string, sessionId: string): string {
+  const id = encodeURIComponent(sessionId);
+  return profile === 'default' ? `/api/sessions/${id}` : `/p/${encodeURIComponent(profile)}/api/sessions/${id}`;
+}
+
+/** The ledger join key's canonical shape (same rule `rowToMeta` applies to a
+ *  row's id): trim, cap. A gate-captured header id is normalized the same way
+ *  so a whitespace/padding difference never mis-joins. */
+function normalizeSessionId(v: string | undefined): string {
+  return typeof v === 'string' ? v.trim().slice(0, 128) : '';
+}
+
 const INT_META_KEYS = ['message_count', 'tool_call_count', 'input_tokens', 'output_tokens', 'reasoning_tokens'] as const;
 
 /**
@@ -287,7 +327,7 @@ function toEpochMs(v: unknown): number | undefined {
  * row that yields no members at all.
  */
 export function rowToMeta(row: GatewaySessionRow): { id: string; meta: HermesSessionMeta } | undefined {
-  const id = typeof row.id === 'string' && row.id.trim() !== '' ? row.id.trim().slice(0, 128) : undefined;
+  const id = normalizeSessionId(typeof row.id === 'string' ? row.id : undefined);
   if (!id) return undefined;
   const meta: HermesSessionMeta = {};
   const str = (k: 'title' | 'model', cap: number): void => {
@@ -575,10 +615,93 @@ export class HermesGatewayConnector {
 
   /** The enrichment for one gate session (its captured `session_id`).
    *  undefined = publish NOTHING (absent = unset): connector disabled,
-   *  gateway unreachable, or the id is not in the last-known ledger. */
+   *  gateway unreachable, or the id is not in the last-known ledger.
+   *  #83: a MISS (reachable + enabled) also schedules ONE bounded
+   *  single-session lookup — delegate/subagent children never appear in the
+   *  default listing, so their ids could otherwise never enrich. The lookup
+   *  never changes THIS answer (still undefined until a later heartbeat
+   *  finds the merged row); the publish stays last-known-wins. */
   metaFor(sessionId: string | undefined): HermesSessionMeta | undefined {
     if (!this.cfg.enabled || !sessionId || !this.reachable) return undefined;
-    return this.ledger.get(sessionId);
+    const id = normalizeSessionId(sessionId);
+    if (!id) return undefined;
+    const hit = this.ledger.get(id);
+    if (hit) return hit;
+    this.missEnrich(id);
+    return undefined;
+  }
+
+  /**
+   * #83 bookkeeping for the per-id miss lookups: session id → attempts spent
+   * + the attempt clock (throttle), and the in-flight dedup set. The
+   * bookkeeping map is size-capped (oldest record evicted first — the
+   * SESSION_ID_INDEX_MAX posture) so a flood of unknown ids cannot grow it.
+   */
+  private readonly singleAttempts = new Map<string, { attempts: number; lastAt: number }>();
+  private readonly singleInFlight = new Set<string>();
+
+  /** Schedule one bounded single-session lookup for a ledger miss (fire and
+   *  forget; never throws outward). Throttle: ≤ SINGLE_MAX_ATTEMPTS per id,
+   *  ≥ SINGLE_RETRY_MS apart, one in flight per id. */
+  private missEnrich(id: string): void {
+    if (this.singleInFlight.has(id)) return;
+    const nowMs = this.now();
+    const rec = this.singleAttempts.get(id);
+    if (rec && (rec.attempts >= SINGLE_MAX_ATTEMPTS || nowMs - rec.lastAt < SINGLE_RETRY_MS)) return;
+    this.singleAttempts.set(id, { attempts: (rec?.attempts ?? 0) + 1, lastAt: nowMs });
+    if (this.singleAttempts.size > SINGLE_TRACKED_MAX) {
+      const oldest = this.singleAttempts.keys().next();
+      if (!oldest.done) this.singleAttempts.delete(oldest.value);
+    }
+    this.singleInFlight.add(id);
+    void this.lookupSingle(id);
+  }
+
+  /** Probe the single-session route per KEYED profile (the gate header
+   *  carries the session id only, so the owning profile is unknown; profiles
+   *  are probed in config order, first exact hit wins). Every failure is
+   *  fail-quiet: a transport error ends the probe, a 401/404/non-200/malformed
+   *  answer moves to the next profile; the attempt already stands against
+   *  the throttle either way. */
+  private async lookupSingle(id: string): Promise<void> {
+    try {
+      for (const profile of this.cfg.profiles) {
+        const key = profile === 'default' ? this.cfg.key : this.cfg.profileKeys.get(profile);
+        if (!key) continue; // unkeyed profile: not addressable, no request
+        let res: Response;
+        try {
+          res = await this.fetchImpl(`${this.cfg.base_url}${sessionPath(profile, id)}`, {
+            headers: { authorization: `Bearer ${key}` },
+            signal: AbortSignal.timeout(this.cfg.timeout_ms),
+          });
+        } catch {
+          return; // transport failure: fail-quiet, the attempt is spent
+        }
+        if (res.status !== 200) continue; // 404/401/etc: try the next keyed profile
+        let body: unknown;
+        try {
+          body = await res.json();
+        } catch {
+          continue;
+        }
+        // Payload shape (verified in api_server.py `_handle_get_session`):
+        // `{object:'hermes.session', session:{…safe-keys…}}` — the same
+        // sanitizer the listing rows pass, so `rowToMeta` applies verbatim.
+        const session = (body as { session?: unknown } | undefined)?.session;
+        if (typeof session !== 'object' || session === null) continue;
+        const m = rowToMeta(session as GatewaySessionRow);
+        if (!m || m.id !== id) continue; // answered a different row: drop
+        this.ledger.set(id, mergeHermesMeta(this.ledger.get(id), m.meta));
+        // Stamp the eviction bookkeeping with the CURRENT reachable-round so
+        // the single-sourced row ages like any other (#82 posture: an ended
+        // child evicts after the grace; the hard cap can still LRU it).
+        this.lastSeenRound.set(id, this.ageRound);
+        this.log(`hermes single-session lookup enriched ${id} (profile ${profile})`);
+        return;
+      }
+    } finally {
+      this.singleInFlight.delete(id);
+    }
   }
 
   /** The host facts for the client register heartbeat (ADD-keys).
