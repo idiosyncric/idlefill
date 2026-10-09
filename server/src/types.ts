@@ -426,6 +426,28 @@ export interface ClientRecord {
    * any client's ~/.hermes). Display/audit only; never a gate.
    */
   agent_roster?: AgentRosterRow[];
+  /**
+   * #73: the version of the Hermes gateway the client's GATEWAY API
+   * connector reached (from the gateway's unauthenticated
+   * `GET /v1/health` — the inbound plane, the OBSERVED complement to the
+   * gate). ADD-key: stored on a valid report (string ≤64), absent on old
+   * clients, on machines without the connector, and before the
+   * connector's first poll round — the row renders unchanged. This is
+   * the #49 code-staleness story's Hermes side: the operator sees which
+   * gateway generation a machine's sessions run against.
+   */
+  hermes_version?: string;
+  /**
+   * #73: whether the client's gateway API connector reached the gateway
+   * on its latest poll round (slice B). Stored verbatim as the client
+   * last reported it — the reachability lives at the client's loopback
+   * and the arbiter cannot observe it. ADD-key, exception-only by design:
+   * the client publishes it ONLY when the connector is enabled and has
+   * run a poll round, and the dashboard renders the `gateway down` badge
+   * ONLY when it is `false` (a reachable gateway and a connector-less
+   * daemon both leave the row exactly as before).
+   */
+  gateway_reachable?: boolean;
 }
 
 /**
@@ -541,6 +563,36 @@ export interface SessionRecord {
    * before #67 and on old routers. Sanitizer posture: drop-don't-reject.
    */
   phase?: { state: 'thinking' | 'output' | 'tools'; at: number } | null;
+  /**
+   * #73: the Hermes Gateway API session ledger's facts for this session
+   * (the OBSERVED complement to the gate — the gateway is the inbound
+   * plane, it never holds a provider call in flight). Carried on the
+   * register heartbeat as the `hermes_meta` ADD-key, joined by the CLIENT
+   * on the session's captured `session_id` (#42 slice 0): the router
+   * looks up the ledger row and reports what it found — the arbiter only
+   * sanitizes + echoes (client-truth discipline: it has no view of any
+   * client's gateway). Members: `title`, `model`, request/tool/token
+   * counts, `estimated_cost_usd`, `last_active` (epoch-ms), `ended_at`
+   * (epoch-ms or null = ended without a reason), `end_reason`. Every
+   * member is optional (the block carries only what the ledger row had —
+   * absent = unset, never a fake zero). Sanitizer posture: drop-don't-
+   * reject; an ABSENT key NEVER clears a stored block (the ledger is
+   * last-known-wins: a poll that loses a row, a gateway outage, or an old
+   * router never erases what a better poll reported).
+   */
+  hermes_meta?: {
+    title?: string;
+    model?: string;
+    message_count?: number;
+    tool_call_count?: number;
+    input_tokens?: number;
+    output_tokens?: number;
+    reasoning_tokens?: number;
+    estimated_cost_usd?: number;
+    last_active?: number;
+    ended_at?: number | null;
+    end_reason?: string | null;
+  };
 }
 
 /**

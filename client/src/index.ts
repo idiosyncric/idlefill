@@ -63,6 +63,7 @@
 
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync, appendFileSync, openSync } from 'node:fs';
+import { homedir } from 'node:os';
 import * as path from 'node:path';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -71,6 +72,7 @@ import { loadClientConfig, type ClientConfig, type ClientProjectConfig, type Sch
 import { startLlmProxy, waitProxyReady, type LlmProxy } from './proxy.js';
 import { startAggregateRouter, type AggregateAliasEntry, type AggregateCatalogEntry, type AggregateRouter, type ServerKeyRow } from './aggregate.js';
 import { SessionGate, type SessionStateRow } from './session-gate.js';
+import { HermesGatewayConnector, resolveHermesGatewayConfig } from './hermes-gateway.js';
 import { resolveVersion } from './version.js';
 import { resolveRevision } from './revision.js';
 import { scanHermesProfiles, type AgentRosterRow } from './agent-roster.js';
@@ -1095,6 +1097,18 @@ export class ClientDaemon {
    * live inside the loopback proxy. Null only when session_gate=false.
    */
   private gate: SessionGate | null = null;
+  /**
+   * #73: the Hermes Gateway API connector (the OBSERVED complement to the
+   * gate — the inbound plane; it never holds a provider call in flight).
+   * Reads the gateway's session ledger + health and publishes the merged
+   * facts on the register heartbeat (ADD-keys: `hermes_meta` per session,
+   * `hermes_version`/`gateway_reachable` per client). Strictly fail-open:
+   * the gateway down ⇒ the complement publishes nothing and the gate's
+   * behaviour is byte-for-byte unchanged. The connector is constructed
+   * with the env-derived enabled flag (IDLEFILL_HERMES_GATEWAY=1);
+   * disabled ⇒ it publishes nothing (see the constructor).
+   */
+  private hermesGateway: HermesGatewayConnector | null = null;
   /** Set by the gate to wake the poll loop early (on-demand /api/state). */
   private stateWake = false;
   private ws: WebSocket | null = null;
@@ -1122,6 +1136,29 @@ export class ClientDaemon {
       log: hooks.log ?? new RotatingLog(join(clientDir, 'logs')),
     };
     this.checkExecutorScript();
+    // #73: the Hermes Gateway API connector (the observed complement to
+    // the gate). ENABLEMENT IS OPT-IN PER MACHINE — this host runs the
+    // Hermes Gateway API: IDLEFILL_HERMES_GATEWAY=1 (env-only; the config
+    // loader drops unknown keys, so the switch cannot ride config.json,
+    // and config.ts is the frozen surface of the parallel #47 work).
+    // Unset ⇒ the connector is not constructed ⇒ the register heartbeat
+    // bodies stay byte-for-byte the pre-#73 shape (strictest fail-quiet).
+    // Set ⇒ the daemon is the fetcher (the gateway is loopback-only,
+    // reachable only from THIS machine) and the facts ride the register
+    // heartbeat (the ADD-key precedent). base_url honours
+    // IDLEFILL_HERMES_GATEWAY_URL (test seam / non-default port) before
+    // the Hermes default.
+    const gwSwitch = (process.env.IDLEFILL_HERMES_GATEWAY ?? '').trim().toLowerCase();
+    if (gwSwitch === '1' || gwSwitch === 'true' || gwSwitch === 'yes') {
+      const gwCfg = resolveHermesGatewayConfig(
+        { ...(process.env.IDLEFILL_HERMES_GATEWAY_URL ? { base_url: process.env.IDLEFILL_HERMES_GATEWAY_URL } : {}) },
+        process.env,
+        homedir(),
+      );
+      this.hermesGateway = new HermesGatewayConnector(gwCfg, {
+        log: (m) => this.log.info(m),
+      });
+    }
   }
 
   /**
@@ -1180,6 +1217,29 @@ export class ClientDaemon {
     const a = clientRevision.toLowerCase();
     const b = live.toLowerCase();
     return a === b || a.startsWith(b) || b.startsWith(a) ? false : true;
+  }
+
+  /**
+   * #73: the register body's Hermes gateway host facts (slice B).
+   * `hermes_version` + `gateway_reachable` — the OBSERVED complement's
+   * facts, sibling of `gate_posture` (reachability of the complement,
+   * never a gate signal). ADD-key posture: returns {} when the
+   * connector is absent (block disabled) or has not run a poll round —
+   * the heartbeat body stays byte-for-byte the pre-#73 shape.
+   */
+  private hermesGatewayHostFacts(): Record<string, unknown> {
+    const snap = this.hermesGateway?.snapshot();
+    if (!snap) return {};
+    return {
+      ...(snap.version ? { hermes_version: snap.version } : {}),
+      gateway_reachable: snap.reachable,
+    };
+  }
+
+  /** #73: the gateway connector (tests / operators inspect it); null when
+   *  the env switch is unset (the complement is not constructed). */
+  get hermesConnector(): HermesGatewayConnector | null {
+    return this.hermesGateway;
   }
 
   /** Loopback proxy base URL once up (tests / operators); null before boot. */
@@ -1293,6 +1353,16 @@ export class ClientDaemon {
       // session gate reports nothing (there is no gate to be armed), and an
       // old arbiter ignores the key and keeps working.
       ...(this.gate ? { gate_posture: this.gate.failOpen ? 'fail_open' : 'armed' } : {}),
+      // #73: the Hermes gateway host facts (slice B), alongside
+      // gate_posture — the OBSERVED complement's reachability, not a gate
+      // signal. ADD-key posture: the connector publishes NOTHING before
+      // its first poll round and when the `hermes_gateway` block is
+      // disabled (the heartbeat body stays byte-for-byte the pre-#73
+      // shape). After a round: `gateway_reachable: false` is the
+      // exception-only "gateway down" badge (exception-only render on the
+      // dashboard side); a reachable gateway publishes `hermes_version`
+      // + `gateway_reachable: true`. An old arbiter ignores both keys.
+      ...this.hermesGatewayHostFacts(),
       // Session launcher (#43): the port the session-gate proxy ACTUALLY
       // bound (cfg proxy_port may be 0 = ephemeral). The arbiter echoes it,
       // so the Sessions surface can hand the operator the exact
@@ -1458,6 +1528,12 @@ export class ClientDaemon {
     // fire-and-forget cadence — the tick never waits on the driver, and a
     // project with no cycles file does nothing (cycles fail closed, D4).
     void this.maybeRunCycleDrivers();
+
+    // #73: the Hermes Gateway API poll (fire-and-forget, like the cycle
+    // drivers — the tick never waits on the gateway). A round that fails
+    // (gateway down) is fail-quiet: the connector publishes nothing and
+    // the gate's behaviour is byte-for-byte unchanged.
+    void this.hermesGateway?.poll().catch(() => {});
 
     const { status, body } = await api<{
       idle: { idle: boolean; degraded: boolean; reidle_gated: boolean };
@@ -1751,6 +1827,16 @@ export class ClientDaemon {
           // actually hits, not the leaseServerId watched-row fallback. A
           // `/s/<token>` key never enters that map, so its heartbeat body
           // stays exactly as before (D6).
+          // #73: the enrichment is computed HERE (not passed through the
+          // gate) because the gate's register dep is a frozen surface the
+          // parallel #47 work is editing — the closure looks up the
+          // connector's last-known ledger facts for this session's
+          // captured `session_id` (#42 slice 0). ADD-key posture:
+          // `metaFor` returns undefined when the connector is off (env
+          // switch unset), the gateway is unreachable, or the id is not
+          // in the last-known ledger — the body then omits `hermes_meta`
+          // and the gate's byte-for-byte behaviour stands (fail-quiet).
+          const hermesMeta = sessionId ? this.hermesGateway?.metaFor(sessionId) : undefined;
           const aggregateServerId = this.aggregateServers.get(token);
           const { status } = await api(this.cfg, 'POST', '/api/sessions/register', {
             token,
@@ -1798,6 +1884,14 @@ export class ClientDaemon {
             // the extra key (back-compat); a new arbiter surfaces it on
             // the session row.
             ...(priority ? { priority } : {}),
+            // #73: the gateway session ledger's facts for this session
+            // (title, token/cost totals, end state) — the facts the
+            // router can NEVER observe. ADD-key: absent when the
+            // connector is off / the gateway is unreachable / the
+            // session's id is not in the last-known ledger — the arbiter
+            // then keeps its stored value (never a fake zero). An old
+            // arbiter ignores the extra key (back-compat).
+            ...(hermesMeta ? { hermes_meta: hermesMeta } : {}),
           });
           return status === 200 || status === 201;
         },
