@@ -37,6 +37,9 @@ import {
   setSessionOverride,
   setSessionPin,
   getSessionTranscript,
+  readLocalHermesTranscript,
+  type HermesTranscriptMessage,
+  type HermesTranscriptPage,
   type SessionRow,
   type SessionTranscript,
   type StateSnapshot,
@@ -140,9 +143,172 @@ function HermesOpenButton({ sessionId }: { sessionId?: string }) {
 // router only ever saw timing + a sniffed model + a token total, never the
 // conversation, so the panel says so plainly and shows exactly that and nothing
 // more. Data: GET /api/sessions/<token>/transcript (arbiter → client proxy).
+//
+// #85 slice A adds the REAL conversation below it, but ONLY when the row
+// carries a Hermes session id AND the owning client's loopback daemon is
+// online: the page fetches GET http://127.0.0.1:<proxy_port>/client/hermes-
+// transcript/<session_id>?offset=…&limit=… ON-DEMAND (viewer open, one
+// bounded page per click — never bulk-polled, never through the arbiter).
 // ---------------------------------------------------------------------------
 
-function TranscriptSheet({ token, title, onClose }: { token: string; title: string; onClose: () => void }) {
+const CONVO_PAGE = 50;
+
+// The owning client's loopback proxy port for a session row — the #85
+// transcript is read over loopback ONLY, so the panel needs the client that
+// hosts the session to be online and to have reported a proxy_port.
+function hostProxyPort(st: StateSnapshot, s: SessionRow): number | undefined {
+  if (!s.client_id) return undefined;
+  const c = (st.clients ?? []).find((x) => x.client_id === s.client_id);
+  if (!c || !c.proxy_port) return undefined;
+  if (!isOnline(c.last_seen, st.now)) return undefined;
+  return c.proxy_port;
+}
+
+// One conversation message row: role chip, content (capped server-side),
+// tool name / tool calls, token count, timestamp.
+function ConvoMessageRow({ m, i }: { m: HermesTranscriptMessage; i: number }) {
+  const role = m.role ?? "?";
+  const roleTone = role === "user" ? "text-accent" : role === "assistant" ? "text-ok" : "text-dim";
+  return (
+    <div className="flex flex-col gap-1 rounded-md border border-border bg-panel/50 px-2.5 py-1.5 text-[12px]">
+      <div className="flex items-center gap-2">
+        <span className={`font-mono font-semibold ${roleTone}`}>{role}</span>
+        {m.timestamp != null && (
+          <span className="font-mono text-[10px] text-dim" title="the ledger's message timestamp">
+            {new Date(m.timestamp).toLocaleTimeString([], { hour12: false })}
+          </span>
+        )}
+        {typeof m.token_count === "number" && (
+          <span className="text-[10px] text-dim" title="token_count recorded for this message">
+            {m.token_count >= 1000 ? `${Math.round(m.token_count / 100) / 10}k` : m.token_count} tok
+          </span>
+        )}
+        {m.finish_reason && (
+          <Badge variant="outline" className="rounded-pill px-1.5 py-0 text-[10px] font-normal text-dim" title="finish_reason">
+            {m.finish_reason}
+          </Badge>
+        )}
+      </div>
+      {m.content && (
+        <p className="whitespace-pre-wrap break-words text-[11px] leading-relaxed text-foreground/85">
+          {m.content}
+          {m.content_truncated && <span className="text-dim"> …[capped]</span>}
+        </p>
+      )}
+      {m.tool_name && (
+        <span className="text-[10px] text-dim font-mono" title="tool this message names">
+          tool: {m.tool_name}
+        </span>
+      )}
+      {m.tool_calls?.length && (
+        <div className="flex flex-wrap gap-1.5">
+          {m.tool_calls.map((c, j) => (
+            <Badge key={`${i}-${j}`} variant="outline" className="rounded-pill px-1.5 py-0 text-[10px] font-normal text-dim" title="tool call">
+              call {c.name}
+            </Badge>
+          ))}
+          {m.tool_calls_truncated && <span className="text-[10px] text-dim">…calls capped</span>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// The on-demand Hermes conversation: page fetched when the sheet opens,
+// "older page" button walks offset forward, bounded per page by the client.
+function ConvoPanel({ port, sessionId }: { port: number; sessionId: string }) {
+  const [page, setPage] = React.useState<HermesTranscriptPage | null>(null);
+  const [messages, setMessages] = React.useState<HermesTranscriptMessage[]>([]);
+  const [error, setError] = React.useState<string | null>(null);
+  const [loading, setLoading] = React.useState(true);
+  const [loadingMore, setLoadingMore] = React.useState(false);
+
+  React.useEffect(() => {
+    let live = true;
+    setLoading(true);
+    setError(null);
+    setMessages([]);
+    readLocalHermesTranscript(port, sessionId, 0, CONVO_PAGE)
+      .then((p) => {
+        if (!live) return;
+        setPage(p);
+        setMessages(p.messages);
+      })
+      .catch((e) => {
+        if (live) setError((e as Error).message);
+      })
+      .finally(() => {
+        if (live) setLoading(false);
+      });
+    return () => {
+      live = false;
+    };
+  }, [port, sessionId]);
+
+  const loadMore = async () => {
+    if (!page) return;
+    setLoadingMore(true);
+    try {
+      const next = await readLocalHermesTranscript(port, sessionId, page.next_offset, CONVO_PAGE);
+      setPage(next);
+      setMessages((prev) => [...prev, ...next.messages]);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoadingMore(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center justify-between text-[11px] text-dim">
+        <span>
+          the real conversation (gateway ledger, profile <code>{page?.profile ?? "?"}</code>) — fetched on-demand over loopback, never via the arbiter
+        </span>
+      </div>
+
+      {loading && <div className="text-[12px] text-dim">loading the conversation…</div>}
+
+      {!loading && error && (
+        <div className="flex flex-col gap-1 text-[12px] text-err">
+          <span className="font-semibold">conversation unavailable</span>
+          <span className="text-dim">{error}</span>
+        </div>
+      )}
+
+      {!loading && !error && messages.length === 0 && (
+        <div className="rounded-md border border-border bg-panel/50 px-3 py-2 text-[12px] text-dim">
+          the gateway reports no messages for this session id
+        </div>
+      )}
+
+      {messages.map((m, i) => <ConvoMessageRow key={m.id ?? `page-${page?.offset ?? 0}-${i}`} m={m} i={i} />)}
+
+      {page?.has_more && !error && (
+        <Button size="xs" variant="outline" className="h-7 px-3 text-[11px]" onClick={loadMore} disabled={loadingMore}>
+          {loadingMore ? "loading…" : `older messages (offset ${page.next_offset})`}
+        </Button>
+      )}
+      {page && !page.has_more && messages.length > 0 && (
+        <div className="text-[10px] text-dim">end of the fetched page — {messages.length} message(s) loaded</div>
+      )}
+    </div>
+  );
+}
+
+function TranscriptSheet({
+  token,
+  title,
+  onClose,
+  sessionId,
+  proxyPort,
+}: {
+  token: string;
+  title: string;
+  onClose: () => void;
+  sessionId?: string;
+  proxyPort?: number;
+}) {
   const [data, setData] = React.useState<SessionTranscript | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const [loading, setLoading] = React.useState(true);
@@ -257,6 +423,20 @@ function TranscriptSheet({ token, title, onClose }: { token: string; title: stri
               )}
             </>
           )}
+
+          {/* #85 slice A: the REAL conversation, on-demand from the owning
+              client's loopback daemon. Only rendered when the row carries a
+              Hermes session id and that client reports a live proxy port. */}
+          {sessionId && proxyPort ? (
+            <div className="mt-2 flex flex-col gap-2 border-t border-border pt-3">
+              <ConvoPanel port={proxyPort} sessionId={sessionId} />
+            </div>
+          ) : sessionId ? (
+            <div className="mt-2 border-t border-border pt-3 text-[11px] text-dim">
+              the owning client reports no loopback port — the conversation can only be
+              read over loopback, so this page cannot reach it.
+            </div>
+          ) : null}
         </div>
       </SheetContent>
     </Sheet>
@@ -434,6 +614,8 @@ function SessionRowView({ s, st }: { s: SessionRow; st: StateSnapshot }) {
           token={s.token}
           title={`session ${shortTok} — router's view`}
           onClose={() => setViewOpen(false)}
+          sessionId={s.session_id}
+          proxyPort={hostProxyPort(st, s)}
         />
       )}
       {s.server_id && !s.engine_pin && (

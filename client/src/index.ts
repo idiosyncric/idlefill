@@ -1959,6 +1959,17 @@ export class ClientDaemon {
           };
         },
       },
+      // #85 slice A: the ON-DEMAND transcript proxy for the session viewer.
+      // Same loopback bind, same edit-token guard. The connector is passed as
+      // a getter so the route answers the boot-time truth (null connector ⇒
+      // the named 503 refusal, zero gateway requests). This route is hit only
+      // when the viewer is open, one page at a time: transcript bytes NEVER
+      // ride the register heartbeat, the arbiter's /api/state, or any mesh
+      // publish — they go from the gateway straight to the local page.
+      hermesTranscript: {
+        token: this.cfg.token,
+        connector: () => this.hermesGateway,
+      },
       // #46: the true-pause interrupt half — POST /sessions/<token>/release
       // on this SAME loopback bind answers a paused/over-capacity
       // session's parked holds with the retryable 503 + Retry-After (the

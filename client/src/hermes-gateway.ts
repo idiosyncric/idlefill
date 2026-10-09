@@ -306,6 +306,148 @@ export function sessionPath(profile: string, sessionId: string): string {
   return profile === 'default' ? `/api/sessions/${id}` : `/p/${encodeURIComponent(profile)}/api/sessions/${id}`;
 }
 
+/**
+ * #85 slice A: the URL path for ONE session's MESSAGES (the `session_messages`
+ *  capability, per-profile mirror included). Verified live against
+ *  `gateway/platforms/api_server.py` `_handle_session_messages`: the envelope is
+ *  `{object:'list', session_id, data:[_message_response rows…], pagination:{limit, offset, order, returned}}`
+ *  and the gateway itself clamps `limit` to 500.
+ */
+export function transcriptPath(profile: string, sessionId: string): string {
+  const id = encodeURIComponent(sessionId);
+  return profile === 'default'
+    ? `/api/sessions/${id}/messages`
+    : `/p/${encodeURIComponent(profile)}/api/sessions/${id}/messages`;
+}
+
+// ---------------------------------------------------------------------------
+// #85 slice A: the on-demand transcript (viewer-only, NEVER bulk-polled,
+// NEVER published to the arbiter — it rides no heartbeat, no /api/state).
+// ---------------------------------------------------------------------------
+
+/** Page bounds: the viewer asks page by page; a request can NEVER pull more
+ *  than TRANSCRIPT_PAGE_MAX rows. A missing/invalid limit falls to the
+ *  default (50) — the gateway's own 500 cap is deliberately tightened here
+ *  so one viewer click moves a bounded, renderable page. */
+export const TRANSCRIPT_PAGE_DEFAULT = 50;
+export const TRANSCRIPT_PAGE_MAX = 200;
+/** Offsets are clamped so a hostile/typo offset cannot walk the ledger into
+ *  absurd deep pages (one bounded fetch stays one bounded fetch). */
+export const TRANSCRIPT_OFFSET_MAX = 100_000;
+/** Per-member caps (drop-don't-crash sanitizers, same posture as rowToMeta). */
+export const TRANSCRIPT_CONTENT_CAP = 4000;
+export const TRANSCRIPT_TOOL_NAME_CAP = 128;
+export const TRANSCRIPT_TOOL_CALLS_MAX = 20;
+export const TRANSCRIPT_TOOL_ARGS_CAP = 500;
+export const TRANSCRIPT_FINISH_REASON_CAP = 64;
+
+/** A sanitized transcript row: exactly the `_message_response` safe-keys the
+ *  viewer needs, each member individually checked/capped. Malformed members
+ *  are dropped, never crash. `timestamp` is epoch-ms (the ledger stores
+ *  epoch-seconds; toEpochMs normalizes both). */
+export interface TranscriptMessage {
+  role: string;
+  content?: string;
+  content_truncated?: boolean;
+  tool_name?: string;
+  tool_calls?: { name: string; arguments?: string }[];
+  tool_calls_truncated?: boolean;
+  token_count?: number;
+  finish_reason?: string;
+  timestamp?: number;
+  id?: number;
+}
+
+/** A transcript verdict: either a bounded sanitized page, or a refusal with
+ *  the HTTP status the loopback route answers (503-class for disabled /
+ *  unkeyed / unreachable / ambiguous-only walk; 404 ONLY when every keyed
+ *  profile answered an explicit 404; 400 for a malformed id). `reason` is
+ *  the NAMED refusal. */
+export type TranscriptResult =
+  | {
+      ok: true;
+      profile: string;
+      session_id: string;
+      offset: number;
+      limit: number;
+      /** Sanitized rows actually rendered (a dropped malformed row counts
+       *  against this, NOT against the paging bookkeeping). */
+      returned: number;
+      /** Where the NEXT page starts: offset + the RAW gateway rows this
+       *  page consumed. Never derived from the sanitized count — rows the
+       *  sanitizer dropped must never re-show or overlap on the next fetch. */
+      next_offset: number;
+      /** Heuristic: a full RAW page means a next page may exist (the
+       *  gateway's pagination envelope carries no has_more for messages). */
+      has_more: boolean;
+      messages: TranscriptMessage[];
+    }
+  | { ok: false; status: number; error: string; reason: string };
+
+/** Clamp the viewer's raw offset/limit query params to the bounded range.
+ *  Anything non-integer/negative falls to 0/default (fail-quiet, never an
+ *  error page for a typo in the URL). */
+export function clampTranscriptPage(offsetRaw: unknown, limitRaw: unknown): { offset: number; limit: number } {
+  const o = Number(offsetRaw);
+  const offset = Number.isInteger(o) && o >= 0 ? Math.min(o, TRANSCRIPT_OFFSET_MAX) : 0;
+  const l = Number(limitRaw);
+  const limit = Number.isInteger(l) && l >= 1 ? Math.min(l, TRANSCRIPT_PAGE_MAX) : TRANSCRIPT_PAGE_DEFAULT;
+  return { offset, limit };
+}
+
+/**
+ * Sanitize ONE gateway message row (the `_message_response` safe-keys). A
+ * row without a usable role is dropped whole — it cannot render, and a
+ * dropped row never poisons the page. Every other member is checked
+ * individually: bad member → dropped, rest kept.
+ */
+export function sanitizeTranscriptMessage(raw: unknown): TranscriptMessage | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const m = raw as Record<string, unknown>;
+  const role = typeof m.role === 'string' ? m.role.trim().slice(0, 64) : '';
+  if (!role) return undefined;
+  const out: TranscriptMessage = { role };
+  if (typeof m.id === 'number' && Number.isInteger(m.id) && m.id >= 0) out.id = m.id;
+  if (typeof m.content === 'string' && m.content !== '') {
+    if (m.content.length > TRANSCRIPT_CONTENT_CAP) {
+      out.content = m.content.slice(0, TRANSCRIPT_CONTENT_CAP);
+      out.content_truncated = true;
+    } else {
+      out.content = m.content;
+    }
+  }
+  if (typeof m.tool_name === 'string' && m.tool_name.trim() !== '') {
+    out.tool_name = m.tool_name.trim().slice(0, TRANSCRIPT_TOOL_NAME_CAP);
+  }
+  if (Array.isArray(m.tool_calls)) {
+    const calls: { name: string; arguments?: string }[] = [];
+    for (const c of m.tool_calls.slice(0, TRANSCRIPT_TOOL_CALLS_MAX)) {
+      if (!c || typeof c !== 'object' || Array.isArray(c)) continue;
+      const fn = (c as { function?: unknown }).function;
+      const name =
+        fn && typeof fn === 'object' && typeof (fn as { name?: unknown }).name === 'string'
+          ? (fn as { name: string }).name.trim().slice(0, TRANSCRIPT_TOOL_NAME_CAP)
+          : '';
+      if (!name) continue;
+      const args = (fn as { arguments?: unknown }).arguments;
+      const entry: { name: string; arguments?: string } = { name };
+      if (typeof args === 'string' && args !== '') entry.arguments = args.slice(0, TRANSCRIPT_TOOL_ARGS_CAP);
+      calls.push(entry);
+    }
+    if (calls.length > 0) out.tool_calls = calls;
+    if (m.tool_calls.length > TRANSCRIPT_TOOL_CALLS_MAX) out.tool_calls_truncated = true;
+  }
+  if (typeof m.token_count === 'number' && Number.isInteger(m.token_count) && m.token_count >= 0) {
+    out.token_count = m.token_count;
+  }
+  if (typeof m.finish_reason === 'string' && m.finish_reason.trim() !== '') {
+    out.finish_reason = m.finish_reason.trim().slice(0, TRANSCRIPT_FINISH_REASON_CAP);
+  }
+  const ts = toEpochMs(m.timestamp);
+  if (ts !== undefined) out.timestamp = ts;
+  return out;
+}
+
 /** The ledger join key's canonical shape (same rule `rowToMeta` applies to a
  *  row's id): trim, cap. A gate-captured header id is normalized the same way
  *  so a whitespace/padding difference never mis-joins. */
@@ -748,6 +890,121 @@ export class HermesGatewayConnector {
     } finally {
       this.singleInFlight.delete(id);
     }
+  }
+
+  /**
+   * #85 slice A: the ON-DEMAND transcript page for one exact session id.
+   *
+   * Walk posture (the #83 probe walk, applied to the messages route): the
+   * profiles are tried in config order and the FIRST profile that answers
+   * 200 wins; an explicit 404 from one profile ("not in THIS profile's
+   * ledger") moves to the next keyed profile; a 401/403/5xx or a malformed
+   * body is ambiguous and also moves on; a transport failure (refused /
+   * timeout) ends the walk with a 503-class refusal.
+   *
+   * Refusal honesty (the #83 walk verdicts): the named 404 `session_not_found`
+   * is answered ONLY when EVERY keyed profile gave an explicit 404 (a
+   * definitive "not in this profile"). A walk that met only 401/403/5xx or
+   * malformed bodies is ambiguous — the gateway never said "no such session" —
+   * and answers the named 503-class `gateway_ambiguous` instead of a false 404.
+   *
+   * Zero-request guarantees (the fail-open rule): the connector is disabled,
+   * the session id is malformed, or NO profile carries a key ⇒ the walk
+   * never issues a single HTTP request. Nothing here is ever polled, cached
+   * into the ledger, or published: the answer is returned straight to the
+   * loopback viewer and goes nowhere else.
+   */
+  async fetchTranscript(sessionId: string | undefined, offsetRaw: unknown, limitRaw: unknown): Promise<TranscriptResult> {
+    const id = normalizeSessionId(sessionId);
+    if (!id) return { ok: false, status: 400, error: 'session id required', reason: 'invalid_session_id' };
+    if (!this.cfg.enabled) {
+      return { ok: false, status: 503, error: 'hermes gateway connector is disabled', reason: 'connector_disabled' };
+    }
+    const { offset, limit } = clampTranscriptPage(offsetRaw, limitRaw);
+    const keyed: { profile: string; key: string }[] = [];
+    for (const profile of this.cfg.profiles) {
+      const key = profile === 'default' ? this.cfg.key : this.cfg.profileKeys.get(profile);
+      if (key) keyed.push({ profile, key });
+    }
+    if (keyed.length === 0) {
+      return {
+        ok: false,
+        status: 503,
+        error: 'no hermes profile carries an API key — the gateway cannot be addressed',
+        reason: 'no_key',
+      };
+    }
+    let transportFailed = false;
+    // #83 walk-verdict discipline: the honest 404 is reserved for a walk in
+    // which EVERY keyed profile answered an explicit 404 (a definitive miss).
+    // Any other posture the walk met (401/403/5xx, malformed body) is
+    // ambiguous and poisons that verdict → the named 503-class refusal.
+    let everyKeyedProfileSaidNotFound = true;
+    for (const { profile, key } of keyed) {
+      let res: Response;
+      try {
+        res = await this.fetchImpl(
+          `${this.cfg.base_url}${transcriptPath(profile, id)}?offset=${offset}&limit=${limit}&order=oldest`,
+          { headers: { authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(this.cfg.timeout_ms) },
+        );
+      } catch {
+        transportFailed = true;
+        break; // gateway down: one bounded attempt per profile walk, no retry storm
+      }
+      if (res.status === 404) continue; // definitive miss for THIS profile: walk on
+      everyKeyedProfileSaidNotFound = false; // this profile never said "no such session"
+      if (res.status !== 200) continue; // 401/403/5xx: ambiguous, walk on
+      let body: unknown;
+      try {
+        body = await res.json();
+      } catch {
+        continue; // malformed envelope: ambiguous, walk on
+      }
+      const env = body as { session_id?: unknown; data?: unknown } | undefined;
+      if (!env || !Array.isArray(env.data)) continue; // not the envelope: ambiguous, walk on
+      // Paging bookkeeping rides the RAW rows the gateway answered (a
+      // sanitizer drop must never overlap or re-show on the next fetch).
+      const consumed = Math.min(env.data.length, TRANSCRIPT_PAGE_MAX);
+      const messages: TranscriptMessage[] = [];
+      for (const raw of env.data.slice(0, TRANSCRIPT_PAGE_MAX)) {
+        const m = sanitizeTranscriptMessage(raw);
+        if (m) messages.push(m); // drop-don't-crash: a bad row never poisons the page
+      }
+      const saidId = typeof env.session_id === 'string' ? env.session_id.trim().slice(0, 128) : '';
+      return {
+        ok: true,
+        profile,
+        session_id: saidId !== '' ? saidId : id,
+        offset,
+        limit,
+        returned: messages.length,
+        next_offset: offset + consumed,
+        has_more: consumed >= limit,
+        messages,
+      };
+    }
+    if (transportFailed) {
+      return {
+        ok: false,
+        status: 503,
+        error: 'hermes gateway unreachable — transcript unavailable',
+        reason: 'gateway_unreachable',
+      };
+    }
+    if (everyKeyedProfileSaidNotFound) {
+      return {
+        ok: false,
+        status: 404,
+        error: `no hermes profile holds session ${id} — every keyed profile answered 404`,
+        reason: 'session_not_found',
+      };
+    }
+    return {
+      ok: false,
+      status: 503,
+      error: 'no keyed profile answered the transcript definitively — 401/403/5xx or malformed bodies only',
+      reason: 'gateway_ambiguous',
+    };
   }
 
   /** The host facts for the client register heartbeat (ADD-keys).

@@ -776,6 +776,59 @@ export async function writeLocalHermesGateway(
   return { restart_required: parsed.restart_required === true, stored_profiles: parsed.stored_profiles ?? [] };
 }
 
+// #85 slice A: the REAL conversation for one Hermes session, fetched ON-DEMAND
+// from the owning client's loopback daemon (never through the arbiter — the
+// transcript bytes stay on loopback, one bounded page at a time, only while
+// the viewer is open). The client daemon proxies the gateway's
+// GET /api/sessions/<id>/messages and sanitizes it. A refusal carries a named
+// reason: connector_disabled / no_key / gateway_unreachable / gateway_ambiguous
+// (walk met only 401/403/5xx/malformed answers), or session_not_found (404 —
+// every keyed profile answered an explicit 404).
+export interface HermesTranscriptMessage {
+  role: string;
+  content?: string;
+  content_truncated?: boolean;
+  tool_name?: string;
+  tool_calls?: { name: string; arguments?: string }[];
+  tool_calls_truncated?: boolean;
+  token_count?: number;
+  finish_reason?: string;
+  timestamp?: number;
+  id?: number;
+}
+
+export interface HermesTranscriptPage {
+  ok: true;
+  profile: string;
+  session_id: string;
+  offset: number;
+  limit: number;
+  returned: number;
+  // Where the next page starts (raw gateway rows consumed, sanitizer drops
+  // included) — the viewer walks with this, never offset+returned.
+  next_offset: number;
+  has_more: boolean;
+  messages: HermesTranscriptMessage[];
+}
+
+export async function readLocalHermesTranscript(
+  port: number,
+  sessionId: string,
+  offset: number,
+  limit: number,
+): Promise<HermesTranscriptPage> {
+  const res = await fetch(
+    `http://127.0.0.1:${port}/client/hermes-transcript/${encodeURIComponent(sessionId)}?offset=${offset}&limit=${limit}`,
+    { headers: { [EDIT_HEADER]: apiToken() ?? "" }, cache: "no-store" },
+  );
+  const body = (await res.json().catch(() => ({}))) as
+    | (Partial<HermesTranscriptPage> & { ok?: boolean; error?: string; reason?: string });
+  if (!res.ok || body.ok !== true) {
+    throw new Error(body.error ?? `transcript unavailable (HTTP ${res.status})`);
+  }
+  return body as HermesTranscriptPage;
+}
+
 // Assembled at runtime: the write-path redactor mangles token-like dotted
 // literals. The header is the client proxy's edit credential.
 const EDIT_HEADER = ["x-idlefill", "edit"].join("-");
