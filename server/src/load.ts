@@ -7,9 +7,11 @@
  *     `/metrics` endpoint the probe found in 2026-10-09 that idlefill
  *     never fetched); the feed's newest-entry rate rides the SAME tick
  *     (the feed fetch is already in the tick — no extra HTTP call, D5);
- *   - oMLX: GET {url}/health → identity and pool residency (D8:
- *     `/health` is identity and residency, not load — no veto for this
- *     kind, ever, in this wave);
+ *   - oMLX: GET {url}/api/status → the 0.7.0 status envelope (#52 slice 5,
+ *     the D8 amendment: the probe hit `/health` and missed `/api/status`;
+ *     the installed 0.7.0 carries `active_requests` — a real aggregate
+ *     in-flight count — `waiting_requests` — the first queue depth in the
+ *     fleet — and `loaded_models`, the actual loaded ids);
  *   - strata: GET {url}/metrics (the JSON the feed adapter already
  *     parses, #60 B) → the single in-flight generation state
  *     (`live.state`). The D4 predicate: `live.state` not in
@@ -25,8 +27,11 @@
  *   - llama-swap: `gpu_util_percent` ABOVE the owner-set
  *     `metrics_llamaswap_busy_gpu_percent` (NO default — unset means
  *     the kind has no predicate, the key stays absent, the verdict
- *     reads byte-for-byte as pre-#52);
- *   - oMLX: none (the key is always absent).
+ *     reads byte-for-byte as pre-#52 — LOCKED UNSET by the owner, do not
+ *     invent a number);
+ *   - oMLX: `active_requests` > 0 (slice 5, D8 amendment — the kind's
+ *     first real veto; a read with no `active_requests` input is
+ *     UNKNOWN, never a fake idle).
  * HARD RULE (D2 rule 1): a busy read can only DELAY a grant. It can
  * never make a busy engine read idle — the veto applies to `idle`
  * only. Failure posture (mirrors the feed fetcher): a failed read —
@@ -52,6 +57,8 @@ export interface LoadReading {
   gpu_mem_total_bytes?: number;
   tokens_per_second?: number;
   in_flight?: number;
+  /** oMLX `/api/status` `waiting_requests` — the scheduler queue (D8: the first queue depth in the fleet). */
+  queue_depth?: number;
   /** The strata `live.state` value, verbatim (lower-cased) — the D4 busy predicate input. */
   strata_live_state?: string;
   model_loaded?: string;
@@ -92,6 +99,12 @@ export interface LoadSignalView {
   gpu_mem_total_bytes?: number;
   tokens_per_second?: number;
   in_flight?: number;
+  /**
+   * The scheduler queue (oMLX 0.7.0 `/api/status` `waiting_requests`, D8
+   * slice 5 — the first queue count in the fleet). Absent on llama-swap
+   * and strata (the probes found no queue count there). ADD key.
+   */
+  queue_depth?: number;
   model_loaded?: string;
   model_quant?: string;
   omlx_loaded_count?: number;
@@ -180,40 +193,60 @@ export function modelQuantFromName(name: string): string | undefined {
 }
 
 /**
- * The oMLX `/health` identity + residency (D8: identity and residency,
- * NOT load). Field shape verified against the live payload (probe
- * 2026-10-09, inventory doc):
- * `{status, default_model, engine_pool:{model_count, loaded_count,
- * final_ceiling, current_model_memory}, mcp}`.
+ * The oMLX 0.7.0 `/api/status` envelope (#52 slice 5, the D8 amendment —
+ * the probe hit `/health` and missed this endpoint). Shape pinned against
+ * the INSTALLED 0.7.0 source (brew `omlx` 0.7.0, `omlx/server.py`
+ * `server_status`, the exact code that answers — the server itself was
+ * DOWN at the probe and at this slice, so no live capture exists yet;
+ * the envelope fields match the inventory addendum):
+ * `{status, version, uptime_seconds, models_discovered, models_loaded,
+ * models_loading, default_model, loaded_models: [ids], total_requests,
+ * active_requests, waiting_requests, total_*_tokens, cache_efficiency,
+ * avg_*_tps, model_memory_used/max, ...}`.
  *
- * `model_loaded` is the engine's only model NAME in the payload
- * (`default_model`), published only when a model is actually resident
- * (`loaded_count > 0`): with 0 resident the payload names no loaded
- * model (D5: omlx model_loaded ABSENT when the payload carries none),
- * and `model_quant` is derived from that name when parseable.
- * Returns null when the payload carries no usable identity or
- * residency at all.
+ * The D8 lock wires: `in_flight` = `active_requests` (the aggregate
+ * in-flight across loaded engines — a REAL count, the D4 predicate
+ * input), `queue_depth` = `waiting_requests` (the scheduler queue, the
+ * first queue count in the fleet), `model_loaded` = the actual loaded
+ * ids from `loaded_models` (joined with `,` when several are resident —
+ * identity, not the default), `model_quant` = the shared quant when every
+ * loaded id parses to the same one (the fleet's same-quant preference;
+ * ambiguous when they differ), and `omlx_loaded_count` = `models_loaded`
+ * (pool residency).
+ *
+ * Tolerant sanitizer: a non-finite/negative count drops that KEY (never a
+ * fake zero), a non-string entry in `loaded_models` is skipped, and a
+ * body with NO usable count and NO model info is a failed read (null) —
+ * absent = unknown, never a fake idle (a 200 that names nothing must not
+ * make the verdict read a busy engine as not-busy).
  */
-export function parseOmlxHealth(body: unknown): {
+export function parseOmlxStatus(body: unknown): {
+  in_flight?: number;
+  queue_depth?: number;
   model_loaded?: string;
   model_quant?: string;
   omlx_loaded_count?: number;
 } | null {
   const j = (body ?? {}) as Record<string, unknown>;
-  const defaultModel =
-    typeof j.default_model === 'string' && j.default_model.trim() !== '' ? j.default_model.trim() : undefined;
-  const pool = j.engine_pool as Record<string, unknown> | undefined;
-  const loadedCount = pool?.loaded_count;
-  const resident = typeof loadedCount === 'number' && Number.isFinite(loadedCount) && loadedCount > 0;
-  const count =
-    typeof loadedCount === 'number' && Number.isFinite(loadedCount) && loadedCount >= 0 ? loadedCount : undefined;
-  const model = resident && defaultModel !== undefined ? defaultModel : undefined;
-  const quant = model !== undefined ? modelQuantFromName(model) : undefined;
-  if (model === undefined && count === undefined) return null;
+  const count = (v: unknown): number | undefined =>
+    typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : undefined;
+  const active = count(j.active_requests);
+  const waiting = count(j.waiting_requests);
+  const ids = Array.isArray(j.loaded_models)
+    ? (j.loaded_models as unknown[])
+        .filter((s): s is string => typeof s === 'string' && s.trim() !== '')
+        .map((s) => s.trim())
+    : [];
+  const resident = count(j.models_loaded) ?? (ids.length > 0 ? ids.length : undefined);
+  if (active === undefined && waiting === undefined && resident === undefined && ids.length === 0) return null;
+  const quants = ids.map((id) => modelQuantFromName(id));
+  const quant = quants.length > 0 && quants[0] !== undefined && quants.every((q) => q === quants[0]) ? quants[0] : undefined;
   return {
-    ...(model !== undefined ? { model_loaded: model } : {}),
+    ...(active !== undefined ? { in_flight: active } : {}),
+    ...(waiting !== undefined ? { queue_depth: waiting } : {}),
+    ...(ids.length > 0 ? { model_loaded: ids.join(',') } : {}),
     ...(quant !== undefined ? { model_quant: quant } : {}),
-    ...(count !== undefined ? { omlx_loaded_count: count } : {}),
+    ...(resident !== undefined ? { omlx_loaded_count: resident } : {}),
   };
 }
 
@@ -253,10 +286,11 @@ export function parseStrataLoadState(body: unknown): string | null {
  * The D4 busy predicate, per kind, on a CAPTURED reading. Returns:
  *   true  — a fresh read fired the predicate (the engine reads busy);
  *   false — a fresh read says not busy (the engine reads not busy);
- *   null  — UNKNOWN: no predicate for the kind (oMLX: none; llama-swap:
- *           the owner's `metrics_llamaswap_busy_gpu_percent` is unset),
- *           or the predicate input is missing (a llama-swap read with
- *           no `gpu_util_percent` gauge). Unknown NEVER vetoes and
+ *   null  — UNKNOWN: no predicate for the kind (llama-swap: the owner's
+ *           `metrics_llamaswap_busy_gpu_percent` is unset), or the
+ *           predicate input is missing (a llama-swap read with no
+ *           `gpu_util_percent` gauge; an oMLX read with no
+ *           `active_requests`). Unknown NEVER vetoes and
  *           NEVER un-vetoes — `load_busy` is absent (D2 rules 1 and 2).
  * A busy result can only DELAY a grant (D2 rule 1); nothing in this
  * function can make a busy engine read idle.
@@ -270,7 +304,13 @@ export function loadBusyFor(
     const state = reading.strata_live_state;
     return state === undefined ? null : state !== 'idle' && state !== 'stopped' && state !== 'none';
   }
-  if (kind === 'omlx') return null; // D4: oMLX has NO veto (identity/residency, not load)
+  if (kind === 'omlx') {
+    // D8 amendment (slice 5): the kind's first real veto — oMLX
+    // `active_requests` (published as `in_flight`) ABOVE zero. A read
+    // without the count is UNKNOWN (never a fake idle, never a fake busy).
+    const active = reading.in_flight;
+    return typeof active === 'number' && Number.isFinite(active) ? active > 0 : null;
+  }
   // llama-swap (default kind, #60 B): the threshold predicate.
   const util = reading.gpu_util_percent;
   if (typeof util !== 'number' || !Number.isFinite(util)) return null; // no gauge = unknown
@@ -309,7 +349,7 @@ export interface LoadCollectorOpts {
 }
 
 const LLAMASWAP_SOURCE = 'llamaswap-metrics';
-const OMLX_SOURCE = 'omlx-health';
+const OMLX_SOURCE = 'omlx-status'; // D8 amendment (slice 5): /api/status, not /health
 const STRATA_SOURCE = 'strata-metrics';
 
 export class LoadCollector {
@@ -343,7 +383,7 @@ export class LoadCollector {
    * at all (a pre-#52 row reads unchanged).
    */
   static specFor(provider?: ServerProvider): { path: string; source: string } | null {
-    if (provider === 'omlx') return { path: '/health', source: OMLX_SOURCE };
+    if (provider === 'omlx') return { path: '/api/status', source: OMLX_SOURCE }; // the 0.7.0 status envelope (D8)
     if (provider === 'strata') return { path: '/metrics', source: STRATA_SOURCE }; // the JSON the feed adapter already parses
     return { path: '/metrics', source: LLAMASWAP_SOURCE }; // llama-swap (default kind)
   }
@@ -408,7 +448,11 @@ export class LoadCollector {
     let reading: LoadReading | null = null;
     try {
       if (this.o.provider === 'omlx') {
-        const parsed = parseOmlxHealth(JSON.parse(text));
+        // The D8 amendment (slice 5): the 0.7.0 status envelope — active/
+        // waiting counts + the loaded ids. A 200 that names no count and no
+        // model info is a failed read (null), never a zero-filled one, and
+        // never a fake idle (the D4 predicate would read UNKNOWN).
+        const parsed = parseOmlxStatus(JSON.parse(text));
         if (parsed) reading = { ...parsed, load_source: spec.source, read_at: now };
       } else if (this.o.provider === 'strata') {
         // The strata /metrics JSON (the feed adapter's own payload): the
@@ -453,7 +497,8 @@ export class LoadCollector {
   /**
    * The operator-readable reason for an AUTH-rejected load read (#52
    * slice 4 — the D4 strata auth gap). A 401/403 from the credential-
-   * gated kinds (strata /metrics, oMLX /health) with NO row credential is
+   * gated kinds (strata /metrics, oMLX /api/status via `verify_api_key`)
+   * with NO row credential is
    * the gap itself — the D4 busy predicate can never fire until the
    * operator sets the row's `auth_token` — and is named exactly so, with
    * the engine's own error message riding verbatim when it parses
@@ -467,8 +512,20 @@ export class LoadCollector {
     const path = LoadCollector.specFor(kind)!.path;
     let msg = '';
     try {
-      const j = JSON.parse(body) as { error?: { message?: unknown } } & { message?: unknown };
-      msg = String(typeof j.error?.message === 'string' ? j.error.message : typeof j.message === 'string' ? j.message : '');
+      // The message rides verbatim when it parses: strata's
+      // `error.message` and oMLX's FastAPI `detail` (slice 5, verified
+      // in the installed 0.7.0 source: HTTPException(401, detail=...))
+      // are the two shapes the fleet's gated engines answer with.
+      const j = JSON.parse(body) as { error?: { message?: unknown }; message?: unknown; detail?: unknown };
+      msg = String(
+        typeof j.error?.message === 'string'
+          ? j.error.message
+          : typeof j.message === 'string'
+            ? j.message
+            : typeof j.detail === 'string'
+              ? j.detail
+              : '',
+      );
     } catch {
       /* not JSON: the status is the whole story */
     }
@@ -487,8 +544,8 @@ export class LoadCollector {
    * kind's predicate answers. A stale reading is UNKNOWN — `load_busy`
    * is ABSENT (the data keys still ride, so the operator sees why), and
    * the verdict falls back to the feed and mtime basis. A reading whose
-   * predicate is unknown (oMLX: no predicate; llama-swap: the knob is
-   * unset; no gauge on the read) publishes NO `load_busy` either —
+     * predicate is unknown (llama-swap: the knob is unset; oMLX/strata:
+     * the read carries no predicate input) publishes NO `load_busy` either —
    * unknown never vetoes and never un-vetoes. A dead /metrics endpoint
    * never degrades the verdict (D2 rule 3): the load axis is a veto on
    * top of the feed, not part of it.

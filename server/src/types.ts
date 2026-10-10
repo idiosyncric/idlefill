@@ -943,14 +943,15 @@ export interface IdleSignal {
   // make a busy engine read idle.
   // ------------------------------------------------------------------
 
-  /** Which load surface produced the reading (design doc D5): `llamaswap-metrics` | `omlx-health` | `strata-metrics`. Absent = no load collector wired for the kind. ADD key. */
+  /** Which load surface produced the reading (design doc D5): `llamaswap-metrics` | `strata-metrics` | `omlx-status` (the D8 amendment, #52 slice 5 — the oMLX kind re-pointed from `omlx-health`). Absent = no load collector wired for the kind. ADD key. */
   load_source?: string;
   /**
    * The D4 busy predicate on this row's LAST load reading (slice 3):
    * strata — `live.state` not in {idle, stopped, none}; llama-swap —
    * `gpu_util_percent` above `metrics_llamaswap_busy_gpu_percent`
-   * (the knob, owner-set — no default); oMLX — none (the kind has no
-   * predicate, the key is always absent). PRESENT only on a FRESH read
+   * (the knob, owner-set — no default, LOCKED UNSET); oMLX —
+   * `active_requests` > 0 (the D8 amendment, slice 5 — the kind's first
+   * real veto). PRESENT only on a FRESH read
    * (the `metrics_load_stale_s` window, D3): a stale or missing reading
    * is UNKNOWN — the key is absent, so the verdict falls back to the
    * feed and mtime basis. A dead load source never degrades the verdict
@@ -978,18 +979,25 @@ export interface IdleSignal {
   gpu_mem_total_bytes?: number;
   /** The newest feed entry's engine-reported rate (llama-swap feed `tokens` block, #52 slice 1). Display and sample only, never a veto input. Absent = no reading. ADD key. */
   tokens_per_second?: number;
-  /** In-flight generation count. No engine exposes one today (llama-swap: none; strata: one slot, wired in the D4 wave; oMLX: none) — absent when the kind's engine exposes nothing. ADD key. */
+  /** In-flight generation count. strata: one slot (0 or 1); oMLX: `active_requests` — the aggregate in-flight across loaded engines (the D8 amendment, slice 5); llama-swap: none (HTTP has no in-flight count — WS-only upstream). Absent when the kind's engine exposes nothing on the read. ADD key. */
   in_flight?: number;
   /**
-   * oMLX `/health` identity: the default model name — ABSENT when the
-   * payload names none (design doc D8: the payload names the default,
-   * not the loaded; `loaded_count` 0 means nothing is resident).
-   * ADD key.
+   * The scheduler queue depth. oMLX 0.7.0 `/api/status` `waiting_requests`
+   * — the first queue count in the fleet (the D8 amendment, #52 slice 5;
+   * the D5 "named, not filled" key, now filled for this kind). Absent on
+   * llama-swap and strata (the probes found no queue count there). ADD key.
+   */
+  queue_depth?: number;
+  /**
+   * What the engine holds now. oMLX (`omlx-status`, slice 5): the ACTUAL
+   * loaded ids from `loaded_models` (joined with `,` when several are
+   * resident; D8 — no longer the default-model guess, and absent when
+   * nothing is loaded). llama-swap/strata: see design doc D5. ADD key.
    */
   model_loaded?: string;
   /** Best-effort quant identity parsed from `model_loaded` (D5: absent when not parseable). ADD key. */
   model_quant?: string;
-  /** oMLX `/health` pool residency: models loaded in memory (counts models, NOT requests). Display and sample only. Absent = no reading. ADD key. */
+  /** oMLX pool residency (`/api/status` `models_loaded`; the D8 amendment moved it off `/health`): models loaded in memory (counts models, NOT requests). Display and sample only. Absent = no reading. ADD key. */
   omlx_loaded_count?: number;
 }
 

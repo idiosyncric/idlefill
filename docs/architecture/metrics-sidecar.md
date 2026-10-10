@@ -7,16 +7,19 @@ with the same-day re-probe addendum. Every claim in the "what the probes
 found" section carries its probe there), `docs/reports/ISSUE52-GRILL-
 REPORT.md` (the grill, 2026-10-09: what it verified, what the owner
 settled), and the slice reports ISSUE52-CAPTURE / -DISPLAY / -VETO /
--STRATA-AUTH (slices 1–4, all on main).
+-STRATA-AUTH (slices 1–4, all on main) + ISSUE52-OMLX-STATUS-SLICE5 (the
+D8 amendment wired — the oMLX `/api/status` collector).
 
 Status: LOCKED (the grill closed it 2026-10-09, owner answers on every
 decision). D1/D2/D3/D6/D7 LOCKED as written — shipped and proven in
 slices 1–4. D4 LOCKED with the llama-swap threshold UNSET by the owner
 (the veto is live for strata — OBSERVED on the urza row — and inert for
 llama-swap by choice). D5 LOCKED, hour buckets stay load-free. D8
-AMENDED by the grill: the installed oMLX 0.7.0 exposes `/api/status`
-with `active_requests` / `waiting_requests` / `loaded_models`; the
-follow-up slice wires it. No wire key beyond the shipped ADD keys rides
+AMENDED by the grill and SHIPPED in slice 5: the installed oMLX 0.7.0
+exposes `/api/status` with `active_requests` / `waiting_requests` /
+`loaded_models`; the collector now reads it (`load_source`
+`omlx-status`, predicate `active_requests > 0`, `queue_depth` =
+`waiting_requests`). No wire key beyond the shipped ADD keys rides
 from this doc.
 
 ## The ask
@@ -185,12 +188,11 @@ honest. The kinds expose different truths.
   The per-request feed rate and `cache_tokens` ride as display once the
   parse keeps them (no extra HTTP call for them. The feed fetch is
   already in the tick. Shipped in slice 1).
-- oMLX: NO veto TODAY (shipped: `/health` is identity and residency, not
-  load; `loaded_count` counts models resident in memory, not requests
-  running; the collector publishes residency — display and sample only).
-  AMENDED by the grill: the installed 0.7.0 exposes `/api/status` with
-  a real `active_requests` count, so this kind GETS a predicate
-  (`active_requests > 0`) in the D8 follow-up slice. See D8.
+- oMLX: SHIPPED (the D8 amendment, slice 5 — this kind's first real
+  D4 veto): `active_requests > 0` from `/api/status` (was: no veto,
+  `/health` identity/residency only). A read without the count is
+  UNKNOWN — `load_busy` absent, never a fake idle. The live proof on
+  the row is pending: the local oMLX server is still DOWN (see D8).
 
 ## D5 — Wire keys (ADD, absent = unset)
 
@@ -203,8 +205,8 @@ server row `signal` block on `/api/state` gains:
 
 | Key | Type | Kind | Meaning |
 | --- | --- | --- | --- |
-| `load_source` | string | all | `llamaswap-metrics` \| `strata-metrics` \| `omlx-health`. Absent = no load collector wired for the kind (pre-#52 rows read unchanged) |
-| `load_busy` | boolean | strata, llama-swap (threshold set) | Present only on a FRESH read. true = the D4 predicate fired. false = the fresh read says not busy |
+| `load_source` | string | all | `llamaswap-metrics` \| `strata-metrics` \| `omlx-status` (slice 5 re-pointed the oMLX kind from `omlx-health`). Absent = no load collector wired for the kind (pre-#52 rows read unchanged) |
+| `load_busy` | boolean | strata, llama-swap (threshold set), oMLX (`active_requests > 0`, slice 5) | Present only on a FRESH read. true = the D4 predicate fired. false = the fresh read says not busy |
 | `load_age_s` | number | all | Seconds since the last successful load read. Absent = no read since boot |
 | `in_flight` | number | strata | 0 or 1 (the single `live` slot) |
 | `gpu_util_percent` | number | llama-swap | from `/metrics` |
@@ -214,12 +216,12 @@ server row `signal` block on `/api/state` gains:
 | `model_loaded` | string | llama-swap, strata | What the engine holds now, even when idle. llama-swap: the `/v1/models` entry with status `loaded` (the arbiter probes it every tick already). strata: `engine.model` from the `/metrics` read. omlx: ABSENT (the payload names the default, not the loaded) |
 | `model_quant` | string | all | Best-effort parse of the quant identity. llama-swap: from the description text. strata: from the model id (`q2_0`). omlx: from the model name when one is loaded. Absent when not parseable |
 
-Named, not filled (no engine exposes these today. The keys exist so a
-build wave adds values without a shape change):
+Named (the keys exist so a build wave adds values without a shape
+change; `queue_depth` was filled for oMLX in slice 5):
 
 | Key | Type | Kind | Meaning |
 | --- | --- | --- | --- |
-| `queue_depth` | number | none shipped today | Absent on llama-swap and strata (the probe found no queue count there). oMLX 0.7.0 `/api/status` carries `waiting_requests` — the D8 amendment slice fills the key for oMLX |
+| `queue_depth` | number | oMLX (`/api/status` `waiting_requests` — SHIPPED, slice 5) | Absent on llama-swap and strata (the probe found no queue count there). oMLX 0.7.0 `/api/status` carries `waiting_requests` — the D8 amendment filled the key for oMLX (the first queue count in the fleet) |
 
 The #51 engine sample line (`metrics-raw`, `EngineSampleLine`) carries
 the SAME key names. The sample is where the series lives. The hour line
@@ -261,7 +263,8 @@ itself, not a snapshot change. Deferred.
 
 ## D8 — The oMLX gap (named, not hidden) — AMENDED by the grill
 
-**AMENDED + LOCKED (2026-10-09, grill).** This doc called oMLX "the hole
+**AMENDED + LOCKED (2026-10-09, grill). SHIPPED — slice 5
+(`docs/reports/ISSUE52-OMLX-STATUS-SLICE5.md`).** This doc called oMLX "the hole
 in this design" because the probe hit `/health` and never `/api/status`.
 The grill's research closed the hole with the ALREADY INSTALLED version:
 oMLX 0.7.0 (brew, the current stable — 0.7.1.dev1 is a pre-release)
@@ -292,7 +295,10 @@ real `model_loaded` / `model_quant`, `in_flight` = `active_requests`,
 `queue_depth` = `waiting_requests`. The mtime stays the fallback basis
 until a fresh read lands. Caveat on the record: the local oMLX server
 was DOWN at the grill re-probe (the 05:55 `/health` capture stands);
-the slice re-verifies the live payload when the host is back.
+slice 5 re-checked — STILL DOWN (`/api/status` and `/health` both `000`,
+nothing on :8000), so the slice pinned the envelope to the INSTALLED
+0.7.0 source (`omlx/server.py` `server_status`, the exact return dict)
+and the live wire capture stays open until the host is back.
 
 ## Rules (restated crisp)
 
@@ -305,8 +311,8 @@ the slice re-verifies the live payload when the host is back.
    holds only while fresh.
 4. Per-kind predicates: strata `live.state` (ON — observed live on the
    urza row). llama-swap GPU threshold (OFF — the owner kept the knob
-   UNSET at the grill). oMLX none today (display and sample only); the
-   D8 amendment slice turns it on with `active_requests > 0`.
+   UNSET at the grill). oMLX `active_requests > 0` (ON in code — slice
+   5; live on the row once the engine is back).
 5. Wire keys are ADD on the signal block and the #51 sample line.
    Absent = unset. `queue_depth` is named. There is no KV key.
 6. The mesh snapshot is byte-for-byte. The load axis never rides the
@@ -325,20 +331,22 @@ load read beside the idle word (slice 2, the two-axes pattern of
 `docs/architecture/engine-health-routing.md` D5), and the strata
 collector credential fix (slice 4).
 
-Follow-up slice (the D8 amendment, after the owner lock): re-point the
-omlx collector at `/api/status` — `load_source` `omlx-status`, the
-`active_requests > 0` predicate, real `model_loaded` / `model_quant`,
-`in_flight`, `queue_depth` = `waiting_requests`; plus the llama-swap
-`model_loaded` / `model_quant` pairing with the `/v1/models` probe the
-tick already makes (the capture slice left it unwired). The owner's
-llama-swap threshold number (if/when set) is a config value, not code.
+SHIPPED (slice 5, the D8 amendment — `ISSUE52-OMLX-STATUS-SLICE5.md`):
+the omlx collector re-pointed at `/api/status` — `load_source`
+`omlx-status`, the `active_requests > 0` predicate, real
+`model_loaded` / `model_quant` (from `loaded_models`), `in_flight`,
+`queue_depth` = `waiting_requests` (the ADD key filled for the kind).
+Still follow-up: the llama-swap `model_loaded` / `model_quant` pairing
+with the `/v1/models` probe the tick already makes (the capture slice
+left it unwired), and the owner's llama-swap threshold number
+(if/when set) — a config value, not code.
 
 Suite (the build wave proves each): a fresh busy read vetoes (feed idle,
 engine busy, verdict not idle). A stale busy read expires to unknown
 (the verdict stands on feed and mtime). A dead `/metrics` never degrades
 (`signal_degraded` stays false. No grant block from the load axis). The
 per-kind predicates (strata on, llama-swap off until the threshold
-lands, oMLX display-only). The ADD keys absent on pre-#52 rows (byte
+lands, oMLX `active_requests > 0` — slice 5). The ADD keys absent on pre-#52 rows (byte
 parity). The strata experiment end to end (`live.state` generating, the
 veto lands, the grant is denied while the feed says idle).
 

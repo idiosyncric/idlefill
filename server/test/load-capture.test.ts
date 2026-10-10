@@ -8,7 +8,9 @@
  *     gauges the design doc D5 names (metric names pinned here)
  *   - the captured llama-swap activity entry → the tokens block and
  *     duration_ms kept by the type (ADD fields, no renames)
- *   - the captured oMLX /health payload → identity + residency keys
+ *   - the captured oMLX /health payload → superseded by the D8 amendment
+ *     (slice 5): the collector reads /api/status, pinned to the installed
+ *     0.7.0 source — active/waiting counts + the loaded ids
  *   - failure paths: 404, unreachable, malformed body → NO reading
  *     (absent = unset, never a fake zero), the last good reading stays
  *     with a growing load_age_s
@@ -25,7 +27,7 @@ import { IdleDetector } from '../src/idle.js';
 import {
   LoadCollector,
   parseLlamaSwapMetrics,
-  parseOmlxHealth,
+  parseOmlxStatus,
   parsePrometheusGauges,
   newestFeedTps,
   modelQuantFromName,
@@ -87,17 +89,38 @@ const LLAMASWAP_ACTIVITY_ENTRY_FIXTURE = {
   metadata: { fifo_priority: '0' },
 };
 
-/** oMLX GET /health → 200 (captured 2026-10-09). */
-const OMLX_HEALTH_FIXTURE = {
-  status: 'healthy',
+/** oMLX GET /api/status → 200 — the envelope pinned to the INSTALLED 0.7.0
+ *  source (brew `omlx` 0.7.0, `omlx/server.py` `server_status`, the exact
+ *  return dict that answers). HONEST NOTE: the oMLX server was DOWN at the
+ *  2026-10-09 probe AND at slice 5 (nothing listens on :8000 — re-checked),
+ *  so NO live capture of this endpoint exists yet; the shape is pinned to
+ *  the installed source + the inventory addendum, and the values below are
+ *  plausible fleet values matching the 05:55 /health capture (default
+ *  LFM2.5-2.6B-MLX-8bit, nothing resident, idle). */
+const OMLX_STATUS_FIXTURE = {
+  status: 'ok',
+  version: '0.7.0',
+  uptime_seconds: 54321,
+  models_discovered: 13,
+  models_loaded: 0,
+  models_loading: 0,
   default_model: 'LFM2.5-2.6B-MLX-8bit',
-  engine_pool: {
-    model_count: 13,
-    loaded_count: 0,
-    final_ceiling: 38332312276,
-    current_model_memory: 0,
-  },
-  mcp: null,
+  loaded_models: [],
+  total_requests: 4211,
+  active_requests: 0,
+  waiting_requests: 0,
+  total_prompt_tokens: 8123456,
+  total_completion_tokens: 987654,
+  total_cached_tokens: 123456,
+  cache_efficiency: 0.41,
+  avg_prefill_tps: 312.5,
+  avg_generation_tps: 128.7,
+  model_memory_used: 0,
+  model_memory_max: 38332312276,
+  model_memory_used_formatted: '0B',
+  model_memory_max_formatted: '35.7GB',
+  custom_kernels: { available: true, loaded: 0 },
+  ane_prefill: { patch_available: false, configured_models: 0, models: [] },
 };
 
 // ---------------------------------------------------------------------------
@@ -218,29 +241,75 @@ test('newestFeedTps: newest-first entries → the first rate wins; absent = null
   assert.equal(newestFeedTps([]), null);
 });
 
-test('parseOmlxHealth: the captured payload → residency, model_loaded ABSENT at loaded_count 0', () => {
-  const h = parseOmlxHealth(OMLX_HEALTH_FIXTURE);
-  assert.deepEqual(h, { omlx_loaded_count: 0 }, 'the payload names the default, not the loaded (D8)');
+// ---------------------------------------------------------------------------
+// #52 slice 5 (D8 amendment): the oMLX /api/status envelope. Shape pinned
+// to the INSTALLED 0.7.0 source (the exact `server_status` return dict;
+// the server was DOWN at the probe and at this slice — no live capture
+// exists yet, see the fixture comment). The sanitizer is tolerant: a
+// garbage value drops its KEY, never the whole reading; no usable data is
+// null (absent = unknown, never a fake zero/idle).
+
+test('parseOmlxStatus: the idle 0.7.0 envelope → REAL zero counts, model_loaded ABSENT when nothing is resident', () => {
+  assert.deepEqual(parseOmlxStatus(OMLX_STATUS_FIXTURE), {
+    in_flight: 0,
+    queue_depth: 0,
+    omlx_loaded_count: 0,
+  }, 'the payload names no loaded model when nothing is resident (D5/D8)');
 });
 
-test('parseOmlxHealth: a resident model carries model_loaded + the derived model_quant', () => {
-  const h = parseOmlxHealth({
-    status: 'healthy',
-    default_model: 'LFM2.5-2.6B-MLX-8bit',
-    engine_pool: { model_count: 13, loaded_count: 1, final_ceiling: 38332312276, current_model_memory: 1234 },
-    mcp: null,
-  });
-  assert.deepEqual(h, {
-    model_loaded: 'LFM2.5-2.6B-MLX-8bit',
-    model_quant: '8bit',
-    omlx_loaded_count: 1,
-  });
+test('parseOmlxStatus: a busy envelope → in_flight=active_requests, queue_depth=waiting_requests, real loaded ids + quant', () => {
+  assert.deepEqual(
+    parseOmlxStatus({
+      ...OMLX_STATUS_FIXTURE,
+      models_loaded: 1,
+      loaded_models: ['qwen3.8-flash-next-q2_0'],
+      active_requests: 2,
+      waiting_requests: 3,
+      model_memory_used: 12345678,
+    }),
+    {
+      in_flight: 2,
+      queue_depth: 3,
+      model_loaded: 'qwen3.8-flash-next-q2_0',
+      model_quant: 'q2_0',
+      omlx_loaded_count: 1,
+    },
+  );
 });
 
-test('parseOmlxHealth: a payload with no usable identity or residency is null (not a fake reading)', () => {
-  assert.equal(parseOmlxHealth({}), null);
-  assert.equal(parseOmlxHealth(null), null);
-  assert.equal(parseOmlxHealth({ default_model: 'x', engine_pool: { loaded_count: 'many' } }), null);
+test('parseOmlxStatus: several loaded ids join with ","; the quant rides only when they all share one', () => {
+  const same = parseOmlxStatus({
+    active_requests: 0,
+    waiting_requests: 0,
+    models_loaded: 2,
+    loaded_models: ['model-a-q4_0', 'model-b-q4_0'],
+  });
+  assert.deepEqual(same, {
+    in_flight: 0,
+    queue_depth: 0,
+    model_loaded: 'model-a-q4_0,model-b-q4_0',
+    model_quant: 'q4_0',
+    omlx_loaded_count: 2,
+  });
+  const mixed = parseOmlxStatus({ active_requests: 1, loaded_models: ['model-a-q4_0', 'model-b-q8_0'] });
+  assert.deepEqual(mixed, {
+    in_flight: 1,
+    model_loaded: 'model-a-q4_0,model-b-q8_0',
+    omlx_loaded_count: 2,
+  }, 'ambiguous quant → absent (never a guess); residency falls back to the id count');
+});
+
+test('parseOmlxStatus: tolerant sanitizer — garbage drops the KEY (never a fake zero); nothing usable is null', () => {
+  assert.equal(parseOmlxStatus({}), null);
+  assert.equal(parseOmlxStatus(null), null);
+  assert.equal(parseOmlxStatus(undefined), null);
+  assert.equal(parseOmlxStatus({ active_requests: -1, waiting_requests: 'x', models_loaded: NaN, loaded_models: 'nope' }), null, 'every field garbage → failed read');
+  assert.deepEqual(parseOmlxStatus({ active_requests: -1, waiting_requests: 'x', models_loaded: 0 }), { omlx_loaded_count: 0 }, 'counts garbage → the residency key still rides');
+  assert.deepEqual(
+    parseOmlxStatus({ active_requests: 0, waiting_requests: 0, loaded_models: ['ok-model', null, 7, '  '] }),
+    { in_flight: 0, queue_depth: 0, model_loaded: 'ok-model', omlx_loaded_count: 1 },
+    'non-string/blank loaded_models entries are skipped',
+  );
 });
 
 test('modelQuantFromName: best-effort, absent when not parseable', () => {
@@ -284,31 +353,49 @@ test('llama-swap: no feed rate this tick → tokens_per_second stays absent', as
   assert.equal('tokens_per_second' in view, false);
 });
 
-test('omlx: /health → omlx-health reading with load_age_s labelling the age', async () => {
-  const { transport } = fakeTransport((url) =>
-    url === 'http://127.0.0.1:8000/health' ? { ok: true, status: 200, text: JSON.stringify(OMLX_HEALTH_FIXTURE) } : { ok: false, status: 404 },
+test('omlx: /api/status → omlx-status reading with the D8 keys + load_age_s labelling the age', async () => {
+  const { transport, calls } = fakeTransport((url) =>
+    url === 'http://127.0.0.1:8000/api/status' ? { ok: true, status: 200, text: JSON.stringify(OMLX_STATUS_FIXTURE) } : { ok: false, status: 404 },
   );
   const c = new LoadCollector({ url: 'http://127.0.0.1:8000', provider: 'omlx', transport });
   await c.read(T0, null);
+  assert.equal(calls[0]?.url, 'http://127.0.0.1:8000/api/status', 'the D8 amendment re-points the collector: /api/status, not /health');
   const view = c.current(T0)!;
-  assert.equal(view.load_source, 'omlx-health');
+  assert.equal(view.load_source, 'omlx-status');
+  assert.equal(view.in_flight, 0, 'in_flight = active_requests (a REAL count — the zero is the engine saying idle, not a fake)');
+  assert.equal(view.queue_depth, 0, 'queue_depth = waiting_requests — the first queue count in the fleet');
   assert.equal(view.omlx_loaded_count, 0);
-  assert.equal('model_loaded' in view, false, '0 resident → the payload names no loaded model');
+  assert.equal('model_loaded' in view, false, 'nothing resident → the payload names no loaded model');
   // 20s later the SAME reading rides with a labelled age (the stale
-  // window is display-only: nothing vetoes, nothing is dropped).
+  // window gates the veto, not the data).
   const later = c.current(T0 + 20_000)!;
   assert.equal(later.load_age_s, 20);
-  assert.equal(later.omlx_loaded_count, 0);
+  assert.equal(later.queue_depth, 0);
+});
+
+test('omlx: a busy /api/status read publishes in_flight/queue_depth and the real loaded ids', async () => {
+  const busy = { ...OMLX_STATUS_FIXTURE, models_loaded: 1, loaded_models: ['Qwen3.8-27B-6bit'], active_requests: 1, waiting_requests: 4 };
+  const { transport } = fakeTransport((url) =>
+    url === 'http://127.0.0.1:8000/api/status' ? { ok: true, status: 200, text: JSON.stringify(busy) } : { ok: false, status: 404 },
+  );
+  const c = new LoadCollector({ url: 'http://127.0.0.1:8000', provider: 'omlx', stale_window_ms: 45_000, transport });
+  await c.read(T0, null);
+  const view = c.current(T0)!;
+  assert.equal(view.in_flight, 1);
+  assert.equal(view.queue_depth, 4);
+  assert.equal(view.model_loaded, 'Qwen3.8-27B-6bit', 'the ACTUAL loaded id (D8), not the default-model guess');
+  assert.equal(view.model_quant, '6bit');
+  assert.equal(view.omlx_loaded_count, 1);
 });
 
 test('omlx: the credential rides the Authorization header (same family as the feed fetchers)', async () => {
   const { transport, calls } = fakeTransport((url) =>
-    url === 'http://127.0.0.1:8000/health' ? { ok: true, status: 200, text: JSON.stringify(OMLX_HEALTH_FIXTURE) } : { ok: false, status: 404 },
+    url === 'http://127.0.0.1:8000/api/status' ? { ok: true, status: 200, text: JSON.stringify(OMLX_STATUS_FIXTURE) } : { ok: false, status: 404 },
   );
   const c = new LoadCollector({ url: 'http://127.0.0.1:8000', provider: 'omlx', auth_token: 'sekret', transport });
   await c.read(T0, null);
-  assert.equal(calls[0]?.url, 'http://127.0.0.1:8000/health');
-  assert.equal(calls[0]?.headers?.authorization, 'Bearer sekret');
+  assert.equal(calls[0]?.url, 'http://127.0.0.1:8000/api/status');
+  assert.equal(calls[0]?.headers?.authorization, 'Bearer sekret', 'oMLX verify_api_key accepts the Bearer header (installed 0.7.0 source) — the row key qualifies');
 });
 
 test('strata kind: the /metrics collector reads live.state; a payload with no live object is UNKNOWN (no reading)', async () => {
@@ -726,4 +813,88 @@ test('a successful strata read CLEARS a prior auth-rejection reason (last-succes
   const view = c.current(T0 + 15_000)!;
   assert.equal('load_fail_reason' in view, false, 'the cleared reason no longer rides');
   assert.equal(view.load_busy, true, 'and the D4 predicate fires on the fresh generating read');
+});
+
+// ---------------------------------------------------------------------------
+// #52 slice 5 (the D8 amendment): the oMLX fail-open parity. `/api/status`
+// is guarded by oMLX `verify_api_key` — the row's key rides the Bearer
+// header (installed 0.7.0 source). An unreachable/401 oMLX must degrade to
+// TODAY's mtime-only behaviour byte-for-byte, never poison the row:
+//   - unreachable → SILENT (no reading, no reason, no keys) — the live
+//     row is exactly this while the server is down;
+//   - 401 with NO row credential → the slice-4 named reason, path now
+//     /api/status (the D4 predicate `active_requests > 0` can never fire
+//     until the operator sets the row's auth_token);
+//   - 401 WITH a credential → the wrong/revoked case named; a later 200
+//     clears it and the predicate starts firing;
+//   - the VERDICT plane is byte-identical to the no-collector baseline.
+
+test('omlx unreachable → SILENT no reading: no keys ride, the row reads byte-for-byte as the mtime-only row today', async () => {
+  const { transport } = fakeTransport(() => 'throw');
+  const c = new LoadCollector({ url: 'http://127.0.0.1:8000', provider: 'omlx', stale_window_ms: 45_000, transport });
+  assert.equal(await c.read(T0, null), null, 'read() resolves null, never throws');
+  assert.equal(c.lastFailReason, null, 'unreachable is not an auth rejection → pre-#52 silence');
+  assert.equal(c.current(T0), null, 'no keys at all → byte-for-byte the mtime-only row');
+});
+
+test('omlx 401 with NO credential: the named reason says set the row auth_token (the slice-4 shape on /api/status)', async () => {
+  const calls: { url: string; headers?: Record<string, string> }[] = [];
+  const transport = (async (url: string, opts?: { headers?: Record<string, string> }) => {
+    calls.push({ url, headers: opts?.headers });
+    // oMLX 0.7.0 (installed source): verify_api_key raises
+    // HTTPException(401, detail="API key required") — FastAPI shape.
+    return { status: 401, ok: false, text: async () => JSON.stringify({ detail: 'API key required' }) };
+  }) as never;
+  const c = new LoadCollector({ url: 'http://127.0.0.1:8000', provider: 'omlx', stale_window_ms: 45_000, transport });
+  assert.equal(await c.read(T0, null), null);
+  assert.equal(calls[0]?.headers?.authorization, undefined, 'no row credential → no header sent');
+  assert.ok(c.lastFailReason, 'the auth rejection is named, not silent');
+  assert.match(c.lastFailReason!, /\/api\/status/, 'the path names the D8 surface');
+  assert.match(c.lastFailReason!, /401/);
+  assert.match(c.lastFailReason!, /API key required/, 'the engine own message rides verbatim (FastAPI detail)');
+  assert.match(c.lastFailReason!, /set auth_token/);
+  assert.match(c.lastFailReason!, /can never fire/, 'the active_requests>0 predicate is gated by that key');
+  const view = c.current(T0)!;
+  assert.equal(Object.keys(view).length, 1, 'reason-only: no fake load_source / load_age_s / load_busy');
+  assert.equal('load_busy' in view, false, 'a dark load axis never vetoes (D2 rule 3)');
+});
+
+test('omlx 401 WITH a credential names the revoked case; a later 200 clears it and the predicate fires', async () => {
+  let revoked = true;
+  const { transport } = fakeTransport(() =>
+    revoked
+      ? { ok: false, status: 401, text: '' }
+      : { ok: true, status: 200, text: JSON.stringify({ ...OMLX_STATUS_FIXTURE, active_requests: 3, waiting_requests: 1 }) },
+  );
+  const c = new LoadCollector({ url: 'http://127.0.0.1:8000', provider: 'omlx', auth_token: 'omlx-key-abc', stale_window_ms: 45_000, transport });
+  await c.read(T0, null);
+  assert.match(c.lastFailReason!, /credential was rejected/, 'a rejection WITH a token names the wrong/revoked case');
+  assert.ok(c.current(T0)?.load_fail_reason, 'the reason rides the view while the read fails');
+  revoked = false;
+  assert.ok(await c.read(T0 + 15_000, null), 'the restored key resolves a reading');
+  assert.equal(c.lastFailReason, null, 'a success clears the reason (last-success-wins)');
+  const view = c.current(T0 + 15_000)!;
+  assert.equal('load_fail_reason' in view, false);
+  assert.equal(view.load_busy, true, 'and the D4 predicate (active_requests 3 > 0) fires on the fresh read');
+  assert.equal(view.in_flight, 3);
+  assert.equal(view.queue_depth, 1);
+});
+
+test('omlx failed load reads (unreachable, 401) leave the VERDICT byte-identical to the no-collector baseline', async () => {
+  const baseline = await detectorWith([entry(10)]).poll(T0, new Set());
+  const cases: { name: string; transport: unknown }[] = [
+    { name: 'unreachable', transport: async () => { throw new Error('ECONNREFUSED'); } },
+    { name: '401', transport: async () => ({ status: 401, ok: false, text: async () => JSON.stringify({ detail: 'API key required' }) }) },
+  ];
+  for (const c of cases) {
+    const d = detectorWith([entry(10)]);
+    const sig = await d.poll(T0, new Set());
+    const col = new LoadCollector({ url: 'http://127.0.0.1:8000', provider: 'omlx', stale_window_ms: 45_000, transport: c.transport as never });
+    assert.equal(await col.read(T0, null), null, `${c.name}: no reading`);
+    assert.deepEqual(
+      JSON.stringify(verdictOnly(sig)),
+      JSON.stringify(verdictOnly(baseline)),
+      `${c.name}: the mtime-only verdict is byte-identical with a failed oMLX load read`,
+    );
+  }
 });

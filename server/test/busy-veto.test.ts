@@ -13,6 +13,10 @@
  *     stands on the feed and mtime (D2 rule 2 / D3);
  *   - llama-swap WITH the owner's knob set: gpu ABOVE it vetoes, gpu
  *     BELOW (or AT) it does not (D4);
+ *   - oMLX (slice 5, the D8 amendment): a FRESH `active_requests` > 0
+ *     read vetoes, a fresh 0 says not busy, a stale read is UNKNOWN —
+ *     the kind's first real veto, pinned to the installed 0.7.0
+ *     /api/status envelope;
  *   - the HARD RULE (D2 rule 1): a busy read can only DELAY a grant —
  *     it never makes a busy engine read idle, and a fresh load_busy
  *     false never forces idle (the feed+mtime basis stands);
@@ -109,9 +113,15 @@ test('D4 llama-swap predicate: gpu ABOVE the owner-set knob; absent knob = no pr
   assert.equal(loadBusyFor('llama-swap', llamaReading(91), -5), null);
 });
 
-test('D4 oMLX predicate: none (identity/residency, not load)', () => {
-  assert.equal(loadBusyFor('omlx', { omlx_loaded_count: 3, load_source: 'omlx-health', read_at: T0 }), null);
-  assert.equal(loadBusyFor('omlx', llamaReading(99), 80), null, 'the kind wins over the input');
+test('D4 oMLX predicate (the D8 amendment, slice 5): active_requests > 0 means busy; no count is UNKNOWN', () => {
+  assert.equal(loadBusyFor('omlx', { in_flight: 2, queue_depth: 1, load_source: 'omlx-status', read_at: T0 }), true);
+  assert.equal(loadBusyFor('omlx', { in_flight: 0, queue_depth: 0, load_source: 'omlx-status', read_at: T0 }), false);
+  assert.equal(
+    loadBusyFor('omlx', { omlx_loaded_count: 3, load_source: 'omlx-status', read_at: T0 }),
+    null,
+    'a residency-only read carries no predicate input → UNKNOWN, never a fake idle/busy',
+  );
+  assert.equal(loadBusyFor('omlx', llamaReading(99), 80), null, 'the kind wins over the input (a GPU gauge is not the oMLX input)');
 });
 
 // ---------------------------------------------------------------------------
@@ -182,8 +192,69 @@ test('collector: strata FRESH busy publishes load_busy true; FRESH idle publishe
 });
 
 // ---------------------------------------------------------------------------
-// parseStrataLoadState (pinned against the payload shape).
+// The oMLX collector path (the D8 amendment, slice 5): the kind's first
+// real veto. Envelope shape pinned to the INSTALLED omlx 0.7.0 source
+// (`omlx/server.py` server_status — the server itself was DOWN at the
+// probe and at this slice, no live capture exists yet).
 
+/** oMLX /api/status with two requests in flight (the D4 busy input). */
+const OMLX_BUSY = JSON.stringify({
+  status: 'ok',
+  version: '0.7.0',
+  models_loaded: 1,
+  loaded_models: ['qwen3.8-flash-next-q2_0'],
+  active_requests: 2,
+  waiting_requests: 3,
+});
+/** oMLX /api/status, everything idle. */
+const OMLX_IDLE = JSON.stringify({
+  status: 'ok',
+  version: '0.7.0',
+  models_loaded: 1,
+  loaded_models: ['qwen3.8-flash-next-q2_0'],
+  active_requests: 0,
+  waiting_requests: 0,
+});
+
+function omlxCollector(body: string) {
+  return new LoadCollector({
+    url: 'http://127.0.0.1:8000',
+    provider: 'omlx',
+    stale_window_ms: 45_000, // the D3 default window
+    transport: (async () => ({ status: 200, ok: true, text: async () => body })) as never,
+  });
+}
+
+test('collector: oMLX FRESH active_requests>0 publishes load_busy true, in_flight and queue_depth ride; fresh 0 publishes false', async () => {
+  const cb = omlxCollector(OMLX_BUSY);
+  await cb.read(T0, null);
+  const vb = cb.current(T0)!;
+  assert.equal(vb.load_source, 'omlx-status', 'the D8 amendment re-pointed the kind');
+  assert.equal(vb.in_flight, 2, 'in_flight = active_requests');
+  assert.equal(vb.queue_depth, 3, 'queue_depth = waiting_requests (the first queue count in the fleet)');
+  assert.equal(vb.model_loaded, 'qwen3.8-flash-next-q2_0', 'the ACTUAL loaded id');
+  assert.equal(vb.model_quant, 'q2_0');
+  assert.equal(vb.load_busy, true, 'active_requests 2 > 0 → the kind\'s first real veto input');
+  const ci = omlxCollector(OMLX_IDLE);
+  await ci.read(T0, null);
+  const vi = ci.current(T0)!;
+  assert.equal(vi.in_flight, 0);
+  assert.equal(vi.queue_depth, 0);
+  assert.equal(vi.load_busy, false, 'a fresh 0 says not busy (a REAL zero, not a fake)');
+});
+
+test('collector: a STALE oMLX busy read is UNKNOWN — load_busy absent, the counts still ride (D3)', async () => {
+  const c = omlxCollector(OMLX_BUSY);
+  await c.read(T0, null);
+  assert.equal(c.current(T0)!.load_busy, true, 'fresh at T0 → busy');
+  const v = c.current(T0 + 46_000)!;
+  assert.equal('load_busy' in v, false, 'past the 45s window → unknown (D2 rule 2)');
+  assert.equal(v.in_flight, 2, 'the last good reading stays');
+  assert.equal(v.load_age_s, 46, 'and its age is labelled');
+});
+
+// ---------------------------------------------------------------------------
+// parseStrataLoadState (pinned against the payload shape).
 test('parseStrataLoadState: the live slot, verbatim; no live object → null (unknown)', () => {
   assert.equal(parseStrataLoadState(JSON.parse(STRATA_BUSY)), 'generating');
   assert.equal(parseStrataLoadState(JSON.parse(STRATA_IDLE)), 'idle');
@@ -364,6 +435,49 @@ test('llama-swap WITH the knob set: gpu ABOVE vetoes, gpu BELOW does not', async
   assert.equal(sigCool.idle, true, 'the feed+mtime basis stands');
   assert.equal(grant(hCool, T0).ok, true);
   rmSync(hCool.dir, { recursive: true, force: true });
+});
+
+test('a FRESH oMLX busy read VETOES (the D8 amendment, slice 5): feed idle, engine busy, grant denied with reason load_busy', async () => {
+  const c = omlxCollector(OMLX_BUSY);
+  await c.read(T0, null);
+  const h = makeArbiter({ loadView: loadViewOf(c) });
+  const sig = await sigAt(h, T0);
+  assert.equal(sig.load_source, 'omlx-status');
+  assert.equal(sig.load_busy, true, 'active_requests 2 > 0 — the kind\'s first real D4 veto');
+  assert.equal(sig.in_flight, 2);
+  assert.equal(sig.queue_depth, 3, 'the first queue count in the fleet rides the vetoed signal');
+  assert.equal(sig.idle_for_s, 400, 'the feed basis is still idle (idle_for unchanged)');
+  assert.equal(sig.idle, false, 'the veto flips the verdict (D2 rule 4)');
+  assert.equal(sig.signal_degraded, false, 'the load axis never degrades (D2 rule 3)');
+  const r = grant(h, T0);
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, 'load_busy', 'the denial names the load axis, not the feed');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('a FRESH oMLX idle read (active_requests 0) publishes load_busy false and the grant goes through', async () => {
+  const c = omlxCollector(OMLX_IDLE);
+  await c.read(T0, null);
+  const h = makeArbiter({ loadView: loadViewOf(c) });
+  const sig = await sigAt(h, T0);
+  assert.equal(sig.load_busy, false, 'a fresh real zero says not busy');
+  assert.equal(sig.idle, true);
+  assert.equal(grant(h, T0).ok, true, `expected a grant, got ${JSON.stringify(grant(h, T0 + 1))}`);
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test('a STALE oMLX busy read is UNKNOWN: no veto, the verdict stands on feed and mtime, the counts still ride', async () => {
+  const c = omlxCollector(OMLX_BUSY);
+  await c.read(T0, null); // busy at T0
+  const h = makeArbiter({ loadView: loadViewOf(c) });
+  const sig = await sigAt(h, T0 + 46_000); // past the 45s window
+  assert.equal('load_busy' in (sig as Record<string, unknown>), false, 'stale → the key is absent (D2 rule 2)');
+  assert.equal(sig.load_age_s, 46, 'the age still rides (the operator sees why the veto is absent)');
+  assert.equal(sig.in_flight, 2, 'the last good reading stays (display + sample)');
+  assert.equal(sig.idle, true, 'the verdict stands on the feed and mtime');
+  const r = grant(h, T0 + 46_000);
+  assert.equal(r.ok, true, `the grant is not blocked by a stale read, got ${JSON.stringify(r)}`);
+  rmSync(h.dir, { recursive: true, force: true });
 });
 
 // ---------------------------------------------------------------------------

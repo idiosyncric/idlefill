@@ -89,7 +89,8 @@ export interface EngineSampleLine {
    * present only on a FRESH read (the `metrics_load_stale_s` window):
    * strata `live.state` not in {idle, stopped, none}; llama-swap
    * `gpu_util_percent` above the owner-set `metrics_llamaswap_busy_gpu_percent`
-   * (no default — absent knob = the key is absent); oMLX none. Stale is
+   * (no default — absent knob = the key is absent, LOCKED UNSET by the
+   * owner); oMLX `active_requests` > 0 (the D8 amendment, slice 5). Stale is
    * unknown → absent (D2 rule 2). A true load_busy DELAYS the grant: the
    * sample's `idle` reflects it (the feed says idle, the engine is busy).
    * ADD key.
@@ -111,6 +112,13 @@ export interface EngineSampleLine {
   gpu_mem_total_bytes?: number;
   tokens_per_second?: number | null;
   in_flight?: number;
+  /**
+   * The scheduler queue depth (oMLX 0.7.0 `/api/status` `waiting_requests`
+   * — the first queue count in the fleet, the D8 amendment, #52 slice 5;
+   * absent on llama-swap and strata). Same key name as the signal block
+   * (D5). ADD key.
+   */
+  queue_depth?: number;
   model_loaded?: string;
   model_quant?: string;
   omlx_loaded_count?: number;
