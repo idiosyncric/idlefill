@@ -1249,13 +1249,23 @@ export class ClientDaemon {
    * never a gate signal). ADD-key posture: returns {} when the
    * connector is absent (block disabled) or has not run a poll round —
    * the heartbeat body stays byte-for-byte the pre-#73 shape.
+   *
+   * #85 slice D: the same block also carries `hermes_jobs` — HERMES' OWN
+   * scheduled jobs (the gateway's cron; the naming rule is deliberate,
+   * idlefill has its own job concept). Sanitized + capped client-side,
+   * fetched at most once per connector round, published ONLY when a round
+   * actually answered with a non-empty list: absent ⇒ the key is omitted
+   * and the body stays byte-for-byte today's shape. READ-ONLY — no verb,
+   * no control, no write path touches /api/jobs beyond the GET.
    */
   private hermesGatewayHostFacts(): Record<string, unknown> {
     const snap = this.hermesGateway?.snapshot();
     if (!snap) return {};
+    const hermesJobs = this.hermesGateway?.jobsSnapshot();
     return {
       ...(snap.version ? { hermes_version: snap.version } : {}),
       gateway_reachable: snap.reachable,
+      ...(hermesJobs && hermesJobs.length > 0 ? { hermes_jobs: hermesJobs } : {}),
     };
   }
 

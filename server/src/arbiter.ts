@@ -72,7 +72,7 @@ import type {
   ThemeColors,
 } from './types.js';
 import type { StateStore } from './state.js';
-import type { ClientOverride, Lease, ProjectAllocation, ServerConfig, ServerConnection, ServerProvider, UtcDate, AgentRosterRow } from './types.js';
+import type { ClientOverride, Lease, ProjectAllocation, ServerConfig, ServerConnection, ServerProvider, UtcDate, AgentRosterRow, HermesJobRow } from './types.js';
 import { PROVIDER_KINDS, THEME_DEFAULTS, THEME_HEX_RE, THEME_TOKEN_KEYS } from './types.js';
 
 /**
@@ -113,6 +113,67 @@ export function cleanAgentRoster(raw: unknown): AgentRosterRow[] | undefined {
     if (typeof o.base_url === 'string') {
       const u = o.base_url.trim();
       if (u !== '' && u.length <= 512) row.base_url = u;
+    }
+    out.push(row);
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+/**
+ * #85 slice D: sanitize a reported HERMES JOBS block (#85's naming rule:
+ * these are Hermes' own cron jobs — NOT idlefill's job queue) for storage
+ * on the client row. The client already projects safe members; this is the
+ * arbiter's own edge (the client is untrusted input):
+ *   - a non-array (or a missing report) → undefined, so the caller treats
+ *     it as ABSENT (a malformed report never poisons the state file, and
+ *     absent never clears the stored value — a gateway outage or an old
+ *     client leaves the row byte-for-byte as-is);
+ *   - each member is checked INDIVIDUALLY and a malformed member is dropped
+ *     while the rest are kept: `id` a non-empty string ≤64 chars (a row
+ *     without it cannot be attributed — dropped whole), `profile` an
+ *     optional string ≤64, `name` ≤128, `schedule` ≤128, `state` ≤32,
+ *     `enabled` an EXACT boolean, `last_run`/`next_run` finite positive
+ *     epoch-ms (< 1e15) — anything else drops just that member;
+ *   - bounded hard at 100 rows (a display strip, not a job dump — the
+ *     client caps its own publish the same way; a hostile/buggy client
+ *     cannot bloat the state file).
+ *
+ * Returns undefined for a non-array or an all-dropped array (no empty list
+ * is stored, and the caller leaves the stored block untouched in that
+ * case). There is deliberately NO member here for the gateway's prompt,
+ * deliver target, workdir, error texts or execution records — a poison
+ * attempt carrying them lands in the drop bucket, not the state file.
+ */
+export function cleanHermesJobs(raw: unknown): HermesJobRow[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out: HermesJobRow[] = [];
+  for (const r of raw as unknown[]) {
+    if (out.length >= 100) break;
+    if (!r || typeof r !== 'object' || Array.isArray(r)) continue;
+    const o = r as Record<string, unknown>;
+    const id = typeof o.id === 'string' ? o.id.trim() : '';
+    if (id === '' || id.length > 64) continue;
+    const row: HermesJobRow = { id };
+    if (typeof o.profile === 'string') {
+      const p = o.profile.trim();
+      if (p !== '' && p.length <= 64) row.profile = p;
+    }
+    if (typeof o.name === 'string') {
+      const n = o.name.trim();
+      if (n !== '' && n.length <= 128) row.name = n;
+    }
+    if (typeof o.schedule === 'string') {
+      const s = o.schedule.trim();
+      if (s !== '' && s.length <= 128) row.schedule = s;
+    }
+    if (typeof o.enabled === 'boolean') row.enabled = o.enabled;
+    if (typeof o.state === 'string') {
+      const s = o.state.trim();
+      if (s !== '' && s.length <= 32) row.state = s;
+    }
+    for (const k of ['last_run', 'next_run'] as const) {
+      const v = o[k];
+      if (typeof v === 'number' && Number.isFinite(v) && v > 0 && v < 1e15) row[k] = Math.round(v);
     }
     out.push(row);
   }
@@ -554,7 +615,7 @@ export class Arbiter {
     observedIp: string,
     projects?: ProjectAllocation[],
     now?: number,
-    info?: { version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open'; proxy_port?: number; aggregate_port?: number; daemon_behind?: boolean; client_log?: string[]; agent_roster?: unknown; hermes_version?: unknown; gateway_reachable?: unknown },
+    info?: { version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open'; proxy_port?: number; aggregate_port?: number; daemon_behind?: boolean; client_log?: string[]; agent_roster?: unknown; hermes_version?: unknown; gateway_reachable?: unknown; hermes_jobs?: unknown },
   ): { client_id: string; created: boolean } {
     const s = this.store.state;
     const seen = now ?? Date.now();
@@ -658,6 +719,13 @@ export class Arbiter {
         ? info.hermes_version.trim()
         : undefined;
     const gatewayReachable = typeof info?.gateway_reachable === 'boolean' ? info.gateway_reachable : undefined;
+    // #85 slice D: HERMES JOBS (Hermes' own cron — see cleanHermesJobs; the
+    // naming rule is the issue's: `hermes_jobs`, never a bare "jobs" block).
+    // Same ADD-key edge as the roster: a present, valid block updates the
+    // row; a non-array / all-dropped block is ABSENT (never a clear); an old
+    // client (or a connector that never answered /api/jobs) leaves the row
+    // exactly as it was — byte-for-byte unchanged.
+    const hermesJobs = cleanHermesJobs(info?.hermes_jobs);
     const existing = s.clients.find((c) => c.name === name);
     if (existing) {
       if (validIp(observedIp)) existing.ip = observedIp; // observed wins
@@ -718,6 +786,10 @@ export class Arbiter {
       // connector disabled / pre-first-round) leaves it exactly as-is.
       if (hermesVersion) existing.hermes_version = hermesVersion;
       if (gatewayReachable !== undefined) existing.gateway_reachable = gatewayReachable;
+      // #85 slice D (Hermes jobs): same ADD-key rule as the roster — a
+      // present, valid block replaces the stored list; absent (old client /
+      // gateway outage / all-malformed report) NEVER clears it.
+      if (hermesJobs !== undefined) existing.hermes_jobs = hermesJobs;
       this.store.save();
       return { client_id: existing.client_id, created: false };
     }
@@ -751,6 +823,9 @@ export class Arbiter {
       // report (same ADD-key store rule as the heartbeat path).
       ...(hermesVersion ? { hermes_version: hermesVersion } : {}),
       ...(gatewayReachable !== undefined ? { gateway_reachable: gatewayReachable } : {}),
+      // #85 slice D (Hermes jobs): lands only on a present, valid block
+      // (same ADD-key store rule as the heartbeat path).
+      ...(hermesJobs !== undefined ? { hermes_jobs: hermesJobs } : {}),
     });
     this.store.appendEvent({ kind: 'client_registered', detail: `${name} (${client_id})` });
     // A fresh registration that already carries rebuild state (client

@@ -22,7 +22,7 @@ import { buildMeshSnapshot, type MeshFederation } from './mesh.js';
 import { verifyRequester, NonceReplayStore, EDGE_TS_SKEW_MS, type EdgeSignaturePayload } from './edges.js';
 import { isLoopbackAddress } from './catalog.js';
 import type { LoadSignalView } from './load.js';
-import type { ClientRecord, CycleStatusRow, ProjectAllocation, QueuePreviewRow, RebuildRunState, ServerConfig, ServerConnection } from './types.js';
+import type { ClientRecord, CycleStatusRow, HermesJobRow, ProjectAllocation, QueuePreviewRow, RebuildRunState, ServerConfig, ServerConnection } from './types.js';
 
 export interface ApiDeps {
   arbiter: Arbiter;
@@ -102,7 +102,7 @@ function bearer(req: { headers: Record<string, unknown>; query: unknown }): stri
 function projectView(
   arbiter: Arbiter,
   cfg: ServerConfig,
-  clients: { name: string; last_seen: number; projects: { name: string; model: string; estimated_seconds: number; queue_depth: number; queue_preview?: QueuePreviewRow[]; stats?: Record<string, number | string>; last_rebuild?: RebuildRunState; cycles?: CycleStatusRow[]; cycle_cap?: number }[]; version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open'; proxy_port?: number; daemon_behind?: boolean; hermes_version?: string; gateway_reachable?: boolean }[],
+  clients: { name: string; last_seen: number; projects: { name: string; model: string; estimated_seconds: number; queue_depth: number; queue_preview?: QueuePreviewRow[]; stats?: Record<string, number | string>; last_rebuild?: RebuildRunState; cycles?: CycleStatusRow[]; cycle_cap?: number }[]; version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open'; proxy_port?: number; daemon_behind?: boolean; hermes_version?: string; gateway_reachable?: boolean; hermes_jobs?: HermesJobRow[] }[],
   day: string,
   now: number,
   today: Record<string, { finished: number; failed: number }>,
@@ -158,6 +158,12 @@ function projectView(
           // only on false — the echo keeps the stored value visible).
           ...(c.hermes_version ? { hermes_version: c.hermes_version } : {}),
           ...(c.gateway_reachable !== undefined ? { gateway_reachable: c.gateway_reachable } : {}),
+          // #85 slice D: the HERMES jobs strip data (Hermes' own cron — the
+          // naming rule is deliberate). Echoed exception-only: absent = the
+          // connector never answered /api/jobs (or an old client) — the row
+          // renders byte-for-byte as before. The block the dashboard's
+          // "Hermes jobs" strip renders; read-only, never a control surface.
+          ...(c.hermes_jobs && c.hermes_jobs.length > 0 ? { hermes_jobs: c.hermes_jobs } : {}),
         };
       })
       .sort((a, b) => Number(b.online) - Number(a.online) || a.client.localeCompare(b.client));
@@ -384,7 +390,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   // ------------------------------------------------------------------
 
   app.post('/api/clients/register', async (req, reply) => {
-    const body = (req.body ?? {}) as { name?: string; ip?: string; projects?: ProjectAllocation[]; version?: unknown; protocol?: unknown; revision?: unknown; gate_posture?: unknown; proxy_port?: unknown; aggregate_port?: unknown; daemon_behind?: unknown; client_log?: unknown; agent_roster?: unknown; hermes_version?: unknown; gateway_reachable?: unknown };
+    const body = (req.body ?? {}) as { name?: string; ip?: string; projects?: ProjectAllocation[]; version?: unknown; protocol?: unknown; revision?: unknown; gate_posture?: unknown; proxy_port?: unknown; aggregate_port?: unknown; daemon_behind?: unknown; client_log?: unknown; agent_roster?: unknown; hermes_version?: unknown; gateway_reachable?: unknown; hermes_jobs?: unknown };
     const name = typeof body.name === 'string' ? body.name.trim() : '';
     if (!name) return reply.code(400).send({ error: 'name required' });
     const remote = (req.ip ?? '').split(':').pop() ?? 'unknown';
@@ -537,14 +543,21 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     // daemons without the connector: absent NEVER clears a stored value.
     const hermes_version = typeof body.hermes_version === 'string' ? body.hermes_version : undefined;
     const gateway_reachable = typeof body.gateway_reachable === 'boolean' ? body.gateway_reachable : undefined;
+    // #85 slice D: the HERMES jobs block (Hermes' own cron — the naming rule
+    // is deliberate, `hermes_jobs`). A plain array pass-through here —
+    // sanitized (bounded rows, malformed members dropped individually,
+    // non-array/all-dropped → absent) in registerClient via cleanHermesJobs.
+    // Absent on old clients and on daemons whose connector never answered
+    // /api/jobs: absent NEVER clears the stored block.
+    const hermes_jobs = Array.isArray(body.hermes_jobs) ? (body.hermes_jobs as unknown) : undefined;
     const res = arbiter.registerClient(
       name,
       typeof body.ip === 'string' && body.ip.trim() ? body.ip.trim() : undefined,
       remote,
       projects,
       undefined,
-      version !== undefined || protocol !== undefined || revision !== undefined || gate_posture !== undefined || proxy_port !== undefined || aggregate_port !== undefined || daemon_behind !== undefined || client_log !== undefined || agent_roster !== undefined || hermes_version !== undefined || gateway_reachable !== undefined
-        ? { version, protocol, revision, gate_posture, proxy_port, aggregate_port, daemon_behind, client_log, agent_roster, hermes_version, gateway_reachable }
+      version !== undefined || protocol !== undefined || revision !== undefined || gate_posture !== undefined || proxy_port !== undefined || aggregate_port !== undefined || daemon_behind !== undefined || client_log !== undefined || agent_roster !== undefined || hermes_version !== undefined || gateway_reachable !== undefined || hermes_jobs !== undefined
+        ? { version, protocol, revision, gate_posture, proxy_port, aggregate_port, daemon_behind, client_log, agent_roster, hermes_version, gateway_reachable, hermes_jobs }
         : undefined,
     );
     return reply.code(200).send({ client_id: res.client_id, created: res.created });

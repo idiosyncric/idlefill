@@ -14,11 +14,13 @@ import {
   apiToken,
   unthrottleJob,
   type CycleStatusRow,
+  type HermesJobRow,
   type LeaseRow,
   type StateSnapshot,
   type ThrottledJob,
 } from "@/lib/api";
 import { ago, cycleTone, durFmt, fmt, liveWord, minSec } from "@/lib/format";
+import { HERMES_JOBS_LABEL, collectHermesJobGroups, type HermesJobGroup } from "@/lib/hermes-jobs";
 
 const TONE: Record<string, string> = {
   ok: "text-ok",
@@ -40,20 +42,22 @@ const TONE: Record<string, string> = {
 export function Overview({ st }: { st: StateSnapshot | null }) {
   if (!st) return <OverviewSkeleton />;
   const cycleGroups = collectCycleGroups(st);
+  const jobGroups = collectHermesJobGroups(st);
   const throttled = st.throttled_jobs ?? [];
 
   return (
     <section className="flex flex-col gap-3">
       <SystemCard st={st} />
-      {cycleGroups.length === 0 && throttled.length === 0 ? (
+      {cycleGroups.length === 0 && throttled.length === 0 && jobGroups.length === 0 ? (
         <Card className="py-4 shadow-none">
           <CardContent className="px-4 text-[12px] text-dim">
-            nothing needs attention — no dev cycles published, no jobs throttled.
+            nothing needs attention — no dev cycles published, no jobs throttled, no Hermes jobs reported.
           </CardContent>
         </Card>
       ) : (
         <div className="grid gap-3 lg:grid-cols-2">
           {cycleGroups.length > 0 && <CycleStrip groups={cycleGroups} />}
+          {jobGroups.length > 0 && <HermesJobsCard st={st} groups={jobGroups} />}
           {throttled.length > 0 && <ThrottledCard st={st} jobs={throttled} />}
         </div>
       )}
@@ -228,6 +232,94 @@ function CycleRow({ c }: { c: CycleStatusRow }) {
             ))}
           </>
         )}
+      </span>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// HERMES JOBS (#85 slice D): Hermes' OWN cron, published by each client's
+// gateway connector (sanitized, fetched at most once per connector round).
+// The strip sits BESIDE the dev-cycle strip on purpose — the operator sees
+// Hermes' schedule next to idlefill's cycles. The NAMING is the issue's
+// hard rule ("Hermes jobs" everywhere — idlefill has its own job concept
+// and the collision is the named hazard; the header uses the single label
+// constant from lib/hermes-jobs). READ-ONLY by construction: rendered rows
+// only — the gateway's pause/resume/run/create verbs are deliberately NOT
+// exposed in this issue, so there is no button here to mis-click.
+// Exception-only: no client reported the block ⇒ no card (never an empty
+// list pretending to be truth).
+// ---------------------------------------------------------------------------
+
+function HermesJobsCard({ st, groups }: { st: StateSnapshot; groups: HermesJobGroup[] }) {
+  return (
+    <Card className="py-0 shadow-none">
+      <CardHeader className="flex-row items-center gap-2 px-4 py-2 pb-0">
+        <CardTitle className="text-[12px] font-semibold uppercase tracking-wide text-dim">{HERMES_JOBS_LABEL}</CardTitle>
+        <CardAction>
+          <span
+            className="text-[11px] text-dim"
+            title="Hermes' own cron on each worker's machine — read-only visibility; idlefill's own jobs are the queue/lease rows elsewhere"
+          >
+            {groups.length} {groups.length === 1 ? "client" : "clients"} reporting · read-only
+          </span>
+        </CardAction>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-2.5 px-4 py-2.5">
+        {groups.map((g) => (
+          <div key={g.client} className="flex flex-col gap-1">
+            <div className="flex items-center gap-2 text-[12px]">
+              <span
+                className={`size-1.5 rounded-full ${g.online ? "bg-ok" : "bg-border"}`}
+                title={g.online ? "client online" : "client offline"}
+              />
+              <span className="font-semibold">{g.client}</span>
+              <Badge
+                variant="outline"
+                className="rounded-pill px-1.5 py-0 text-[10px] font-normal text-dim"
+                title="Hermes' own cron jobs reported by this machine's gateway connector"
+              >
+                {g.jobs.length} Hermes {g.jobs.length === 1 ? "job" : "jobs"}
+              </Badge>
+            </div>
+            <div className="flex flex-col gap-0.5">
+              {g.jobs.map((j) => (
+                <HermesJobRowView key={`${g.client}/${j.profile ?? "default"}/${j.id}`} j={j} now={st.now} />
+              ))}
+            </div>
+          </div>
+        ))}
+      </CardContent>
+    </Card>
+  );
+}
+
+function HermesJobRowView({ j, now }: { j: HermesJobRow; now: number }) {
+  const paused = j.enabled === false || j.state === "paused";
+  const dueIn = j.next_run !== undefined && j.next_run > now ? minSec((j.next_run - now) / 1000) : null;
+  return (
+    <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 pl-3.5 text-[12px]">
+      <code className="text-[11px] text-dim" title="the Hermes job id (gateway cron, not an idlefill job id)">{j.id}</code>
+      {j.profile && <span className="text-[11px] text-dim" title="the Hermes profile that owns this job">{j.profile}</span>}
+      <span className="min-w-0" title="the job name (display member — the Hermes prompt is never published)">
+        {j.name ?? j.id}
+      </span>
+      {j.schedule && <span className="text-dim">{j.schedule}</span>}
+      {paused && (
+        <Badge
+          variant="outline"
+          className="h-4 rounded-pill border-warn/50 px-1.5 py-0 text-[10px] font-normal text-warn"
+          title="this Hermes job is paused/disabled on its machine — the strip is read-only (control verbs are out of this issue)"
+        >
+          paused
+        </Badge>
+      )}
+      {j.state && !paused && j.state !== "scheduled" && (
+        <span className="text-[11px] text-dim" title="the gateway's own state word for the job">{j.state}</span>
+      )}
+      <span className="ml-auto text-[11px] text-dim" title="last run · next scheduled run (the client's clock)">
+        {j.last_run !== undefined ? `ran ${ago(now - j.last_run)}` : "never ran"}
+        {dueIn ? ` · due in ${dueIn}` : j.next_run !== undefined ? " · due passed" : ""}
       </span>
     </div>
   );

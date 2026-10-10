@@ -532,6 +532,24 @@ export interface ClientRecord {
    * daemon both leave the row exactly as before).
    */
   gateway_reachable?: boolean;
+  /**
+   * #85 slice D: HERMES' OWN scheduled jobs (`GET /api/jobs` on the
+   * client machine's gateway — Hermes cron, NOT idlefill's job queue;
+   * the naming rule is deliberate and the key says `hermes_jobs`). The
+   * connector fetches at most once per connector round, sanitizes to
+   * safe display members (id, profile, name, schedule text, enabled,
+   * state, last_run/next_run epoch-ms — the prompt, deliver target,
+   * workdir, error texts and execution records are NEVER published),
+   * and publishes the block on the register heartbeat. ADD-key: stored on
+   * a valid report (sanitized array — malformed rows dropped
+   * individually, ≤100 rows via cleanHermesJobs); an all-malformed /
+   * non-array report is treated as absent; absent NEVER clears the
+   * stored list — a gateway outage or an old client leaves the row
+   * byte-for-byte as-is. Read-only visibility: the arbiter and dashboard
+   * render it, NOTHING here addresses Hermes' job verbs. Display only;
+   * never a gate.
+   */
+  hermes_jobs?: HermesJobRow[];
 }
 
 /**
@@ -553,6 +571,31 @@ export interface AgentRosterRow {
   provider?: string;
   /** The endpoint URL justifying the posture (absent for unset / userinfo). */
   base_url?: string;
+}
+
+/**
+ * #85 slice D: one HERMES job row (Hermes' own cron — the naming rule is
+ * the issue's: these are "Hermes jobs", idlefill has its own job concept).
+ * The CLIENT connector sanitizes (slice-B names-only caps); the arbiter
+ * re-sanitizes on arrival (`cleanHermesJobs`). Only safe display members
+ * exist here by shape — the prompt, deliver target, workdir/script, error
+ * texts and execution records have NO member to land in. `last_run` /
+ * `next_run` are epoch-ms.
+ */
+export interface HermesJobRow {
+  /** Owning Hermes profile (the connector stamps it; display attribution). */
+  profile?: string;
+  /** The Hermes job id (live class: 12 hex chars; capped ≤64). */
+  id: string;
+  name?: string;
+  /** The schedule text (display form preferred; ≤128 chars). */
+  schedule?: string;
+  enabled?: boolean;
+  /** `scheduled` | `paused` | `completed` | `error` (string-capped, not an
+   *  exact-enum drop: the gateway owns this vocabulary and may extend it). */
+  state?: string;
+  last_run?: number;
+  next_run?: number;
 }
 
 /**

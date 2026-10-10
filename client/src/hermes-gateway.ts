@@ -517,6 +517,117 @@ export function sanitizeTranscriptMessage(raw: unknown): TranscriptMessage | und
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// #85 slice D: HERMES JOBS — Hermes' OWN scheduled jobs (`GET /api/jobs`),
+// the read-plane visibility strip so the operator sees Hermes cron beside
+// idlefill's cycles. NAMING (the hard rule): these are HERMES jobs
+// everywhere — the wire key is `hermes_jobs`, every identifier here says
+// Hermes — idlefill has its own job concept (queue/lease jobs) and the
+// collision is the named hazard. READ-ONLY: the connector NEVER touches the
+// gateway's POST/PATCH/DELETE or pause/resume/run verbs (they stay outside
+// this issue). Fetch: at most ONE bounded `GET /api/jobs?include_disabled=
+// true` per profile per connector round (inside the existing poll round —
+// never per page render, never bulk-polled); zero requests while the
+// gateway is down or the profile is unkeyed/disabled. include_disabled so
+// PAUSED jobs stay visible (the enabled/state bits carry the pause; the
+// default listing hides them — an operator strip must not lose the frozen
+// cron).
+//
+// Live shape (verified at build, gateway 0.21.x, read-only curl with the
+// operator's default-profile key): `GET /api/jobs` → `{jobs:[record…]}`;
+// a record carries id (`[a-f0-9]{12}`), name, prompt (HUNDREDS of chars —
+// NEVER published), schedule (object `{kind,expr,display}`; legacy records
+// may carry a bare cron string), schedule_display (derived display string),
+// repeat `{times,completed}`, enabled (bool), state (`scheduled|paused|
+// completed|error`), created_at/next_run_at/last_run_at (ISO-8601 with
+// offset), last_status, deliver, workdir, script, and a latest_execution
+// record (pids, process ids, error text). The sanitizer projects ONLY the
+// safe display members (names-only style caps — the slice-B discipline):
+// id, profile, name, schedule text, enabled, state, last_run/next_run
+// (epoch-ms). The prompt, deliver target, workdir/script, error texts and
+// execution records NEVER ride the wire.
+// ---------------------------------------------------------------------------
+
+/** Count caps: per-profile rows (the cron store is small; a hostile/buggy
+ *  list cannot bloat a heartbeat) and the total published rows. */
+export const JOBS_MAX_PER_PROFILE = 50;
+export const JOBS_MAX_TOTAL = 100;
+/** Per-member string caps (drop-don't-poison, rowToMeta posture). */
+export const JOB_PROFILE_CAP = 64;
+export const JOB_ID_CAP = 64; // the live gateway id class is 12 hex chars
+export const JOB_NAME_CAP = 128;
+export const JOB_SCHEDULE_CAP = 128;
+export const JOB_STATE_CAP = 32;
+
+/** One sanitized Hermes job row — ONLY the safe display members. `profile`
+ *  carries the owning Hermes profile (the strip attributes rows by it);
+ *  `last_run`/`next_run` are epoch-ms (the gateway stores ISO-8601). */
+export interface HermesJobRow {
+  profile?: string;
+  id: string;
+  name?: string;
+  schedule?: string;
+  enabled?: boolean;
+  state?: string;
+  last_run?: number;
+  next_run?: number;
+}
+
+/** The URL path for a profile's Hermes jobs: `default` = the home store
+ *  (no prefix); a named profile = the gateway's per-profile mirror
+ *  (verified live: unkeyed mirrors 401, the per-profile key rule holds). */
+export function jobsPath(profile: string): string {
+  return profile === 'default' ? '/api/jobs' : `/p/${encodeURIComponent(profile)}/api/jobs`;
+}
+
+/** The gateway stores job timestamps as ISO-8601 strings (with offset);
+ *  legacy/other shapes may carry epoch numbers. Anything unparsable or
+ *  out of a sane epoch range is dropped (never a fake zero on the strip). */
+function isoToEpochMs(v: unknown): number | undefined {
+  if (typeof v === 'number') return toEpochMs(v);
+  if (typeof v !== 'string' || v.trim() === '') return undefined;
+  const t = Date.parse(v.trim());
+  if (!Number.isFinite(t) || t <= 0) return undefined;
+  return t;
+}
+
+/**
+ * Sanitize ONE Hermes job record into a published row. A record without a
+ * usable id is dropped whole (it cannot be attributed). Every member is
+ * checked individually — a malformed member is DROPPED, the rest are kept.
+ * The prompt, deliver target, workdir/script, error texts and the
+ * latest_execution record are NEVER projected: this is a names-only strip,
+ * not a job dump.
+ */
+export function sanitizeHermesJob(raw: unknown, profile: string): HermesJobRow | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const j = raw as Record<string, unknown>;
+  const id = typeof j.id === 'string' ? j.id.trim().slice(0, JOB_ID_CAP) : '';
+  if (id === '') return undefined;
+  const out: HermesJobRow = { id };
+  const prof = typeof profile === 'string' ? profile.trim().slice(0, JOB_PROFILE_CAP) : '';
+  if (prof !== '') out.profile = prof;
+  if (typeof j.name === 'string' && j.name.trim() !== '') out.name = j.name.trim().slice(0, JOB_NAME_CAP);
+  // Schedule text: the derived `schedule_display` wins (the gateway's own
+  // human form); fall back schedule.display → schedule.expr → a legacy
+  // bare-string schedule.
+  let sched: string | undefined;
+  if (typeof j.schedule_display === 'string' && j.schedule_display.trim() !== '') sched = j.schedule_display.trim();
+  else if (j.schedule && typeof j.schedule === 'object' && !Array.isArray(j.schedule)) {
+    const s = j.schedule as Record<string, unknown>;
+    if (typeof s.display === 'string' && s.display.trim() !== '') sched = s.display.trim();
+    else if (typeof s.expr === 'string' && s.expr.trim() !== '') sched = s.expr.trim();
+  } else if (typeof j.schedule === 'string' && j.schedule.trim() !== '') sched = j.schedule.trim();
+  if (sched !== undefined) out.schedule = sched.slice(0, JOB_SCHEDULE_CAP);
+  if (typeof j.enabled === 'boolean') out.enabled = j.enabled;
+  if (typeof j.state === 'string' && j.state.trim() !== '') out.state = j.state.trim().slice(0, JOB_STATE_CAP);
+  const lastRun = isoToEpochMs(j.last_run_at);
+  if (lastRun !== undefined) out.last_run = lastRun;
+  const nextRun = isoToEpochMs(j.next_run_at);
+  if (nextRun !== undefined) out.next_run = nextRun;
+  return out;
+}
+
 /** The ledger join key's canonical shape (same rule `rowToMeta` applies to a
  *  row's id): trim, cap. A gate-captured header id is normalized the same way
  *  so a whitespace/padding difference never mis-joins. */
@@ -660,9 +771,15 @@ async function fetchRound(cfg: HermesGatewayConfig, fetchImpl: FetchImpl, nowMs:
   reachable: boolean;
   version: string | undefined;
   rows: Map<string, GatewaySessionRow>;
+  /** #85 slice D: profile → the sanitized Hermes job list THIS round answered
+   *  (ONLY for profiles whose GET 200'd with a well-formed envelope — a
+   *  failed/401/malformed profile round adds NOTHING, the connector keeps
+   *  that profile's last-known list). */
+  jobs: Map<string, HermesJobRow[]>;
   fetchedAt: number;
 }> {
   const rows = new Map<string, GatewaySessionRow>();
+  const jobs = new Map<string, HermesJobRow[]>();
   let reachable = false;
   let version: string | undefined;
   const base = cfg.base_url;
@@ -680,7 +797,7 @@ async function fetchRound(cfg: HermesGatewayConfig, fetchImpl: FetchImpl, nowMs:
   } catch {
     /* unreachable — fail-quiet */
   }
-  if (!reachable) return { reachable, version, rows, fetchedAt: nowMs };
+  if (!reachable) return { reachable, version, rows, jobs, fetchedAt: nowMs };
 
   for (const profile of cfg.profiles) {
     // A named profile uses ONLY its own key (no fallback to the default
@@ -730,7 +847,48 @@ async function fetchRound(cfg: HermesGatewayConfig, fetchImpl: FetchImpl, nowMs:
       if (env.has_more !== true) break; // the list envelope decides: absent/false ⇒ last page
     }
   }
-  return { reachable, version, rows, fetchedAt: nowMs };
+
+  // #85 slice D: HERMES JOBS — one bounded GET per keyed profile per round
+  // (inside THIS round: at most once per connector cadence, never per page
+  // render, never bulk-polled; zero requests while down — the unreachable
+  // round returned above). GET only: the read plane never touches the
+  // gateway's create/update/pause/resume/run/delete verbs (out of scope).
+  for (const profile of cfg.profiles) {
+    const key = profile === 'default' ? cfg.key : cfg.profileKeys.get(profile);
+    if (!key) continue; // unkeyed profile ⇒ zero requests; its rows stay last-known
+    let res: Response;
+    try {
+      res = await fetchImpl(`${base}${jobsPath(profile)}?include_disabled=true`, {
+        headers: { authorization: `Bearer ${key}` },
+        signal: timeout(),
+      });
+    } catch {
+      continue; // transport failure: this profile's Hermes jobs stay last-known
+    }
+    if (res.status !== 200) continue; // 401/403/404/5xx: stay last-known (an unregistered mirror 404s — verified live)
+    let body: unknown;
+    try {
+      body = await res.json();
+    } catch {
+      continue;
+    }
+    const env = body as { jobs?: unknown };
+    if (!Array.isArray(env.jobs)) continue; // malformed envelope: this profile stands as-is
+    const list: HermesJobRow[] = [];
+    for (const raw of env.jobs) {
+      if (list.length >= JOBS_MAX_PER_PROFILE) break;
+      const row = sanitizeHermesJob(raw, profile);
+      if (row) list.push(row); // drop-don't-poison: one bad record never poisons the list
+    }
+    // A 200 with a well-formed envelope is the COMPLETE truth for THIS
+    // profile (the gateway's list_jobs is unpaginated — verified live), so
+    // it REPLACES that profile's last-known list: a deleted Hermes job
+    // leaves the strip within one round instead of haunting it forever.
+    // A round that did not answer leaves the stored list standing
+    // (last-known-wins across rounds, merge-on-arrival per profile).
+    jobs.set(profile, list);
+  }
+  return { reachable, version, rows, jobs, fetchedAt: nowMs };
 }
 
 /**
@@ -745,6 +903,10 @@ export class HermesGatewayConnector {
   private readonly now: () => number;
   private readonly log: (msg: string) => void;
   private ledger = new Map<string, HermesSessionMeta>();
+  /** #85 slice D: the last-known HERMES job list per profile (see the
+   *  slice-D section + `fetchRound` for the replace-on-answer /
+   *  stand-on-failure discipline). */
+  private jobsByProfile = new Map<string, HermesJobRow[]>();
   /** #82: session id → the (reachable) poll round that last reported it.
    *  Bookkeeping for the ledger evictions; a parallel structure so the
    *  published `HermesSessionMeta` shape never changes. */
@@ -785,6 +947,10 @@ export class HermesGatewayConnector {
       this.reachable = round.reachable;
       if (round.version) this.version = round.version;
       this.ledger = mergeLedgerRows(this.ledger, round.rows);
+      // #85 slice D: apply this round's HERMES job answers (only profiles
+      // that answered are in the map — see `fetchRound`; a profile that
+      // failed/401'd/malformed this round keeps its last-known list).
+      for (const [profile, list] of round.jobs) this.jobsByProfile.set(profile, list);
       // #82: only a REACHABLE round ages the ledger (an outage never evicts).
       if (round.reachable) this.pruneLedger(round.rows);
       // #83: a fresh REACHABLE round reopens the per-round lookup budget. An
@@ -1102,6 +1268,28 @@ export class HermesGatewayConnector {
   snapshot(): { version?: string; reachable: boolean } | undefined {
     if (!this.cfg.enabled || !this.polled) return undefined;
     return { ...(this.version ? { version: this.version } : {}), reachable: this.reachable };
+  }
+
+  /**
+   * #85 slice D: the HERMES jobs block for the client register heartbeat
+   * (ADD-key `hermes_jobs`). undefined = publish NOTHING (the key is
+   * omitted — the arbiter keeps its stored list, and an old arbiter never
+   * saw this key at all): connector disabled, no poll round run yet, or
+   * every profile answered empty/nothing. Rows iterate in config order
+   * (stable profile attribution) and are capped at JOBS_MAX_TOTAL.
+   */
+  jobsSnapshot(): HermesJobRow[] | undefined {
+    if (!this.cfg.enabled || !this.polled) return undefined;
+    const out: HermesJobRow[] = [];
+    for (const profile of this.cfg.profiles) {
+      const list = this.jobsByProfile.get(profile);
+      if (!list) continue;
+      for (const row of list) {
+        if (out.length >= JOBS_MAX_TOTAL) return out;
+        out.push(row);
+      }
+    }
+    return out.length > 0 ? out : undefined;
   }
 
   /** Test/inspection seam: the last-known ledger size. */

@@ -107,6 +107,11 @@ export type WorkerRow = {
   gate_posture?: "armed" | "fail_open";
   proxy_port?: number;
   daemon_behind?: boolean;
+  /** HERMES' OWN scheduled jobs (#85 slice D) — Hermes cron on this worker's
+   *  machine, sanitized client-side and echoed exception-only. ABSENT when the
+   *  connector never answered `GET /api/jobs` (old client / gateway outage).
+   *  NAMING: these are "Hermes jobs" — NOT idlefill's queue/lease jobs. */
+  hermes_jobs?: HermesJobRow[];
   // Joined client row facts (the client that reports this project).
   client_id?: string;
   override?: ClientOverride | null;
@@ -148,6 +153,9 @@ export type ClientRow = {
   daemon_behind?: boolean;
   /** The client's local Hermes profile roster (#80); absent on old clients / no Hermes home. */
   agent_roster?: AgentRosterRow[];
+  /** HERMES' OWN scheduled jobs (#85 slice D) — Hermes cron on this client's
+   *  machine; see the WorkerRow note for the naming rule + absence posture. */
+  hermes_jobs?: HermesJobRow[];
   projects: {
     name: string;
     model: string;
@@ -330,6 +338,33 @@ export type AgentRosterRow = {
   posture: "adopted" | "external" | "unset";
   provider?: string;
   base_url?: string;
+};
+
+// ---------------------------------------------------------------------------
+// Hermes jobs (#85 slice D): HERMES' OWN scheduled cron jobs, harvested by
+// the client's gateway connector (`GET /api/jobs` on the machine's Hermes
+// gateway, at most once per connector round, sanitized client-side) and
+// published as the `hermes_jobs` ADD-key on the register heartbeat. The
+// naming rule is the issue's and it is a HARD one: these are "Hermes jobs"
+// everywhere — idlefill has its own job concept (queue/lease jobs) and the
+// collision is the named hazard. Read-only: the strip renders rows, there
+// are NO pause/resume/run affordances anywhere. Sanitized safe members
+// only — the Hermes prompt, deliver target, workdir and execution records
+// never reach the arbiter. Absent on old clients / gateway outages (the
+// strip hides; never an empty list pretending to be truth).
+// ---------------------------------------------------------------------------
+export type HermesJobRow = {
+  profile?: string;
+  id: string;
+  name?: string;
+  /** Display form of the schedule ("every day at 6:00" / cron expr). */
+  schedule?: string;
+  enabled?: boolean;
+  /** The gateway's own state word (scheduled | paused | completed | error). */
+  state?: string;
+  /** epoch-ms (the client converts the gateway's ISO-8601). */
+  last_run?: number;
+  next_run?: number;
 };
 
 export type MeshPeerServer = {
