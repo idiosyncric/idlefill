@@ -72,8 +72,70 @@ import type {
   ThemeColors,
 } from './types.js';
 import type { StateStore } from './state.js';
-import type { ClientOverride, Lease, ProjectAllocation, ServerConfig, ServerConnection, ServerProvider, UtcDate, AgentRosterRow, HermesJobRow } from './types.js';
+import type { ClientOverride, Lease, ProjectAllocation, ServerConfig, ServerConnection, ServerProvider, UtcDate, AgentRosterRow, HermesJobRow, HermesHostFactsSummary, HostFactStatus } from './types.js';
 import { PROVIDER_KINDS, THEME_DEFAULTS, THEME_HEX_RE, THEME_TOKEN_KEYS } from './types.js';
+
+/**
+ * Sanitize a reported gateway host-facts block (#85 slice E) for storage
+ * on the client row. Same edge posture as `cleanAgentRoster`:
+ *   - a non-object (or missing report) → undefined, so the caller treats
+ *     it as ABSENT (a malformed report never poisons the state file, and
+ *     absent never clears the stored block);
+ *   - every member checked INDIVIDUALLY: `readiness` one of the four
+ *     known verdicts (anything else normalizes to `unknown` only when a
+ *     status string was actually present), `checks` an object whose ONLY
+ *     members are the fixed whitelist names with a known verdict — an
+ *     unknown name or a bad value drops just that entry, the rest stand;
+ *     `connected_platforms` / `active_api_runs` non-negative integers
+ *     (≤100 / ≤10000), else dropped;
+ *   - the raw payload's numbers never reach here by construction: the
+ *     client sanitizer drops `used_percent`/`free_bytes`, and this edge
+ *     drops anything the client did not whitelist. What can land is at
+ *     most 7 short strings + two small integers.
+ *
+ * Returns undefined when NOTHING valid survived — the caller then leaves
+ * the stored block exactly as it was (never a fake empty block, never a
+ * clear).
+ */
+export function cleanHostFacts(raw: unknown): HermesHostFactsSummary | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const o = raw as Record<string, unknown>;
+  const STATUS: ReadonlySet<HostFactStatus> = new Set(['ok', 'degraded', 'down', 'unknown']);
+  const CHECKS: ReadonlySet<string> = new Set(['state_db', 'session_store', 'config', 'model', 'disk', 'gateway', 'background_queues']);
+  const out: HermesHostFactsSummary = {};
+
+  if (typeof o.readiness === 'string') {
+    const s = o.readiness.trim().toLowerCase();
+    if (s !== '') out.readiness = STATUS.has(s as HostFactStatus) ? (s as HostFactStatus) : 'unknown';
+  }
+
+  if (o.checks && typeof o.checks === 'object' && !Array.isArray(o.checks)) {
+    const held: Record<string, HostFactStatus> = {};
+    for (const [name, status] of Object.entries(o.checks as Record<string, unknown>)) {
+      if (Object.keys(held).length >= CHECKS.size) break; // bounded: the whitelist is the cap
+      if (!CHECKS.has(name)) continue; // an unknown check name earns no wire space
+      if (typeof status !== 'string') continue;
+      const s = status.trim().toLowerCase();
+      if (s === '') continue;
+      held[name] = STATUS.has(s as HostFactStatus) ? (s as HostFactStatus) : 'unknown';
+    }
+    if (Object.keys(held).length > 0) out.checks = held;
+  }
+
+  const platforms = o.connected_platforms;
+  if (typeof platforms === 'number' && Number.isInteger(platforms) && platforms >= 0 && platforms <= 100) {
+    out.connected_platforms = platforms;
+  }
+  const runs = o.active_api_runs;
+  if (typeof runs === 'number' && Number.isInteger(runs) && runs >= 0 && runs <= 10_000) {
+    out.active_api_runs = runs;
+  }
+
+  if (out.readiness === undefined && out.checks === undefined && out.connected_platforms === undefined && out.active_api_runs === undefined) {
+    return undefined;
+  }
+  return out;
+}
 
 /**
  * Sanitize a reported agent roster (#80) for storage on the client row.
@@ -615,7 +677,7 @@ export class Arbiter {
     observedIp: string,
     projects?: ProjectAllocation[],
     now?: number,
-    info?: { version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open'; proxy_port?: number; aggregate_port?: number; daemon_behind?: boolean; client_log?: string[]; agent_roster?: unknown; hermes_version?: unknown; gateway_reachable?: unknown; hermes_jobs?: unknown },
+    info?: { version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open'; proxy_port?: number; aggregate_port?: number; daemon_behind?: boolean; client_log?: string[]; agent_roster?: unknown; hermes_version?: unknown; gateway_reachable?: unknown; hermes_jobs?: unknown; hermes_host_facts?: unknown },
   ): { client_id: string; created: boolean } {
     const s = this.store.state;
     const seen = now ?? Date.now();
@@ -705,6 +767,13 @@ export class Arbiter {
     //     stored value: a daemon without a Hermes home omits the key, so an
     //     old client's roster survives a mixed-version re-registration).
     const roster = cleanAgentRoster(info?.agent_roster);
+    // #85 slice E: the richer gateway host facts. Re-sanitized at the edge
+    // (the client already caps the block; the arbiter does not trust a
+    // client's caps — the whitelist, the verdict enum, and the integer
+    // bounds are re-checked here). A malformed block → undefined → treated
+    // as ABSENT: it can never clear a stored block, so an old client's row
+    // (or a mixed-version heartbeat) stays byte-for-byte unchanged.
+    const hostFacts = cleanHostFacts(info?.hermes_host_facts);
     // #73: the gateway host facts (slice B). `hermes_version`: string
     // ≤64 (the gateway's health-reported version) — same edge rule as
     // version/revision, absent leaves the row as-is (never a fake version
@@ -790,6 +859,12 @@ export class Arbiter {
       // present, valid block replaces the stored list; absent (old client /
       // gateway outage / all-malformed report) NEVER clears it.
       if (hermesJobs !== undefined) existing.hermes_jobs = hermesJobs;
+      // #85 slice E: the richer host facts — same ADD-key rule as the
+      // roster: a present, valid block replaces the stored one; an absent
+      // (or wholly malformed) block NEVER clears it (the client only
+      // publishes when the detailed payload earned it, so an absent key
+      // is "nothing new this round", not "the facts went away").
+      if (hostFacts !== undefined) existing.hermes_host_facts = hostFacts;
       this.store.save();
       return { client_id: existing.client_id, created: false };
     }
@@ -826,6 +901,9 @@ export class Arbiter {
       // #85 slice D (Hermes jobs): lands only on a present, valid block
       // (same ADD-key store rule as the heartbeat path).
       ...(hermesJobs !== undefined ? { hermes_jobs: hermesJobs } : {}),
+      // #85 slice E: the richer host facts land only when a valid block
+      // was reported — the fresh row simply has no key otherwise.
+      ...(hostFacts !== undefined ? { hermes_host_facts: hostFacts } : {}),
     });
     this.store.appendEvent({ kind: 'client_registered', detail: `${name} (${client_id})` });
     // A fresh registration that already carries rebuild state (client

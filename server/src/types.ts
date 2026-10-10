@@ -550,6 +550,35 @@ export interface ClientRecord {
    * never a gate.
    */
   hermes_jobs?: HermesJobRow[];
+  /**
+   * #85 slice E: the bounded richer host facts from the gateway's
+   * authenticated `GET /health/detailed` — the readiness verdict plus a
+   * fixed whitelist of per-check statuses and two integer counts. The
+   * raw payload's disk numbers (`used_percent`/`free_bytes`), platform
+   * names, pids, timestamps and metrics are dropped by the sanitizer:
+   * what lands on the row is at most 7 short status strings and two
+   * small integers. ADD-key, earned-only: the client publishes the key
+   * only when the detailed payload carried something beyond
+   * `status`/`version`, and an ABSENT key never clears a stored block
+   * (an old client's row stays byte-for-byte unchanged). Display/audit
+   * only; never a gate.
+   */
+  hermes_host_facts?: HermesHostFactsSummary;
+}
+
+/**
+ * #85 slice E: the stored shape of a client's gateway readiness summary.
+ * Mirrors the client-side `HermesHostFacts` (the arbiter re-sanitizes it
+ * at the edge, so the two are independently bounded). `checks` carries
+ * ONLY the whitelisted names; unknown names are dropped individually.
+ */
+export type HostFactStatus = 'ok' | 'degraded' | 'down' | 'unknown';
+
+export interface HermesHostFactsSummary {
+  readiness?: HostFactStatus;
+  checks?: Record<string, HostFactStatus>;
+  connected_platforms?: number;
+  active_api_runs?: number;
 }
 
 /**

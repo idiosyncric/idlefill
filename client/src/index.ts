@@ -1257,6 +1257,14 @@ export class ClientDaemon {
    * actually answered with a non-empty list: absent ⇒ the key is omitted
    * and the body stays byte-for-byte today's shape. READ-ONLY — no verb,
    * no control, no write path touches /api/jobs beyond the GET.
+   *
+   * #85 slice E adds ONE more ADD-key, `hermes_host_facts`: the bounded
+   * summary of the authenticated `GET /health/detailed` round (readiness
+   * verdict + whitelisted check statuses + two counts). It rides ONLY
+   * when the payload earned it — a gateway that is down, a detailed
+   * route that 401s/times out, or a body that adds nothing beyond
+   * version/status publishes NOTHING, so the body stays byte-for-byte
+   * the slice-B shape. An old arbiter ignores the key.
    */
   private hermesGatewayHostFacts(): Record<string, unknown> {
     const snap = this.hermesGateway?.snapshot();
@@ -1266,6 +1274,7 @@ export class ClientDaemon {
       ...(snap.version ? { hermes_version: snap.version } : {}),
       gateway_reachable: snap.reachable,
       ...(hermesJobs && hermesJobs.length > 0 ? { hermes_jobs: hermesJobs } : {}),
+      ...(snap.hostFacts ? { hermes_host_facts: snap.hostFacts } : {}),
     };
   }
 

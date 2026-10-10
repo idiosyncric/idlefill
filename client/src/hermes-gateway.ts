@@ -28,6 +28,15 @@
  *      `{status, version}`. The daemon publishes `hermes_version` +
  *      `gateway_reachable` posture on its client register heartbeat,
  *      alongside `gate_posture` (the same ADD-key discipline).
+ *      #85 slice E extends the block ONLY when the authenticated
+ *      `GET /health/detailed` payload earns it: ONE extra request per
+ *      REACHABLE round, reduced to a bounded summary (`hermes_host_facts`:
+ *      readiness status + whitelisted check statuses + two integer
+ *      counts). The raw body's `used_percent`/`free_bytes`, platform
+ *      NAMES, pids, timestamps and metrics are dropped by the sanitizer —
+ *      never published, never stored. If the detailed body carries nothing
+ *      beyond what /v1/health already reported (status/version), the
+ *      round skips it silently: zero extra keys on the wire.
  *
  *   C. RUNS CONTROL (the seam) — `POST /v1/runs` dispatches agent-shaped
  *      work INTO Hermes; `GET /v1/runs/{id}`, `POST /v1/runs/{id}/stop`,
@@ -108,8 +117,131 @@ export interface HermesGatewayConfig {
   key_file: string;
 }
 
-/** One raw row of `GET .../api/sessions` (the gateway's `_session_response`). */
+/** A raw row of `GET .../api/sessions` (the gateway's `_session_response`). */
 export type GatewaySessionRow = Record<string, unknown>;
+
+/**
+ * #85 slice E: the bounded host-facts summary harvested from the
+ * authenticated `GET /health/detailed` round. Deliberately TINY — a
+ * readiness verdict, per-check statuses from a fixed whitelist, and two
+ * integer counts. Everything the raw body carries that is not here is
+ * dropped by construction: `used_percent`/`free_bytes` (raw disk numbers
+ * are a privacy/scale question, not a display fact), platform NAMES,
+ * pids, timestamps, listener URLs, and the metrics block. Every member is
+ * optional: absent = the round did not earn that fact (never a fake zero).
+ */
+export interface HermesHostFacts {
+  /** The gateway's own readiness verdict (`readiness.status`, falling back
+   *  to the top-level `status`). Normalized to the four known verdicts. */
+  readiness?: HostFactStatus;
+  /** check name → status, from READINESS_CHECKS only (≤7 entries). */
+  checks?: Record<string, HostFactStatus>;
+  /** `readiness.checks.gateway.connected_platforms` (a COUNT — the
+   *  platform names are never published). */
+  connected_platforms?: number;
+  /** `readiness.checks.background_queues.active_api_runs`. */
+  active_api_runs?: number;
+}
+
+/** The known readiness verdicts. Anything the gateway reports outside this
+ *  set normalizes to `unknown` (never a crash, never a fabricated `ok`). */
+export type HostFactStatus = 'ok' | 'degraded' | 'down' | 'unknown';
+
+/**
+ * The ONLY readiness checks the summary may carry: a fixed whitelist, so a
+ * future gateway check cannot smuggle an unbounded payload onto the wire.
+ * Names mirror the live gateway (`state_db`, `session_store`, `config`,
+ * `model`, `disk`, `gateway`, `background_queues`).
+ */
+export const READINESS_CHECKS: readonly string[] = [
+  'state_db',
+  'session_store',
+  'config',
+  'model',
+  'disk',
+  'gateway',
+  'background_queues',
+];
+const STATUS_SET = new Set<HostFactStatus>(['ok', 'degraded', 'down', 'unknown']);
+
+function normalizeStatus(v: unknown): HostFactStatus | undefined {
+  if (typeof v !== 'string') return undefined;
+  const s = v.trim().toLowerCase();
+  if (s === '') return undefined;
+  return STATUS_SET.has(s as HostFactStatus) ? (s as HostFactStatus) : 'unknown';
+}
+
+/** Integer, non-negative, bounded — else undefined (absent, never a zero). */
+function boundedInt(v: unknown, max: number): number | undefined {
+  if (typeof v !== 'number' || !Number.isInteger(v) || v < 0 || v > max) return undefined;
+  return v;
+}
+
+/**
+ * Turn ONE raw `/health/detailed` body into the bounded summary. Returns
+ * undefined when the payload earns NOTHING beyond what `/v1/health` already
+ * gave (the "skip silently" rule of issue #85 slice E): no readiness block,
+ * no whitelisted check statuses, and no counts → no key on the wire. A
+ * malformed body is never a crash — each member is checked individually and
+ * a bad member is dropped while the rest stand.
+ *
+ * `healthStatus` is the verdict the same round already got from
+ * `/v1/health`; when the detailed body's top-level status matches it AND
+ * the readiness block adds nothing, the round earns nothing.
+ */
+export function sanitizeHostFacts(raw: unknown, healthStatus?: string): HermesHostFacts | undefined {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
+  const body = raw as Record<string, unknown>;
+  const out: HermesHostFacts = {};
+
+  const readiness = body.readiness;
+  const readinessObj = typeof readiness === 'object' && readiness !== null && !Array.isArray(readiness)
+    ? (readiness as Record<string, unknown>)
+    : undefined;
+
+  const readinessStatus = normalizeStatus(readinessObj?.status) ?? normalizeStatus(body.status);
+  if (readinessStatus !== undefined) out.readiness = readinessStatus;
+
+  const checks = readinessObj?.checks;
+  if (typeof checks === 'object' && checks !== null && !Array.isArray(checks)) {
+    const held: Record<string, HostFactStatus> = {};
+    for (const name of READINESS_CHECKS) {
+      const entry = (checks as Record<string, unknown>)[name];
+      // A check may be a bare status string or an object with a `status`
+      // member (the live shape); anything else earns nothing.
+      const status = typeof entry === 'string' ? normalizeStatus(entry) : normalizeStatus((entry as Record<string, unknown> | undefined)?.status);
+      if (status === undefined) continue;
+      held[name] = status;
+      if (Object.keys(held).length >= READINESS_CHECKS.length) break;
+    }
+    if (Object.keys(held).length > 0) out.checks = held;
+
+    const gw = (checks as Record<string, unknown>)['gateway'];
+    const platforms = boundedInt((gw as Record<string, unknown> | undefined)?.connected_platforms, 100);
+    if (platforms !== undefined) out.connected_platforms = platforms;
+    const bq = (checks as Record<string, unknown>)['background_queues'];
+    const runs = boundedInt((bq as Record<string, unknown> | undefined)?.active_api_runs, 10_000);
+    if (runs !== undefined) out.active_api_runs = runs;
+  }
+
+  // The earnings test: a detailed body that carries nothing past the
+  // plain health verdict (no readiness block, no check statuses, no
+  // counts) is not worth a wire key.
+  if (out.readiness === undefined && out.checks === undefined && out.connected_platforms === undefined && out.active_api_runs === undefined) {
+    return undefined;
+  }
+  if (out.readiness !== undefined && out.checks === undefined && out.connected_platforms === undefined && out.active_api_runs === undefined) {
+    // Only a status verdict: if it is the SAME verdict the health round
+    // already reported, the payload earned nothing new.
+    const knownHealth = normalizeStatus(healthStatus);
+    if (knownHealth !== undefined && knownHealth === out.readiness) return undefined;
+  }
+  return out;
+}
+
+/** The URL for the detailed health surface (#85 slice E) — the default-home
+ *  listener only (native routes are unprofiled for health). */
+export const DETAILED_HEALTH_PATH = '/health/detailed';
 
 /** One dispatched run (the runs-control seam keeps ONLY its own runs). */
 export interface HermesRun {
@@ -762,14 +894,23 @@ interface ProfileFetch {
 }
 
 /**
- * One ledger round against the gateway: health (unauthenticated) + one
+ * One ledger round against the gateway: health (unauthenticated) + ONE
+ * `GET /health/detailed` per REACHABLE round (#85 slice E) + one
  * `GET .../api/sessions` per configured profile, sequential (a round
  * must never overlap the next; the in-flight guard in poll() enforces
  * it). Every failure is a fail-quiet verdict — the round never throws.
+ *
+ * #85 slice E: the detailed health probe runs ONLY after the health round
+ * proved the server reachable, and ONLY when at least one profile carries a
+ * key (the surface is authenticated). It never runs while the gateway is
+ * down, so a down gateway still sees zero extra requests — byte-for-byte
+ * the pre-#73 wire. A 401/403/5xx/transport failure on the detailed route
+ * earns nothing: the round stands on the plain health facts alone.
  */
 async function fetchRound(cfg: HermesGatewayConfig, fetchImpl: FetchImpl, nowMs: number): Promise<{
   reachable: boolean;
   version: string | undefined;
+  hostFacts: HermesHostFacts | undefined;
   rows: Map<string, GatewaySessionRow>;
   /** #85 slice D: profile → the sanitized Hermes job list THIS round answered
    *  (ONLY for profiles whose GET 200'd with a well-formed envelope — a
@@ -782,6 +923,8 @@ async function fetchRound(cfg: HermesGatewayConfig, fetchImpl: FetchImpl, nowMs:
   const jobs = new Map<string, HermesJobRow[]>();
   let reachable = false;
   let version: string | undefined;
+  let healthStatus: string | undefined;
+  let hostFacts: HermesHostFacts | undefined;
   const base = cfg.base_url;
   const timeout = () => AbortSignal.timeout(cfg.timeout_ms);
 
@@ -791,13 +934,40 @@ async function fetchRound(cfg: HermesGatewayConfig, fetchImpl: FetchImpl, nowMs:
     const res = await fetchImpl(`${base}/v1/health`, { signal: timeout() });
     if (res.status === 200) {
       reachable = true;
-      const body = (await res.json()) as { version?: unknown };
+      const body = (await res.json()) as { version?: unknown; status?: unknown };
       if (typeof body.version === 'string' && body.version.trim() !== '') version = body.version.trim().slice(0, 64);
+      if (typeof body.status === 'string' && body.status.trim() !== '') healthStatus = body.status.trim().toLowerCase();
     }
   } catch {
     /* unreachable — fail-quiet */
   }
-  if (!reachable) return { reachable, version, rows, jobs, fetchedAt: nowMs };
+  if (!reachable) return { reachable, version, hostFacts, rows, jobs, fetchedAt: nowMs };
+
+  // #85 slice E: the richer host facts, ONE request per reachable round.
+  // Requires an operator key (the route is authenticated) and a key is
+  // exactly what the ledger reads need too — no key ⇒ no probe (zero
+  // extra requests). Any failure here is silent: the round stands on the
+  // health facts alone, and an unearned summary never reaches the wire.
+  const anyKey = cfg.key ?? [...cfg.profileKeys.values()][0];
+  if (anyKey) {
+    try {
+      const res = await fetchImpl(`${base}${DETAILED_HEALTH_PATH}`, {
+        headers: { authorization: `Bearer ${anyKey}` },
+        signal: timeout(),
+      });
+      if (res.status === 200) {
+        let body: unknown;
+        try {
+          body = await res.json();
+        } catch {
+          body = undefined; // malformed detailed body: skip silently
+        }
+        hostFacts = sanitizeHostFacts(body, healthStatus);
+      }
+    } catch {
+      /* detailed probe failed (timeout/refused) — skip silently */
+    }
+  }
 
   for (const profile of cfg.profiles) {
     // A named profile uses ONLY its own key (no fallback to the default
@@ -888,7 +1058,7 @@ async function fetchRound(cfg: HermesGatewayConfig, fetchImpl: FetchImpl, nowMs:
     // (last-known-wins across rounds, merge-on-arrival per profile).
     jobs.set(profile, list);
   }
-  return { reachable, version, rows, jobs, fetchedAt: nowMs };
+  return { reachable, version, hostFacts, rows, jobs, fetchedAt: nowMs };
 }
 
 /**
@@ -915,6 +1085,10 @@ export class HermesGatewayConnector {
   private ageRound = 0;
   private reachable = false;
   private version: string | undefined;
+  /** #85 slice E: the last earned host-facts summary (undefined = never
+   *  earned: no detailed request, a non-200, or a body that adds nothing
+   *  beyond the plain health facts). */
+  private hostFacts: HermesHostFacts | undefined;
   private fetchedAt: number | null = null;
   private inFlight = false;
   private lastError: string | undefined;
@@ -946,6 +1120,11 @@ export class HermesGatewayConnector {
       this.polled = true;
       this.reachable = round.reachable;
       if (round.version) this.version = round.version;
+      // #85 slice E: a round that earned nothing publishes nothing (the
+      // arbiter's stored block stands — absent never clears), so keeping
+      // the last summary is only meaningful while the gateway is up; the
+      // snapshot gate (`reachable && hostFacts`) is the real wire guard.
+      this.hostFacts = round.hostFacts;
       this.ledger = mergeLedgerRows(this.ledger, round.rows);
       // #85 slice D: apply this round's HERMES job answers (only profiles
       // that answered are in the map — see `fetchRound`; a profile that
@@ -1264,10 +1443,16 @@ export class HermesGatewayConnector {
    *  connector is disabled, or no poll round has run yet. After a round:
    *  `reachable:false` rides only when the gateway is DOWN (the
    *  exception-only "gateway down" badge); an enabled + reachable
-   *  gateway publishes `version` + `reachable:true`. */
-  snapshot(): { version?: string; reachable: boolean } | undefined {
+   *  gateway publishes `version` + `reachable:true`, plus `hostFacts`
+   *  (#85 slice E) ONLY when the `/health/detailed` payload earned a
+   *  summary — otherwise the snapshot is exactly the pre-#85 shape. */
+  snapshot(): { version?: string; reachable: boolean; hostFacts?: HermesHostFacts } | undefined {
     if (!this.cfg.enabled || !this.polled) return undefined;
-    return { ...(this.version ? { version: this.version } : {}), reachable: this.reachable };
+    return {
+      ...(this.version ? { version: this.version } : {}),
+      reachable: this.reachable,
+      ...(this.reachable && this.hostFacts ? { hostFacts: this.hostFacts } : {}),
+    };
   }
 
   /**

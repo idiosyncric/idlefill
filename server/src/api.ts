@@ -390,7 +390,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   // ------------------------------------------------------------------
 
   app.post('/api/clients/register', async (req, reply) => {
-    const body = (req.body ?? {}) as { name?: string; ip?: string; projects?: ProjectAllocation[]; version?: unknown; protocol?: unknown; revision?: unknown; gate_posture?: unknown; proxy_port?: unknown; aggregate_port?: unknown; daemon_behind?: unknown; client_log?: unknown; agent_roster?: unknown; hermes_version?: unknown; gateway_reachable?: unknown; hermes_jobs?: unknown };
+    const body = (req.body ?? {}) as { name?: string; ip?: string; projects?: ProjectAllocation[]; version?: unknown; protocol?: unknown; revision?: unknown; gate_posture?: unknown; proxy_port?: unknown; aggregate_port?: unknown; daemon_behind?: unknown; client_log?: unknown; agent_roster?: unknown; hermes_version?: unknown; gateway_reachable?: unknown; hermes_jobs?: unknown; hermes_host_facts?: unknown };
     const name = typeof body.name === 'string' ? body.name.trim() : '';
     if (!name) return reply.code(400).send({ error: 'name required' });
     const remote = (req.ip ?? '').split(':').pop() ?? 'unknown';
@@ -550,14 +550,20 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     // Absent on old clients and on daemons whose connector never answered
     // /api/jobs: absent NEVER clears the stored block.
     const hermes_jobs = Array.isArray(body.hermes_jobs) ? (body.hermes_jobs as unknown) : undefined;
+    // #85 slice E: the richer host facts — plain pass-through here,
+    // sanitized (whitelist + verdict enum + integer bounds) in
+    // registerClient via cleanHostFacts. Absent on old clients and on
+    // daemons whose detailed round earned nothing: absent NEVER clears a
+    // stored block.
+    const hermes_host_facts = body.hermes_host_facts;
     const res = arbiter.registerClient(
       name,
       typeof body.ip === 'string' && body.ip.trim() ? body.ip.trim() : undefined,
       remote,
       projects,
       undefined,
-      version !== undefined || protocol !== undefined || revision !== undefined || gate_posture !== undefined || proxy_port !== undefined || aggregate_port !== undefined || daemon_behind !== undefined || client_log !== undefined || agent_roster !== undefined || hermes_version !== undefined || gateway_reachable !== undefined || hermes_jobs !== undefined
-        ? { version, protocol, revision, gate_posture, proxy_port, aggregate_port, daemon_behind, client_log, agent_roster, hermes_version, gateway_reachable, hermes_jobs }
+      version !== undefined || protocol !== undefined || revision !== undefined || gate_posture !== undefined || proxy_port !== undefined || aggregate_port !== undefined || daemon_behind !== undefined || client_log !== undefined || agent_roster !== undefined || hermes_version !== undefined || gateway_reachable !== undefined || hermes_jobs !== undefined || hermes_host_facts !== undefined
+        ? { version, protocol, revision, gate_posture, proxy_port, aggregate_port, daemon_behind, client_log, agent_roster, hermes_version, gateway_reachable, hermes_jobs, hermes_host_facts }
         : undefined,
     );
     return reply.code(200).send({ client_id: res.client_id, created: res.created });

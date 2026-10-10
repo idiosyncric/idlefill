@@ -47,6 +47,7 @@ import {
   mergeLedgerRows,
   ledgerPath,
   sessionPath,
+  sanitizeHostFacts,
   type GatewaySessionRow,
   type HermesSessionMeta,
 } from '../src/hermes-gateway.js';
@@ -82,6 +83,13 @@ interface FakeGatewayOpts {
   singleRouteStatus?: number;
   /** Respond with 401 to authed ledger reads when the key does not match. */
   expectKeys?: Record<string, string>;
+  /** #85 slice E: canned `GET /health/detailed` body. undefined = the stub
+   *  404s the route (the connector earns nothing — zero wire change);
+   *  null = a 500 (the detailed probe fails, silently); an object = the
+   *  live gateway's richer payload. `detailedExpectKey` 401s the probe
+   *  when the connector's Bearer does not match. */
+  detailedHealth?: unknown | null;
+  detailedExpectKey?: string;
   /** Runs stub state: verb recording + canned responses. */
   runsState?: {
     create?: (body: unknown) => { run_id: string };
@@ -116,6 +124,15 @@ function startFakeGateway(opts: FakeGatewayOpts = {}): Promise<FakeGateway> {
       if (req.method === 'GET' && (url.pathname === '/v1/health' || /^\/p\/[^/]+\/v1\/health$/.test(url.pathname))) {
         if (opts.health === null) return send(500, { error: 'down' });
         return send(opts.health?.status ?? 200, { status: 'ok', version: opts.health?.version ?? '0.21.6' });
+      }
+      // #85 slice E: the detailed health surface (authenticated).
+      if (req.method === 'GET' && url.pathname === '/health/detailed') {
+        if (opts.detailedHealth === undefined) return send(404, { error: { code: 'not_found' } });
+        if (opts.detailedHealth === null) return send(500, { error: 'detailed boom' });
+        if (opts.detailedExpectKey && (req.headers.authorization ?? '') !== `Bearer ${opts.detailedExpectKey}`) {
+          return send(401, { error: { code: 'gateway_auth_failed' } });
+        }
+        return send(200, opts.detailedHealth);
       }
       // Ledger reads (authed).
       const m = url.pathname.match(/^\/(?:p\/([^/]+)\/)?api\/sessions$/);
@@ -740,6 +757,161 @@ test('config resolution: defaults, explicit list wins, disabled, key file', () =
   assert.equal(badKf.key, undefined);
 });
 
+
+// ---------------------------------------------------------------------------
+// #85 slice E: richer host facts from GET /health/detailed
+// ---------------------------------------------------------------------------
+
+// The LIVE payload shape (verified 2026-10-09 against the operator's
+// 0.21.6 gateway — see docs/reports/ISSUE85-HOSTFACTS-SLICE-E.md): degraded
+// disk, four connected platforms, empty background queues. The raw free_bytes
+// / used_percent / platform NAMES / pids are the bait the sanitizer must drop.
+const LIVE_DEGRADED_DETAIL = {
+  status: 'degraded',
+  readiness: {
+    status: 'degraded',
+    checks: {
+      state_db: { status: 'ok' },
+      session_store: { status: 'ok' },
+      config: { status: 'ok' },
+      model: { status: 'ok' },
+      disk: { status: 'degraded', used_percent: 98.1, free_bytes: 76318728192 },
+      gateway: { status: 'ok', state: 'running', connected_platforms: 4, platforms: 4 },
+      background_queues: { status: 'ok', active_api_runs: 0, process_completions: 0, active_delegations: 0 },
+    },
+  },
+  platform: 'hermes-agent',
+  version: '0.21.6',
+  gateway_state: 'running',
+  platforms: {
+    discord: { state: 'connected', writer_pid: 99363 },
+    homeassistant: { state: 'connected', writer_pid: 99363 },
+  },
+  api_server: { host: '127.0.0.1', port: 8642, active_runs: 0 },
+  metrics_today: { requests: 0, tokens: 0 },
+  pid: 99363,
+};
+
+test('#85E sanitize: degraded disk shows as a NAMED degraded check; raw numbers dropped', () => {
+  const facts = sanitizeHostFacts(LIVE_DEGRADED_DETAIL, 'ok');
+  assert.equal(facts?.readiness, 'degraded');
+  assert.equal(facts?.checks?.disk, 'degraded', 'the degraded disk earns its named slot');
+  assert.equal(facts?.checks?.state_db, 'ok');
+  assert.equal(facts?.checks?.gateway, 'ok');
+  assert.equal(facts?.connected_platforms, 4, 'a COUNT rides — never the platform names');
+  assert.equal(facts?.active_api_runs, 0, 'a real zero is a fact, not a fake: it rides');
+  const json = JSON.stringify(facts);
+  assert.ok(!json.includes('used_percent'), 'used_percent never leaves the connector');
+  assert.ok(!json.includes('free_bytes'), 'free_bytes never leaves the connector');
+  assert.ok(!json.includes('discord') && !json.includes('homeassistant'), 'platform names never leave');
+  assert.ok(!json.includes('pid'), 'pids never leave');
+  // The wire block is bounded: at most 7 statuses + 2 counts + 1 verdict.
+  assert.equal(Object.keys(facts!.checks!).length, 7);
+  assert.ok(json.length < 300, 'the published block stays tiny');
+});
+
+test('#85E sanitize: a payload with NOTHING beyond status/version is skipped (undefined)', () => {
+  // The exact /v1/health shape riding the detailed route: earns nothing.
+  assert.equal(sanitizeHostFacts({ status: 'ok', platform: 'hermes-agent', version: '0.21.6' }, 'ok'), undefined);
+  // readiness status identical to the health verdict, no checks: nothing earned.
+  assert.equal(sanitizeHostFacts({ status: 'ok', readiness: { status: 'ok' } }, 'ok'), undefined);
+  // A malformed body: no crash, no block.
+  assert.equal(sanitizeHostFacts(null, 'ok'), undefined);
+  assert.equal(sanitizeHostFacts('garbage', 'ok'), undefined);
+  assert.equal(sanitizeHostFacts([1, 2, 3], 'ok'), undefined);
+  assert.equal(sanitizeHostFacts({}, 'ok'), undefined);
+  // Non-whitelisted checks earn nothing.
+  assert.equal(sanitizeHostFacts({ readiness: { status: 'ok', checks: { quantum_flux: { status: 'degraded' } } } }, 'ok'), undefined);
+  // A DIFFERENT verdict from health does earn a block even with no checks.
+  const earned = sanitizeHostFacts({ status: 'degraded', readiness: { status: 'degraded' } }, 'ok');
+  assert.deepEqual(earned, { readiness: 'degraded' });
+  // Unknown status strings normalize (never a crash, never a fabricated ok).
+  const weird = sanitizeHostFacts({ readiness: { status: 'magenta', checks: { disk: 'spaghetti' } } }, undefined);
+  assert.deepEqual(weird, { readiness: 'unknown', checks: { disk: 'unknown' } });
+  // A check may be a bare string (the stub shape) or an object (the live shape).
+  const bare = sanitizeHostFacts({ readiness: { status: 'ok', checks: { model: 'degraded' } } }, 'ok');
+  assert.deepEqual(bare, { readiness: 'ok', checks: { model: 'degraded' } });
+  // Oversized counts are dropped, the rest stands.
+  const huge = sanitizeHostFacts({ readiness: { status: 'ok', checks: { gateway: { status: 'ok', connected_platforms: 9999 }, background_queues: { status: 'ok', active_api_runs: -5 } } } }, 'ok');
+  assert.deepEqual(huge, { readiness: 'ok', checks: { gateway: 'ok', background_queues: 'ok' } }, 'the status stands, the absurd counts are dropped');
+});
+
+test('#85E connector: reachable round hits /health/detailed EXACTLY once and the snapshot carries the facts', async () => {
+  const gw = await startFakeGateway({
+    health: { status: 200, version: '0.21.6' },
+    defaultRows: [ROW_A],
+    detailedHealth: LIVE_DEGRADED_DETAIL,
+  });
+  cleanup.push(() => gw.close());
+  const c = new HermesGatewayConnector(gwCfg(gw.base));
+  await c.poll();
+  const detailReqs = gw.requests.filter((r) => r.path === '/health/detailed');
+  assert.equal(detailReqs.length, 1, 'ONE detailed probe per reachable round');
+  assert.equal(detailReqs[0]?.auth, 'Bearer default-key', 'the authenticated surface gets the operator key');
+  const snap = c.snapshot();
+  assert.equal(snap?.reachable, true);
+  assert.equal(snap?.version, '0.21.6');
+  assert.equal(snap?.hostFacts?.readiness, 'degraded');
+  assert.equal(snap?.hostFacts?.checks?.disk, 'degraded');
+  assert.equal(snap?.hostFacts?.connected_platforms, 4);
+});
+
+test('#85E connector: an UNREACHABLE gateway issues ZERO detailed requests (fail-open unchanged)', async () => {
+  // A closed port: the connector never reaches the detailed probe.
+  const dead = http.createServer();
+  await new Promise<void>((r) => dead.listen(0, '127.0.0.1', () => r()));
+  const deadBase = `http://127.0.0.1:${(dead.address() as { port: number }).port}`;
+  await new Promise<void>((r) => dead.close(() => r()));
+  const c = new HermesGatewayConnector(gwCfg(deadBase));
+  await c.poll();
+  assert.deepEqual(c.snapshot(), { reachable: false }, 'the snapshot stays the slice-B shape: no hostFacts key at all');
+  assert.ok(!('hostFacts' in c.snapshot()!), 'absent = unset: an old-shaped snapshot');
+});
+
+test('#85E connector: detailed route 500 / 401 / 404 ⇒ silent skip, snapshot byte-for-byte the slice-B shape', async () => {
+  for (const mode of [null, undefined]) {
+    const gw = await startFakeGateway({ health: { status: 200, version: '0.21.6' }, defaultRows: [ROW_A], detailedHealth: mode });
+    cleanup.push(() => gw.close());
+    const c = new HermesGatewayConnector(gwCfg(gw.base));
+    await c.poll();
+    assert.deepEqual(c.snapshot(), { version: '0.21.6', reachable: true }, mode === null ? '500 on the detailed route: skipped silently' : 'no detailed route: skipped silently');
+    assert.equal(c.metaFor('20261009_010000_aaaa')?.title, 'Gate research session', 'the ledger enrichment stands untouched');
+  }
+  // Wrong key on the detailed surface: 401, silently skipped.
+  const gw = await startFakeGateway({
+    health: { status: 200, version: '0.21.6' },
+    defaultRows: [ROW_A],
+    detailedHealth: LIVE_DEGRADED_DETAIL,
+    detailedExpectKey: 'not-the-connectors-key',
+  });
+  cleanup.push(() => gw.close());
+  const c = new HermesGatewayConnector(gwCfg(gw.base));
+  await c.poll();
+  assert.deepEqual(c.snapshot(), { version: '0.21.6', reachable: true }, 'a 401 detailed probe earns nothing');
+});
+
+test('#85E connector: no operator key ⇒ the authenticated probe never fires (zero extra requests)', async () => {
+  const gw = await startFakeGateway({ health: { status: 200, version: '0.21.6' }, detailedHealth: LIVE_DEGRADED_DETAIL });
+  cleanup.push(() => gw.close());
+  const c = new HermesGatewayConnector(gwCfg(gw.base, { key: undefined, profileKeys: new Map() }));
+  await c.poll();
+  assert.equal(gw.requests.filter((r) => r.path === '/health/detailed').length, 0, 'an unkeyed daemon sends no authenticated probe');
+  assert.deepEqual(c.snapshot(), { version: '0.21.6', reachable: true });
+});
+
+test('#85E connector: a gateway whose detailed body adds NOTHING publishes no key (skip silently)', async () => {
+  const gw = await startFakeGateway({
+    health: { status: 200, version: '0.21.6' },
+    defaultRows: [ROW_A],
+    detailedHealth: { status: 'ok', platform: 'hermes-agent', version: '0.21.6' },
+  });
+  cleanup.push(() => gw.close());
+  const c = new HermesGatewayConnector(gwCfg(gw.base));
+  await c.poll();
+  // The probe ran (reachable round), but the payload earned nothing: no key.
+  assert.deepEqual(c.snapshot(), { version: '0.21.6', reachable: true }, 'nothing beyond version/status ⇒ nothing on the wire');
+});
+
 // ---------------------------------------------------------------------------
 // Suite 1c: runs control (the seam) against the stub
 // ---------------------------------------------------------------------------
@@ -1007,6 +1179,43 @@ test('enrichment on the wire (switch on, gateway up): hermes_meta + host facts r
       3000,
       'the host facts on the client heartbeat',
     );
+  } finally {
+    await daemon.stop();
+    await arb.close();
+    await up.close();
+    rmSync(dir, { recursive: true, force: true });
+    restoreGwEnv();
+  }
+});
+
+test('#85E enrichment on the wire: the degraded-disk facts ride the client heartbeat as hermes_host_facts', async () => {
+  const gw = await startFakeGateway({
+    health: { status: 200, version: '0.21.6' },
+    defaultRows: [ROW_A],
+    detailedHealth: LIVE_DEGRADED_DETAIL,
+  });
+  cleanup.push(() => gw.close());
+  setGwEnv({ IDLEFILL_HERMES_GATEWAY: '1', IDLEFILL_HERMES_GATEWAY_URL: gw.base, IDLEFILL_HERMES_GATEWAY_KEY: 'test-key' });
+  const up = await startHeldUpstream();
+  const { daemon, arb, dir } = await bootDaemon(up.url);
+  try {
+    await waitFor(() => daemon.hermesConnector?.snapshot()?.hostFacts !== undefined, 3000, 'the detailed round earns the summary');
+    await waitFor(
+      () => arb.registers.some((b) => (b as Record<string, unknown>).hermes_host_facts !== undefined),
+      5000,
+      'the richer host facts on the client heartbeat',
+    );
+    const body = arb.registers.find((b) => (b as Record<string, unknown>).hermes_host_facts !== undefined) as Record<string, unknown>;
+    const facts = body.hermes_host_facts as { readiness: string; checks: Record<string, string>; connected_platforms: number };
+    assert.equal(facts.readiness, 'degraded');
+    assert.equal(facts.checks.disk, 'degraded', 'the degraded disk shows as a NAMED check on the wire');
+    assert.equal(facts.connected_platforms, 4, 'a count, never a platform name');
+    const json = JSON.stringify(body);
+    assert.ok(!json.includes('used_percent') && !json.includes('free_bytes') && !json.includes('discord'), 'the heartbeat carries no raw numbers or platform names');
+    // One detailed probe per reachable round: it never outnumbers the health probes.
+    const detail = gw.requests.filter((r) => r.path === '/health/detailed');
+    const health = gw.requests.filter((r) => r.path === '/v1/health');
+    assert.ok(detail.length >= 1 && detail.length <= health.length, 'no detailed probe without a reachable health round');
   } finally {
     await daemon.stop();
     await arb.close();

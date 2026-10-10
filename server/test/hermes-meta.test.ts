@@ -28,7 +28,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildApi, attachWebSocket } from '../src/api.js';
-import { Arbiter } from '../src/arbiter.js';
+import { Arbiter, cleanHostFacts } from '../src/arbiter.js';
 import { StateStore } from '../src/state.js';
 import type { ServerConfig } from '../src/types.js';
 
@@ -262,4 +262,116 @@ test('slice B: absent never touches a client row (old client byte-for-byte)', as
   };
   const row2 = s2.clients.find((c) => c.name === 'legacy-mac');
   assert.deepEqual(Object.keys(row2!).sort(), Object.keys(row1!).sort(), 'a key-less heartbeat changes nothing on the row');
+});
+
+// ---------------------------------------------------------------------------
+// #85 slice E: the richer host facts (`hermes_host_facts`) on the client row
+// ---------------------------------------------------------------------------
+
+test('#85E: a valid host-facts block (degraded disk NAMED) stores + echoes; raw numbers never land', async () => {
+  await fetch(`${base}/api/clients/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({
+      name: 'hf-mac',
+      ip: '100.94.165.102',
+      hermes_version: '0.21.6',
+      gateway_reachable: true,
+      hermes_host_facts: {
+        readiness: 'degraded',
+        checks: { state_db: 'ok', session_store: 'ok', config: 'ok', model: 'ok', disk: 'degraded', gateway: 'ok', background_queues: 'ok' },
+        connected_platforms: 4,
+        active_api_runs: 0,
+      },
+    }),
+  });
+  let state = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: Array<{ name: string; hermes_host_facts?: Record<string, unknown> }>;
+  };
+  const row = state.clients.find((c) => c.name === 'hf-mac');
+  assert.equal(row?.hermes_host_facts?.readiness, 'degraded');
+  assert.equal((row?.hermes_host_facts as Record<string, unknown>)?.checks?.disk, 'degraded', 'the degraded disk rides as a NAMED check');
+  assert.equal((row?.hermes_host_facts as Record<string, unknown>)?.connected_platforms, 4);
+  assert.equal((row?.hermes_host_facts as Record<string, unknown>)?.active_api_runs, 0, 'a real zero is a fact: it stores');
+});
+
+test('#85E: a malformed/oversized block is dropped silently — the stored block stands (never cleared)', async () => {
+  await fetch(`${base}/api/clients/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ name: 'hf-mac', ip: '100.94.165.102', hermes_host_facts: 'not-an-object' }),
+  });
+  let state = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: Array<{ name: string; hermes_host_facts?: Record<string, unknown> }>;
+  };
+  let row = state.clients.find((c) => c.name === 'hf-mac');
+  assert.equal(row?.hermes_host_facts?.readiness, 'degraded', 'a garbage block never clears the stored one');
+
+  // Junk members: unknown check names + absurd counts dropped individually,
+  // the valid members still land (a fresh replacement of the stored block).
+  await fetch(`${base}/api/clients/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({
+      name: 'hf-mac',
+      ip: '100.94.165.102',
+      hermes_host_facts: { readiness: 'ok', checks: { disk: 'degraded', quantum_flux: 'degraded' }, connected_platforms: 99999 },
+    }),
+  });
+  state = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: Array<{ name: string; hermes_host_facts?: Record<string, unknown> }>;
+  };
+  row = state.clients.find((c) => c.name === 'hf-mac');
+  const facts = row?.hermes_host_facts as Record<string, unknown>;
+  assert.equal(facts.readiness, 'ok');
+  assert.equal(facts.checks?.disk, 'degraded', 'the valid member stands');
+  assert.ok(!('quantum_flux' in (facts.checks as Record<string, unknown>)), 'a non-whitelisted check name is dropped');
+  assert.ok(!('connected_platforms' in facts), 'an oversized count is dropped');
+});
+
+test('#85E: an ABSENT key leaves the stored block byte-for-byte (old client / gateway down)', async () => {
+  const before = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: Array<{ name: string; hermes_host_facts?: unknown }>;
+  };
+  const stored = before.clients.find((c) => c.name === 'hf-mac')?.hermes_host_facts;
+  assert.ok(stored !== undefined, 'the block is stored before the legacy heartbeat');
+  // The OLD payload shape: slice-B keys only, no hermes_host_facts key at all.
+  await fetch(`${base}/api/clients/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ name: 'hf-mac', ip: '100.94.165.102', hermes_version: '0.21.6', gateway_reachable: true }),
+  });
+  const after = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: Array<{ name: string; hermes_host_facts?: unknown }>;
+  };
+  const row = after.clients.find((c) => c.name === 'hf-mac');
+  assert.deepEqual(row?.hermes_host_facts, stored, 'absent never clears: the stored block survives byte-for-byte');
+});
+
+test('#85E: an OLD client payload (no slice-B or slice-E keys) still registers and never gains the key', async () => {
+  await fetch(`${base}/api/clients/register`, { method: 'POST', headers: auth, body: JSON.stringify({ name: 'legacy-no-facts', ip: '10.0.0.1' }) });
+  const state = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: Array<{ name: string } & Record<string, unknown>>;
+  };
+  const row = state.clients.find((c) => c.name === 'legacy-no-facts');
+  assert.ok(row, 'the old shape registers fine');
+  assert.ok(!('hermes_host_facts' in row), 'a key-less heartbeat never adds the block');
+  await fetch(`${base}/api/clients/register`, { method: 'POST', headers: auth, body: JSON.stringify({ name: 'legacy-no-facts', ip: '10.0.0.1', version: '1.2.3' }) });
+  const s2 = (await (await fetch(`${base}/api/state`, { headers: auth })).json()) as {
+    clients: Array<{ name: string } & Record<string, unknown>>;
+  };
+  const r2 = s2.clients.find((c) => c.name === 'legacy-no-facts');
+  assert.ok(!('hermes_host_facts' in r2), 'still absent after a second legacy heartbeat');
+});
+
+test('#85E cleanHostFacts: the edge sanitizer bounds the block directly', () => {
+  assert.equal(cleanHostFacts(undefined), undefined);
+  assert.equal(cleanHostFacts(null), undefined);
+  assert.equal(cleanHostFacts([]), undefined);
+  assert.equal(cleanHostFacts('degraded'), undefined);
+  assert.equal(cleanHostFacts({ checks: { nope: 'ok' } }), undefined, 'nothing valid survived ⇒ absent');
+  const ok = cleanHostFacts({ readiness: 'OK', checks: { disk: 'degraded', model: 'weird', intruder: 'ok' }, connected_platforms: 4, active_api_runs: 3, used_percent: 98.1, free_bytes: 76318728192 });
+  assert.deepEqual(ok, { readiness: 'ok', checks: { disk: 'degraded', model: 'unknown' }, connected_platforms: 4, active_api_runs: 3 }, 'lowercase-normalized verdicts; unknown status → unknown; unknown names and raw numbers dropped');
+  assert.equal(cleanHostFacts({ connected_platforms: 101 }), undefined, 'over-cap counts alone earn no block');
+  assert.equal(cleanHostFacts({ active_api_runs: 10_001 }), undefined);
 });
