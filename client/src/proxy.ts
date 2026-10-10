@@ -25,6 +25,7 @@ import { handleClientProjects, type ClientProjectsOpts } from './client-projects
 import { handleSessionControl, type SessionControlOpts } from './session-control.js';
 import { handleClientHermes, type ClientHermesOpts } from './client-hermes.js';
 import { handleHermesTranscript, type HermesTranscriptOpts } from './hermes-transcript.js';
+import { handleHermesLifecycle, type HermesLifecycleOpts } from './hermes-lifecycle.js';
 
 /**
  * #78: `GET /sessions/<token>/transcript` — the read-only surface for the
@@ -123,6 +124,16 @@ export function startLlmProxy(opts: {
    * passthrough exactly as before.
    */
   hermesTranscript?: HermesTranscriptOpts;
+  /**
+   * #85 slice G: the operator-driven session LIFECYCLE surface. When set,
+   * PATCH `/client/hermes-lifecycle/<session_id>` is answered ON THIS SAME
+   * loopback server (Host/Origin/token guarded inside handleHermesLifecycle)
+   * and forwarded to the gateway — the verb's payload NEVER touches the
+   * arbiter wire. Absent = the path falls to plain passthrough exactly as
+   * before. This verb fires ONLY on a deliberate dashboard click (the scope
+   * law): no cycle/lease/poll path ever calls it, and it never retries.
+   */
+  hermesLifecycle?: HermesLifecycleOpts;
 }): LlmProxy {
   const target = new URL(opts.target);
   const log: ProxyLogEntry[] = [];
@@ -266,6 +277,34 @@ export function startLlmProxy(opts: {
       // itself on every contract path; this catch only covers a seam
       // surprise after the response was half-written.
       handleHermesTranscript(req, res, ut, opts.hermesTranscript).catch(() => {
+        if (!res.headersSent) {
+          try {
+            res.writeHead(500, { 'content-type': 'application/json' });
+          } catch {
+            /* raced with socket teardown */
+          }
+        }
+        try {
+          res.end();
+        } catch {
+          /* ignore */
+        }
+      });
+      return;
+    }
+    // #85 slice G: the operator-driven lifecycle surface (same loopback bind,
+    // answered BEFORE passthrough — a lifecycle write can never reach the
+    // LLM target). Absent ⇒ the path falls through untouched. Fire-safe async
+    // like the transcript surface: handleHermesLifecycle answers every
+    // contract path itself; the catch is seam-surprise insurance only.
+    if (opts.hermesLifecycle && rawUrl.startsWith('/client/hermes-lifecycle/')) {
+      let ul: URL;
+      try {
+        ul = new URL(rawUrl, 'http://127.0.0.1');
+      } catch {
+        ul = new URL('http://127.0.0.1/');
+      }
+      handleHermesLifecycle(req, res, ul, opts.hermesLifecycle).catch(() => {
         if (!res.headersSent) {
           try {
             res.writeHead(500, { 'content-type': 'application/json' });

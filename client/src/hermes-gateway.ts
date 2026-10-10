@@ -129,6 +129,75 @@ export interface RunResult {
   error?: string;
 }
 
+/**
+ * #85 slice G: the operator-driven session LIFECYCLE verb's field set.
+ * Exactly the gateway's client-safe flags MINUS `end_reason`: ending a
+ * LIVE row while its agent still runs is a footgun the gate cannot
+ * arbitrate, so `end_reason` — and `model`, and every other field — is
+ * refused BY NAME before a single byte reaches the gateway. The verb
+ * fires ONLY on a deliberate operator gesture (the Sessions-row rename /
+ * pin click); no cycle, lease, or automatic path may call it, and the
+ * verb's payload is NEVER published to the arbiter (it never rides a
+ * heartbeat or /api/state).
+ */
+export const LIFECYCLE_FIELDS = ['title', 'pinned', 'archived', 'hidden', 'unread'] as const;
+
+/** A validated lifecycle patch: `title: null` restores the derived title
+ *  (the gateway's documented restore semantics); flags are booleans. */
+export type HermesLifecyclePatch = {
+  title?: string | null;
+  pinned?: boolean;
+  archived?: boolean;
+  hidden?: boolean;
+  unread?: boolean;
+};
+
+/**
+ * Validate a lifecycle body (fail closed, whole body — the sibling
+ * surfaces' discipline). Returns the sanitized patch or a NAMED error
+ * that lists every offending field (end_reason gets its own explicit
+ * reason so the operator learns why it is off the table this issue).
+ */
+export function validateLifecyclePatch(body: unknown): { ok: true; patch: HermesLifecyclePatch } | { ok: false; error: string } {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return { ok: false, error: 'body must be an object carrying lifecycle fields (title/pinned/archived/hidden/unread)' };
+  }
+  const r = body as Record<string, unknown>;
+  const unknown = Object.keys(r).filter((k) => !LIFECYCLE_FIELDS.includes(k as (typeof LIFECYCLE_FIELDS)[number])).sort();
+  if (unknown.length > 0) {
+    const hint = unknown.includes('end_reason')
+      ? ' — end_reason is deliberately NOT exposed this issue (ending a live row while its agent runs is a footgun the gate cannot arbitrate)'
+      : '';
+    return { ok: false, error: `Unsupported lifecycle field(s): ${unknown.join(', ')}${hint}` };
+  }
+  const patch: HermesLifecyclePatch = {};
+  if (r.title !== undefined) {
+    if (r.title === null) patch.title = null;
+    else if (typeof r.title === 'string' && r.title.trim() !== '') patch.title = r.title.trim().slice(0, 256);
+    else return { ok: false, error: "'title' must be a non-empty string or null (null restores the derived title)" };
+  }
+  for (const flag of ['pinned', 'archived', 'hidden', 'unread'] as const) {
+    if (r[flag] !== undefined) {
+      if (typeof r[flag] !== 'boolean') return { ok: false, error: `'${flag}' must be a boolean` };
+      patch[flag] = r[flag];
+    }
+  }
+  if (Object.keys(patch).length === 0) return { ok: false, error: 'nothing to patch — carry at least one of title/pinned/archived/hidden/unread' };
+  return { ok: true, patch };
+}
+
+/**
+ * A lifecycle verdict — the slice-A posture applied to a control verb:
+ * either the patch landed on the owning profile, or the refusal carries
+ * the HTTP status the loopback route answers plus a NAMED reason. The
+ * verb's payload never appears in the verdict (only the field NAMES that
+ * were applied), so a refusal/echo can never carry conversation-adjacent
+ * content outward.
+ */
+export type LifecycleResult =
+  | { ok: true; profile: string; session_id: string; patched: string[] }
+  | { ok: false; status: number; error: string; reason: string };
+
 // ---------------------------------------------------------------------------
 // Config resolution
 // ---------------------------------------------------------------------------
@@ -557,6 +626,23 @@ export function mergeLedgerRows(last: Map<string, HermesSessionMeta>, rows: Map<
 // ---------------------------------------------------------------------------
 
 type FetchImpl = typeof fetch;
+
+/** The gateway's error envelope (`_error_response`: `{error:{message,code,
+ *  type}}`, or a bare string on some paths) → one bounded complaint string
+ *  for the operator's toast. Malformed/absent ⇒ '' (the caller falls back
+ *  to the status). */
+function gatewayErrorMessage(parsed: unknown): string {
+  if (!parsed || typeof parsed !== 'object') return '';
+  const e = (parsed as { error?: unknown }).error;
+  if (typeof e === 'string') return e;
+  if (e && typeof e === 'object') {
+    const m = (e as { message?: unknown }).message;
+    if (typeof m === 'string' && m.trim() !== '') return m;
+    const c = (e as { code?: unknown }).code;
+    if (typeof c === 'string' && c.trim() !== '') return c;
+  }
+  return '';
+}
 
 interface ProfileFetch {
   profile: string;
@@ -1021,6 +1107,131 @@ export class HermesGatewayConnector {
   /** Test/inspection seam: the last-known ledger size. */
   get ledgerSize(): number {
     return this.ledger.size;
+  }
+
+  /**
+   * #85 slice G: the operator-driven session LIFECYCLE verb. PATCH
+   * `.../api/sessions/{id}` with ONLY the client-safe flags (title /
+   * pinned / archived / hidden / unread). `end_reason` and every other
+   * field are refused BY NAME here — before any HTTP request leaves the
+   * process (the gateway would itself 400 `unsupported_session_field`;
+   * verified in api_server.py `_handle_patch_session` — we refuse earlier,
+   * and `end_reason` never gets the chance to end a live row).
+   *
+   * Owning-profile resolution is the #83 probe walk — the exact slice-A
+   * `fetchTranscript` posture: keyed profiles are tried in config order,
+   * the FIRST whose exact-id GET answers 200 owns the row, and the PATCH
+   * lands on that SAME profile exactly ONCE per call (the verb never
+   * retries — one deliberate click, one PATCH). A transport failure ends
+   * the walk immediately: one bounded attempt, no retry storm.
+   *
+   * Refusal honesty (the slice-A walk verdicts): the named 404
+   * `session_not_found` answers ONLY when EVERY keyed profile gave an
+   * explicit 404 (a definitive "not in this profile"). A walk that met only
+   * 401/403/5xx is ambiguous — the gateway never said "no such session" —
+   * and answers the named 503 `gateway_ambiguous`, never a false not-found.
+   * A 2xx probe whose PATCH the gateway itself rejects answers the named
+   * `gateway_rejected` with the gateway's status (never retried — the row
+   * was HERE, and a blind retry against a rejected write is how double
+   * patches happen).
+   *
+   * Zero-request guarantees (the fail-open rule): disabled connector,
+   * malformed id, disallowed body, or NO profile carrying a key ⇒ the walk
+   * never issues a single HTTP request.
+   *
+   * Scope law (the #85 control-slice decision): invoked ONLY from an
+   * explicit dashboard gesture — there is no automatic caller (no cycle,
+   * lease, or poll path references this method). It is logged LOCALLY
+   * (field NAMES only, never values — a title is conversation-adjacent)
+   * and its payload is NEVER published: the verdict carries no session
+   * echo, and NOTHING here touches the enrichment ledger. Writing the
+   * patch into the ledger would let the new title ride the `hermes_meta`
+   * heartbeat — that WOULD be publishing the verb's payload; the next
+   * natural poll refreshes the row instead.
+   */
+  async patchLifecycle(sessionId: string, body: unknown): Promise<LifecycleResult> {
+    const id = normalizeSessionId(sessionId);
+    if (!id) return this.lifecycleRefuse(id, 400, 'session id required', 'invalid_session_id');
+    if (!this.cfg.enabled) {
+      return this.lifecycleRefuse(id, 503, 'hermes gateway connector is disabled — lifecycle unavailable', 'connector_disabled');
+    }
+    const v = validateLifecyclePatch(body);
+    if (!v.ok) return this.lifecycleRefuse(id, 400, v.error, 'invalid_body'); // refused BEFORE any HTTP request
+
+    const keyed: { profile: string; key: string }[] = [];
+    for (const profile of this.cfg.profiles) {
+      const key = profile === 'default' ? this.cfg.key : this.cfg.profileKeys.get(profile);
+      if (key) keyed.push({ profile, key });
+    }
+    if (keyed.length === 0) {
+      return this.lifecycleRefuse(id, 503, 'no hermes profile carries an API key — the gateway cannot be addressed', 'no_key');
+    }
+
+    // #83 walk-verdict discipline: the honest 404 is reserved for a walk in
+    // which EVERY keyed profile answered an explicit 404 (a definitive
+    // miss). Any other posture (401/403/5xx) is ambiguous and poisons that
+    // verdict → the named 503-class refusal.
+    let everyKeyedProfileSaidNotFound = true;
+    for (const { profile, key } of keyed) {
+      const url = `${this.cfg.base_url}${sessionPath(profile, id)}`;
+      let probe: Response;
+      try {
+        probe = await this.fetchImpl(url, {
+          headers: { authorization: `Bearer ${key}` },
+          signal: AbortSignal.timeout(this.cfg.timeout_ms),
+        });
+      } catch {
+        return this.lifecycleRefuse(id, 503, 'hermes gateway unreachable — the lifecycle verb made no patch', 'gateway_unreachable');
+      }
+      if (probe.status === 404) continue; // definitive miss for THIS profile: walk on
+      everyKeyedProfileSaidNotFound = false; // this profile never said "no such session"
+      if (probe.status !== 200) continue; // 401/403/5xx: ambiguous, walk on
+
+      // The row exists in THIS profile — the PATCH lands HERE, exactly once.
+      let res: Response;
+      try {
+        res = await this.fetchImpl(url, {
+          method: 'PATCH',
+          headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
+          body: JSON.stringify(v.patch),
+          signal: AbortSignal.timeout(this.cfg.timeout_ms),
+        });
+      } catch {
+        return this.lifecycleRefuse(id, 503, 'hermes gateway became unreachable during the patch — nothing was retried', 'gateway_unreachable');
+      }
+      let parsed: unknown;
+      try {
+        parsed = await res.json();
+      } catch {
+        parsed = undefined;
+      }
+      if (res.status >= 200 && res.status < 300) {
+        // Local log only, and only the FIELD NAMES — the values never reach
+        // the log line, the verdict, or any publish.
+        this.log(`hermes lifecycle patch applied to ${id} (profile ${profile}): ${Object.keys(v.patch).join(', ')}`);
+        return { ok: true, profile, session_id: id, patched: Object.keys(v.patch) };
+      }
+      // The gateway answered the patch non-2xx: surface its complaint
+      // verbatim (bounded), never retry, never walk on (the row was HERE).
+      const gwErr = gatewayErrorMessage(parsed);
+      return this.lifecycleRefuse(
+        id,
+        res.status,
+        `gateway refused the patch: ${(gwErr !== '' ? gwErr : `HTTP ${res.status}`).slice(0, 256)}`,
+        'gateway_rejected',
+      );
+    }
+    if (everyKeyedProfileSaidNotFound) {
+      return this.lifecycleRefuse(id, 404, `no hermes profile holds session ${id} — every keyed profile answered 404`, 'session_not_found');
+    }
+    return this.lifecycleRefuse(id, 503, 'no keyed profile resolved the session definitively — 401/403/5xx answers only', 'gateway_ambiguous');
+  }
+
+  /** Refusal bookend: log LOCALLY (reason only — never the patch payload),
+   *  return the named verdict the loopback route answers verbatim. */
+  private lifecycleRefuse(id: string, status: number, error: string, reason: string): LifecycleResult {
+    this.log(`hermes lifecycle verb refused for ${id !== '' ? id : '(no id)'}: ${reason}`);
+    return { ok: false, status, error, reason };
   }
 
   /** Runs control (the seam, slice C) — see `HermesRunsControl`. */

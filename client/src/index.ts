@@ -1970,6 +1970,19 @@ export class ClientDaemon {
         token: this.cfg.token,
         connector: () => this.hermesGateway,
       },
+      // #85 slice G: the operator-driven session LIFECYCLE verb (rename / pin
+      // from the Sessions row). Same loopback bind, same edit-token guard.
+      // The scope law: this route fires ONLY on a deliberate dashboard click
+      // — no cycle/lease/poll path in this daemon calls patchLifecycle — it
+      // never retries (one click, one PATCH), and the verb's payload never
+      // rides any publish: the verdict carries field names only and never
+      // enters the enrichment ledger, so it cannot reach the register
+      // heartbeat or /api/state. `end_reason` is refused BY NAME (deliberately
+      // not exposed this issue), as is every non-client-safe field.
+      hermesLifecycle: {
+        token: this.cfg.token,
+        connector: () => this.hermesGateway,
+      },
       // #46: the true-pause interrupt half — POST /sessions/<token>/release
       // on this SAME loopback bind answers a paused/over-capacity
       // session's parked holds with the retryable 503 + Retry-After (the

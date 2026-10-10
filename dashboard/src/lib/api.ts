@@ -811,6 +811,48 @@ export interface HermesTranscriptPage {
   messages: HermesTranscriptMessage[];
 }
 
+// #85 slice G: the operator-driven session LIFECYCLE verb (rename / pin),
+// fired over the OWNING client's loopback daemon ONLY on a deliberate
+// dashboard click (the scope law: never automated by cycles/leases, never
+// auto-retried — this helper sends exactly one PATCH per call). Client-safe
+// fields ONLY: title/pinned/archived/hidden/unread (`end_reason` is refused
+// BY NAME by the client, deliberately not exposed this issue). A refusal
+// throws with the NAMED reason verbatim: connector_disabled / no_key /
+// gateway_unreachable / gateway_ambiguous / session_not_found (404, only
+// when every keyed profile answered an explicit 404) / gateway_rejected /
+// invalid_body.
+export interface HermesLifecyclePatch {
+  title?: string | null;
+  pinned?: boolean;
+  archived?: boolean;
+  hidden?: boolean;
+  unread?: boolean;
+}
+
+export async function patchLocalHermesLifecycle(
+  port: number,
+  sessionId: string,
+  patch: HermesLifecyclePatch,
+): Promise<{ profile: string; patched: string[] }> {
+  const res = await fetch(`http://127.0.0.1:${port}/client/hermes-lifecycle/${encodeURIComponent(sessionId)}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json", [EDIT_HEADER]: apiToken() ?? "" },
+    body: JSON.stringify(patch),
+  });
+  const body = (await res.json().catch(() => ({}))) as {
+    ok?: boolean;
+    profile?: string;
+    patched?: string[];
+    error?: string;
+    reason?: string;
+  };
+  if (!res.ok || body.ok !== true) {
+    const reason = body.reason ?? "refused";
+    throw new Error(body.error ? `${reason} — ${body.error}` : `${reason} (HTTP ${res.status})`);
+  }
+  return { profile: body.profile ?? "?", patched: body.patched ?? [] };
+}
+
 export async function readLocalHermesTranscript(
   port: number,
   sessionId: string,

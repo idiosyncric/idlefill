@@ -30,6 +30,7 @@ import {
   SheetTitle,
   SheetDescription,
 } from "@/components/ui/sheet";
+import { Input } from "@/components/ui/input";
 import { Sparkline } from "@/components/Sparkline";
 import { copyText } from "@/lib/clipboard";
 import {
@@ -38,6 +39,8 @@ import {
   setSessionPin,
   getSessionTranscript,
   readLocalHermesTranscript,
+  patchLocalHermesLifecycle,
+  type HermesLifecyclePatch,
   type HermesTranscriptMessage,
   type HermesTranscriptPage,
   type SessionRow,
@@ -162,6 +165,170 @@ function hostProxyPort(st: StateSnapshot, s: SessionRow): number | undefined {
   if (!c || !c.proxy_port) return undefined;
   if (!isOnline(c.last_seen, st.now)) return undefined;
   return c.proxy_port;
+}
+
+// ---------------------------------------------------------------------------
+// #85 slice G: the row's lifecycle controls — rename + pin, wired to the
+// OWNING client's loopback route (PATCH /client/hermes-lifecycle/<id>,
+// edit-token guarded). The scope law: these fire ONLY on a deliberate click.
+// Nothing here calls them automatically (no timer, no refresh hook), one
+// click sends exactly ONE PATCH (the buttons are disabled while in flight),
+// and a refusal is NEVER retried — the toast carries the NAMED refusal
+// reason verbatim ("session_not_found — no hermes profile holds session…").
+// The verb's payload never touches the arbiter: the client daemon proxies it
+// straight to the gateway and publishes nothing.
+//
+// WHICH FIELDS: `title` and `pinned` are the issue's named row UX.
+// archived / hidden / unread stay API-only on purpose — the Sessions list is
+// arbiter truth, not the Hermes desktop sidebar, so a hidden/archived row
+// would keep showing here regardless and the flag would be an invisible
+// no-op on this page; inventing chrome for it was explicitly out of scope.
+// The client route allow-lists all five, so a future slice can surface them
+// without a wire change.
+// ---------------------------------------------------------------------------
+
+function LifecycleControls({ st, s }: { st: StateSnapshot; s: SessionRow }) {
+  const sessionId = s.session_id;
+  const port = hostProxyPort(st, s);
+  const shortTok = String(s.token ?? "").slice(0, 8);
+  const [editing, setEditing] = React.useState(false);
+  const [draft, setDraft] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  // The Hermes flag is never published, so the page cannot OBSERVE it — it
+  // remembers only what THIS page did (first click pins, the next unpins).
+  // A pin over an already-pinned row is a gateway no-op, so a page-local
+  // guess can never corrupt the row.
+  const [pinnedHere, setPinnedHere] = React.useState(false);
+
+  if (!sessionId) return null;
+
+  const run = async (body: HermesLifecyclePatch, onOk: (profile: string) => void) => {
+    if (!port || busy) return;
+    setBusy(true);
+    try {
+      const r = await patchLocalHermesLifecycle(port, sessionId, body);
+      onOk(r.profile);
+    } catch (e) {
+      // Verbatim: the message already reads "<named reason> — <refusal detail>".
+      toast.error((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const commitRename = () => {
+    const t = draft.trim().slice(0, 256);
+    if (t === "") return; // an empty draft is a no-op, never a write
+    void run({ title: t }, (profile) => {
+      toast.success(`session ${shortTok} renamed over loopback (profile ${profile})`);
+      setEditing(false);
+      setDraft("");
+    });
+  };
+
+  const togglePin = () => {
+    const next = !pinnedHere;
+    void run({ pinned: next }, (profile) => {
+      setPinnedHere(next);
+      toast.success(`session ${shortTok} ${next ? "pinned" : "unpinned"} over loopback (profile ${profile})`);
+    });
+  };
+
+  if (editing) {
+    return (
+      <span className="flex items-center gap-1">
+        <Input
+          autoFocus
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commitRename();
+            else if (e.key === "Escape") {
+              setEditing(false);
+              setDraft("");
+            }
+          }}
+          placeholder="new title (Enter writes, Esc cancels)"
+          maxLength={256}
+          disabled={busy}
+          className="h-6 w-[190px] text-[11px]"
+        />
+        <Button
+          size="xs"
+          variant="outline"
+          className="h-6 px-2 text-[11px]"
+          disabled={busy || draft.trim() === ""}
+          onClick={commitRename}
+          title="PATCH /api/sessions/<id> {title} over the owning client's loopback — one click, one write, never retried"
+        >
+          {busy ? "writing…" : "save"}
+        </Button>
+        <Button
+          size="xs"
+          variant="ghost"
+          className="h-6 px-1.5 text-[10px] text-dim"
+          onClick={() => {
+            setEditing(false);
+            setDraft("");
+          }}
+          title="discard (nothing was sent)"
+        >
+          ×
+        </Button>
+      </span>
+    );
+  }
+
+  if (!port) {
+    // Honest disabled state: no Hermes id would be hidden above; a live
+    // loopback port is the only way this verb can fire (never relayed
+    // through the arbiter).
+    return (
+      <TooltipProvider delayDuration={0}>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span>
+              <Button size="xs" variant="outline" className="h-6 px-2 text-[11px]" disabled>
+                rename
+              </Button>
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>
+            the owning client has no live loopback port — lifecycle writes go over loopback only, never through the arbiter
+          </TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
+    );
+  }
+
+  return (
+    <span className="flex items-center gap-1">
+      <Button
+        size="xs"
+        variant="outline"
+        className="h-6 px-2 text-[11px]"
+        disabled={busy}
+        onClick={() => setEditing(true)}
+        title="rename this Hermes session (PATCH {title} to the gateway over the owning client's loopback)"
+      >
+        rename
+      </Button>
+      <Button
+        size="xs"
+        variant={pinnedHere ? "outline" : "ghost"}
+        className={`h-6 px-2 text-[11px] ${pinnedHere ? "text-accent" : "text-dim"}`}
+        disabled={busy}
+        onClick={togglePin}
+        title={
+          pinnedHere
+            ? "unpin this Hermes session (the page remembers only what it clicked — Hermes' current flag is never published; a pin over an already-pinned row is a no-op)"
+            : "pin this Hermes session in its desktop sidebar (PATCH {pinned:true} over loopback — one click, one write, never retried)"
+        }
+      >
+        {pinnedHere ? "unpin" : "pin"}
+      </Button>
+    </span>
+  );
 }
 
 // One conversation message row: role chip, content (capped server-side),
@@ -600,6 +767,7 @@ function SessionRowView({ s, st }: { s: SessionRow; st: StateSnapshot }) {
         </span>
       )}
       <HermesOpenButton sessionId={s.session_id} />
+      <LifecycleControls st={st} s={s} />
       <Button
         size="xs"
         variant="ghost"
