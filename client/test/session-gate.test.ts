@@ -1461,3 +1461,39 @@ test('#47 the register heartbeat reports the resolved class as the `priority` AD
   upOff.release(1);
   await rOff;
 });
+
+// ---------------------------------------------------------------------------
+// #46 slice 3: the operator turn interrupt flag (the /gate/state `interrupt`
+// ADD-key) — arming, the parked-only shape, and TTL lapse (clock seam).
+// ---------------------------------------------------------------------------
+test('#46 interrupt: requestInterrupt arms the flag for a tracked token only; it rides held state reads and lapses at the TTL', () => {
+  const clock = { t: 5_000_000 };
+  const { gate } = makeGate({ maxActive: 1, now: () => clock.t });
+  gate.onStatePoll([{ token: 'tokI', override: { override: 'pause' } }]);
+
+  // Unknown token: no flag, no phantom session, no error.
+  assert.deepEqual(gate.requestInterrupt('tok-nope'), { armed: false, released: 0 });
+  assert.deepEqual(gate.gateStateForSession('id-nope', 'tok-nope'), { state: 'armed' });
+
+  // Paused session (no wire traffic in this pure unit): the read is the
+  // byte-for-byte pre-slice shape until the operator arms the interrupt.
+  assert.deepEqual(gate.gateStateForSession('id-i', 'tokI'), { state: 'paused' });
+
+  const r = gate.requestInterrupt('tokI');
+  assert.equal(r.armed, true, 'the interrupt arms for a tracked token');
+  assert.equal(r.released, 0, 'no wire holds here (the middleware plane is the held one)');
+  assert.deepEqual(gate.gateStateForSession('id-i', 'tokI'), { state: 'paused', interrupt: true }, 'the flag rides the HELD state read (the plugin consumes it there)');
+
+  // Armed session (nothing holds it): the flag never rides an armed
+  // answer — a not-parked session is not interrupted by accident. (tokI's
+  // pause row stays present: a poll without it would clear the override.)
+  gate.onStatePoll([{ token: 'tokI', override: { override: 'pause' } }, { token: 'tokJ' }]);
+  gate.requestInterrupt('tokJ');
+  assert.deepEqual(gate.gateStateForSession('id-j', 'tokJ'), { state: 'armed' }, 'armed answer carries no interrupt key');
+
+  // TTL lapse: past the window the flag is gone (a stale interrupt must
+  // never fire on a much later parked call).
+  clock.t += 30_001;
+  assert.deepEqual(gate.gateStateForSession('id-i', 'tokI'), { state: 'paused' }, 'the flag lapsed: pre-slice shape again, no interrupt key');
+  assert.deepEqual(gate.gateStateForSession('id-j', 'tokJ'), { state: 'armed' });
+});

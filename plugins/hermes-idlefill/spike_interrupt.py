@@ -11,6 +11,11 @@ a raised exception actually does:
       (what the real /stop path does inside the interruptible call)
   S4  the real plugin callback: the gate raises from inside its try
       (simulating a raise in the parked loop) -- does anything escape?
+  S6  (added by slice 3) parked callback raises the frame's OWN fence,
+      _DownstreamExecutionError wrapping InterruptedError -- the frame's
+      `except _DownstreamExecutionError: raise exc.original` cannot tell
+      where the fence was raised, so the stop type reaches the turn loop
+      WITHOUT the provider call. This is the shipped interrupt path.
 
 No network. The real `hermes_cli.plugins` needs third-party deps (ruamel);
 the frame only needs `_delivery_manager()` with `_middleware` +
@@ -131,6 +136,18 @@ def main() -> None:
     r5, n5 = _run_frame("S5  parked callback raises KeyboardInterrupt (BaseException, not Exception)",
                         parked_base_exception, lambda p: "llm-response")
 
+    def parked_fence_interrupted(request, next_call, **ctx):
+        # S6: synthesize the frame's OWN fence around the stop type. The
+        # frame catches _DownstreamExecutionError before its skip-and-
+        # continue branch and re-raises `exc.original` -- it cannot tell
+        # the fence was raised BY the callback, not below it.
+        raise mw._DownstreamExecutionError(
+            InterruptedError("idlefill gate: operator interrupt")
+        )
+
+    r6, n6 = _run_frame("S6  parked callback raises _DownstreamExecutionError(InterruptedError)",
+                        parked_fence_interrupted, lambda p: "llm-response")
+
     # --- S4: the real plugin callback (its own fail-open wrapper) ---------
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     # Load the REAL plugin file directly: the hermes workspace above carries a
@@ -169,6 +186,42 @@ def main() -> None:
     print(f"   stub provider call executed: {calls['n']}x")
     print()
 
+    # --- S7: the REAL plugin, daemon answer says paused + interrupt -------
+    # (fresh module load: S4 replaced this module's _gate_state stub;
+    # sys.path still carries the real Hermes, so the plugin's lazy
+    # `from hermes_cli.middleware import _DownstreamExecutionError` at
+    # raise time resolves to the REAL frame class.)
+    plugin7 = loader.load_module()
+    plugin7._post_json = lambda url, payload: None
+    plugin7._get_json = lambda url: {"state": "paused", "interrupt": True}
+    plugin7._sleep = lambda s: None
+    plugin7_logs: list[str] = []
+    plugin7._log = plugin7_logs.append
+    calls7 = {"n": 0}
+
+    def next_call7():
+        calls7["n"] += 1
+        return "llm-response"
+
+    raised7 = None
+    result7 = None
+    try:
+        result7 = plugin7.llm_execution_gate({"request": True}, next_call7,
+                                             session_id="20261009_spike7",
+                                             base_url="http://127.0.0.1:8800/v1")
+    except BaseException as exc:  # noqa: BLE001 - the observation IS the raise
+        raised7 = exc
+    fence7 = isinstance(raised7, mw._DownstreamExecutionError) and isinstance(
+        getattr(raised7, "original", None), InterruptedError
+    )
+    print("== S7  real plugin, daemon answers paused + interrupt (real frame class importable)")
+    print(f"   raised out of llm_execution_gate: {type(raised7).__name__ if raised7 is not None else 'nothing'}"
+          + (f" wrapping {type(raised7.original).__name__}" if fence7 else ""))
+    print(f"   stub provider call executed: {calls7['n']}x")
+    for line in plugin7_logs:
+        print(f"   plugin logged: {line}")
+    print()
+
     # --- verdict ------------------------------------------------------------
     swallowed = (r1 is None and n1 == 1) and (r2 is None and n2 == 1)
     propagated = isinstance(r3, InterruptedError) and n3 == 1
@@ -179,11 +232,19 @@ def main() -> None:
     print(f"  S5 KeyboardInterrupt raised while parked -> escaped the frame: {isinstance(r5, KeyboardInterrupt)} "
           f"(provider ran: {n5}x)")
     print(f"  S4 real plugin: raise inside its own try -> swallowed by the plugin, provider ran: {raised4 is None and calls['n'] == 1}")
-    if swallowed and propagated and raised4 is None and calls["n"] == 1:
-        print("  => a raise from the parked callback does NOT stop the turn (no daemon endpoint needed,")
-        print("     but none possible either): the frame swallows it (warn-once) and the call proceeds.")
-        print("     Only InterruptedError raised BY the provider call itself stops the turn -- that is")
-        print("     what /stop does in-process (agent interrupt state), unreachable from the middleware.")
+    print(f"  S6 the frame's own fence wrapping InterruptedError -> stop type escapes, provider ran {n6}x: "
+          f"{isinstance(r6, InterruptedError) and n6 == 0}")
+    print(f"  S7 real plugin, daemon paused+interrupt -> fence(InterruptedError) escapes, provider ran {calls7['n']}x: "
+          f"{fence7 and calls7['n'] == 0}")
+    s6_ok = isinstance(r6, InterruptedError) and n6 == 0
+    s7_ok = fence7 and calls7["n"] == 0
+    if swallowed and propagated and raised4 is None and calls["n"] == 1 and s6_ok and s7_ok:
+        print("  => a PLAIN raise from the parked callback does NOT stop the turn (the frame swallows it,")
+        print("     warn-once, provider call proceeds -- S1/S2/S4). But the frame re-raises its own fence")
+        print("     _DownstreamExecutionError(original), so a parked gate CAN deliver a clean turn")
+        print("     interrupt: synthesize the fence around the runner's stop type (S6/S7) -- the stop type")
+        print("     reaches conversation_loop's `except InterruptedError` -> handle_api_interrupt, and the")
+        print("     provider call NEVER runs. This is the shipped #46 slice-3 interrupt path.")
         sys.exit(0)
     print("  => UNEXPECTED result: re-run and inspect the frame; do not ship on this output.")
     sys.exit(1)

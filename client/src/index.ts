@@ -2002,13 +2002,16 @@ export class ClientDaemon {
         token: this.cfg.token,
         connector: () => this.hermesGateway,
       },
-      // #46: the true-pause interrupt half — POST /sessions/<token>/release
+      // #46: the true-pause control half — POST /sessions/<token>/release
       // on this SAME loopback bind answers a paused/over-capacity
       // session's parked holds with the retryable 503 + Retry-After (the
-      // in-session "held by gate" feedback) and frees the queue slot.
-      // Guarded like the config editor (Host/Origin/token); the token
-      // compared is the one this daemon already holds. No gate ⇒ absent
-      // (a gate-less daemon has no parked holds to release).
+      // in-session "held by gate" feedback) and frees the queue slot;
+      // POST /sessions/<token>/interrupt (slice 3) additionally arms the
+      // plugin-visible interrupt so the PARKED middleware turn stops
+      // cleanly (the /stop equivalent — #46 spike S6). Guarded like the
+      // config editor (Host/Origin/token); the token compared is the one
+      // this daemon already holds. No gate ⇒ absent (a gate-less daemon
+      // has no parked holds to release and no plugin surface to signal).
       ...(this.gate ? { sessionControl: { token: this.cfg.token, gate: this.gate } } : {}),
     });
     await waitProxyReady(this.proxy.server);

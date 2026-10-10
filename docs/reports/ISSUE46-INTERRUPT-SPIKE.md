@@ -58,3 +58,16 @@ S4 real plugin: gate raises inside its try   -> swallowed by the plugin, provide
 **Verification (real output):** spike exit 0; `python3 -m unittest
 plugins/hermes-idlefill/test_plugin.py` 17/17 OK (unchanged suite); root
 `NODE_ENV=test npm run test` (all workspaces) exit 0.
+## ADDENDUM (same day, slice 3) — the spike's missed branch SUPERSEDES the verdict
+The verdict holds for PLAIN raises (S1/S2/S4) — and it stopped the design
+one branch short: the frame's `except _DownstreamExecutionError as exc:
+raise exc.original` runs BEFORE the skip branch and cannot tell where the
+fence was raised. Synthesizing that fence around the stop type from the
+parked callback escapes the frame and stops the turn (provider never
+runs). Added spike cases S6 (bare fence, real frame) and S7 (real plugin,
+daemon answers paused+interrupt) prove it against the installed frame —
+the interrupt SHIPPED on this path in slice 3: `docs/reports/ISSUE46-INTERRUPT-REPORT.md`.
+The "no daemon endpoint" conclusion also flips: the shipped
+`POST /sessions/<token>/interrupt` is what arms the flag the plugin
+consumes. Re-run the spike after any Hermes upgrade that touches
+middleware — it is the pin for the private-symbol dependency.

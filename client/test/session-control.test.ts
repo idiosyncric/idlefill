@@ -387,4 +387,124 @@ test('(r6) the control path is answered on the loopback bind and never reaches t
   assert.equal(body.released, 0);
   assert.equal(up.hits.length, hitsBefore, 'the control write never reached the LLM target');
   assert.equal(gate.queueDepth, 0, 'nothing was parked, nothing released');
+
+  // The interrupt verb rides the SAME guard: fresh router ⇒ answered
+  // loopback, never forwarded.
+  const rInt = await fetch(`${proxy.base_url}/sessions/nope/interrupt`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-idlefill-edit': CONTROL_TOKEN },
+  });
+  assert.equal(rInt.status, 200);
+  assert.deepEqual(await rInt.json(), { ok: true, armed: false, released: 0 }, 'unknown token: not armed, nothing released');
+  assert.equal(up.hits.length, hitsBefore, 'the interrupt write never reached the LLM target either');
+});
+
+// ---------------------------------------------------------------------------
+// (r7) #46 slice 3: interrupt = arm the plugin-visible flag (the /gate/state
+//      `interrupt` ADD-key) AND release the wire holds; pause still owns
+// ---------------------------------------------------------------------------
+test('(r7) interrupt arms the gate-state interrupt key for a paused session and answers its parked holds — and does NOT clear the pause override', async () => {
+  const { proxy, up, gate } = await controlHarness();
+  // The operator pause lands first: tokB's traffic parks, and the parked
+  // request never reaches the engine.
+  gate.onStatePoll([{ token: 'tokB', override: { override: 'pause' } }]);
+
+  const resB = postChat(proxy.base_url, '/s/tokB/v1/chat/completions');
+  await waitFor(() => gate.queueDepth === 1, 3000, 'B parked by the pause');
+  assert.equal(up.hits.length, 0, 'the parked request never reached the engine');
+
+  // Pre-interrupt: the plugin read is the byte-for-byte pre-slice shape.
+  const pre = await fetch(`${proxy.base_url}/gate/state?session_id=id-b&token=tokB`);
+  const preBody = (await pre.json()) as Record<string, unknown>;
+  assert.deepEqual(preBody, { state: 'paused', position: 1 }, 'no interrupt key until armed');
+
+  // The interrupt: 200, armed, and the ONE wire hold answered (503 +
+  // Retry-After — the slice-1 release contract, one answer shape).
+  const rInt = await fetch(`${proxy.base_url}/sessions/tokB/interrupt`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-idlefill-edit': CONTROL_TOKEN },
+  });
+  assert.equal(rInt.status, 200);
+  assert.deepEqual(await rInt.json(), { ok: true, armed: true, released: 1 });
+  const rb = await resB;
+  assert.equal(rb.status, 503, 'the wire hold is answered with the retryable 503');
+  await rb.json();
+
+  // The plugin-visible half: while the session is STILL held (the pause
+  // override owns admission), /gate/state now carries `interrupt: true` —
+  // this is what the parked middleware loop consumes (#46 spike S6/S7).
+  const post = await fetch(`${proxy.base_url}/gate/state?session_id=id-b&token=tokB`);
+  assert.deepEqual(await post.json(), { state: 'paused', interrupt: true }, 'the interrupt ADD-key rides the parked state read');
+
+  // The pause still owns admission (the interrupt stops the TURN, not the
+  // policy): a NEW request parks again.
+  const resB2 = postChat(proxy.base_url, '/s/tokB/v1/chat/completions');
+  await waitFor(() => gate.queueDepth === 1, 3000, 'B parks again — the pause override was NOT cleared');
+  assert.equal(up.hits.length, 0, 'still no traffic reached the engine');
+
+  // Clean up: clear the override, wait for the forwarded request to
+  // actually land upstream, then settle it.
+  gate.onStatePoll([]);
+  await waitFor(() => up.hits.length === 1, 3000, 'unpause forwards the parked request');
+  up.release(1);
+  const rb2 = await resB2;
+  assert.equal(rb2.status, 200);
+});
+
+// ---------------------------------------------------------------------------
+// (r8) interrupt is idempotent: unknown / settled token = no-op, never a
+//      phantom session, never an error
+// ---------------------------------------------------------------------------
+test('(r8) interrupt on an unknown or already-idle token is a no-op (armed:false) and never adopts a phantom session', async () => {
+  const { proxy, gate } = await controlHarness();
+  gate.onStatePoll([]);
+
+  const r1 = await fetch(`${proxy.base_url}/sessions/never-seen/interrupt`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-idlefill-edit': CONTROL_TOKEN },
+  });
+  assert.equal(r1.status, 200);
+  assert.deepEqual(await r1.json(), { ok: true, armed: false, released: 0 });
+
+  // An IDLE (adopted, no holds) token: the flag arms for the NEXT held
+  // call (the TTL window) — still released:0, still never an error.
+  gate.onStatePoll([{ token: 'tokIdle' }]);
+  const r2 = await fetch(`${proxy.base_url}/sessions/tokIdle/interrupt`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-idlefill-edit': CONTROL_TOKEN },
+  });
+  assert.equal(r2.status, 200);
+  assert.deepEqual(await r2.json(), { ok: true, armed: true, released: 0 });
+  // Armed but NOT held (state 'armed'): the key never rides an armed
+  // answer — an unstopped session must not be interrupted later by
+  // accident (the plugin only consumes the key while parked).
+  const st = await fetch(`${proxy.base_url}/gate/state?session_id=id-idle&token=tokIdle`);
+  assert.deepEqual(await st.json(), { state: 'armed' }, 'no interrupt key on an armed answer');
+});
+
+// ---------------------------------------------------------------------------
+// (r9) the interrupt verb honors the SAME auth/method guards as release
+// ---------------------------------------------------------------------------
+test('(r9) a wrong token / GET on the interrupt path are 401/405 NO-OPs — the hold stays parked, the flag never arms', async () => {
+  const { proxy, gate } = await controlHarness();
+  gate.onStatePoll([{ token: 'tokB', override: { override: 'pause' } }]);
+  const resB = postChat(proxy.base_url, '/s/tokB/v1/chat/completions');
+  await waitFor(() => gate.queueDepth === 1, 3000, 'B parked');
+
+  const rWrong = await fetch(`${proxy.base_url}/sessions/tokB/interrupt`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-idlefill-edit': 'NOT-the-token' },
+  });
+  assert.equal(rWrong.status, 401);
+  const rGet = await fetch(`${proxy.base_url}/sessions/tokB/interrupt`, { method: 'GET' });
+  assert.equal(rGet.status, 405);
+
+  // Both are NO-OPs: the hold is still parked and no flag armed (the
+  // plugin read stays the byte-for-byte pre-slice shape).
+  assert.equal(gate.queueDepth, 1, 'the parked hold survived the refused writes');
+  const st = await fetch(`${proxy.base_url}/gate/state?session_id=id-b&token=tokB`);
+  assert.deepEqual(await st.json(), { state: 'paused', position: 1 }, 'no interrupt key after refused writes');
+
+  gate.releaseHold('tokB');
+  await resB;
 });

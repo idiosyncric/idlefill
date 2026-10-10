@@ -9,6 +9,14 @@
  *
  *   POST /sessions/<token>/release
  *        → { ok: true, released: N }   (N parked requests answered)
+ *   POST /sessions/<token>/interrupt   (#46 slice 3 — the /stop half)
+ *        → { ok: true, armed: true|false, released: N }
+ *      Arms the plugin-visible interrupt (the gate's `GET /gate/state`
+ *      carries `interrupt: true` while held; the parked plugin then stops
+ *      holding and raises Hermes' own frame fence around the runner's
+ *      stop type — a clean turn stop, #46 spike S6) AND releases the
+ *      wire-plane holds with the same 503 + Retry-After as `release`.
+ *      Unknown token ⇒ armed:false, released:0 (idempotent no-op).
  *
  * Guarded with the EXACT posture the sibling client-config editor
  * (client-projects.ts) uses — same fail-closed shape, loopback only:
@@ -40,14 +48,18 @@ export interface SessionControlOpts {
   /** The arbiter token this client holds (config.json `token`). */
   token: string;
   /** The session gate that owns the parked holds (absent = gate off). */
-  gate: { releaseHold(token: string): number };
+  gate: {
+    releaseHold(token: string): number;
+    requestInterrupt(token: string): { armed: boolean; released: number };
+  };
 }
 
-/** `/sessions/<token>/release` — distinct from the gate's `/s/<token>/…`
- *  passthrough (that regex requires `/s/`, so the control path can never
- * be mistaken for session traffic) and from `/sessions/<token>/transcript`
- *  (different last segment; both live on this loopback bind). */
-const RELEASE_PATH_RE = /^\/sessions\/([^/]+)\/release$/;
+/** `/sessions/<token>/release` and `/sessions/<token>/interrupt` —
+ *  distinct from the gate's `/s/<token>/…` passthrough (that regex
+ *  requires `/s/`, so the control path can never be mistaken for session
+ *  traffic) and from `/sessions/<token>/transcript` (GET-only sibling on
+ *  the same loopback bind). */
+const CONTROL_PATH_RE = /^\/sessions\/([^/]+)\/(release|interrupt)$/;
 
 /** Loopback hostname test (same rule as client-projects.ts keeps local). */
 function loopbackHost(host: string): boolean {
@@ -84,7 +96,8 @@ function corsHeaders(origin: string | undefined): Record<string, string> {
 }
 
 /**
- * Handle POST /sessions/<token>/release. Returns true when the request was
+ * Handle POST /sessions/<token>/release or /interrupt. Returns true when
+ * the request was
  * handled (the caller must then NOT passthrough it). The path must match
  * exactly (with-or-without query); every other path/method falls through
  * (false) so passthrough and the sibling control routes are untouched.
@@ -95,7 +108,7 @@ export function handleSessionControl(
   url: URL,
   opts: SessionControlOpts,
 ): boolean {
-  const m = RELEASE_PATH_RE.exec(url.pathname);
+  const m = CONTROL_PATH_RE.exec(url.pathname);
   if (!m) return false;
 
   const cors = corsHeaders(req.headers.origin);
@@ -148,9 +161,19 @@ export function handleSessionControl(
   } catch {
     /* malformed %xx: keep the raw token (the arbiter stores it verbatim) */
   }
-  // releaseHold is idempotent: unknown token or no parked holds ⇒ 0.
-  const released = opts.gate.releaseHold(token);
-  const body = JSON.stringify({ ok: true, released });
+  const verb = m[2];
+  let body: string;
+  if (verb === 'interrupt') {
+    // #46 slice 3: arm the parked-call interrupt + release the wire holds.
+    // Unknown token ⇒ { armed: false, released: 0 } (idempotent, never
+    // an error, never a phantom session).
+    const { armed, released } = opts.gate.requestInterrupt(token);
+    body = JSON.stringify({ ok: true, armed, released });
+  } else {
+    // releaseHold is idempotent: unknown token or no parked holds ⇒ 0.
+    const released = opts.gate.releaseHold(token);
+    body = JSON.stringify({ ok: true, released });
+  }
   res.writeHead(200, {
     'content-type': 'application/json',
     'content-length': String(Buffer.byteLength(body)),

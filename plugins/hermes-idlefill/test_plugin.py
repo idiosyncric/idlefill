@@ -6,12 +6,22 @@ against a stub idlefill daemon loopback (scripted /gate/heartbeat +
 no-session-id. The stub `next_call` mirrors the real middleware frame:
 single-use — a second call raises.
 
-Seams: the plugin resolves `_post_json` / `_get_json` / `_sleep` through
-its OWN module globals, so patching `plugin._post_json` etc. is enough —
-no real HTTP, no real sleeping.
+Seams: the plugin resolves `_post_json` / `_get_json` / `_sleep` / `_now`
+/ `_log` through its OWN module globals, so patching `plugin._post_json`
+etc. is enough — no real HTTP, no real sleeping, no real clock. The fake
+clock advances only with the stub's sleeps, so hold durations in the
+#46 signal lines are exact.
+
+#46 slice 3 adds the interrupt tests: with a stubbed Hermes fence class
+(a fake `hermes_cli.middleware` in sys.modules) the parked call raises
+the fence wrapping InterruptedError and NEVER calls next_call; without it
+the plugin degrades to today's release semantics (admit, one honest log
+line).
 """
 import importlib
 import os
+import sys
+import types
 import unittest
 
 PORT = "18899"  # the stub daemon's loopback port (never bound)
@@ -22,10 +32,13 @@ def _load_plugin():
 
 
 class StubDaemon:
-    """Scripted idlefill daemon loopback: gate states + traffic counters."""
+    """Scripted idlefill daemon loopback: gate states + traffic counters.
+    `sleep` advances the shared fake clock by the slept seconds, so the
+    plugin's hold-signal "Ns" is fully deterministic."""
 
-    def __init__(self, states):
+    def __init__(self, states, clock=None):
         self.states = list(states)
+        self.clock = clock
         self.state_polls = 0
         self.heartbeats = []
         self.sleeps = []
@@ -50,6 +63,8 @@ class StubDaemon:
 
     def sleep(self, seconds):
         self.sleeps.append(seconds)
+        if self.clock is not None:
+            self.clock[0] += seconds
 
     # --- next_call: single-use like the real middleware frame ---
 
@@ -72,17 +87,30 @@ class GatePluginTest(unittest.TestCase):
         self._real_log = self.plugin._log
         self.lines = []
         self.plugin._log = self._record_log
+        # Fake clock: frozen unless a stub sleep advances it, so the
+        # hold-signal "Ns" values are exact and clock-independent.
+        self.clock = [0.0]
+        self.plugin._now = lambda: self.clock[0]
 
     def _record_log(self, line):
         self.lines.append(line)
 
-    def _fake_now(self, values):
-        vals = list(values)
+    def _install_fake_fence(self):
+        """Fake `hermes_cli.middleware` carrying the frame fence class, so
+        the plugin's lazy interrupt import resolves without real Hermes."""
 
-        def now():
-            return vals.pop(0) if vals else 0.0
+        class _DownstreamExecutionError(Exception):
+            def __init__(self, original):
+                super().__init__(str(original))
+                self.original = original
 
-        self.plugin._now = now
+        pkg = types.ModuleType("hermes_cli")
+        mod = types.ModuleType("hermes_cli.middleware")
+        mod._DownstreamExecutionError = _DownstreamExecutionError
+        pkg.middleware = mod
+        sys.modules["hermes_cli"] = pkg
+        sys.modules["hermes_cli.middleware"] = mod
+        return _DownstreamExecutionError
 
     def tearDown(self):
         os.environ.pop("IDLEFILL_GATE_PORT", None)
@@ -92,9 +120,11 @@ class GatePluginTest(unittest.TestCase):
         self.plugin._now = self._real_now
         self.plugin._log = self._real_log
         self.plugin._last_heartbeat.clear()
+        sys.modules.pop("hermes_cli.middleware", None)
+        sys.modules.pop("hermes_cli", None)
 
     def _run(self, states, session_id="20261009_test_gate", base_url="http://127.0.0.1:8800/v1"):
-        stub = StubDaemon(states)
+        stub = StubDaemon(states, self.clock)
         self.plugin._post_json = stub.post_json
         self.plugin._get_json = stub.get_json
         self.plugin._sleep = stub.sleep
@@ -141,30 +171,43 @@ class GatePluginTest(unittest.TestCase):
         self.assertEqual(stub.next_call_polls, 2)
         self.assertEqual(len(stub.sleeps), 1)
 
-    # --- issue #46 slice 2: the in-session hold signal ---
+    # --- issue #46 slice 2 + 3: the LIVE in-session hold signal ---
 
-    def test_queued_hold_emits_one_signal_line(self):
-        self._fake_now([1000.0, 2000.0, 2031.0])
-        stub, result = self._run(
-            [{"state": "queued"}, {"state": "queued"}, {"state": "armed"}],
-            base_url="http://127.0.0.1:11435/s/abc123",
-        )
+    def test_queued_hold_signals_on_detect_then_refresh(self):
+        # Cumulative stub sleeps: 0.4, 0.6, 0.9, 1.35, then 2.0s steps —
+        # the first 15s refresh fires at ~15.25s of fake-clock hold.
+        states = [{"state": "queued"}] * 11 + [{"state": "armed"}]
+        stub, result = self._run(states, base_url="http://127.0.0.1:11435/s/abc123")
         self.assertEqual(result, "llm-response")
         self.assertEqual(stub.next_calls, 1)
-        # Exactly ONE exception-only line for the whole hold episode
-        # (two queued reports, one line): the reason and the measured
-        # hold length (31s on the fake clock).
-        self.assertEqual(self.lines, ["held by idlefill gate (queued, 31s)"])
-        # The token never appears in the signal line.
+        # Exception-only, exception-fast: the FIRST line lands the moment
+        # the hold is detected (0s measured — never a fake zero, it is the
+        # actual hold length at detection), then ONE refresh line ages it.
+        self.assertEqual(
+            self.lines,
+            ["held by idlefill gate (queued, 0s)", "held by idlefill gate (queued, 15s)"],
+        )
+        # The token never appears in any signal line.
         for line in self.lines:
             self.assertNotIn("abc123", line)
 
-    def test_paused_hold_emits_one_signal_line(self):
-        self._fake_now([1000.0, 5000.0, 5040.0])
+    def test_paused_hold_signals_on_detect(self):
         stub, result = self._run([{"state": "paused"}, {"state": "armed"}])
         self.assertEqual(result, "llm-response")
         self.assertEqual(stub.next_calls, 1)
-        self.assertEqual(self.lines, ["held by idlefill gate (paused, 40s)"])
+        self.assertEqual(self.lines, ["held by idlefill gate (paused, 0s)"])
+
+    def test_state_word_change_re_signals_the_new_reason(self):
+        states = [{"state": "queued"}, {"state": "paused"}, {"state": "armed"}]
+        stub, result = self._run(states)
+        self.assertEqual(result, "llm-response")
+        self.assertEqual(stub.next_calls, 1)
+        # The reason flipped queued -> paused: a fresh line names the NEW
+        # word at once (no waiting for the 15s refresh).
+        self.assertEqual(
+            self.lines,
+            ["held by idlefill gate (queued, 0s)", "held by idlefill gate (paused, 0s)"],
+        )
 
     def test_armed_session_emits_no_signal_line(self):
         stub, result = self._run([{"state": "armed"}])
@@ -184,6 +227,80 @@ class GatePluginTest(unittest.TestCase):
         self.assertEqual(result, "llm-response")  # no exception escapes
         self.assertEqual(stub.next_calls, 1)
         self.assertEqual(self.lines, [])
+
+    # --- issue #46 slice 3: the operator turn interrupt ---
+
+    def test_interrupt_stops_the_parked_turn_never_calls_provider(self):
+        fence = self._install_fake_fence()
+        stub = StubDaemon([{"state": "paused", "interrupt": True}], self.clock)
+        self.plugin._post_json = stub.post_json
+        self.plugin._get_json = stub.get_json
+        self.plugin._sleep = stub.sleep
+        raised = None
+        try:
+            self.plugin.llm_execution_gate(
+                {"request": True}, stub.next_call,
+                session_id="20261009_test_gate", base_url="http://127.0.0.1:8800/v1",
+            )
+        except BaseException as exc:  # noqa: BLE001 - the observation IS the raise
+            raised = exc
+        # The plugin raises the frame's OWN fence wrapping the stop type:
+        # the frame re-raises the original, the turn loop finalizes
+        # cleanly, the provider call NEVER runs (spike S6/S7).
+        self.assertIsInstance(raised, fence)
+        self.assertIsInstance(getattr(raised, "original", None), InterruptedError)
+        self.assertEqual(stub.next_calls, 0)
+        self.assertEqual(stub.sleeps, [])  # interrupted at once, no hold-on
+        self.assertEqual(len(self.lines), 2)
+        self.assertEqual(self.lines[0], "held by idlefill gate (paused, 0s)")
+        self.assertIn("interrupt requested: parked turn stopped", self.lines[1])
+
+    def test_interrupt_mid_hold_stops_without_provider_call(self):
+        self._install_fake_fence()
+        stub = StubDaemon(
+            [{"state": "queued"}, {"state": "queued", "interrupt": True}], self.clock,
+        )
+        self.plugin._post_json = stub.post_json
+        self.plugin._get_json = stub.get_json
+        self.plugin._sleep = stub.sleep
+        raised = None
+        try:
+            self.plugin.llm_execution_gate(
+                {"request": True}, stub.next_call,
+                session_id="20261009_test_gate", base_url="http://127.0.0.1:8800/v1",
+            )
+        except BaseException as exc:  # noqa: BLE001 - the observation IS the raise
+            raised = exc
+        self.assertIsInstance(getattr(raised, "original", None), InterruptedError)
+        self.assertEqual(stub.next_calls, 0)
+        self.assertEqual(len(stub.sleeps), 1)  # held once, then the interrupt lands
+        self.assertEqual(self.lines[0], "held by idlefill gate (queued, 0s)")
+        self.assertIn("interrupt requested: parked turn stopped", self.lines[-1])
+
+    def test_interrupt_without_fence_degrades_to_admit(self):
+        # No `hermes_cli` importable (this test env): the plugin must NOT
+        # raise (a raw InterruptedError would be swallowed by the frame
+        # and the provider would run anyway — spike S2). It admits and
+        # says so honestly.
+        stub, result = self._run([{"state": "paused", "interrupt": True}])
+        self.assertEqual(result, "llm-response")
+        self.assertEqual(stub.next_calls, 1)
+        self.assertEqual(len(self.lines), 2)
+        self.assertIn("no interrupt path: call proceeds", self.lines[1])
+
+    def test_interrupt_never_fires_while_armed(self):
+        # An armed session is not parked: the flag is not consumed, the
+        # call proceeds exactly like before, no line, no raise.
+        stub, result = self._run([{"state": "armed", "interrupt": True}])
+        self.assertEqual(result, "llm-response")
+        self.assertEqual(stub.next_calls, 1)
+        self.assertEqual(self.lines, [])
+
+    def test_malformed_interrupt_key_is_not_true(self):
+        # `interrupt` must be exactly true: a string/1/0 never interrupts.
+        stub, result = self._run([{"state": "paused", "interrupt": "1"}])
+        self.assertEqual(result, "llm-response")
+        self.assertEqual(stub.next_calls, 1)
 
     def test_unreachable_never_raises_and_admits(self):
         down = ConnectionError("daemon down")

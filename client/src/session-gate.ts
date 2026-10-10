@@ -306,6 +306,16 @@ const RING_TTL_MS = 600_000;
  */
 const SESSION_ID_INDEX_MAX = 256;
 
+/**
+ * #46 slice 3: how long an operator turn interrupt stays live (ms). The
+ * plugin polls the parked state at ≤2s, so a call ALREADY parked consumes
+ * it in seconds; the extra window only covers the call about to start on a
+ * session whose current call is still in flight (the gate never preempts
+ * in-flight traffic). Past the window the flag lapses: interrupting is
+ * not a latch, and a stale interrupt must never stop a later turn.
+ */
+const INTERRUPT_TTL_MS = 30_000;
+
 /** #45: the `history` ADD-key shape published on the register heartbeat. */
 export interface SessionHistory {
   /** requests/min counts, 60s buckets, oldest→newest, always 10 entries. */
@@ -360,10 +370,17 @@ export interface SessionTranscript {
  * 1-based queue place — present only while the session actually sits in
  * the queue (never a fake zero, the #44 posture). The token never
  * appears in this shape: the body is state + position only.
+ *
+ * #46 slice 3: the `interrupt` ADD-key — `interrupt: true` rides ONLY
+ * while the operator's turn interrupt is live for the session (armed by
+ * `POST /sessions/<token>/interrupt`, consumed by the plugin's parked
+ * loop). Absent = never armed / already expired: a plugin that does not
+ * know the key sees the byte-for-byte pre-slice body.
  */
 export interface GateStateResponse {
   state: 'armed' | 'queued' | 'paused';
   position?: number;
+  interrupt?: true;
 }
 
 /** #45: compact request history for the register heartbeat — counts per
@@ -494,6 +511,18 @@ export class SessionGate {
    * ('armed'), never a fake hold.
    */
   private readonly sessionIdIndex = new Map<string, string>();
+
+  /**
+   * #46 slice 3: token → interrupt-expiry (epoch-ms). The loopback control
+   * route `POST /sessions/<token>/interrupt` arms it; the plugin's parked
+   * loop consumes it via the `interrupt` ADD-key on `GET /gate/state` and
+   * stops the parked turn cleanly (its raise path is Hermes' own fence —
+   * #46 spike S6). SHORT-LIVED by design (INTERRUPT_TTL_MS): an interrupt
+   * no parked call picks up inside the window simply lapses — a stale
+   * handle must never fire on a much later call. Keyed only for tokens
+   * this gate already tracks; pruned on read and per poll.
+   */
+  private readonly interrupts = new Map<string, number>();
 
   private readonly interactiveWindowMs: number;
   private readonly agingMs: number;
@@ -675,13 +704,67 @@ export class SessionGate {
     if (!s) return { state: 'armed' };
     if (s.override === 'pause') {
       const pos = this.queue.indexOf(tok) + 1;
-      return { state: 'paused', ...(pos > 0 ? { position: pos } : {}) };
+      return {
+        state: 'paused',
+        ...(pos > 0 ? { position: pos } : {}),
+        ...(this.interruptLive(tok) ? { interrupt: true } : {}),
+      };
     }
     if (s.holds.length > 0) {
       const pos = this.queue.indexOf(tok) + 1;
-      return { state: 'queued', ...(pos > 0 ? { position: pos } : {}) };
+      return {
+        state: 'queued',
+        ...(pos > 0 ? { position: pos } : {}),
+        ...(this.interruptLive(tok) ? { interrupt: true } : {}),
+      };
     }
+    this.interruptLive(tok); // read-through prune: an expired flag never lingers
     return { state: 'armed' };
+  }
+
+  /** #46 slice 3: is an operator interrupt live for this token? Reading
+   *  prunes the expired entry (no timer, no background sweep). */
+  private interruptLive(token: string): boolean {
+    const exp = this.interrupts.get(token);
+    if (exp === undefined) return false;
+    if (this.now() >= exp) {
+      this.interrupts.delete(token);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * #46 slice 3: the true-pause interrupt — arm the plugin-visible
+   * interrupt for a token AND release its parked wire holds (one call,
+   * two hold planes):
+   *   - the middleware plane: `GET /gate/state` starts carrying
+   *     `interrupt: true` while the session is held, so the plugin's
+   *     parked loop stops holding and raises the frame's own fence around
+   *     the runner's stop type (Hermes' `handle_api_interrupt` path —
+   *     the /stop equivalent, #46 spike S6);
+   *   - the wire plane: the same `releaseHold` answer as slice 1
+   *     (retryable 503 + Retry-After) for HTTP requests parked at the
+   *     router.
+   *
+   * Honest limits (same posture as `releaseHold`): it does NOT interrupt
+   * an IN-FLIGHT call — the gate never preempts running traffic; the
+   * flag lands on the session's NEXT held call (within the TTL window).
+   * It does NOT clear the operator pause override: the NEXT call parks
+   * again while paused (the interrupt stops the TURN, not the policy).
+   *
+   * Unknown token ⇒ `{ armed: false, released: 0 }` — never an error,
+   * never a phantom session (the control caller may hold a stale handle).
+   */
+  requestInterrupt(token: string): { armed: boolean; released: number } {
+    const s = this.sessions.get(token);
+    if (!s || this.released) return { armed: false, released: 0 };
+    this.interrupts.set(token, this.now() + INTERRUPT_TTL_MS);
+    const released = this.releaseHold(token);
+    this.log(
+      `session ${token} interrupt armed by operator (live ${INTERRUPT_TTL_MS / 1000}s for the held call; ${released} parked request(s) answered 503 + Retry-After)`,
+    );
+    return { armed: true, released };
   }
 
   // ------------------------------------------------------------------
