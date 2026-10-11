@@ -15,6 +15,6 @@
     "timeout_seconds": 30
   },
   "scripts": {
-    "test": "node --test noop.test.mjs"
+    "test": "node --test *.test.mjs"
   }
 }
