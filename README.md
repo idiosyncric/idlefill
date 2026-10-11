@@ -442,9 +442,13 @@ cutover; this section replaces their two former sections.
   Quit. The retired `com.sam.idlefill.menubar` label is gone from this
   machine (booted out at the cutover, plist removed, in the same step as
   the install — never a zero-tray window, never two trays).
-- **Update:** there is no update plane — an update is a rebuild from the
-  checkout (`./update.sh`; see the Releases & CI section below for the
-  build-identity rules).
+- **Update:** two paths (#75, `docs/architecture/shell-updater.md`): the
+  settings window's **Update** section — **Check for updates…** is the
+  only trigger — pulls the signed updater pair (`latest.json` + the
+  signed `Idlefill.app.tar.gz`) from the Forgejo release feed, and
+  `./update.sh` stays the manual build-from-checkout path (see Updating
+  below for the build-identity rules). The daemon and the arbiter carry
+  no updater — they run from their checkouts.
 - **The bundled views** (settings + glance) are React in `tauri/ui/`;
   `tauri/settings-ui/` is the committed build output (the frontendDist —
   `bash tauri/build.sh` needs no npm step, the build-from-checkout rule).
@@ -452,14 +456,19 @@ cutover; this section replaces their two former sections.
 
 ## Updating (build from a checkout)
 
-There is no update plane. The Sparkle feed, the appcast, the ed25519
-signing, the branch (edge) channel, and every self-update row and check
-retired with the Swift shells at the #69 cutover (Q-b LOCKED,
-2026-10-06). The app is built from a checkout on every machine that runs
+The Swift-era update plane — the Sparkle feed, the appcast, the ed25519
+signing, the branch (edge) channel, and every self-update row and check —
+retired with the Swift shells at the #69 cutover (2026-10-06). The Tauri
+shell then earned its OWN signed updater channel (#75, LOCKED,
+`docs/architecture/shell-updater.md`): `tauri-plugin-updater` reading the
+existing Forgejo release endpoint (two anonymous GETs — `latest.json`,
+then the signed bundle, both from the `latest` pseudo-tag), the settings
+Update section as the only trigger. The daemon and the arbiter carry
+none. The app is still built from a checkout on every machine that runs
 it; the Rust toolchain (cargo + the tauri CLI) and the Node toolchain are
 required on that machine — both present on this one.
 
-An update is `./update.sh` — one command, fail-closed at every step:
+The manual path is `./update.sh` — one command, fail-closed at every step:
 
 1. refuse a checkout with uncommitted tracked changes;
 2. fast-forward `main` (`--no-pull` skips the pull and rebuilds the
@@ -512,7 +521,11 @@ app zips):
 - **`release.yml`** — on a `v<N>` tag on `main` (or manual re-run): the
   same full suite runs **first, as a hard gate** — any failing step stops
   the job and nothing is published. Only a fully green gate reaches the
-  publish step: the tag's release NOTES (no artifacts — Q-b).
+  publish step: the tag's release NOTES. The shell's signed updater pair
+  (#75) rides the SAME release when the operator publishes it with
+  `bash scripts/release.sh` — that path builds the shell with updater
+  artifacts on, attaches `latest.json` + `Idlefill.app.tar.gz` (+`.sig`),
+  and verifies the live feed before calling it done.
 
 **Why tag-triggered, not merge-triggered:** the arbiter, daemon, and MCP
 server run from each machine's local checkout, and the shell is built
@@ -526,9 +539,10 @@ it publishes the notes that say how to get that build.
 Releases are **numbered** — release #1, #2, #3, … — not semver. The release
 number is the version: the root `package.json` holds the current release
 number, the tag is `v<number>`, and the Forgejo release is named
-`Release #<number>` (notes only since the #69 cutover — the pre-numbering
-releases `v0.0.1`/`v0.0.2` and the artifact releases before the cutover
-are the historical record).
+`Release #<number>` (notes from the tag via release.yml; the shell's
+signed updater pair rides the same release via `scripts/release.sh` —
+the pre-numbering releases `v0.0.1`/`v0.0.2` and the Swift-era artifact
+releases before the cutover are the historical record).
 
 The root `package.json` is the single version source for the daemon: its
 registration carries `version` + `protocol` (the version handshake),
@@ -818,17 +832,18 @@ records-to-show — a dock, not a tab: it stays reachable from every view).
   url + activity path is a 400 shown in the form). All settings editors are
   token-gated: with no gate token the write is refused and the header
   points at the token field.
-- **queue detail page** — a worker row with queued jobs gets a **view**
-  link into `/[project]/[worker]/queue` (served by the arbiter as the SAME
-  single-file dashboard; the inline script switches views on the path):
-  the worker's published **queue preview** — the first rows of its queue
-  file in priority order (job, company, score, retries used) — plus model,
-  per-job estimate, full depth vs. rows shown, online state, and what is
-  running now. The preview is client-published: the heartbeat carries the
-  first 100 rows (sanitized at registration: bounded rows/fields), and the
-  arbiter displays it verbatim — it never reads queue files. A worker
-  running an older client that doesn't publish a preview degrades to the
-  depth number.
+- **queue detail (deep link)** — a worker row with queued jobs gets a
+  **view** link into `/[project]/[worker]/queue`; the arbiter resolves
+  every such deep link to the dashboard SPA shell (the built React
+  bundle — the legacy single-file page and its inline view-switch
+  retired at the cutover). The queue VIEW is a tracked follow-up (not
+  yet ported to React); its data already rides the API: the worker's
+  published **queue preview** — the first rows of its queue file in
+  priority order (job, company, score, retries used). The preview is
+  client-published: the heartbeat carries the first 100 rows (sanitized
+  at registration: bounded rows/fields), and the arbiter displays it
+  verbatim — it never reads queue files. A worker running an older
+  client that doesn't publish a preview degrades to the depth number.
 
 Workers are **self-reported by the clients** (the arbiter does not infer
 allocations): each client daemon re-registers on every poll tick (~20s) with
