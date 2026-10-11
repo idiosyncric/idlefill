@@ -106,7 +106,7 @@ jobs:
           esac
           if [ "$V" -lt 1 ]; then echo "release number must be >= 1 (got $V)"; exit 1; fi
           echo "==> publishing Release #$V notes (tag $T)"
-          BODY="Release #$V (tag $T). The idlefill Tauri shell has no release artifacts (Q-b, #69): build it from a checkout — './update.sh' pulls, rebuilds and reinstalls on this machine; 'bash tauri/build.sh' builds only (marker: the commit's short sha); 'idlefill-app --version' prints the build marker the running app was cut from. The arbiter and the daemon run from each machine's own checkout; their registration carries this release number."
+          BODY="Release #$V (tag $T). The Tauri shell has a signed updater channel (#75): the settings window's Update section (Check for updates…) pulls latest.json + the signed Idlefill.app.tar.gz from this repo's release feed — the pair attaches when the operator publishes the release with scripts/release.sh. Manual path: './update.sh' pulls, rebuilds and reinstalls on this machine; 'bash tauri/build.sh' builds only (marker: the commit's short sha); 'idlefill-app --version' prints the build marker the running app was cut from. The arbiter and the daemon run from each machine's own checkout; their registration carries this release number."
           PAYLOAD="$(python3 -c 'import json,sys; print(json.dumps({"tag_name":"v"+sys.argv[1],"target_branch":"main","name":"Release #"+sys.argv[1],"body":sys.argv[2]}))' "$V" "$BODY")"
           B="Bea"; B="${B}rer"
           RESP="$(curl -sS --max-time 60 -X POST -H "$B: $FORGEJO_TOKEN" \

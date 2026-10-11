@@ -41,6 +41,20 @@ jobs:
       - name: build (all workspaces)
         run: npm run build
 
+      # The committed served bundles (dashboard/dist, tauri/settings-ui) must
+      # byte-match a fresh build of HEAD — the build step just rewrote them,
+      # so any drift shows as an unclean path. A failure means the source
+      # changed without regenerating+committing the bundle it ships.
+      - name: "bundle drift gate (dashboard/dist + tauri/settings-ui)"
+        run: |
+          DIRTY="$(git status --porcelain -- dashboard/dist tauri/settings-ui)"
+          if [ -n "$DIRTY" ]; then
+            echo "error: committed bundles drift from HEAD's sources:"
+            printf '%s\n' "$DIRTY"
+            echo "fix: npm run build, then commit dashboard/dist + tauri/settings-ui with the source change."
+            exit 1
+          fi
+
       - name: mcp server syntax
         run: node --check adapters/career-ops/idlefill-mcp.mjs
 
