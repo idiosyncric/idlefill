@@ -55,6 +55,7 @@ export interface LoadReading {
   gpu_util_percent?: number;
   gpu_mem_used_bytes?: number;
   gpu_mem_total_bytes?: number;
+  gpu_power_watts?: number;
   tokens_per_second?: number;
   in_flight?: number;
   /** oMLX `/api/status` `waiting_requests` — the scheduler queue (D8: the first queue depth in the fleet). */
@@ -97,6 +98,8 @@ export interface LoadSignalView {
   gpu_util_percent?: number;
   gpu_mem_used_bytes?: number;
   gpu_mem_total_bytes?: number;
+  /** llama-swap `/metrics` power gauge (watts), SUMMED across cards on a multi-GPU host. Absent = the read carried no power gauge. ADD key. */
+  gpu_power_watts?: number;
   tokens_per_second?: number;
   in_flight?: number;
   /**
@@ -154,29 +157,37 @@ export function parsePrometheusGauges(text: string): Map<string, number[]> {
 }
 
 /**
- * The llama-swap `/metrics` GPU gauges (the three the design doc D5
- * names). Metric names pinned against the live capture (probe 2026-10-09,
+ * The llama-swap `/metrics` GPU gauges (the four the load axis names).
+ * Metric names pinned against the live capture (probe 2026-10-09,
  * inventory doc): `llamaswap_gpu_util_percent`,
- * `llamaswap_gpu_memory_used_bytes`, `llamaswap_gpu_memory_total_bytes`.
- * Returns null when NONE of the three gauges is present — a 200 body
- * that carries no recognized gauge (an engine rebuild that renamed the
- * metrics) is a failed read, not a zero-filled one.
+ * `llamaswap_gpu_memory_used_bytes`, `llamaswap_gpu_memory_total_bytes`,
+ * `llamaswap_gpu_power_draw_watts` (the power gauge the upstream exposes
+ * and #52 left on the table — the Fleet power tile rides it). Power is
+ * SUMMED across the per-card series (a multi-GPU host reports one series
+ * per card; the row-level number is the whole host's draw). Returns null
+ * when NONE of the four gauges is present — a 200 body that carries no
+ * recognized gauge (an engine rebuild that renamed the metrics) is a
+ * failed read, not a zero-filled one.
  */
 export function parseLlamaSwapMetrics(text: string): {
   gpu_util_percent?: number;
   gpu_mem_used_bytes?: number;
   gpu_mem_total_bytes?: number;
+  gpu_power_watts?: number;
 } | null {
   const g = parsePrometheusGauges(text);
   const first = (name: string): number | undefined => g.get(name)?.[0];
   const util = first('llamaswap_gpu_util_percent');
   const used = first('llamaswap_gpu_memory_used_bytes');
   const total = first('llamaswap_gpu_memory_total_bytes');
-  if (util === undefined && used === undefined && total === undefined) return null;
+  const powerSeries = g.get('llamaswap_gpu_power_draw_watts') ?? [];
+  const power = powerSeries.length > 0 ? powerSeries.reduce((a, b) => a + b, 0) : undefined;
+  if (util === undefined && used === undefined && total === undefined && power === undefined) return null;
   return {
     ...(util !== undefined ? { gpu_util_percent: util } : {}),
     ...(used !== undefined ? { gpu_mem_used_bytes: used } : {}),
     ...(total !== undefined ? { gpu_mem_total_bytes: total } : {}),
+    ...(power !== undefined ? { gpu_power_watts: power } : {}),
   };
 }
 

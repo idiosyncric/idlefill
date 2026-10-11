@@ -12,6 +12,7 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   apiToken,
+  getRawLines,
   unthrottleJob,
   type CycleStatusRow,
   type HermesJobRow,
@@ -20,6 +21,7 @@ import {
   type ThrottledJob,
 } from "@/lib/api";
 import { ago, cycleTone, durFmt, fmt, liveWord, minSec } from "@/lib/format";
+import { fleetLoadTiles, tokensTodayTile, type StatTile } from "@/lib/fleet-stats";
 import { HERMES_JOBS_LABEL, collectHermesJobGroups, type HermesJobGroup } from "@/lib/hermes-jobs";
 
 const TONE: Record<string, string> = {
@@ -32,11 +34,14 @@ const TONE: Record<string, string> = {
 
 // ---------------------------------------------------------------------------
 // Overview — the system glance. The header carries the one-word state;
-// this view adds the context: the idle detail, the dev-cycle strip (the
-// worker-published rows, rendered verbatim), the throttled jobs (the
-// anti-thrash backstop, each with its operator recovery), the recent
-// events, and the recent leases. Cycles + throttled are exception-only:
-// the card stands in only while it has rows.
+// this view adds the context: the fleet stat tiles (the sparkDash
+// concept — Fleet decode / Fleet power / Memory in use / Tokens today,
+// computed over idlefill's own load axis + metrics store), the idle
+// detail, the dev-cycle strip (the worker-published rows, rendered
+// verbatim), the throttled jobs (the anti-thrash backstop, each with its
+// operator recovery), the recent events, and the recent leases. Cycles +
+// throttled are exception-only: the card stands in only while it has
+// rows.
 // ---------------------------------------------------------------------------
 
 export function Overview({ st }: { st: StateSnapshot | null }) {
@@ -47,6 +52,7 @@ export function Overview({ st }: { st: StateSnapshot | null }) {
 
   return (
     <section className="flex flex-col gap-3">
+      <FleetStats st={st} />
       <SystemCard st={st} />
       {cycleGroups.length === 0 && throttled.length === 0 && jobGroups.length === 0 ? (
         <Card className="py-4 shadow-none">
@@ -70,6 +76,12 @@ export function Overview({ st }: { st: StateSnapshot | null }) {
 function OverviewSkeleton() {
   return (
     <section className="flex flex-col gap-3">
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <Skeleton className="h-20 rounded-lg" />
+        <Skeleton className="h-20 rounded-lg" />
+        <Skeleton className="h-20 rounded-lg" />
+        <Skeleton className="h-20 rounded-lg" />
+      </div>
       <Skeleton className="h-24 rounded-lg" />
       <div className="grid gap-3 lg:grid-cols-2">
         <Skeleton className="h-32 rounded-lg" />
@@ -77,6 +89,76 @@ function OverviewSkeleton() {
       </div>
       <Skeleton className="h-40 rounded-lg" />
     </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// FLEET STAT TILES — the sparkDash Overview concept (fleet-wide headline
+// numbers above the fold): Fleet decode, Fleet power, Memory in use,
+// Tokens today. The three load tiles compute from the 5s state poll
+// (fresh load readings only — the same metrics_load_stale_s window that
+// gates the LOAD axis, stale is unknown and never counted). The token
+// tile reads the metrics store (bucket=raw, so the in-progress day
+// rides) on its OWN 60s timer — the store's own cadence, not the state
+// poll. Absent = "—" with the reason named in the sub line: never a
+// fake zero, never a silent average over partial coverage.
+// ---------------------------------------------------------------------------
+
+const TOKEN_TILE_REFRESH_MS = 60_000;
+
+function FleetStats({ st }: { st: StateSnapshot }) {
+  const loadTiles = fleetLoadTiles(st);
+  const [tokenTile, setTokenTile] = React.useState<StatTile | null>(null);
+
+  // The active-lease token counters ride the state poll; the fetch timer
+  // reads them through a ref so the poll never re-arms the interval.
+  const activeRef = React.useRef(st.active_leases);
+  activeRef.current = st.active_leases;
+
+  React.useEffect(() => {
+    let dead = false;
+    const refresh = async () => {
+      const now = Date.now();
+      const midnight = new Date(now);
+      midnight.setHours(0, 0, 0, 0);
+      try {
+        const { engine, lease } = await getRawLines(midnight.getTime(), now);
+        if (!dead) setTokenTile(tokensTodayTile(engine, lease, activeRef.current ?? [], midnight.getTime()));
+      } catch {
+        /* store unreachable / 501: keep the last good tile (drop-don't-wipe, as Usage does) */
+      }
+    };
+    void refresh();
+    const id = setInterval(() => void refresh(), TOKEN_TILE_REFRESH_MS);
+    return () => {
+      dead = true;
+      clearInterval(id);
+    };
+  }, []);
+
+  const tiles: { label: string; title: string; tile: StatTile }[] = [
+    { label: "Fleet decode", title: "sum of the engine-reported generation rates across the fleet's FRESH load readings", tile: loadTiles[0] },
+    { label: "Fleet power", title: "sum of the engine-reported GPU power draw across the fleet's FRESH load readings", tile: loadTiles[1] },
+    { label: "Memory in use", title: "GPU memory used across the fleet's FRESH load readings, against the reported total", tile: loadTiles[2] },
+    {
+      label: "Tokens today",
+      title: "output tokens since local midnight — engine-reported counters where the kind publishes them, lease-reported otherwise (incl. running leases)",
+      tile: tokenTile ?? { value: "…", sub: "reading the metrics store…" },
+    },
+  ];
+
+  return (
+    <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+      {tiles.map(({ label, title, tile }) => (
+        <Card key={label} className="py-0 shadow-none">
+          <CardContent className="flex flex-col gap-0.5 px-4 py-2.5" title={title}>
+            <span className="text-[11px] font-semibold uppercase tracking-wide text-dim">{label}</span>
+            <span className="text-[16px] font-semibold">{tile.value}</span>
+            <span className="text-[11px] text-dim">{tile.sub}</span>
+          </CardContent>
+        </Card>
+      ))}
+    </div>
   );
 }
 

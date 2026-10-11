@@ -78,3 +78,18 @@ test("partial read → only the present keys, no fake zeros", () => {
   assert.ok(r);
   assert.deepEqual(r.parts, ["Mistral-7B"], "no gpu / no tps → only the model name");
 });
+
+// The power key (Fleet power plumbing): present → its part rides after gpu.
+test("gpu_power_watts present → the W part rides; absent → nothing", () => {
+  const sig = baseSig({
+    load_source: "llamaswap-metrics",
+    load_age_s: 3,
+    gpu_util_percent: 40,
+    gpu_power_watts: 448.69,
+  });
+  const r = loadRead(sig, LOAD_FRESHNESS_DEFAULT_S);
+  assert.ok(r);
+  assert.deepEqual(r.parts, ["gpu 40%", "449 W"], "the watts part sits after the gpu part");
+  const noPower = baseSig({ load_source: "llamaswap-metrics", load_age_s: 3, gpu_util_percent: 40 });
+  assert.deepEqual(loadRead(noPower, LOAD_FRESHNESS_DEFAULT_S)?.parts, ["gpu 40%"], "absent power key → no part, never a zero");
+});

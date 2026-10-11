@@ -977,6 +977,8 @@ export interface IdleSignal {
   gpu_mem_used_bytes?: number;
   /** llama-swap `/metrics` GPU memory total (bytes). ADD key. */
   gpu_mem_total_bytes?: number;
+  /** llama-swap `/metrics` GPU power draw (watts), SUMMED across the per-card series on a multi-GPU host. Absent = the read carried no power gauge. ADD key. */
+  gpu_power_watts?: number;
   /** The newest feed entry's engine-reported rate (llama-swap feed `tokens` block, #52 slice 1). Display and sample only, never a veto input. Absent = no reading. ADD key. */
   tokens_per_second?: number;
   /** In-flight generation count. strata: one slot (0 or 1); oMLX: `active_requests` — the aggregate in-flight across loaded engines (the D8 amendment, slice 5); llama-swap: none (HTTP has no in-flight count — WS-only upstream). Absent when the kind's engine exposes nothing on the read. ADD key. */

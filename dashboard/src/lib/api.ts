@@ -27,6 +27,7 @@ export type ServerSignal = {
   gpu_util_percent?: number;
   gpu_mem_used_bytes?: number;
   gpu_mem_total_bytes?: number;
+  gpu_power_watts?: number;
   tokens_per_second?: number;
   in_flight?: number;
   model_loaded?: string;
@@ -512,6 +513,43 @@ export function getEngineMetrics(serverId: string, from: number, to: number): Pr
     const body = await json<{ series: MetricsSeries }>(await fetch(url, { cache: "no-store" }));
     return body.series.find((s) => s.key === serverId)?.points ?? [];
   })();
+}
+
+// Raw-window lines (bucket=raw — the current in-progress day rides, unlike
+// the hour buckets which only hold rolled-up hours). The fleet stat tiles
+// read these for a live "today" total. Only the members the tiles use are
+// typed; the store line carries more (ADD-key discipline: everything
+// optional here too).
+export type RawEngineLine = {
+  ts: number;
+  kind: "engine";
+  server_id: string;
+  tokens_out_delta?: number | null;
+  tokens_in_delta?: number | null;
+};
+
+export type RawLeaseLine = {
+  ts: number;
+  kind: "lease";
+  project: string;
+  status: string;
+  tokens_out: number;
+  tokens_in: number;
+};
+
+export async function getRawLines(from: number, to: number): Promise<{ engine: RawEngineLine[]; lease: RawLeaseLine[] }> {
+  const [eng, lease] = await Promise.all([
+    json<{ series: { key: string; points: Record<string, unknown>[] }[] }>(
+      await fetch(`/api/metrics?series=engine&bucket=raw&from=${from}&to=${to}`, { cache: "no-store" }),
+    ),
+    json<{ series: { key: string; points: Record<string, unknown>[] }[] }>(
+      await fetch(`/api/metrics?series=lease&bucket=raw&from=${from}&to=${to}`, { cache: "no-store" }),
+    ),
+  ]);
+  return {
+    engine: eng.series.flatMap((s) => s.points as unknown as RawEngineLine[]),
+    lease: lease.series.flatMap((s) => s.points as unknown as RawLeaseLine[]),
+  };
 }
 
 /**

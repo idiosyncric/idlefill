@@ -163,13 +163,21 @@ test('parsePrometheusGauges: malformed lines are skipped, never a fake zero', ()
   assert.deepEqual([...g.entries()], [['llamaswap_gpu_util_percent', [91]]]);
 });
 
-test('parseLlamaSwapMetrics: the D5 gauges from the captured sample', () => {
+test('parseLlamaSwapMetrics: the load-axis gauges from the captured sample', () => {
   const m = parseLlamaSwapMetrics(LLAMASWAP_METRICS_FIXTURE);
   assert.deepEqual(m, {
     gpu_util_percent: 91,
     gpu_mem_used_bytes: 3.2656850944e10,
     gpu_mem_total_bytes: 3.4190917632e10,
+    gpu_power_watts: 448.69,
   });
+});
+
+test('parseLlamaSwapMetrics: multi-card power gauges SUM (the host draw, not one card)', () => {
+  const m = parseLlamaSwapMetrics(
+    'llamaswap_gpu_util_percent{id="0"} 40\nllamaswap_gpu_power_draw_watts{id="0"} 120.5\nllamaswap_gpu_power_draw_watts{id="1"} 80.25\n',
+  );
+  assert.equal(m?.gpu_power_watts, 200.75);
 });
 
 test('parseLlamaSwapMetrics: a 200 body with no recognized gauge is a failed read (null, not zero)', () => {
@@ -337,6 +345,7 @@ test('llama-swap: /metrics gauges + the feed rate ride the reading (D5 keys)', a
   assert.equal(view.gpu_util_percent, 91);
   assert.equal(view.gpu_mem_used_bytes, 3.2656850944e10);
   assert.equal(view.gpu_mem_total_bytes, 3.4190917632e10);
+  assert.equal(view.gpu_power_watts, 448.69);
   assert.equal(view.tokens_per_second, 141.41882904412867);
   assert.equal('gpu_memory_util_percent' in view, false, 'only the D5 keys ride');
   assert.equal('in_flight' in view, false, 'no engine exposes one today → absent, not zero');

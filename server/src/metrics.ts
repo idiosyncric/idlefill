@@ -110,6 +110,8 @@ export interface EngineSampleLine {
   gpu_util_percent?: number;
   gpu_mem_used_bytes?: number;
   gpu_mem_total_bytes?: number;
+  /** llama-swap `/metrics` power gauge (watts, summed across cards) — same key name as the signal block. ADD key. */
+  gpu_power_watts?: number;
   tokens_per_second?: number | null;
   in_flight?: number;
   /**

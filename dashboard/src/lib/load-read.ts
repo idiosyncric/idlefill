@@ -36,6 +36,7 @@ export function loadRead(sig: ServerSignal | null | undefined, staleS: number): 
   if (typeof source !== "string" || source === "") return null; // absent → nothing
   const parts: string[] = [];
   if (typeof sig.gpu_util_percent === "number") parts.push(`gpu ${Math.round(sig.gpu_util_percent)}%`);
+  if (typeof sig.gpu_power_watts === "number") parts.push(`${Math.round(sig.gpu_power_watts)} W`);
   if (typeof sig.tokens_per_second === "number") parts.push(`${Math.round(sig.tokens_per_second)} tok/s`);
   if (typeof sig.model_loaded === "string" && sig.model_loaded !== "") parts.push(sig.model_loaded);
   const age = typeof sig.load_age_s === "number" ? sig.load_age_s : null;
