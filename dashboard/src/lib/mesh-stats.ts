@@ -14,7 +14,7 @@
 // zero — a peer that never answered is not a machine with an empty queue.
 import { ago, liveWord, type StateWord } from "./format.js";
 import type { StatTile } from "./fleet-stats.js";
-import type { MeshPeer, MeshPeerSnapshot } from "./api.js";
+import type { HostStats, MeshPeer, MeshPeerSnapshot } from "./api.js";
 
 /** Mirror of the arbiter's PEER_STALE_MS (server/src/mesh.ts): the pull window that gates a snapshot. */
 export const MESH_PEER_STALE_S = 90;
@@ -84,4 +84,37 @@ export function meshTiles(peers: MeshPeer[]): StatTile[] {
       : { value: "—", sub: fresh.length > 0 ? "no peer reports engines" : noSnapshot.sub };
 
   return [presence, queue, running, enginesTile];
+}
+
+/**
+ * The coarse host line (the htop-equivalent slice): load 1m/5m · mem
+ * used/total GiB · uptime — rendered ONLY from the keys the host actually
+ * reported (per-key absent, per the server's collector). null = the block
+ * names nothing renderable: the card shows NO line, never a fake zero and
+ * never a bare "—". A peer's numbers are what THAT machine's arbiter
+ * saw of its own host (host-wide even inside its container).
+ */
+export function hostLine(h: HostStats | null | undefined): string | null {
+  if (!h) return null;
+  const parts: string[] = [];
+  const load = (v: number): string => (v >= 10 ? String(Math.round(v)) : String(+v.toFixed(1)));
+  if (h.load1 !== undefined) {
+    parts.push(`load ${h.load1 >= 10 ? Math.round(h.load1) : +h.load1.toFixed(1)}${h.load5 !== undefined ? `/${load(h.load5)}` : ""}`);
+  }
+  const gib = (b: number): string => {
+    const gi = b / 2 ** 30;
+    return gi < 100 ? gi.toFixed(1) : String(Math.round(gi));
+  };
+  if (h.mem_total_bytes !== undefined) {
+    const used = h.mem_free_bytes !== undefined ? h.mem_total_bytes - h.mem_free_bytes : undefined;
+    if (used !== undefined && used >= 0) parts.push(`mem ${gib(used)}/${gib(h.mem_total_bytes)} GiB`);
+    else parts.push(`mem ${gib(h.mem_total_bytes)} GiB total`);
+  }
+  if (h.uptime_s !== undefined) {
+    const d = Math.floor(h.uptime_s / 86_400);
+    const hh = Math.floor((h.uptime_s % 86_400) / 3600);
+    const mm = Math.floor((h.uptime_s % 3600) / 60);
+    parts.push(d > 0 ? `up ${d}d ${hh}h` : hh > 0 ? `up ${hh}h ${mm}m` : `up ${mm}m`);
+  }
+  return parts.length > 0 ? parts.join(" · ") : null;
 }

@@ -9,7 +9,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { Sparkline } from "@/components/Sparkline";
 import { ago, durFmt, fmt, liveWord, type StateWord } from "@/lib/format";
-import { meshTiles, peerVerdict } from "@/lib/mesh-stats";
+import { hostLine, meshTiles, peerVerdict } from "@/lib/mesh-stats";
 import { buildRemoteRows, type RemoteRow } from "@/lib/remote-metrics";
 import { getRemoteMetrics, type MeshPeer, type StateSnapshot } from "@/lib/api";
 
@@ -33,8 +33,16 @@ const TONE: Record<string, string> = {
 // truth (labelled), exactly like a stale engine card. Coarse by
 // construction: presence, per-engine idle state, queue DEPTHS, and
 // session/lease counts — never job ids, titles, URLs, or payloads. The
-// local machine is the rest of this page, never a row here. Read-only:
-// the write plane is the paired control of #39, not this surface.
+// write plane is the paired control of #39, not this surface.
+//
+// "This Machine" (owner call, 2026-10-11) sits FIRST in the list — the
+// earlier rule ("the local machine is the rest of this page, never a row
+// here") is retired: the operator reading a machines list expects to see
+// the machine they are on. Its card is the local truth (this page's own
+// poll, not a pull): the same counts a peer would publish about us, plus
+// the coarse host block (load averages · memory · uptime — the
+// htop-equivalent ADD key off the arbiter's own node:os read; the GPU
+// truth already rides the engine load axis elsewhere).
 //
 // #79/#86: each card gains ONE read-only expand — the remote range read. It
 // pulls that peer's engine + session series THROUGH this arbiter (never to
@@ -99,14 +107,84 @@ export function Machines({ st }: { st: StateSnapshot | null }) {
             snapshots from other idlefill instances
           </CardContent>
         </Card>
-      ) : (
-        <div className="grid gap-2.5 [grid-template-columns:repeat(auto-fit,minmax(300px,1fr))]">
-          {peers.map((p) => (
-            <PeerCard key={p.url} p={p} now={st.now} />
-          ))}
-        </div>
-      )}
+      ) : null}
+      <div className="grid gap-2.5 [grid-template-columns:repeat(auto-fit,minmax(300px,1fr))]">
+        <LocalCard st={st} />
+        {peers.map((p) => (
+          <PeerCard key={p.url} p={p} now={st.now} />
+        ))}
+      </div>
     </section>
+  );
+}
+
+// This Machine — the local card (first in the list, owner call 2026-10-11):
+// the same coarse counts a peer would publish about this instance, read as
+// local truth from this page's own poll. The host line is the arbiter's
+// live node:os read (host-wide even inside a container); absent on an
+// arbiter that predates the key → no line, never a fake zero.
+function LocalCard({ st }: { st: StateSnapshot }) {
+  const running = (st.active_leases ?? []).length > 0;
+  const w: StateWord = liveWord(st.idle, running);
+  const queued = (st.clients ?? []).flatMap((c) => c.projects ?? []).reduce((a, p) => a + (p.queue_depth || 0), 0);
+  const h = st.host;
+  const hline = hostLine(h);
+  return (
+    <Card className="gap-0 py-0 shadow-none">
+      <CardHeader className="flex-row items-center gap-2 px-3 py-2 pb-0">
+        <span className="size-1.5 shrink-0 rounded-full bg-ok" title="this machine — the arbiter serving this page" />
+        <CardTitle className="min-w-0 truncate text-[13px] font-semibold" title="the arbiter serving this page — local truth, not a pull">
+          This Machine
+        </CardTitle>
+        <span className={`shrink-0 text-[11px] font-semibold ${TONE[w.tone]}`} title={w.note}>{w.label}</span>
+        <CardAction>
+          <span className="shrink-0 text-[11px] text-dim" title="this card rides the page's own 5 s state poll — not a peer pull">
+            local
+          </span>
+        </CardAction>
+      </CardHeader>
+
+      <CardContent className="flex flex-col gap-2 px-3 py-2">
+        <div className="flex items-center gap-2 text-[11px] text-dim">
+          <span title="instance id — the identity (tailnet IPs move, the id does not)">instance</span>{" "}
+          <code className="min-w-0 truncate text-foreground/80">{st.mesh?.instance_id ?? "no mesh identity"}</code>
+        </div>
+        <div className="flex flex-col gap-0.5">
+          {(st.servers ?? []).length === 0 && <div className="text-[11px] text-dim">no engines declared</div>}
+          {(st.servers ?? []).map((row) => {
+            const sw: StateWord = liveWord(
+              row.signal ? { idle: row.signal.idle, degraded: row.signal.degraded } : null,
+              running || row.models.some((m) => m.running),
+            );
+            return (
+              <div key={row.id} className="flex items-center gap-2 text-[12px]">
+                <span
+                  className={`size-1.5 shrink-0 rounded-full ${row.signal?.degraded ? "bg-err" : row.signal?.idle ? "bg-border" : "bg-accent"}`}
+                  title={`${row.name}: ${sw.label}`}
+                />
+                <span className="min-w-0 truncate">{row.name}</span>
+                <span className={`ml-auto whitespace-nowrap text-[11px] font-semibold ${TONE[sw.tone]}`} title={sw.note}>
+                  {sw.label}
+                  {row.signal?.idle && row.signal.idle_for_s != null ? ` · ${durFmt(row.signal.idle_for_s)}` : ""}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+        <div className="flex flex-col gap-1">
+          <div className="flex items-center gap-3 text-[11px] text-dim" title="the same coarse counts a peer would pull about this machine">
+            <span className="whitespace-nowrap" title="jobs waiting across this machine's clients"><span className="text-[13px] font-semibold text-foreground">{fmt(queued)}</span> queued</span>
+            <span className="whitespace-nowrap" title="interactive sessions registered here"><span className="text-[13px] font-semibold text-foreground">{fmt((st.sessions ?? []).length)}</span> sessions</span>
+            <span className="whitespace-nowrap" title="leases running here"><span className="text-[13px] font-semibold text-foreground">{fmt((st.active_leases ?? []).length)}</span> running</span>
+          </div>
+          {hline && (
+            <div className="text-[10px] text-dim" title={`coarse host counters — what the arbiter's process sees of its own host (host-wide even inside its container)${h?.cpus ? ` · ${h.cpus} cpus` : ""}${h?.load15 !== undefined ? ` · 15m load ${h.load15}` : ""} · GPU truth rides the engine load axis`}>
+              {hline}
+            </div>
+          )}
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 
@@ -178,14 +256,21 @@ function PeerCard({ p, now }: { p: MeshPeer; now: number }) {
                 );
               })}
             </div>
-            <div className="flex items-center gap-3 text-[11px] text-dim" title="queue depths, session and lease counts — coarse by construction (the peer publishes numbers, never rows)">
-              <span className="whitespace-nowrap" title="jobs waiting on that machine"><span className="text-[13px] font-semibold text-foreground">{fmt(snap.queue_depth)}</span> queued</span>
-              <span className="whitespace-nowrap" title="interactive sessions registered there"><span className="text-[13px] font-semibold text-foreground">{fmt(snap.sessions)}</span> sessions</span>
-              <span className="whitespace-nowrap" title="leases running there"><span className="text-[13px] font-semibold text-foreground">{fmt(snap.active_leases)}</span> running</span>
-              <span className="ml-auto whitespace-nowrap text-[10px]" title="when that machine took the snapshot (its own clock)">
-                snap {ago(now - snap.ts)}
-              </span>
-              {stale && <span className="text-[10px] text-warn" title="the last successful pull lapsed past the 90 s window — these values may be out of date">stale</span>}
+            <div className="flex flex-col gap-1">
+              <div className="flex items-center gap-3 text-[11px] text-dim" title="queue depths, session and lease counts — coarse by construction (the peer publishes numbers, never rows)">
+                <span className="whitespace-nowrap" title="jobs waiting on that machine"><span className="text-[13px] font-semibold text-foreground">{fmt(snap.queue_depth)}</span> queued</span>
+                <span className="whitespace-nowrap" title="interactive sessions registered there"><span className="text-[13px] font-semibold text-foreground">{fmt(snap.sessions)}</span> sessions</span>
+                <span className="whitespace-nowrap" title="leases running there"><span className="text-[13px] font-semibold text-foreground">{fmt(snap.active_leases)}</span> running</span>
+                <span className="ml-auto whitespace-nowrap text-[10px]" title="when that machine took the snapshot (its own clock)">
+                  snap {ago(now - snap.ts)}
+                </span>
+                {stale && <span className="text-[10px] text-warn" title="the last successful pull lapsed past the 90 s window — these values may be out of date">stale</span>}
+              </div>
+              {hostLine(snap.host) && (
+                <div className="text-[10px] text-dim" title="coarse host counters as THAT machine's arbiter reported them (load/memory/uptime — absent on a peer that predates the key)">
+                  {hostLine(snap.host)}
+                </div>
+              )}
             </div>
           </div>
         )}

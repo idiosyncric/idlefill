@@ -79,9 +79,13 @@ Three auth planes, locked:
 - The anonymous `GET /api/state` dashboard read is UNCHANGED. The mesh
   read plane is a NEW scoped endpoint (`/api/mesh`), not raw `/api/state`:
   it carries the coarse projection only — presence, per-engine idle
-  signal, queue DEPTHS, session counts, active lease counts. Never job
-  ids, titles, URLs, or payloads. That is #39's privacy-by-default
-  boundary, enforced by endpoint scope rather than by a filter.
+  signal, queue DEPTHS, session counts, active lease counts, and (ADD
+  key, owner ask 2026-10-11) coarse HOST counters: 1/5-minute load
+  averages, cpu count, memory totals, uptime. Aggregate counters only —
+  never per-process detail; the GPU truth rides the engine load axis,
+  not the snapshot. Never job ids, titles, URLs, or payloads. That is
+  #39's privacy-by-default boundary, enforced by endpoint scope rather
+  than by a filter.
 - Instance identity: each arbiter mints a stable `instance_id` (random
   hex, persisted in its state file at first boot) + a config `name`. The
   snapshot carries both. Peer registry entries key on URL; the arbiter

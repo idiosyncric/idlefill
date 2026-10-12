@@ -376,6 +376,22 @@ export type MeshPeerServer = {
   degraded: boolean;
 };
 
+// Coarse host counters (the htop-equivalent slice, owner ask 2026-10-11):
+// the arbiter's own machine facts from node:os — load averages, cpu count,
+// memory totals, uptime. ADD key everywhere: /api/state carries `host` for
+// This Machine; a peer's MeshSnapshot carries it only when that peer
+// publishes it (absent on an older build — no line, never a zero). The
+// GPU truth deliberately stays on the engine load axis.
+export type HostStats = {
+  load1?: number;
+  load5?: number;
+  load15?: number;
+  cpus?: number;
+  mem_total_bytes?: number;
+  mem_free_bytes?: number;
+  uptime_s?: number;
+};
+
 export type MeshPeerSnapshot = {
   instance_id: string;
   name: string;
@@ -385,6 +401,7 @@ export type MeshPeerSnapshot = {
   sessions: number;
   active_leases: number;
   version?: string;
+  host?: HostStats;
 };
 
 export type MeshPeer = {
@@ -430,6 +447,8 @@ export type StateSnapshot = {
   engine_groups?: EngineGroup[];
   throttled_jobs: ThrottledJob[];
   mesh?: { instance_id: string; peers: MeshPeer[] };
+  /** Coarse host counters for THIS machine (ADD key; absent on a pre-key arbiter). */
+  host?: HostStats;
   /** The operator-tuned color scheme (#68). Absent until set. */
   theme?: ThemeColors;
 };

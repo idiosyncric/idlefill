@@ -7,7 +7,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { freshPeers, meshTiles, peerVerdict } from "../src/lib/mesh-stats.js";
+import { freshPeers, hostLine, meshTiles, peerVerdict } from "../src/lib/mesh-stats.js";
 import type { MeshPeer } from "../src/lib/api.js";
 
 function peer(over: Record<string, unknown> = {}): MeshPeer {
@@ -97,4 +97,22 @@ test("peerVerdict aggregates the peer's own state", () => {
   assert.equal(v([{ idle: false, degraded: false }], 2).label, "Running Idle Tasks");
   assert.equal(v([{ idle: true, degraded: true }], 0).label, "Degraded");
   assert.equal(v([], 1).label, "Running Idle Tasks", "no engines: the lease count still carries the word");
+});
+
+// hostLine — the htop-equivalent line renders ONLY the keys reported:
+// partial blocks render partial lines, an empty/junk block renders NO line
+// (the card omits it — never a bare "—", never a fake zero).
+test("hostLine renders per-key and omits nothing-renders into a bare dash", () => {
+  assert.equal(hostLine(null), null);
+  assert.equal(hostLine({}), null);
+  assert.equal(
+    hostLine({ load1: 1.234, load5: 0.5, mem_total_bytes: 34_359_738_368, mem_free_bytes: 12_025_908_480, uptime_s: 275_000 }),
+    "load 1.2/0.5 · mem 20.8/32.0 GiB · up 3d 4h",
+  );
+  assert.equal(hostLine({ cpus: 8 }), null, "cpu count alone is not a line — it lives in the tooltip");
+  assert.equal(hostLine({ load1: 12.4 }), "load 12");
+  assert.equal(hostLine({ uptime_s: 50 * 60 }), "up 50m");
+  assert.equal(hostLine({ uptime_s: 4 * 3600 + 12 * 60 }), "up 4h 12m");
+  assert.equal(hostLine({ mem_total_bytes: 34_359_738_368 }), "mem 32.0 GiB total", "free absent → total only, never an assumed usage");
+  assert.equal(hostLine({ mem_total_bytes: 1000, mem_free_bytes: 9_999_999 }), "mem 0.0 GiB total", "a peer claiming free > total is not a fake negative usage");
 });

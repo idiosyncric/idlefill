@@ -19,6 +19,7 @@ import { WebSocketServer } from 'ws';
 import { utcDay, type Arbiter, WATCHED_SERVER_ID } from './arbiter.js';
 import { seriesKeyOf, type MetricsBucket, type MetricsSeries, type MetricsStore } from './metrics.js';
 import { buildMeshSnapshot, type MeshFederation } from './mesh.js';
+import { collectHostStats } from './host.js';
 import { verifyRequester, NonceReplayStore, EDGE_TS_SKEW_MS, type EdgeSignaturePayload } from './edges.js';
 import { isLoopbackAddress } from './catalog.js';
 import type { LoadSignalView } from './load.js';
@@ -1268,6 +1269,10 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       // Fleet membership label (#55 D5): ADD key — the multi-tenant seam,
       // machine identity only. Absent = unset; never a secret.
       arbiter.fleetId(),
+      // Coarse host counters (htop-equivalent slice): aggregate load/mem/
+      // uptime for THIS machine, read live from node:os. Aggregate only —
+      // the coarse-by-construction clause holds.
+      collectHostStats(),
     );
   });
 
@@ -1931,6 +1936,11 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       // arbiter labels it with. Absent on configs without the key = the view
       // falls back to its default. ADD key (add, never rename).
       metrics_load_stale_s: cfg.metrics_load_stale_s,
+      // Coarse host counters (htop-equivalent slice, owner ask 2026-10-11):
+      // this machine's load averages / cpu count / memory totals / uptime,
+      // read live from node:os per poll. ADD key; the dashboard's Machines
+      // "This Machine" card renders it, absent = no line (never a zero).
+      host: collectHostStats(),
       idle: {
         idle: sig.idle,
         idle_seconds: cfg.idle_seconds,

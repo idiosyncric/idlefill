@@ -436,8 +436,14 @@ test('fences: local /api/metrics keeps anonymous read + peer_token 401; /api/mes
   assert.equal(withPeer.statusCode, 401);
   const snap = await peer.inject({ method: 'GET', url: '/api/mesh', headers: bearer(PEER) });
   const s = snap.json() as Record<string, unknown>;
+  // The coarse-shape fence (ADD keys land here ONLY with a conscious
+  // amendment): `host` joined 2026-10-11 — the coarse host counters,
+  // aggregate values only.
   assert.deepEqual(
     Object.keys(s).sort(),
-    ['active_leases', 'fleet_id', 'instance_id', 'name', 'public_key', 'queue_depth', 'servers', 'sessions', 'ts'].sort(),
+    ['active_leases', 'fleet_id', 'host', 'instance_id', 'name', 'public_key', 'queue_depth', 'servers', 'sessions', 'ts'].sort(),
   );
+  const HOST_KEYS = new Set(['load1', 'load5', 'load15', 'cpus', 'mem_total_bytes', 'mem_free_bytes', 'uptime_s']);
+  const hostKeys = Object.keys((s.host ?? {}) as Record<string, unknown>);
+  assert.ok(hostKeys.every((k) => HOST_KEYS.has(k)), 'the host block stays aggregate counters — no per-process detail');
 });

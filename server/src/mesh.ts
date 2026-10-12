@@ -32,6 +32,7 @@ import { randomBytes } from 'node:crypto';
 import { FleetClient, enrollmentFileOf, type FleetClientConfig } from './fleet-client.js';
 import { Identity } from './identity.js';
 import type { MetricsBucket, MetricsSeries } from './metrics.js';
+import { sanitizeHostStats, type HostStats } from './host.js';
 import type { ServerConfig } from './types.js';
 import type { EdgeRecord } from './edges.js';
 
@@ -112,6 +113,15 @@ export interface MeshSnapshot {
   sessions: number;
   /** Active leases on this machine. */
   active_leases: number;
+  /**
+   * Coarse host counters (the htop-equivalent slice, owner ask 2026-10-11)
+   * — load averages, cpu count, memory totals, uptime. ADD key: absent on
+   * a snapshot from a peer that predates the key (the reader treats it as
+   * no host block; never a crash, never a fake reading). Aggregate
+   * counters only — the coarse-by-construction clause holds; the GPU truth
+   * rides the engine load axis, not here.
+   */
+  host?: HostStats;
 }
 
 /** The local view of one configured peer (what /api/state's mesh key carries). */
@@ -924,6 +934,8 @@ export function buildMeshSnapshot(
   publicKey?: string,
   /** Fleet membership label (#55 D5) — ADD key, absent = unset. */
   fleetId?: string,
+  /** Coarse host counters (host.ts) — ADD key, absent = not published. */
+  host?: HostStats,
 ): MeshSnapshot {
   const snap: MeshSnapshot = {
     instance_id: instanceId,
@@ -948,6 +960,10 @@ export function buildMeshSnapshot(
   // has one, ABSENT (unset) otherwise; old readers ignore it, a snapshot
   // without the field parses fine on this side.
   if (typeof fleetId === 'string' && fleetId.trim() !== '') snap.fleet_id = fleetId.trim().slice(0, MAX_NAME);
+  // Host counters: ADD key — present when the publisher collects them,
+  // ABSENT otherwise; a pre-key peer's snapshot parses byte-for-byte
+  // unchanged on this side.
+  if (host) snap.host = host;
   return snap;
 }
 
@@ -996,6 +1012,11 @@ export function sanitizeSnapshot(raw: unknown): MeshSnapshot | null {
   // capped like the rest. Absent on pre-slice-2 peers; the field stays
   // unset, never a crash.
   if (typeof r.fleet_id === 'string' && r.fleet_id.trim() !== '') out.fleet_id = r.fleet_id.trim().slice(0, MAX_NAME);
+  // Host counters — ADD key, untrusted input: sanitized per key (garbage
+  // drops the key; nothing credible drops the whole block, never a fake
+  // zero). Absent on pre-key peers.
+  const host = sanitizeHostStats(r.host);
+  if (host) out.host = host;
   return out;
 }
 
