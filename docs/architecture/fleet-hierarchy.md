@@ -203,8 +203,13 @@ local machine only.
 The fuller ask from the same review — **see container logs, execute
 commands, deploy containers**, all under the machine-settings gate — is a
 control/ops plane, not a read plane, and is deliberately NOT designed
-here: filed as **issue #87** for a future grilling (auth plane, exec
-safety vs mesh.md rule 3, log-streaming channel, deploy semantics).
+here: filed as **issue #87**; the grilling ran (2026-10-12) as
+`docs/architecture/container-ops.md` (PROPOSED). The D5 mechanism here
+(client-daemon heartbeat reporting) stands as written — the owner settled
+the vantage gap the same day: urza flips to a **native install** once the
+CLI wave (#88–#92) completes, so the fused daemon carries the Docker
+vantage on every machine; no container host-helper bridge is built for
+the gap (urza honestly shows nothing until the flip).
 
 ### D6 — System Resources: keep the existing split — PROPOSED
 
@@ -239,7 +244,8 @@ blocks a later fleet-settings plane.
    `ClientRecord` ADD key + machine node card. Client/arbiter
    back-compat (old client: key absent, card hidden).
 4. **S3b — container ops plane (logs, exec, deploy).** NOT in this wave —
-   grilling lives in issue #87.
+    grilled in `docs/architecture/container-ops.md` (C1..C4 slices,
+    PROPOSED); C1 may merge with S3 (it replaces S3's mechanism).
 5. **S4 — fleet settings plane.** BLOCKED on fleet-service D7 deploy;
    not in this wave.
 
@@ -254,5 +260,5 @@ blocks a later fleet-settings plane.
   remotely").
 - Work portability / shared-project concept — already deferred by
   mesh.md D4; the tree does not prejudge it.
-- Container ops plane (logs, exec, deploy) — filed as issue #87, not
-  designed in this doc.
+- Container ops plane (logs, exec, deploy) — issue #87, grilled in
+  `docs/architecture/container-ops.md`, not designed in this doc.
