@@ -52,9 +52,97 @@ Architecture below.
 
 ## Architecture
 
+The fleet is a **mesh**: one idlefill instance per machine; each machine's
+arbiter owns only its own machine's truth; peers federate by pulling
+coarse snapshots. A machine leaving the network takes its engine, queue,
+sessions, and arbiter with it (`docs/architecture/mesh.md`, locked).
+
+### The fleet hierarchy (`docs/architecture/fleet-hierarchy.md`)
+
 ```
-                        ┌────────────────────────────────────────────┐
-                        │ urza (Docker)                              │
+FLEET  (a mesh-aggregated VIEW composed at the dashboard — no fleet store;
+ │      the fleet service is identity-only: enrollment, roster, pairing)
+ │
+ ├── MACHINES            one arbiter + client daemon per machine;
+ │   │                   instance_id is the identity, tailnet IPs move
+ │   ├── this machine    ├── Agents       Hermes profiles with idlefill
+ │   │                   │                posture (adopted / external / unset);
+ │   │                   │                adopted profiles point at :8800
+ │   │                   ├── Engines      the machine's OWN inference engines
+ │   │                   │                (the only arbiter that may grant
+ │   │                   │                against them — ownership is exclusive)
+ │   │                   ├── Projects     this machine's queue truth
+ │   │                   ├── Containers   settings-gated rows (reporting now;
+ │   │                   │                logs/exec/deploy ops plane = issue #87)
+ │   │                   ├── SysRes       coarse HostStats (load/CPU/RAM/uptime;
+ │   │                   │                GPU rides the engine load axis)
+ │   │                   └── Settings     config.json + local overrides
+ │   └── mesh peers      read-only snapshot rows: engine REFERENCE rows
+ │                       (fail-closed for grants here), queue depths, session
+ │                       + lease counts, coarse host counters; edge roles
+ │                       (i_control / controls_me) from the pairing plane
+ │
+ ├── GLOBAL PROJECTS     every machine's projects, gathered (names ride the
+ │                       peer snapshot; per-machine truth stays per-machine)
+ ├── MODEL ALIASES       cross-engine model names with health-ordered winners
+ │                       and operator pins — the one genuinely fleet-wide kind
+ └── SETTINGS            per-machine today; a fleet tier is deferred behind
+                        the fleet service's control-plane seed
+```
+
+### How interactive agent traffic routes
+
+```
+ Hermes profile (adopted)                 model name = the ALIAS, e.g.
+ │   POST /v1/chat/completions            "Qwen3.8-Flash-Next" — the agent
+ ▼                                       never learns the engine/variant
+┌─ client daemon · loopback :8800 (aggregate endpoint; the legacy :11435
+│   proxy shares the SAME gate, and the slot cap with it) ──────────────┐
+│ 1. GATE  keyed by session id (X-Hermes-Session-Id / path token):      │
+│      operator override?  paused → park (body unconsumed)              │
+│                        · forced → admit                               │
+│      slot cap (max_active_agent_sessions) — FIFO by arrival           │
+│      gate state + model register/heartbeat → arbiter session row      │
+│ 2. RESOLVE  (the router NEVER computes — it applies arbiter-published  │
+│      state pulled from /api/state every 20 s):                        │
+│      session engine pin (#67)     → that engine; moves target, not    │
+│                                     queue order                       │
+│      else ALIAS winner            → arbiter's health-ordered chain,   │
+│        per 15 s tick: 1 pinned pair + row healthy this tick           │
+│                       2 first non-pinned healthy pair  (fallback:true)│
+│                       3 pinned pair, row NOT healthy  (honest fail)   │
+│                       4 first surviving pair                          │
+│      else catalog row for a literal model name                        │
+│ 3. SPLICE  body model := winner's engine_model (the fence: aliases    │
+│      are the stable contract; /v1/models advertises deduped aliases,  │
+│      never the answering variant)                                    │
+└────┬──────────────────────────────────────────────────────────────────┘
+     │ forward to the winner row's URL with that row's own credentials
+     ▼
+  ENGINE (anywhere on the mesh) — its owning arbiter watches it
+  (idle verdict + /v1/models probe = routing green) and is the ONLY
+  arbiter that grants leases against it
+```
+
+Detection-to-move latency: one arbiter tick (15 s) + one router poll
+(20 s) ≤ ~35 s before traffic leaves a newly-dead engine. Rules:
+`docs/architecture/aggregate-endpoint.md`, `model-aliases.md`,
+`engine-health-routing.md`, `session-gate/`.
+
+### How background work gets an engine (leases) — and the self-traffic trap
+
+```
+ client executor ── requestLease(project, job_id) ──▶ arbiter
+   admission, FAIL-CLOSED per engine, in order:
+   client row → engine row WITH a live detector (owning machine only)
+   → project not paused → job not throttled → per-server concurrency
+   → engine-group cap (same-host engines, max_concurrent) → daily budget
+   ── grant: lease{client, server, project, job} + exempt_ip (below)
+```
+
+```
+                         ┌────────────────────────────────────────────┐
+                         │ urza (Docker)                              │
                         │                                            │
   interactive users ──▶ │  llama-swap :8080 (OpenAI-compat /v1)      │
                         │   ├── activity feed /api/metrics/activity  │
