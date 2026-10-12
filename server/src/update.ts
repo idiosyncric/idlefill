@@ -39,6 +39,10 @@ const INTENTS_SCHEMA = 1;
 export const INTENTS_CAP = 20;
 export const UPDATE_INTENT_TTL_S = 300;
 
+/** The boot sweep's named placeholder — matchable, so the helper's late
+ *  report can replace it (the self-update restart race). */
+export const ABANDONED_DETAIL = 'the arbiter restarted while the helper was running it — outcome unknown';
+
 /** Default file: `update_intents.json` next to the state file. */
 export function intentsFileOf(stateFile: string): string {
   return join(dirname(stateFile) || '.', 'update_intents.json');
@@ -168,10 +172,15 @@ export class UpdateIntents {
     return it;
   }
 
-  /** running → done | failed (the helper's report). Null = not reportable. */
+  /** running → done | failed (the helper's report). Null = not reportable.
+   *  An intent the boot sweep marked abandoned ("outcome unknown") accepts
+   *  a LATE report too — a self-update restarts the arbiter the helper
+   *  reports to, so the honest named outcome replaces the unknown
+   *  placeholder when the helper comes back (live on urza 2026-10-12).
+   *  An abandoned intent never re-QUEUES — only the report lands. */
   finish(id: string, ok: boolean, detail: string | undefined, now: number): UpdateIntent | null {
     const it = this.intents.find((i) => i.id === id);
-    if (!it || it.state !== 'running') return null;
+    if (!it || (it.state !== 'running' && !UpdateIntents.isAbandoned(it))) return null;
     it.state = ok ? 'done' : 'failed';
     it.finished_at = now;
     if (typeof detail === 'string' && detail.trim() !== '') it.detail = detail.trim().slice(0, 500);
@@ -179,18 +188,27 @@ export class UpdateIntents {
     return it;
   }
 
+  /** The abandoned placeholder — a FAILED intent whose detail is exactly
+   *  the boot sweep's named marker (the helper has not reported yet). */
+  static isAbandoned(it: UpdateIntent): boolean {
+    return it.state === 'failed' && it.detail === ABANDONED_DETAIL;
+  }
+
   /**
    * Crash tolerance: a RUNNING intent whose arbiter restarted mid-deploy
    * is ambiguous truth. `resetRunning` marks them failed with the named
    * reason at boot (the helper's report never landed) — never silently
-   * back to queued (the deploy may well have happened).
+   * back to queued (the deploy may well have happened). A late helper
+   * report still lands on such an intent (finish accepts the placeholder):
+   * the arbiter's own restart is a normal step of a self-update, and the
+   * helper's named outcome is the truth the placeholder is waiting for.
    */
   markRunningAbandoned(now: number): UpdateIntent[] {
     const hit = this.intents.filter((i) => i.state === 'running');
     for (const it of hit) {
       it.state = 'failed';
       it.finished_at = now;
-      it.detail = 'the arbiter restarted while the helper was running it — outcome unknown';
+      it.detail = ABANDONED_DETAIL;
     }
     if (hit.length > 0) this.persist();
     return hit;

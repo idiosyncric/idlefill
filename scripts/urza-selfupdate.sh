@@ -92,7 +92,11 @@ docker run -d --name "$CONTAINER" --restart unless-stopped --network host \
 
 # --- healthcheck + rollback -------------------------------------------------
 echo "==> healthcheck $HEALTH_URL (up to ~25s)"
-HEALTH_JSON="$(mktemp)"
+# The .json suffix is load-bearing: the validator require()s the file, and
+# require() reads the LOADER off the extension — an extensionless mktemp is
+# evaluated as JavaScript and fails a perfectly healthy state body (live on
+# urza 2026-10-12: 200 answers, rollback anyway).
+HEALTH_JSON="$(mktemp --suffix=.json)"
 ok=0
 for _ in 1 2 3 4 5 6 7 8; do
   sleep 3

@@ -391,3 +391,19 @@ test('intent store: TTL flips queued to stale, cap holds, abandoned runs fail na
   const again = new UpdateIntents(intentsFileOf(join(f, '..', 'state.json')));
   assert.ok(again.list().length > 0);
 });
+
+test('late report on an abandoned intent lands (the self-update restart race) — never a re-queue, never an overwrite of a settled name', () => {
+  const f = join(mkTmp(), 'update_intents-late.json');
+  const s = new UpdateIntents(f);
+  const t0 = 10_000;
+  const it = s.add('m-a', t0)!;
+  s.claim(it.id, t0 + 1);
+  s.markRunningAbandoned(t0 + 2); // the arbiter restarted mid-deploy (its own swap)
+  assert.equal(s.list()[0]!.state, 'failed');
+  assert.match(s.list()[0]!.detail ?? '', /outcome unknown/);
+  assert.equal(s.claim(it.id, t0 + 3), null, 'an abandoned intent never re-queues — it can never execute');
+  const done = s.finish(it.id, true, 'image swapped, healthcheck green', t0 + 4);
+  assert.equal(done?.state, 'done', 'the helper\u2019s named outcome replaces the unknown placeholder');
+  assert.match(done?.detail ?? '', /healthcheck green/);
+  assert.equal(s.finish(it.id, false, 'a late straggler', t0 + 5), null, 'a settled name is never overwritten twice');
+});

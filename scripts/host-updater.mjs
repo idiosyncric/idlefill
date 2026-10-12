@@ -97,14 +97,30 @@ const runOnce = async () => {
   const ok = !r.error && r.status === 0;
   const detail = ok ? (tail || "exit 0") : `${r.error ? r.error.message : `exit ${r.status}`}${tail ? ` — ${tail}` : ""}`;
   log(`update ${ok ? "succeeded" : "FAILED"}: ${detail}`);
-  try {
-    const rep = await api(`/api/update-intents/${encodeURIComponent(queued.id)}/result`, {
-      method: "POST",
-      body: JSON.stringify({ ok, detail }),
-    });
-    if (!rep.ok) log(`result report refused: HTTP ${rep.status} (the intent was not RUNNING — outcome already named elsewhere)`);
-  } catch (e) {
-    log(`result report failed to send: ${e.message} — the arbiter will name this intent abandoned if it restarts`);
+  // Retry the report: an update that swaps the arbiter takes that arbiter
+  // down mid-command, so the first POST can fail or meet the boot sweep's
+  // abandoned placeholder. The arbiter accepts a late report ON an
+  // abandoned intent (never a re-queue): the named outcome replaces the
+  // unknown. Give the arbiter ~60 s to come back.
+  for (let attempt = 1; attempt <= 12; attempt++) {
+    try {
+      const rep = await api(`/api/update-intents/${encodeURIComponent(queued.id)}/result`, {
+        method: "POST",
+        body: JSON.stringify({ ok, detail }),
+      });
+      if (rep.ok) {
+        log(`result reported: ${ok ? "done" : "failed"}`);
+        break;
+      }
+      if (rep.status === 404) {
+        log(`result refused: HTTP 404 — the intent was settled elsewhere and is not the abandoned placeholder (no overwrite)`);
+        break;
+      }
+      log(`result report refused: HTTP ${rep.status} — retry ${attempt}/12`);
+    } catch (e) {
+      log(`result report failed to send: ${e.message} (arbiter mid-swap?) — retry ${attempt}/12`);
+    }
+    await new Promise((r) => setTimeout(r, 5000));
   }
 };
 
