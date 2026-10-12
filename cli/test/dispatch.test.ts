@@ -30,10 +30,17 @@ test('mesh routes as a live group (S4, #91)', () => {
   assert.equal(GROUPS.mesh.implemented, true);
 });
 
-test('update/agent are registered but refuse by name until S2/S5', () => {
+test('agent routes as a live group (S5, #92)', () => {
+  assert.deepEqual(dispatch(parse(['agent', 'list'])), { kind: 'group', group: 'agent' });
+  assert.deepEqual(dispatch(parse(['agent', 'connect', 'web-dev'])), { kind: 'group', group: 'agent' });
+  assert.equal(GROUPS.agent.implemented, true);
+  assert.equal(GROUPS.agent.slice, 'S5');
+  assert.equal(GROUPS.agent.issue, 92);
+});
+
+test('update is registered but refuses by name until S2', () => {
   const planned: Array<[string, string, number]> = [
     ['update', 'S2', 89],
-    ['agent', 'S5', 92],
   ];
   for (const [id, slice, issue] of planned) {
     const spec = GROUPS[id as keyof typeof GROUPS];

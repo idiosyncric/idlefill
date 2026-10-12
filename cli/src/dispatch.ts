@@ -1,9 +1,9 @@
 /**
  * Group registry + routing table (cli.md D2, issue #88 S1).
  * daemon/control are live passthrough groups (behavior byte-identical to
- * the scripts they wrap); engine is live since S3 (#90) and mesh since
- * S4 (#91); update/agent are registered for S2/S5 (#89/#92) and name
- * their slice on every attempt.
+ * the scripts they wrap); engine is live since S3 (#90), mesh since S4
+ * (#91) and agent since S5 (#92); update is registered for S2 (#89) and
+ * names its slice on every attempt.
  */
 
 import type { Parsed } from './argv.js';
@@ -49,7 +49,7 @@ export const GROUPS: Record<GroupId, GroupSpec> = {
   agent: {
     id: 'agent',
     summary: 'connected/discovered agents: list / connect / disconnect',
-    implemented: false,
+    implemented: true,
     slice: 'S5',
     issue: 92,
   },

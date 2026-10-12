@@ -59,20 +59,36 @@ test('top help lists all six groups with their status', () => {
   assert.ok(help.includes('idlefill <group> [command] [flags]'));
   for (const id of GROUP_ORDER) assert.ok(help.includes(id), id);
   assert.ok(help.includes('live'));
-  for (const issue of ['#89', '#92']) assert.ok(help.includes(issue), issue);
-  assert.ok(!help.includes('#90'), 'engine (S3, #90) is live — no longer listed as planned');
-  assert.ok(!help.includes('#91'), 'mesh (S4, #91) is live — no longer listed as planned');
+  assert.ok(help.includes('#89'), 'update (S2, #89) is still planned');
+  for (const issue of ['#90', '#91', '#92']) {
+    assert.ok(!help.includes(issue), `${issue} landed — no longer listed as planned`);
+  }
   assert.ok(help.includes('--json'));
   assert.ok(help.includes('docs/architecture/cli.md'));
 });
 
-test('planned groups name their slice, issue, and today\'s path', () => {
+test('the planned update group names its slice, issue, and today\'s path', () => {
   assert.ok(UPDATE_USAGE.includes('S2 (issue #89)') && UPDATE_USAGE.includes('./update.sh'));
-  assert.ok(AGENT_USAGE.includes('S5 (issue #92)') && AGENT_USAGE.includes('agent_roster'));
   assert.equal(groupHelp('update'), UPDATE_USAGE);
   assert.equal(groupHelp('mesh'), MESH_USAGE);
   assert.equal(groupHelp('engine'), ENGINE_USAGE);
   assert.equal(groupHelp('agent'), AGENT_USAGE);
+});
+
+test('the agent group help (live, S5 #92) names the write-back guards and the honesty axis', () => {
+  for (const needle of [
+    'idlefill agent connect <profile>',
+    'idlefill agent disconnect <profile>',
+    'named absence',
+    'true 0 naming the zero-config posture',
+    "ONLY out-of-repo write",
+    'never a profile .env',
+    'refused not redacted',
+    'backup is written before any modification',
+    'idle gate still decides admission',
+  ]) {
+    assert.ok(AGENT_USAGE.includes(needle), needle);
+  }
 });
 
 test('the mesh group help (live, S4 #91) names every subcommand and the naming trap', () => {

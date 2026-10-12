@@ -49,7 +49,7 @@ Architecture below.
 | 1 | Monorepo, server (Docker), client daemon, career-ops adapter, tests | **Done** — see `npm test`, Docker build |
 | 1.5 | Arbiter deployed to **urza** (2026-09-25) | **Done** — the live path is `scripts/deploy-server.sh` (gate, native amd64 build on urza, host-network container swap, tailnet healthcheck, auto-rollback). Image tag = the commit sha. State + config live under urza's `~/idlefill/` (0700/0600). Dashboard: `http://100.105.225.1:8787` |
 | 2 | urza hardening (compose + traefik route + IP/auth middleware), launchd client, NInfer log ro-mount | **Superseded (retired 2026-10-08)** — the compose + traefik plane never ran (urza is host-networked via the script above; `/mnt/docker/idlefill` never existed). The launchd client IS live (`tauri/install.sh` renders `tauri/IdlefillApp.plist`; the daemon/arbiter plists render from the Rust lifecycle plane) and the Linux client service is exercised (issue #54) |
-| 3 (operator CLI) | One `idlefill` command for update / mesh / engine / agent (+ daemon/control groups) | **S1 + S3 + S4 landed (2026-10-12)** — `cli/` workspace + the `idlefill` dispatcher + help tree; `daemon`/`control` live as passthrough groups (the `scripts/idlefill-*.mjs` CLIs are shims onto it); `idlefill engine` live (#90) — inventory list/add/set/remove over `/api/servers` + the `add --local` co-location pre-flight (mesh.md rule 1: probe `log_glob` against real files, refuse-with-the-rule-named and save nothing on a miss); `idlefill mesh` live (#91) — status/join/leave/pair, join is probe-then-write (the candidate must answer `GET /api/mesh` with the `peer_token` before any config write; atomic upsert of the `mesh_peers` row into `server/config.json` with timestamped backup — never `server_peers`), plus the wave's one new server surface: `POST /api/mesh/peers/reload`, the scoped re-read of `mesh_peers` + `peer_token` only — a live join needs no arbiter restart. Design: `docs/architecture/cli.md`; remaining slices #89, #92 (S2/S5) filed |
+| 3 (operator CLI) | One `idlefill` command for update / mesh / engine / agent (+ daemon/control groups) | **S1 + S3 + S4 + S5 landed (2026-10-12)** — `cli/` workspace + the `idlefill` dispatcher + help tree; `daemon`/`control` live as passthrough groups (the `scripts/idlefill-*.mjs` CLIs are shims onto it); `idlefill engine` live (#90) — inventory list/add/set/remove over `/api/servers` + the `add --local` co-location pre-flight (mesh.md rule 1: probe `log_glob` against real files, refuse-with-the-rule-named and save nothing on a miss); `idlefill mesh` live (#91) — status/join/leave/pair, join is probe-then-write (the candidate must answer `GET /api/mesh` with the `peer_token` before any config write; atomic upsert of the `mesh_peers` row into `server/config.json` with timestamped backup — never `server_peers`), plus the wave's one new server surface: `POST /api/mesh/peers/reload`, the scoped re-read of `mesh_peers` + `peer_token` only — a live join needs no arbiter restart; `idlefill agent` live (#92) — list renders the published `agent_roster` fetch-honestly (no key = named absence, fetched-empty = true 0), connect/disconnect flip a Hermes profile's model base URL to the aggregate endpoint and back (the wave's only out-of-repo write: backup-before-write, never touches `.env`, never follows `key_env`, userinfo URL = refusal not redaction, unparseable = named refusal; routing only, never admission). Design: `docs/architecture/cli.md`; remaining slice #89 (S2) filed |
 
 ## Architecture
 
@@ -228,9 +228,10 @@ scripts/    thin CLI wrappers (build-careerops-queue.mjs + the control
             every citation and muscle memory keeps working)
 cli/        the `idlefill` operator CLI (#88–#92) — one dispatcher over
             update / mesh / engine / agent + the daemon/control passthrough
-            groups (docs/architecture/cli.md). S1 live: `npx idlefill`
-            (daemon/control byte-identical to the old scripts, --json on
-            reads); S2–S5 refuse by name until they land
+            groups (docs/architecture/cli.md). Live: S1 (`npx idlefill`,
+            daemon/control byte-identical to the old scripts, --json on
+            reads) + S3 engine (#90) + S4 mesh (#91) + S5 agent (#92);
+            S2 (update, #89) refuses by name until it lands
 deploy/     launchd templates (com.sam.idlefill.client.plist,
             com.sam.idlefill.server.plist) + systemd/ + install-client-service.sh
             = the Linux client service (issue #54 — exercised, see below).
@@ -843,15 +844,15 @@ uses), and on a miss it refuses with the rule named and saves nothing.
 A remote row added without `--local` stays available and renders
 fail-closed for grants — display + routing metadata, honestly.
 
- ## The operator CLI (`idlefill`) — dispatcher live (S1), engine live (S3), mesh live (S4)
+ ## The operator CLI (`idlefill`) — dispatcher live (S1), engine live (S3), mesh live (S4), agent live (S5)
 
 Design authority: `docs/architecture/cli.md` (accepted 2026-10-12); waves
-filed as issues #88–#92 — S1 (#88), S3 (#90) and S4 (#91) have landed. One
-dispatcher over the planes that today live in
-`update.sh` and the `scripts/` control CLIs — a front-end, not a new backend:
-every command calls an existing endpoint, runs an existing script, or is
-named as the wave that adds the one missing piece (mesh join's config flow,
-agent connect's profile write-back).
+filed as issues #88–#92 — S1 (#88), S3 (#90), S4 (#91) and S5 (#92) have
+landed (S2, `update` #89, remains). One dispatcher over the planes that
+today live in `update.sh` and the `scripts/` control CLIs — a front-end,
+not a new backend: every command calls an existing endpoint, runs an
+existing script, or is named as the wave that adds the one missing piece
+(mesh join's config flow, agent connect's profile write-back).
 
 ```
 idlefill update [--check] [--no-pull]     # release-feed compare + the update.sh sequence
@@ -868,6 +869,21 @@ their reason; `mesh join` probes the peer's read plane BEFORE writing config;
 `agent connect` is the wave's only out-of-repo write and inherits the
 agent-roster credential rules whole (never touches `.env`, never follows
 `key_env`).
+
+`idlefill agent` (#92, cli.md D7): `list` renders the daemon's published
+`agent_roster` with the dashboard's honesty axis — no roster key is a
+named absence (a daemon with no `~/.hermes` home, or offline), never a
+fake zero; a fetched-empty roster is a true 0 naming the zero-config
+posture. `connect <profile>` flips the profile's model base URL to this
+machine's aggregate endpoint (`127.0.0.1:<aggregate_port>`, the same
+value the roster classifies on); `disconnect <profile>` restores the
+prior config from the backup connect wrote — it never invents a prior
+endpoint. Guards, pinned in tests and proven live: the timestamped
+backup is written before any modification; the edit is line surgery, so
+unrelated keys/comments ride through byte-for-byte; a userinfo-bearing
+URL is refused, not redacted, and never printed; an unparseable config
+is a named refusal. Routing only — connect/disconnect change where a
+profile SENDS traffic; the idle gate still decides admission.
 
 ## Dashboard layout (the work flow)
 

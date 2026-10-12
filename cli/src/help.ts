@@ -121,10 +121,24 @@ it never appears on a command line.
 
 export const AGENT_USAGE = `idlefill agent — connected / discovered agents on this machine.
 
-  idlefill agent [list] | connect <profile> | disconnect <profile>
+  idlefill agent [list] [--json]
+  idlefill agent connect <profile>
+  idlefill agent disconnect <profile>
 
-Planned — S5 (issue #92). Not implemented yet; today: read the daemon's
-agent_roster heartbeat.
+list — renders the agent_roster the daemon already publishes, with the
+dashboard's fetch-honesty posture: no roster key is a named absence (a
+daemon with no ~/.hermes home, or offline) — never a fake zero; a
+fetched-empty roster is a true 0 naming the zero-config posture.
+connect — flips the Hermes profile's model base URL to this machine's
+aggregate endpoint (127.0.0.1:<aggregate_port>); disconnect restores the
+prior config from the timestamped backup connect wrote — it never invents
+a prior endpoint. This is the wave's ONLY out-of-repo write, and the
+agent-roster credential rules are inherited whole: only config.yaml is
+read (never a profile .env, never a key_env reference), a
+userinfo-bearing URL is refused not redacted, an unparseable config is a
+named refusal, and the backup is written before any modification.
+Routing only — connect/disconnect change where a profile SENDS traffic;
+the idle gate still decides admission.
 `;
 
 const GROUP_USAGE: Record<GroupId, string> = {
