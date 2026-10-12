@@ -782,11 +782,23 @@ function SessionRowView({ s, st }: { s: SessionRow; st: StateSnapshot }) {
       />
       <span
         className="min-w-[70px] font-mono text-[12px] font-semibold"
-        title={`session ${s.token}${s.client_name ? " — registered by " + s.client_name : ""}`}
+        title={`session ${s.token}${s.hermes_meta?.title ? ` — “${s.hermes_meta.title}”` : ""}${s.client_name ? " — registered by " + s.client_name : ""}`}
       >
         {shortTok}
       </span>
       {s.client_name && <span className="text-[11px] text-dim">{s.client_name}</span>}
+      {/* The agent this session belongs to (owner ask 2026-10-12): the
+          connector's provenance stamp names which Hermes profile's ledger
+          the router READ this session's row from — exact, never inferred.
+          Absent stamp (old client / ledger miss) = nothing renders. */}
+      {s.hermes_meta?.profile && (
+        <span
+          className="text-[11px] text-dim"
+          title="the agent profile that owns this session — provenance: the profile ledger the gateway row was read from (exact, never inferred)"
+        >
+          @{s.hermes_meta.profile}
+        </span>
+      )}
       {hist?.model && (
         <Badge variant="outline" className="rounded-pill px-1.5 py-0 text-[10px] font-normal" title="last model this session negotiated (sniffed by the router)">
           {hist.model}

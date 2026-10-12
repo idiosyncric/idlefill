@@ -746,6 +746,15 @@ export interface SessionRecord {
   hermes_meta?: {
     title?: string;
     model?: string;
+    /**
+     * The ledger the row was READ FROM: the client connector's profile
+     * provenance stamp (which profile's `GET .../api/sessions` answered
+     * with this row — exact, never inferred). Bounded string ≤64; absent
+     * = the row entered the ledger before the stamp existed, or the
+     * member was dropped. The dashboard nests sessions under agent roster
+     * rows by EXACT profile match — absent never nests, never guesses.
+     */
+    profile?: string;
     message_count?: number;
     tool_call_count?: number;
     input_tokens?: number;

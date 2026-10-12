@@ -178,6 +178,36 @@ test('hermes_meta: partial member drop — a bad member drops only itself', asyn
   assert.equal(row?.hermes_meta?.last_active, 1760000000000);
 });
 
+test('hermes_meta: the profile provenance member — trimmed, bounded, never guessed', async () => {
+  await fetch(`${base}/api/sessions/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({
+      token: 'hm-prof',
+      hermes_meta: { title: 't', profile: '  web-dev  ' },
+    }),
+  });
+  await fetch(`${base}/api/sessions/register`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({
+      token: 'hm-prof2',
+      hermes_meta: { title: 't', profile: 'x'.repeat(80) },
+    }),
+  });
+  const list = (await (await fetch(`${base}/api/sessions`, { headers: auth })).json()) as {
+    sessions: Array<{ token: string; hermes_meta?: Record<string, unknown> }>;
+  };
+  assert.equal(list.sessions.find((s) => s.token === 'hm-prof')?.hermes_meta?.profile, 'web-dev', 'trimmed verbatim');
+  assert.equal(
+    list.sessions.find((s) => s.token === 'hm-prof2')?.hermes_meta?.profile,
+    'x'.repeat(64),
+    'bounded ≤64 (same str() shape as every other member)',
+  );
+  // An absent profile never stamps the block (never a fake provenance).
+  assert.equal(list.sessions.find((s) => s.token === 'hm-3')?.hermes_meta?.profile, undefined);
+});
+
 test('hermes_meta: a fresh row with an all-invalid block starts WITHOUT the key', async () => {
   await fetch(`${base}/api/sessions/register`, {
     method: 'POST',

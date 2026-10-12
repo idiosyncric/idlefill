@@ -13,7 +13,15 @@ import { StatTiles, TilesSkeleton } from "@/components/stat-tiles";
 import { ago, durFmt, fmt, liveWord, type StateWord } from "@/lib/format";
 import { buildGapLine, hostLine, intentWord, meshTiles, peerVerdict, relayOutcome } from "@/lib/mesh-stats";
 import { buildRemoteRows, type RemoteRow } from "@/lib/remote-metrics";
-import { apiToken, getRemoteMetrics, requestPeerUpdate, type MeshPeer, type StateSnapshot } from "@/lib/api";
+import { LOCAL_MACHINE, VIA_NOTE, hostedServers, hostOfServer, type HostVia } from "@/lib/hierarchy";
+import {
+  apiToken,
+  getRemoteMetrics,
+  requestPeerUpdate,
+  type MeshPeer,
+  type ServerRow,
+  type StateSnapshot,
+} from "@/lib/api";
 
 const TONE: Record<string, string> = {
   ok: "text-ok",
@@ -82,6 +90,15 @@ export function Machines({ st }: { st: StateSnapshot | null }) {
     );
   }
   const peers = st.mesh?.peers ?? [];
+  // The hierarchy pass (owner ask 2026-10-12): every declared engine row
+  // joins to exactly one machine by its own named facts (url host / group
+  // label / loopback), and renders inside THAT machine's card — urza's
+  // card carries strata-urza AND llama-swap-urza, not just what urza's
+  // own arbiter happens to report. A row no machine names stays out of
+  // every card and is NAMED below the grid; it never disappears.
+  const hosts = hostedServers(st);
+  const hostedOn = (machine: string): { row: ServerRow; via: HostVia }[] =>
+    (hosts.byMachine.get(machine) ?? []).map((row) => ({ row, via: hostOfServer(st, row)?.via ?? "local-only" }));
 
   return (
     <section className="flex flex-col gap-3">
@@ -111,11 +128,16 @@ export function Machines({ st }: { st: StateSnapshot | null }) {
         </Card>
       ) : null}
       <div className="grid gap-2.5 [grid-template-columns:repeat(auto-fit,minmax(300px,1fr))]">
-        <LocalCard st={st} />
+        <LocalCard st={st} hosted={hostedOn(LOCAL_MACHINE)} />
         {peers.map((p) => (
-          <PeerCard key={p.url} p={p} now={st.now} />
+          <PeerCard key={p.url} p={p} now={st.now} hosted={hostedOn(p.name)} />
         ))}
       </div>
+      {hosts.unhosted.length > 0 && (
+        <div className="text-[11px] text-dim" title="these rows' url hostnames match no machine and their engine group names no machine — the Machines tab never guesses a host; the rows stand whole on the Inference servers tab">
+          host not named: {hosts.unhosted.map((s) => s.name).join(", ")} — url and group name no machine here (whole on the Inference servers tab)
+        </div>
+      )}
     </section>
   );
 }
@@ -125,7 +147,7 @@ export function Machines({ st }: { st: StateSnapshot | null }) {
 // local truth from this page's own poll. The host line is the arbiter's
 // live node:os read (host-wide even inside a container); absent on an
 // arbiter that predates the key → no line, never a fake zero.
-function LocalCard({ st }: { st: StateSnapshot }) {
+function LocalCard({ st, hosted }: { st: StateSnapshot; hosted: { row: ServerRow; via: HostVia }[] }) {
   const running = (st.active_leases ?? []).length > 0;
   const w: StateWord = liveWord(st.idle, running);
   const queued = (st.clients ?? []).flatMap((c) => c.projects ?? []).reduce((a, p) => a + (p.queue_depth || 0), 0);
@@ -153,7 +175,12 @@ function LocalCard({ st }: { st: StateSnapshot }) {
         </div>
         <div className="flex flex-col gap-0.5">
           {(st.servers ?? []).length === 0 && <div className="text-[11px] text-dim">no engines declared</div>}
-          {(st.servers ?? []).map((row) => {
+          {(st.servers ?? []).length > 0 && hosted.length === 0 && (
+            <div className="text-[11px] text-dim" title="every declared row names another machine (url host or engine-group label) — this machine hosts none">
+              no engines hosted on this machine
+            </div>
+          )}
+          {hosted.map(({ row, via }) => {
             const sw: StateWord = liveWord(
               row.signal ? { idle: row.signal.idle, degraded: row.signal.degraded } : null,
               running || row.models.some((m) => m.running),
@@ -162,7 +189,7 @@ function LocalCard({ st }: { st: StateSnapshot }) {
               <div key={row.id} className="flex items-center gap-2 text-[12px]">
                 <span
                   className={`size-1.5 shrink-0 rounded-full ${row.signal?.degraded ? "bg-err" : row.signal?.idle ? "bg-border" : "bg-accent"}`}
-                  title={`${row.name}: ${sw.label}`}
+                  title={`${row.name}: ${sw.label} — hosted here (${VIA_NOTE[via]})`}
                 />
                 <span className="min-w-0 truncate">{row.name}</span>
                 <span className={`ml-auto whitespace-nowrap text-[11px] font-semibold ${TONE[sw.tone]}`} title={sw.note}>
@@ -203,7 +230,7 @@ function LocalCard({ st }: { st: StateSnapshot }) {
   );
 }
 
-function PeerCard({ p, now }: { p: MeshPeer; now: number }) {
+function PeerCard({ p, now, hosted }: { p: MeshPeer; now: number; hosted: { row: ServerRow; via: HostVia }[] }) {
   const snap = p.snapshot;
   const w: StateWord = peerVerdict(snap);
   // Past the arbiter's 90 s pull window the snapshot is the LAST-KNOWN
@@ -292,6 +319,36 @@ function PeerCard({ p, now }: { p: MeshPeer; now: number }) {
                 </div>
               )}
             </div>
+          </div>
+        )}
+        {/* The hierarchy block (owner ask 2026-10-12): the engine rows THIS
+            arbiter declares that host on THAT machine — exact joins (url
+            hostname = the peer's, or engine-group label = the machine's
+            name). urza's card carries strata-urza AND llama-swap-urza even
+            though urza's own snapshot names only one of them. Reads live
+            from this page's poll — never dims with a stale snapshot. */}
+        {hosted.length > 0 && (
+          <div className="flex flex-col gap-0.5 border-t border-border pt-1.5">
+            <span className="text-[10px] uppercase tracking-wide text-dim">hosted here — declared on this arbiter</span>
+            {hosted.map(({ row, via }) => {
+              const sw: StateWord = liveWord(
+                row.signal ? { idle: row.signal.idle, degraded: row.signal.degraded } : null,
+                !!row.engaged || row.models.some((m) => m.running),
+              );
+              return (
+                <div key={row.id} className="flex items-center gap-2 text-[12px]">
+                  <span
+                    className={`size-1.5 shrink-0 rounded-full ${row.signal?.degraded ? "bg-err" : row.signal?.idle ? "bg-border" : "bg-accent"}`}
+                    title={`${row.name} — ${VIA_NOTE[via]} · ${row.url}`}
+                  />
+                  <span className="min-w-0 truncate" title={`${row.url} · ${row.models.length} models seen`}>{row.name}</span>
+                  <span className={`ml-auto whitespace-nowrap text-[11px] font-semibold ${TONE[sw.tone]}`} title={sw.note}>
+                    {sw.label}
+                    {row.signal?.idle && row.signal.idle_for_s != null ? ` · ${durFmt(row.signal.idle_for_s)}` : ""}
+                  </span>
+                </div>
+              );
+            })}
           </div>
         )}
       </CardContent>

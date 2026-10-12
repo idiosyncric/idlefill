@@ -292,6 +292,21 @@ test('rowToMeta: converts ledger rows (epoch-seconds → ms, per-member drop)', 
   assert.equal(rowToMeta({ id: 'only-id' }), undefined);
 });
 
+test('rowToMeta: the profile provenance stamp (exact fetch-source, bounded, never guessed)', () => {
+  // The caller names the profile it fetched ⇒ the meta carries it verbatim.
+  const m = rowToMeta({ id: 's', title: 't' }, 'web-dev');
+  assert.ok(m);
+  assert.equal(m.meta.profile, 'web-dev');
+  // 'default' (the home ledger) is a name too — stamped, not hidden.
+  assert.equal(rowToMeta({ id: 's', title: 't' }, 'default')?.meta.profile, 'default');
+  // Bounded ≤64, trimmed.
+  assert.equal(rowToMeta({ id: 's', title: 't' }, '  pad-me  ')?.meta.profile, 'pad-me');
+  assert.equal(rowToMeta({ id: 's', title: 't' }, 'x'.repeat(80))?.meta.profile, 'x'.repeat(64));
+  // A blank/absent profile stamps NOTHING (never a fake provenance).
+  assert.equal(rowToMeta({ id: 's', title: 't' }, '  ')?.meta.profile, undefined);
+  assert.equal(rowToMeta({ id: 's', title: 't' })?.meta.profile, undefined);
+});
+
 test('mergeHermesMeta: last-known-wins (absent keeps, present replaces, null rides)', () => {
   const existing: HermesSessionMeta = {
     title: 'old title',
@@ -315,15 +330,17 @@ test('mergeHermesMeta: last-known-wins (absent keeps, present replaces, null rid
   assert.deepEqual(m3, { model: 'X' });
 });
 
-test('mergeLedgerRows: same id across profiles — the newer last_active wins the round', () => {
+test('mergeLedgerRows: same id across profiles — the newer last_active wins the round, and its provenance profile rides', () => {
   let ledger = new Map<string, HermesSessionMeta>();
   const oldRow: GatewaySessionRow = { id: 'dup', title: 'older', last_active: 1760000000 };
   const newRow: GatewaySessionRow = { id: 'dup', title: 'newer', last_active: 1760001000 };
-  ledger = mergeLedgerRows(ledger, new Map([['dup', oldRow]]));
+  ledger = mergeLedgerRows(ledger, new Map([['dup', { profile: 'default', row: oldRow }]]));
   assert.equal(ledger.get('dup')?.title, 'older');
+  assert.equal(ledger.get('dup')?.profile, 'default', 'the fetch source rides the merged block');
   // The newer row wins the round (and still last-known-wins against stored).
-  ledger = mergeLedgerRows(ledger, new Map([['dup', newRow]]));
+  ledger = mergeLedgerRows(ledger, new Map([['dup', { profile: 'web-dev', row: newRow }]]));
   assert.equal(ledger.get('dup')?.title, 'newer');
+  assert.equal(ledger.get('dup')?.profile, 'web-dev', 'the round winner carries its provenance');
   // A round without the id leaves the stored row standing (never erases).
   ledger = mergeLedgerRows(ledger, new Map());
   assert.equal(ledger.get('dup')?.title, 'newer');
@@ -360,6 +377,9 @@ test('connector: fetches health + ledgers, publishes meta only when reachable', 
   assert.ok(c.metaFor('20261009_010000_aaaa')?.title === 'Gate research session');
   assert.equal(c.metaFor('20261009_020000_bbbb')?.end_reason, 'user_closed');
   assert.equal(c.metaFor('prow')?.title, 'profile row');
+  // Provenance: each block names the ledger profile it was READ FROM.
+  assert.equal(c.metaFor('20261009_010000_aaaa')?.profile, 'default');
+  assert.equal(c.metaFor('prow')?.profile, 'web-dev');
   assert.equal(c.metaFor('unknown-id'), undefined, 'unknown id ⇒ publish nothing');
   // The round hit the health + BOTH ledger paths with the RIGHT keys.
   const paths = gw.requests.map((r) => r.path);

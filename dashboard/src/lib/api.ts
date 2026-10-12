@@ -244,6 +244,27 @@ export type SessionRow = {
   phase?: SessionPhase | null;
   override?: { token: string; override: "pause" | "force"; until: number | null; set_at: number } | null;
   engine_pin?: { server_id: string; url: string; engine_model?: string; set_at: number };
+  /**
+   * #73: the gateway session ledger's facts for this session (last-known-
+   * wins, ADD-key — absent = never reported). `profile` is the connector's
+   * PROVENANCE stamp: which profile ledger the row was READ FROM (exact,
+   * never inferred). The Agents tab nests a session under a roster profile
+   * ONLY on this EXACT match — absent never nests, never guesses.
+   */
+  hermes_meta?: {
+    title?: string;
+    model?: string;
+    profile?: string;
+    message_count?: number;
+    tool_call_count?: number;
+    input_tokens?: number;
+    output_tokens?: number;
+    reasoning_tokens?: number;
+    estimated_cost_usd?: number;
+    last_active?: number;
+    ended_at?: number | null;
+    end_reason?: string | null;
+  };
 };
 
 export type LeaseRow = {

@@ -79,6 +79,16 @@ import { join } from 'node:path';
 export interface HermesSessionMeta {
   title?: string;
   model?: string;
+  /**
+   * The ledger the row was READ FROM — the configured profile whose
+   * `GET .../api/sessions` answered with this row (or, for a single-session
+   * probe, the profile whose route returned it). Exact provenance, never a
+   * guess: the fetch loop knows which profile it asked, so a session's
+   * owning agent profile is an OBSERVED fact, not an inference. Stamped by
+   * the connector (the raw gateway row carries no such field); absent =
+   * the row entered the ledger before the stamp existed.
+   */
+  profile?: string;
   message_count?: number;
   tool_call_count?: number;
   input_tokens?: number;
@@ -787,15 +797,21 @@ function toEpochMs(v: unknown): number | undefined {
  * client-published block in this codebase). Returns undefined for a
  * row that yields no members at all.
  */
-export function rowToMeta(row: GatewaySessionRow): { id: string; meta: HermesSessionMeta } | undefined {
+export function rowToMeta(row: GatewaySessionRow, profile?: string): { id: string; meta: HermesSessionMeta } | undefined {
   const id = normalizeSessionId(typeof row.id === 'string' ? row.id : undefined);
   if (!id) return undefined;
   const meta: HermesSessionMeta = {};
-  const str = (k: 'title' | 'model', cap: number): void => {
+  const str = (k: 'title' | 'model' | 'profile', cap: number): void => {
     if (typeof row[k] === 'string' && (row[k] as string).trim() !== '') meta[k] = (row[k] as string).trim().slice(0, cap);
   };
   str('title', 256);
   str('model', 128);
+  // Provenance stamp: the configured profile this row was READ FROM (the
+  // fetch loop knows exactly which ledger it asked). Same sanitizer shape
+  // as every other bounded string; the raw row's own `profile` (never
+  // present on the gateway today) stands unless the caller names the
+  // profile it fetched.
+  if (typeof profile === 'string' && profile.trim() !== '') meta.profile = profile.trim().slice(0, 64);
   for (const k of INT_META_KEYS) {
     const v = row[k];
     if (typeof v === 'number' && Number.isInteger(v) && v >= 0) meta[k] = v;
@@ -819,6 +835,7 @@ export function rowToMeta(row: GatewaySessionRow): { id: string; meta: HermesSes
 const META_KEYS: (keyof HermesSessionMeta)[] = [
   'title',
   'model',
+  'profile',
   'message_count',
   'tool_call_count',
   'input_tokens',
@@ -848,16 +865,24 @@ export function mergeHermesMeta(existing: HermesSessionMeta | undefined, incomin
 }
 
 /**
+ * One round's answer for one session id: the raw gateway row PLUS the
+ * configured profile whose ledger fetch produced it (the provenance stamp
+ * — only the fetch loop knows that, the raw row does not carry it).
+ */
+export type LedgerRowEntry = { profile?: string; row: GatewaySessionRow };
+
+/**
  * Merge one fetch round into the last-known ledger map. `rows` maps
  * session id → the freshest row seen THIS round (multiple profiles can
  * carry the same id — the one with the newer `last_active` wins the
- * round). Malformed rows are dropped. Returns the updated map (a new
- * object; the caller swaps the reference).
+ * round, and its provenance profile rides the merged block). Malformed
+ * rows are dropped. Returns the updated map (a new object; the caller
+ * swaps the reference).
  */
-export function mergeLedgerRows(last: Map<string, HermesSessionMeta>, rows: Map<string, GatewaySessionRow>): Map<string, HermesSessionMeta> {
+export function mergeLedgerRows(last: Map<string, HermesSessionMeta>, rows: Map<string, LedgerRowEntry>): Map<string, HermesSessionMeta> {
   const out = new Map(last);
-  for (const [id, row] of rows) {
-    const m = rowToMeta(row);
+  for (const [id, entry] of rows) {
+    const m = rowToMeta(entry.row, entry.profile);
     if (!m) continue;
     out.set(id, mergeHermesMeta(out.get(id), m.meta));
   }
@@ -911,7 +936,7 @@ async function fetchRound(cfg: HermesGatewayConfig, fetchImpl: FetchImpl, nowMs:
   reachable: boolean;
   version: string | undefined;
   hostFacts: HermesHostFacts | undefined;
-  rows: Map<string, GatewaySessionRow>;
+  rows: Map<string, LedgerRowEntry>;
   /** #85 slice D: profile → the sanitized Hermes job list THIS round answered
    *  (ONLY for profiles whose GET 200'd with a well-formed envelope — a
    *  failed/401/malformed profile round adds NOTHING, the connector keeps
@@ -919,7 +944,7 @@ async function fetchRound(cfg: HermesGatewayConfig, fetchImpl: FetchImpl, nowMs:
   jobs: Map<string, HermesJobRow[]>;
   fetchedAt: number;
 }> {
-  const rows = new Map<string, GatewaySessionRow>();
+  const rows = new Map<string, LedgerRowEntry>();
   const jobs = new Map<string, HermesJobRow[]>();
   let reachable = false;
   let version: string | undefined;
@@ -1006,13 +1031,14 @@ async function fetchRound(cfg: HermesGatewayConfig, fetchImpl: FetchImpl, nowMs:
       for (const raw of env.data) {
         if (typeof raw !== 'object' || raw === null) continue;
         const row = raw as GatewaySessionRow;
-        const m = rowToMeta(row);
+        const m = rowToMeta(row, profile);
         if (!m) continue;
-        // Same id from two profiles (or two shifted pages): the newer `last_active` wins the round.
+        // Same id from two profiles (or two shifted pages): the newer `last_active` wins the round —
+        // and the winner's provenance profile rides the merged block.
         const prev = rows.get(m.id);
-        const prevTs = toEpochMs(prev?.last_active) ?? 0;
+        const prevTs = toEpochMs(prev?.row.last_active) ?? 0;
         const nextTs = m.meta.last_active ?? 0;
-        if (!prev || nextTs >= prevTs) rows.set(m.id, row);
+        if (!prev || nextTs >= prevTs) rows.set(m.id, { profile, row });
       }
       if (env.has_more !== true) break; // the list envelope decides: absent/false ⇒ last page
     }
@@ -1169,10 +1195,10 @@ export class HermesGatewayConnector {
    * `hermes_meta` rides the heartbeat ABSENT, and an absent key never
    * clears the arbiter's stored block — eviction cannot erase history.
    */
-  private pruneLedger(seenRows: Map<string, GatewaySessionRow>): void {
+  private pruneLedger(seenRows: Map<string, LedgerRowEntry>): void {
     const round = ++this.ageRound;
-    for (const [id, row] of seenRows) {
-      if (rowToMeta(row)) this.lastSeenRound.set(id, round);
+    for (const [id, entry] of seenRows) {
+      if (rowToMeta(entry.row, entry.profile)) this.lastSeenRound.set(id, round);
     }
     for (const [id, meta] of this.ledger) {
       const seen = this.lastSeenRound.get(id) ?? 0;
@@ -1300,7 +1326,7 @@ export class HermesGatewayConnector {
         // sanitizer the listing rows pass, so `rowToMeta` applies verbatim.
         const session = (body as { session?: unknown } | undefined)?.session;
         if (typeof session !== 'object' || session === null) continue;
-        const m = rowToMeta(session as GatewaySessionRow);
+        const m = rowToMeta(session as GatewaySessionRow, profile); // the route that answered IS the provenance
         if (!m || m.id !== id) continue; // answered a different row: drop
         this.ledger.set(id, mergeHermesMeta(this.ledger.get(id), m.meta));
         // Stamp the eviction bookkeeping with the CURRENT reachable-round so

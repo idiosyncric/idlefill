@@ -41,6 +41,7 @@ import {
   type EngineGroup,
 } from "@/lib/api";
 import { ago, fmt, fmtCtx, liveWord, probeWord, PROVIDER_CHOICES } from "@/lib/format";
+import { LOCAL_MACHINE, VIA_NOTE, hostOfServer, type HostVerdict } from "@/lib/hierarchy";
 import { engineGauges, engineTiles, gibfmt, ramAxis } from "@/lib/fleet-stats";
 import { MemBar } from "@/components/mem-bar";
 import { StatTiles, TilesSkeleton } from "@/components/stat-tiles";
@@ -217,6 +218,7 @@ export function InferenceServers({ st }: { st: StateSnapshot | null }) {
               onEdit={() => {
                 if (requireToken()) setEditId(s.id);
               }}
+              host={st ? hostOfServer(st, s) : null}
             />
           ))}
         </div>
@@ -491,6 +493,7 @@ function ServerCard({
   requireToken,
   onGroupPick,
   onEdit,
+  host,
 }: {
   s: ServerRow;
   now: number;
@@ -503,6 +506,7 @@ function ServerCard({
   requireToken: () => boolean;
   onGroupPick: (gid: string | null) => void;
   onEdit: () => void;
+  host: HostVerdict | null;
 }) {
   const word = s.watched
     ? liveWord({ idle: !!s.signal?.idle, degraded: !!s.signal?.degraded }, running || s.models.some((m) => m.running))
@@ -622,7 +626,18 @@ function ServerCard({
       <CardFooter className="flex-col items-stretch gap-1.5 px-3 py-1.5 text-[11px] text-dim">
         <div className="flex items-center justify-between gap-3">
           <code className="truncate" title="base url — edit to change">{s.url}</code>
-          <span className="whitespace-nowrap">{lastSeen(s, now)}</span>
+          <span className="ml-auto flex shrink-0 items-center gap-2 whitespace-nowrap">
+            {/* The hierarchy line (owner ask 2026-10-12): the card names the
+                machine it rides on — the EXACT join from lib/hierarchy (url
+                host = a peer's host, engine-group label = a machine's name,
+                or loopback). No machine named = no line, never a guess. */}
+            {host && (
+              <span className="text-[10px] text-dim" title={`${VIA_NOTE[host.via]} — the same join the Machines tab nests by`}>
+                on {host.machine === LOCAL_MACHINE ? "this machine" : host.machine}
+              </span>
+            )}
+            {lastSeen(s, now)}
+          </span>
         </div>
         {/* The group picker (D3): a row belongs to at most one group. "no
             group" removes it; picking another group moves it (ungroup from

@@ -33,8 +33,11 @@ import {
   type AgentEndpoint,
   type AgentKeyRow,
   type AgentRosterRow,
+  type SessionRow,
+  type StateSnapshot,
 } from "@/lib/api";
-import { ago } from "@/lib/format";
+import { ago, sessStateWord, sessStale } from "@/lib/format";
+import { localClientIds, sessionsByProfile } from "@/lib/hierarchy";
 import { agentTiles } from "@/lib/agent-stats";
 import { StatTiles, TilesSkeleton } from "@/components/stat-tiles";
 
@@ -205,7 +208,13 @@ export function Agents({ st }: { st: StateSnapshotLike | null }) {
       )}
 
       {hasToken && roster && roster.length > 0 && (
-        <RosterCard roster={roster} keys={keys} onMint={(name) => { setPrefillLabel(name); setModal(true); }} />
+        <RosterCard
+          roster={roster}
+          keys={keys}
+          byProfile={st ? sessionsByProfile(st, localClientIds(st)) : new Map<string, SessionRow[]>()}
+          now={now}
+          onMint={(name) => { setPrefillLabel(name); setModal(true); }}
+        />
       )}
 
       {!hasToken ? (
@@ -248,8 +257,10 @@ export function Agents({ st }: { st: StateSnapshotLike | null }) {
   );
 }
 
-// The minimal state shape the view needs (only for the ages).
-type StateSnapshotLike = { now: number };
+// The minimal state shape the view needs: the ages, plus the session rows +
+// client rows (+ the optional mesh, for the machine joins) that nest the
+// sessions under their agent profiles via lib/hierarchy.
+type StateSnapshotLike = Pick<StateSnapshot, "now" | "sessions" | "clients" | "mesh">;
 
 // ---------------------------------------------------------------------------
 // The local Hermes profile roster (#80): a read-only "profiles on this
@@ -264,10 +275,15 @@ type StateSnapshotLike = { now: number };
 function RosterCard({
   roster,
   keys,
+  byProfile,
+  now,
   onMint,
 }: {
   roster: AgentRosterRow[];
   keys: AgentKeyRow[];
+  /** Sessions nested by EXACT provenance profile (lib/hierarchy). */
+  byProfile: Map<string, SessionRow[]>;
+  now: number;
   onMint: (profile: string) => void;
 }) {
   const adopted = roster.filter((r) => r.posture === "adopted").length;
@@ -281,11 +297,19 @@ function RosterCard({
           <span className="font-semibold uppercase tracking-wide">profiles on this machine</span>
           <span className="ml-auto">{adopted} of {roster.length} profiles adopted</span>
         </div>
+        {/* The hierarchy (owner ask 2026-10-12): a session nests under the
+            profile it belongs to ONLY on exact provenance — the connector
+            stamps which profile's gateway ledger it READ the session row
+            from (`hermes_meta.profile`), and the row's client must be one
+            of this machine's daemons. No stamp, no nesting — never a guess
+            from the model, the token, or a similar name. */}
         <div className="flex flex-col gap-1 px-3 py-2">
           {roster.map((r) => {
             const minted = mintedLabels.has(r.profile);
+            const owned = byProfile.get(r.profile) ?? [];
             return (
-              <div key={r.profile} className="flex items-center gap-2 text-[12px]">
+              <React.Fragment key={r.profile}>
+                <div className="flex items-center gap-2 text-[12px]">
                 <span className="min-w-0 truncate font-semibold" title={r.base_url ?? r.profile}>
                   {r.profile}
                 </span>
@@ -309,6 +333,14 @@ function RosterCard({
                     key minted
                   </Badge>
                 )}
+                {owned.length > 0 && (
+                  <span
+                    className="ml-auto text-[10px] text-dim"
+                    title="sessions whose gateway-ledger provenance names this profile EXACTLY (this machine's clients only)"
+                  >
+                    {owned.length} {owned.length === 1 ? "session" : "sessions"}
+                  </span>
+                )}
                 {r.posture !== "adopted" && !minted && (
                   <Button
                     size="xs"
@@ -320,12 +352,56 @@ function RosterCard({
                     mint key
                   </Button>
                 )}
-              </div>
+                </div>
+                {owned.map((s) => (
+                  <SessionSubRow key={s.token} s={s} now={now} />
+                ))}
+              </React.Fragment>
             );
           })}
         </div>
       </CardContent>
     </Card>
+  );
+}
+
+// One session sub-row nested under its agent profile: the same liveness dot,
+// state word, and honesty the Sessions tab carries — a read-only glance at
+// the child; every write (gate, pin, lifecycle) stays on the Sessions tab.
+function SessionSubRow({ s, now }: { s: SessionRow; now: number }) {
+  const stale = sessStale(s, now);
+  const w = sessStateWord(s, now);
+  const shortTok = String(s.token ?? "").slice(0, 8);
+  const title = s.hermes_meta?.title;
+  const model = s.hermes_meta?.model ?? s.history?.model;
+  const tone =
+    w.tone === "ok" ? "text-ok" : w.tone === "warn" ? "text-warn" : w.tone === "err" ? "text-err" : "text-dim";
+  return (
+    <div className={`ml-4 flex items-center gap-2 text-[12px] ${stale ? "opacity-60" : ""}`}>
+      <span
+        className={`size-1.5 shrink-0 rounded-full ${stale ? "bg-border" : "bg-ok"}`}
+        title={stale ? "stale (no heartbeat within 90s)" : "live (heartbeat within 90s)"}
+      />
+      <span
+        className="font-mono text-[11px]"
+        title={`session ${s.token} — nests under this profile on the gateway ledger's provenance stamp (exact match)`}
+      >
+        {shortTok}
+      </span>
+      {title && (
+        <span className="min-w-0 truncate text-[11px] text-dim" title="the gateway ledger's title for this conversation">
+          {title}
+        </span>
+      )}
+      {model && (
+        <Badge variant="outline" className="rounded-pill px-1.5 py-0 text-[10px] font-normal" title="the model recorded on the ledger row / last sniffed by the router">
+          {model}
+        </Badge>
+      )}
+      <span className={`ml-auto whitespace-nowrap text-[11px] font-semibold ${tone}`} title={w.note}>
+        {w.label}
+      </span>
+    </div>
   );
 }
 

@@ -271,11 +271,20 @@ function ResourceOverview({
   st: StateSnapshot | null;
   onPickTab: (t: string) => void;
 }) {
+  // The hierarchy counts (owner ask 2026-10-12): machines counts MACHINES
+  // (this one + every mesh peer), not clients; agents counts the profile
+  // rows the clients report (the roster ADD-key — absent on an old client
+  // contributes 0, a known gap, never a silent undercount claim).
   const rows = [
     { id: "servers", label: "Inference servers", n: st ? st.servers.length : null },
-    { id: "machines", label: "Machines", n: st ? st.clients.length : null },
+    { id: "machines", label: "Machines", n: st ? 1 + (st.mesh?.peers.length ?? 0) : null },
     { id: "projects", label: "Projects", n: st ? st.projects.length : null },
     { id: "models", label: "Models", n: st ? st.model_aliases.length : null },
+    {
+      id: "agents",
+      label: "Agents",
+      n: st ? (st.clients ?? []).reduce((a, c) => a + (c.agent_roster?.length ?? 0), 0) : null,
+    },
   ];
   return (
     <div className="flex flex-col gap-3">

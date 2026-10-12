@@ -473,6 +473,9 @@ function cleanReportedHistory(
 export type HermesMetaBlock = {
   title?: string;
   model?: string;
+  /** Provenance stamp (see SessionRecord.hermes_meta.profile): the profile
+   *  ledger the client READ the row from. Bounded ≤64; absent never clears. */
+  profile?: string;
   message_count?: number;
   tool_call_count?: number;
   input_tokens?: number;
@@ -502,6 +505,11 @@ function cleanReportedHermesMeta(v: unknown): HermesMetaBlock | undefined {
   if (title !== undefined) out.title = title;
   const model = str('model', 128);
   if (model !== undefined) out.model = model;
+  // Provenance stamp: the profile ledger the client READ the row from.
+  // Same bounded-string shape as every other member (≤64); a hostile/
+  // oversized profile name drops just this member.
+  const profile = str('profile', 64);
+  if (profile !== undefined) out.profile = profile;
   for (const key of ['message_count', 'tool_call_count', 'input_tokens', 'output_tokens', 'reasoning_tokens'] as const) {
     const n = int(key);
     if (n !== undefined) out[key] = n;
