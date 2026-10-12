@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
+import { toast } from "sonner";
 import {
   Card,
   CardHeader,
@@ -9,9 +10,9 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { Sparkline } from "@/components/Sparkline";
 import { ago, durFmt, fmt, liveWord, type StateWord } from "@/lib/format";
-import { hostLine, meshTiles, peerVerdict } from "@/lib/mesh-stats";
+import { hostLine, intentWord, meshTiles, peerVerdict, relayOutcome } from "@/lib/mesh-stats";
 import { buildRemoteRows, type RemoteRow } from "@/lib/remote-metrics";
-import { getRemoteMetrics, type MeshPeer, type StateSnapshot } from "@/lib/api";
+import { apiToken, getRemoteMetrics, requestPeerUpdate, type MeshPeer, type StateSnapshot } from "@/lib/api";
 
 const TONE: Record<string, string> = {
   ok: "text-ok",
@@ -49,6 +50,16 @@ const TONE: Record<string, string> = {
 // a peer origin, D3), on demand (no background pull), and renders the
 // #52/#57 Usage sparkline vocabulary. ADD-only: a failed pull is a render
 // gap, never a fake zero.
+//
+// mesh-update.md D4: the one write this tab is allowed — the update button,
+// on a peer row whose LOCAL edge says `i_control` and nowhere else. Two-step
+// confirm (one click arms "confirm?" for 3 s); the answer is a named toast
+// (queued / update_in_flight / not_paired / direction_denied / …). The
+// button creates an INTENT on the target, never a command: its host updater
+// helper runs the machine's own documented update. This Machine has no
+// button — it updates by the operator's own command line; the intents asked
+// OF this machine render as chips on the local card (the coarse
+// update_intents block).
 // ---------------------------------------------------------------------------
 
 const REMOTE_WINDOW_MS = 7 * 86_400_000; // the 7-day default, local parity (D2)
@@ -96,7 +107,7 @@ export function Machines({ st }: { st: StateSnapshot | null }) {
       <div className="flex items-center gap-3">
         <h2 className="text-[12px] font-semibold uppercase tracking-wide text-dim">Machines</h2>
         <span className="ml-auto text-[11px] text-dim">
-          {peers.length} {peers.length === 1 ? "peer" : "peers"} · read-only snapshots
+          {peers.length} {peers.length === 1 ? "peer" : "peers"} · read-only snapshots · one write: update (paired peers)
         </span>
       </div>
 
@@ -183,6 +194,19 @@ function LocalCard({ st }: { st: StateSnapshot }) {
             </div>
           )}
         </div>
+        {(st.update_intents?.length ?? 0) > 0 && (
+          <div className="flex flex-wrap items-center gap-1.5" title="machine-update intents asked of THIS machine by a paired controller (mesh-update.md) — this machine updates by the operator's own command line, there is no local button">
+            <span className="text-[10px] uppercase tracking-wide text-dim">updates</span>
+            {[...(st.update_intents ?? [])].reverse().map((it) => {
+              const iw = intentWord(it, st.now);
+              return (
+                <span key={it.id} className={`rounded border border-border px-1.5 py-0.5 text-[10px] font-semibold ${TONE[iw.tone]}`} title={`${iw.note} · intent ${it.id} · requested by ${it.source_instance_id}`}>
+                  {iw.label}
+                </span>
+              );
+            })}
+          </div>
+        )}
       </CardContent>
     </Card>
   );
@@ -278,10 +302,78 @@ function PeerCard({ p, now }: { p: MeshPeer; now: number }) {
 
       <RemoteExpand p={p} />
 
-      <div className="border-t border-border px-3 py-1.5 text-[11px] text-dim">
-        <code className="truncate" title="the peer's mesh url">{p.url}</code>
+      <div className="flex items-center gap-2 border-t border-border px-3 py-1.5 text-[11px] text-dim">
+        <code className="min-w-0 truncate" title="the peer's mesh url">{p.url}</code>
+        {p.i_control && <UpdateButton p={p} />}
       </div>
     </Card>
+  );
+}
+
+// The one write the Machines tab carries (mesh-update.md D4): press once to
+// arm ("confirm?" for 3 s), press again to relay the update verb to the
+// peer. The local arbiter signs the #39 envelope; the target records an
+// INTENT and its own host helper does everything else — nothing executable
+// crosses the wire. The button exists only on an `i_control` row; an
+// unpaired or reverse edge never shows it (and the relay refuses it by name
+// even if the UI were wrong).
+function UpdateButton({ p }: { p: MeshPeer }) {
+  const [armed, setArmed] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const disarm = () => {
+    if (timer.current) clearTimeout(timer.current);
+    timer.current = null;
+    setArmed(false);
+  };
+
+  const arm = () => {
+    setArmed(true);
+    if (timer.current) clearTimeout(timer.current);
+    timer.current = setTimeout(() => setArmed(false), 3000);
+  };
+
+  const fire = async () => {
+    disarm();
+    if (!apiToken()) {
+      toast.error("needs the arbiter API token — paste it in the header first");
+      return;
+    }
+    setBusy(true);
+    try {
+      const relay = await requestPeerUpdate(p.instance_id);
+      const w = relayOutcome(relay);
+      if (w.tone === "err") toast.error(`${p.name}: ${w.label}`, { description: w.note });
+      else if (w.tone === "warn") toast.warning(`${p.name}: ${w.label}`, { description: w.note });
+      else toast.success(`${p.name}: ${w.label}`, { description: w.note });
+    } catch (e) {
+      toast.error(`${p.name}: ${e instanceof Error ? e.message : String(e)}`, {
+        description: "the local relay refused before hopping — the denial names itself",
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      disabled={busy}
+      onClick={armed ? () => void fire() : arm}
+      title={
+        busy
+          ? "relaying the update verb to the peer…"
+          : armed
+            ? "one more click asks this machine to update its idlefill install — its host updater helper runs the machine's own update command"
+            : "ask this machine to update its idlefill install (creates an intent there; nothing executable crosses the wire)"
+      }
+      className={`ml-auto shrink-0 rounded border px-2 py-0.5 text-[11px] font-semibold transition-colors ${
+        armed ? "border-warn text-warn" : "border-border text-dim hover:text-foreground"
+      } disabled:opacity-50`}
+    >
+      {busy ? "relaying…" : armed ? "confirm?" : "update"}
+    </button>
   );
 }
 

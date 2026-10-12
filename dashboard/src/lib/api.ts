@@ -426,6 +426,21 @@ export type MeshPeerSnapshot = {
   host?: HostStats;
 };
 
+// One machine-update intent (mesh-update.md D2) — the coarse block
+// /api/state publishes about THIS machine as the controlled side: the last
+// few intents a paired controller asked for. The intent never carries a
+// command — states + coarse ages only; without a host updater helper a
+// queued intent names itself stale, never a fake progress.
+export type UpdateIntent = {
+  id: string;
+  source_instance_id: string;
+  requested_at: number;
+  state: "queued" | "running" | "done" | "failed" | "stale";
+  started_at?: number;
+  finished_at?: number;
+  detail?: string;
+};
+
 export type MeshPeer = {
   url: string;
   name: string;
@@ -434,6 +449,12 @@ export type MeshPeer = {
   fetch_age_s: number | null;
   error?: string;
   snapshot: MeshPeerSnapshot | null;
+  // mesh-update.md D4: the LOCAL edge store's role for this peer (ADD keys,
+  // absent when the edge does not say so). `i_control` = this machine may
+  // relay control to THAT peer — the ONLY condition under which the
+  // Machines tab offers the update button.
+  i_control?: true;
+  controls_me?: true;
 };
 
 export type StateSnapshot = {
@@ -471,6 +492,8 @@ export type StateSnapshot = {
   mesh?: { instance_id: string; peers: MeshPeer[] };
   /** Coarse host counters for THIS machine (ADD key; absent on a pre-key arbiter). */
   host?: HostStats;
+  /** The last few machine-update intents for THIS machine (ADD key, mesh-update.md D4; absent on a pre-plane arbiter). */
+  update_intents?: UpdateIntent[];
   /** The operator-tuned color scheme (#68). Absent until set. */
   theme?: ThemeColors;
 };
@@ -768,6 +791,34 @@ export async function setSessionPin(token: string, server_id: string | null) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ server_id }),
   }));
+}
+
+// mesh-update.md D1/D4: ask a PAIRED peer machine to update its idlefill
+// install. The dashboard fires the LOCAL admin-plane relay (local token);
+// the local arbiter signs the #39 envelope and hops it to the peer. Nothing
+// executable rides the wire — the verb is the entire payload. A local denial
+// (not_paired / direction_denied / peer_unreachable / …) throws with the
+// named error; a peer-side answer (202 queued intent / 409 update_in_flight)
+// arrives relayed: true with the peer's own status + body passed through.
+export type PeerUpdateRelay = {
+  relayed: true;
+  peer: string;
+  status: number;
+  target: { ok?: boolean; intent_id?: string; state?: string; error?: string; hint?: string };
+};
+
+export async function requestPeerUpdate(instanceId: string): Promise<PeerUpdateRelay> {
+  const res = await fetch(`/api/mesh/control/${encodeURIComponent(instanceId)}${qsToken()}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ action: "update" }),
+  });
+  const body = (await res.json().catch(() => ({}))) as Partial<PeerUpdateRelay> & { error?: string; reason?: string };
+  if (!res.ok || body.relayed !== true) {
+    const why = body.error ?? `HTTP ${res.status}`;
+    throw new Error(body.reason ? `${why} — ${body.reason}` : why);
+  }
+  return body as PeerUpdateRelay;
 }
 
 // #78 session viewer: the router's read-only transcript for one session.

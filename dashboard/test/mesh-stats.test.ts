@@ -7,8 +7,8 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { freshPeers, hostLine, meshTiles, peerVerdict } from "../src/lib/mesh-stats.js";
-import type { MeshPeer } from "../src/lib/api.js";
+import { freshPeers, hostLine, intentWord, meshTiles, peerVerdict, relayOutcome } from "../src/lib/mesh-stats.js";
+import type { MeshPeer, UpdateIntent } from "../src/lib/api.js";
 
 function peer(over: Record<string, unknown> = {}): MeshPeer {
   return {
@@ -115,4 +115,41 @@ test("hostLine renders per-key and omits nothing-renders into a bare dash", () =
   assert.equal(hostLine({ uptime_s: 4 * 3600 + 12 * 60 }), "up 4h 12m");
   assert.equal(hostLine({ mem_total_bytes: 34_359_738_368 }), "mem 32.0 GiB total", "free absent → total only, never an assumed usage");
   assert.equal(hostLine({ mem_total_bytes: 1000, mem_free_bytes: 9_999_999 }), "mem 0.0 GiB total", "a peer claiming free > total is not a fake negative usage");
+});
+
+// mesh-update.md D4 — the intent chips and the relayed answer's words.
+// The words name the plane's truths: an unclaimed intent says WHY it went
+// stale (no helper), a peer denial rides verbatim, no progress is invented.
+test("intentWord names every state honestly", () => {
+  const t0 = 1_000_000;
+  const it = (over: Record<string, unknown>): UpdateIntent =>
+    ({ id: "u-1", source_instance_id: "m-controller", requested_at: t0, state: "queued", ...over }) as UpdateIntent;
+  assert.equal(intentWord(it({}), t0 + 60_000).label, "update queued");
+  assert.match(intentWord(it({}), t0 + 60_000).note, /host updater helper/);
+  assert.equal(intentWord(it({ state: "running", started_at: t0 + 5_000 }), t0 + 60_000).label, "update running");
+  const done = intentWord(it({ state: "done", started_at: t0 + 5_000, finished_at: t0 + 40_000, detail: "image swapped" }), t0 + 60_000);
+  assert.equal(done.label, "updated");
+  assert.equal(done.tone, "ok");
+  assert.match(done.note, /image swapped/);
+  assert.equal(intentWord(it({ state: "failed", detail: "healthcheck failed" }), t0 + 60_000).tone, "err");
+  const stale = intentWord(it({ state: "stale" }), t0 + 400_000);
+  assert.equal(stale.label, "update stale");
+  assert.match(stale.note, /can never execute/);
+});
+
+test("relayOutcome passes the peer's answer through named", () => {
+  const q = relayOutcome({ status: 202, target: { ok: true, intent_id: "u-9", state: "queued" } });
+  assert.equal(q.label, "update queued");
+  assert.equal(q.tone, "ok");
+  assert.match(q.note, /u-9/);
+  const busy = relayOutcome({ status: 409, target: { error: "update_in_flight", intent_id: "u-1" } });
+  assert.equal(busy.label, "update in flight");
+  assert.equal(busy.tone, "warn");
+  assert.match(busy.note, /u-1/);
+  const denied = relayOutcome({ status: 403, target: { error: "bad_signature", hint: "the signature did not verify" } });
+  assert.equal(denied.label, "bad_signature", "the peer's own named answer, verbatim");
+  assert.equal(denied.tone, "err");
+  assert.equal(denied.note, "the signature did not verify");
+  const raw = relayOutcome({ status: 500, target: {} });
+  assert.equal(raw.label, "HTTP 500", "a body-less answer is still a named status, never a silent success");
 });
