@@ -56,7 +56,7 @@ NPATH="$(dirname "$NODE_BIN")"
 [ -f "$REPO/scripts/host-updater.mjs" ] || fail "scripts/host-updater.mjs missing in $REPO"
 git -C "$REPO" rev-parse HEAD >/dev/null 2>&1 || fail "$REPO is not a git checkout"
 [ -f "$CFG" ] || fail "no helper config at $CFG — the helper refuses to run without its 0600 config (arbiter_url + token + command); see the header of scripts/host-updater.mjs"
-node -e 'const m=statSync(process.argv[1]).mode & 0o777; process.exit((m & 0o077) !== 0 ? 1 : 0)' "$CFG" \
+node -e 'const {statSync}=require("fs"); const m=statSync(process.argv[1]).mode & 0o777; process.exit((m & 0o077) !== 0 ? 1 : 0)' "$CFG" \
   || fail "$CFG is group/world-accessible — chmod 600 it first (it holds the arbiter token)"
 
 RDIR="$(mktemp -d "${TMPDIR:-/tmp}/idlefill-unit.XXXXXX")"
