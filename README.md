@@ -49,6 +49,7 @@ Architecture below.
 | 1 | Monorepo, server (Docker), client daemon, career-ops adapter, tests | **Done** — see `npm test`, Docker build |
 | 1.5 | Arbiter deployed to **urza** (2026-09-25) | **Done** — the live path is `scripts/deploy-server.sh` (gate, native amd64 build on urza, host-network container swap, tailnet healthcheck, auto-rollback). Image tag = the commit sha. State + config live under urza's `~/idlefill/` (0700/0600). Dashboard: `http://100.105.225.1:8787` |
 | 2 | urza hardening (compose + traefik route + IP/auth middleware), launchd client, NInfer log ro-mount | **Superseded (retired 2026-10-08)** — the compose + traefik plane never ran (urza is host-networked via the script above; `/mnt/docker/idlefill` never existed). The launchd client IS live (`tauri/install.sh` renders `tauri/IdlefillApp.plist`; the daemon/arbiter plists render from the Rust lifecycle plane) and the Linux client service is exercised (issue #54) |
+| 3 (operator CLI) | One `idlefill` command for update / mesh / engine / agent (+ daemon/control groups) | **Design accepted (2026-10-12)** — `docs/architecture/cli.md`; implementation filed as issues #88–#92 (S1–S5) |
 
 ## Architecture
 
@@ -224,6 +225,9 @@ adapters/   per-project executors (career-ops: queue builder + JD evaluator
 scripts/    thin CLI wrappers (build-careerops-queue.mjs, the control
             CLIs: idlefill-control.mjs arbiter-side, idlefill-daemon.mjs
             daemon-side — platform-portable, systemd-aware on Linux)
+cli/        (planned, #88–#92) the `idlefill` operator CLI — one dispatcher
+            over update / mesh / engine / agent + the daemon/control
+            groups (docs/architecture/cli.md)
 deploy/     launchd templates (com.sam.idlefill.client.plist,
             com.sam.idlefill.server.plist) + systemd/ + install-client-service.sh
             = the Linux client service (issue #54 — exercised, see below).
@@ -577,6 +581,10 @@ The manual path is `./update.sh` — one command, fail-closed at every step:
 ./update.sh --no-pull    # rebuild THIS checkout, reinstall
 ```
 
+(Planned, #89: `idlefill update` / `idlefill update --check` wraps this exact
+sequence and adds a release-feed compare against the installed build marker —
+`docs/architecture/cli.md` D4. update.sh stays the locked implementation.)
+
 **Build identity.** The marker contract survives the pipeline's death:
 `idlefill-app --version` prints `idlefill <marker>` — the commit's short
 sha on an `update.sh` build, `dev` on a bare `tauri/build.sh`. The
@@ -817,6 +825,31 @@ node scripts/idlefill-control.mjs servers
 node scripts/idlefill-control.mjs server add box-two http://192.168.9.9:11434 [--models a,b] [--peers peer:gpu2] [--auth TOKEN]
 node scripts/idlefill-control.mjs server set <id> [--name N] [--url U] [--models a,b] [--peers p1] [--auth TOKEN | --auth-clear]
 ```
+
+## The operator CLI (`idlefill`) — design accepted, not yet built
+
+Design authority: `docs/architecture/cli.md` (accepted 2026-10-12); waves filed
+as issues #88–#92. One dispatcher over the planes that today live in
+`update.sh` and the `scripts/` control CLIs — a front-end, not a new backend:
+every command calls an existing endpoint, runs an existing script, or is
+named as the wave that adds the one missing piece (mesh join's config flow,
+agent connect's profile write-back).
+
+```
+idlefill update [--check] [--no-pull]     # release-feed compare + the update.sh sequence
+idlefill mesh   status | join <url> | leave <name|url> | pair [code]
+idlefill engine [list] | add | set | remove   # add --local pre-flights the co-location rule
+idlefill agent  [list] | connect <profile> | disconnect <profile>
+idlefill daemon status | start | stop | restart | logs | diagnose
+idlefill control clients | pause | force | clear | projects | servers …
+```
+
+Standing rules: the token is read at runtime from the gitignored config — it
+never appears on a command line; every read takes `--json`; failures name
+their reason; `mesh join` probes the peer's read plane BEFORE writing config;
+`agent connect` is the wave's only out-of-repo write and inherits the
+agent-roster credential rules whole (never touches `.env`, never follows
+`key_env`).
 
 ## Dashboard layout (the work flow)
 
