@@ -17,11 +17,13 @@ import {
   type CycleStatusRow,
   type HermesJobRow,
   type LeaseRow,
+  type ServerRow,
   type StateSnapshot,
   type ThrottledJob,
 } from "@/lib/api";
 import { ago, cycleTone, durFmt, fmt, liveWord, minSec } from "@/lib/format";
-import { fleetLoadTiles, tokensTodayTile, type StatTile } from "@/lib/fleet-stats";
+import { engineGauges, fleetLoadTiles, gibfmt, tokensTodayTile, type StatTile } from "@/lib/fleet-stats";
+import { LOAD_FRESHNESS_DEFAULT_S } from "@/lib/load-read";
 import { HERMES_JOBS_LABEL, collectHermesJobGroups, type HermesJobGroup } from "@/lib/hermes-jobs";
 
 const TONE: Record<string, string> = {
@@ -54,6 +56,7 @@ export function Overview({ st }: { st: StateSnapshot | null }) {
     <section className="flex flex-col gap-3">
       <FleetStats st={st} />
       <SystemCard st={st} />
+      <EngineCards st={st} />
       {cycleGroups.length === 0 && throttled.length === 0 && jobGroups.length === 0 ? (
         <Card className="py-4 shadow-none">
           <CardContent className="px-4 text-[12px] text-dim">
@@ -159,6 +162,104 @@ function FleetStats({ st }: { st: StateSnapshot }) {
         </Card>
       ))}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// ENGINE CARDS — one glance card per declared inference server/engine host
+// (the sparkDash per-unit card): the verdict word + routing dot, the model
+// the engine names as loaded, its own gauges (decode rate · GPU util ·
+// power) and a VRAM bar. The authoring surface (full model lists,
+// sparklines, groups, edit/remove) stays on the Resources page — these are
+// the glance. Exception-only: no load axis = the card shows only its word;
+// a failed read names its reason; a stale read dims its values (the last-
+// known truth, labelled) — never a fake zero.
+// ---------------------------------------------------------------------------
+
+function EngineCards({ st }: { st: StateSnapshot }) {
+  const rows = st.servers ?? [];
+  if (rows.length === 0) return null;
+  const staleS = st.metrics_load_stale_s ?? LOAD_FRESHNESS_DEFAULT_S;
+  const runningIds = new Set((st.active_leases ?? []).map((l) => l.server_id).filter((x): x is string => Boolean(x)));
+  return (
+    <section className="flex flex-col gap-2">
+      <h2 className="text-[12px] font-semibold uppercase tracking-wide text-dim">Inference engines</h2>
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+        {rows.map((row) => (
+          <EngineCard key={row.id} row={row} staleS={staleS} runningIds={runningIds} now={st.now} />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function EngineCard({
+  row,
+  staleS,
+  runningIds,
+  now,
+}: {
+  row: ServerRow;
+  staleS: number;
+  runningIds: Set<string>;
+  now: number;
+}) {
+  const running = runningIds.has(row.id);
+  const word = row.watched
+    ? liveWord(row.signal ? { idle: row.signal.idle, degraded: row.signal.degraded } : null, running || row.models.some((m) => m.running))
+    : liveWord(null, false);
+  const g = engineGauges(row.signal, staleS);
+  const vramPct =
+    g?.memUsed !== undefined && g?.memTotal !== undefined && g.memTotal > 0
+      ? Math.min(100, Math.round((g.memUsed / g.memTotal) * 100))
+      : null;
+  const vramBar = vramPct === null ? "bg-accent" : vramPct < 80 ? "bg-accent" : vramPct < 95 ? "bg-warn" : "bg-err";
+  return (
+    <Card className="py-0 shadow-none">
+      <CardContent className="flex flex-col gap-1.5 px-3 py-2.5">
+        <div className="flex items-center gap-2">
+          <span className="truncate text-[13px] font-semibold" title={row.name}>{row.name}</span>
+          <span className={`shrink-0 text-[11px] font-semibold ${TONE[word.tone]}`} title={word.note}>{word.label}</span>
+          <span
+            className={`size-1.5 shrink-0 rounded-full ${row.model_source === "probed" ? "bg-ok" : "bg-err"}`}
+            title={row.model_source === "probed" ? "the /v1/models probe answered this tick — the routing green" : "the /v1/models probe never answered — the declared list stands (routing red)"}
+          />
+          <span className="ml-auto shrink-0 text-[10px] text-dim" title="provider kind">{row.provider ?? "llama-swap"}</span>
+        </div>
+        {g?.model && (
+          <div className="truncate text-[11px]" title="the engine names this model as loaded">
+            {g.model}
+            {g.quant ? ` · ${g.quant}` : ""}
+          </div>
+        )}
+        {g && (g.util !== undefined || g.tps !== undefined || g.watts !== undefined) && (
+          <div className={`flex items-center gap-3 text-[11px] text-dim ${g.stale ? "opacity-60" : ""}`}
+            title={g.stale ? `engine load read (${g.source}) — STALE: ${g.ageS}s old (values may be out of date)` : `engine load read (${g.source})`}>
+            {g.util !== undefined && <span className="whitespace-nowrap">gpu <span className="text-[13px] font-semibold text-foreground">{Math.round(g.util)}%</span></span>}
+            {g.tps !== undefined && <span className="whitespace-nowrap"><span className="text-[13px] font-semibold text-foreground">{Math.round(g.tps)}</span> tok/s</span>}
+            {g.watts !== undefined && <span className="whitespace-nowrap"><span className="text-[13px] font-semibold text-foreground">{Math.round(g.watts)}</span> W</span>}
+          </div>
+        )}
+        {g?.memUsed !== undefined && g?.memTotal !== undefined && g.memTotal > 0 && (
+          <div className={`flex flex-col gap-1 ${g.stale ? "opacity-60" : ""}`} title={`GPU memory ${gibfmt(g.memUsed)} used of ${gibfmt(g.memTotal)} (${vramPct}%)${g.stale ? " — stale read" : ""}`}>
+            <div className="flex items-center justify-between text-[10px] text-dim">
+              <span>vram</span>
+              <span>{gibfmt(g.memUsed)} / {gibfmt(g.memTotal)}</span>
+            </div>
+            <div className="h-1 overflow-hidden rounded-full bg-muted">
+              <div className={`h-1 rounded-full ${vramBar}`} style={{ width: `${vramPct}%` }} />
+            </div>
+          </div>
+        )}
+        {g?.failReason && <div className="text-[11px] text-warn" title="the last engine load read failed — this is why the gauges are missing">{g.failReason}</div>}
+        <div className="flex items-center justify-between gap-3 text-[11px] text-dim">
+          <code className="truncate" title={row.url}>{row.url}</code>
+          <span className="whitespace-nowrap" title="last activity seen on this row">
+            {row.signal?.last_activity ? ago(now - row.signal.last_activity.ts) : row.watched ? "no activity yet" : "not watched"}
+          </span>
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 

@@ -24,6 +24,7 @@ export type ServerSignal = {
   // dims when load_age_s exceeds the freshness window.
   load_source?: string;
   load_age_s?: number;
+  load_fail_reason?: string;
   gpu_util_percent?: number;
   gpu_mem_used_bytes?: number;
   gpu_mem_total_bytes?: number;

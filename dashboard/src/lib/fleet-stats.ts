@@ -11,7 +11,7 @@
 // fleet total. Partial coverage is named in `sub` ("2 of 3 engines"),
 // never silently averaged.
 import { LOAD_FRESHNESS_DEFAULT_S } from "./load-read.js";
-import type { RawEngineLine, RawLeaseLine, StateSnapshot } from "./api.js";
+import type { RawEngineLine, RawLeaseLine, ServerSignal, StateSnapshot } from "./api.js";
 
 export type StatTile = {
   /** The tile value, pre-formatted; "—" when the fleet names no number. */
@@ -104,6 +104,49 @@ export function tokensTodayTile(
     return { value: "—", sub: "no tokens recorded today" };
   }
   return { value: compact(sum), sub: "lease-reported · since local midnight" };
+}
+
+/**
+ * The per-engine Overview card's gauges (the sparkDash per-host card).
+ * The whole load reading is reported as-is — stale rows INCLUDED, flagged
+ * via `stale` (unlike the fleet tiles, which drop stale readings from the
+ * sum: the card shows the last-known truth, dimmed). No load axis at all
+ * (no load_source) → null: the card renders the verdict word only.
+ */
+export type EngineGauges = {
+  source: string;
+  stale: boolean;
+  ageS: number | null;
+  util?: number;
+  watts?: number;
+  tps?: number;
+  model?: string;
+  quant?: string;
+  memUsed?: number;
+  memTotal?: number;
+  failReason?: string;
+};
+
+export function engineGauges(sig: ServerSignal | null | undefined, staleS: number): EngineGauges | null {
+  if (!sig || typeof sig.load_source !== "string" || sig.load_source === "") {
+    // No reading, but a named auth/read failure is worth its line.
+    return sig?.load_fail_reason ? { source: "", stale: false, ageS: null, failReason: sig.load_fail_reason } : null;
+  }
+  const ageS = typeof sig.load_age_s === "number" ? sig.load_age_s : null;
+  const num = (v: number | undefined): number | undefined => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
+  return {
+    source: sig.load_source,
+    stale: ageS !== null && ageS > staleS,
+    ageS,
+    util: num(sig.gpu_util_percent),
+    watts: num(sig.gpu_power_watts),
+    tps: num(sig.tokens_per_second),
+    ...(typeof sig.model_loaded === "string" && sig.model_loaded !== "" ? { model: sig.model_loaded } : {}),
+    ...(typeof sig.model_quant === "string" && sig.model_quant !== "" ? { quant: sig.model_quant } : {}),
+    memUsed: num(sig.gpu_mem_used_bytes),
+    memTotal: num(sig.gpu_mem_total_bytes),
+    ...(sig.load_fail_reason ? { failReason: sig.load_fail_reason } : {}),
+  };
 }
 
 // 30.4 GiB (one decimal under 100, none above — the tile line stays one

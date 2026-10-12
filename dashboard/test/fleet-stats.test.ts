@@ -6,7 +6,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { fleetLoadTiles, tokensTodayTile, gibfmt, compact } from "../src/lib/fleet-stats.js";
+import { fleetLoadTiles, tokensTodayTile, engineGauges, gibfmt, compact } from "../src/lib/fleet-stats.js";
 import type { RawEngineLine, RawLeaseLine, StateSnapshot } from "../src/lib/api.js";
 
 function sig(over: Record<string, unknown> = {}) {
@@ -96,8 +96,37 @@ test("tokens today: nothing today is an em-dash, never a fake zero", () => {
   assert.deepEqual(tokensTodayTile([], [], [], 0), { value: "—", sub: "no tokens recorded today" });
 });
 
-test("formatters keep the tile value one word", () => {
-  assert.equal(gibfmt(3.27e10), "30.5 GiB");
+// The per-engine card gauges: the whole reading reported as-is (stale
+// INCLUDED and flagged — the card shows the last-known truth, dimmed,
+// unlike the fleet tiles which drop it). No load axis → null.
+test("engineGauges: full reading rides; stale flagged, not dropped; absent axis is null", () => {
+  const fresh = sig({
+    load_source: "strata-metrics",
+    load_age_s: 5,
+    gpu_util_percent: 39,
+    gpu_power_watts: 239.4,
+    tokens_per_second: 113.9,
+    gpu_mem_used_bytes: 33891942400,
+    gpu_mem_total_bytes: 34190917632,
+    model_loaded: "qwen3.8-flash-next-iq3_s",
+    model_quant: "iq3_s",
+  });
+  const g = engineGauges(fresh, 45);
+  assert.ok(g);
+  assert.equal(g.stale, false);
+  assert.deepEqual([g.util, g.watts, g.tps], [39, 239.4, 113.9]);
+  assert.equal(g.model, "qwen3.8-flash-next-iq3_s");
+  assert.equal(gibfmt(g.memUsed ?? 0), "31.6 GiB");
+  const stale = engineGauges({ ...fresh, load_age_s: 300 }, 45);
+  assert.ok(stale?.stale, "stale rides the card, flagged for dimming");
+  assert.equal(stale?.util, 39, "stale values still show (last-known truth)");
+  assert.equal(engineGauges(sig(), 45), null, "no load axis → null → the card shows the word only");
+  const failOnly = engineGauges(sig({ load_fail_reason: "401 missing or wrong API key" }), 45);
+  assert.equal(failOnly?.failReason, "401 missing or wrong API key", "a failed read still names its reason");
+  assert.equal(failOnly?.source, "");
+});
+
+test("formatters keep the tile value one word", () => {  assert.equal(gibfmt(3.27e10), "30.5 GiB");
   assert.equal(gibfmt(3.42e11), "319 GiB");
   assert.equal(compact(1_234_567), "1.2M");
   assert.equal(compact(500), "500");
