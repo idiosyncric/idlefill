@@ -8,6 +8,9 @@ server/config.json
 client/config.json
 client/logs/
 fleet/config.json
+# timestamped config backups carry the same live tokens as the configs (mesh
+# join / agent connect write them) — same secret rule, never committable
+config.json.bak-*
 fleet/*.db
 fleet/*.db-*
 .DS_Store
