@@ -433,5 +433,11 @@ export function makeRealLogMtimeSource(): LogMtimeSource {
 }
 
 function escapeRe(s: string): string {
-  return s.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
+  // `*` joins the escape set so the wildcard pass above has a `\*` to
+  // translate: pre-fix, `*` fell through as a bare REGEX quantifier —
+  // `*.log` threw (caught → null, log signal silently disabled) and
+  // `strata-*.log` only matched `strata.log`. The documented contract
+  // ("the newest-mtime file matching log_glob") is a basename glob.
+  // Caught by the CLI engine `add --local` probe (#90, cli.md D6).
+  return s.replace(/[.+*?^${}()|[\]\\]/g, '\\$&');
 }

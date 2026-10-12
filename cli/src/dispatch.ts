@@ -1,8 +1,9 @@
 /**
  * Group registry + routing table (cli.md D2, issue #88 S1).
  * daemon/control are live passthrough groups (behavior byte-identical to
- * the scripts they wrap); update/engine/mesh/agent are registered for
- * S2–S5 (#89–#92) and name their slice on every attempt.
+ * the scripts they wrap); engine is live since S3 (#90); update/mesh/agent
+ * are registered for S2/S4/S5 (#89/#91/#92) and name their slice on every
+ * attempt.
  */
 
 import type { Parsed } from './argv.js';
@@ -41,7 +42,7 @@ export const GROUPS: Record<GroupId, GroupSpec> = {
   engine: {
     id: 'engine',
     summary: 'inference-engine inventory: list / add / set / remove',
-    implemented: false,
+    implemented: true,
     slice: 'S3',
     issue: 90,
   },

@@ -59,18 +59,34 @@ test('top help lists all six groups with their status', () => {
   assert.ok(help.includes('idlefill <group> [command] [flags]'));
   for (const id of GROUP_ORDER) assert.ok(help.includes(id), id);
   assert.ok(help.includes('live'));
-  for (const issue of ['#89', '#90', '#91', '#92']) assert.ok(help.includes(issue), issue);
+  for (const issue of ['#89', '#91', '#92']) assert.ok(help.includes(issue), issue);
+  assert.ok(!help.includes('#90'), 'engine (S3, #90) is live — no longer listed as planned');
   assert.ok(help.includes('--json'));
   assert.ok(help.includes('docs/architecture/cli.md'));
 });
 
 test('planned groups name their slice, issue, and today\'s path', () => {
   assert.ok(UPDATE_USAGE.includes('S2 (issue #89)') && UPDATE_USAGE.includes('./update.sh'));
-  assert.ok(ENGINE_USAGE.includes('S3 (issue #90)') && ENGINE_USAGE.includes('idlefill-control.mjs server'));
   assert.ok(MESH_USAGE.includes('S4 (issue #91)') && MESH_USAGE.includes('mesh_peers'));
   assert.ok(AGENT_USAGE.includes('S5 (issue #92)') && AGENT_USAGE.includes('agent_roster'));
   assert.equal(groupHelp('update'), UPDATE_USAGE);
   assert.equal(groupHelp('mesh'), MESH_USAGE);
   assert.equal(groupHelp('engine'), ENGINE_USAGE);
   assert.equal(groupHelp('agent'), AGENT_USAGE);
+});
+
+test('the engine group help (live, S3 #90) names every subcommand and the --local rule', () => {
+  for (const needle of [
+    'idlefill engine [list]',
+    'idlefill engine add <name> <url>',
+    'idlefill engine set <id>',
+    'idlefill engine remove <id>',
+    '--json',
+    'co-location pre-flight (mesh.md rule 1)',
+    '--log-glob',
+    'fail-closed for',
+    'never appears on a command line',
+  ]) {
+    assert.ok(ENGINE_USAGE.includes(needle), needle);
+  }
 });

@@ -81,13 +81,25 @@ hand-editing server/config.json (mesh_peers — NOT server_peers) and
 restarting the arbiter.
 `;
 
-export const ENGINE_USAGE = `idlefill engine — the inference-engine inventory.
+export const ENGINE_USAGE = `idlefill engine — the inference-engine inventory (the terminal twin of
+the dashboard Resources tab and \`idlefill control server …\`).
 
-  idlefill engine [list] | add <name> <url> [--models a,b] [--peers p1] [--local]
-                | set <id> […] | remove <id>
+  idlefill engine [list] [--json]
+  idlefill engine add <name> <url> [--models a,b] [--peers p1] [--local [--log-glob G]]
+  idlefill engine set <id> [--name N] [--url U] [--models a,b] [--peers p1]
+  idlefill engine remove <id>
 
-Planned — S3 (issue #90). Not implemented yet; today: the dashboard
-Resources tab or scripts/idlefill-control.mjs server …
+add --local — the co-location pre-flight (mesh.md rule 1): the arbiter's
+idle detector reads the engine's log file ON THE ARBITER'S HOST, so a
+local engine must carry a log_glob that matches a real file here. The CLI
+probes candidate log locations BEFORE saving — no match, nothing is saved
+and the rule is named. Pass --log-glob to point at the engine's log.
+Without --local a row is display + routing metadata: fail-closed for
+grants, exactly as the ownership rule intends.
+remove refuses a row with live leases — the arbiter answers, the CLI
+names it.
+Auth: the arbiter token is read AT RUNTIME from the gitignored config —
+it never appears on a command line.
 `;
 
 export const AGENT_USAGE = `idlefill agent — connected / discovered agents on this machine.

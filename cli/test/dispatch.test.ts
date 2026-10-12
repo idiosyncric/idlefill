@@ -19,10 +19,14 @@ test('daemon/control route as live passthrough groups (S1)', () => {
   assert.equal(GROUPS.control.implemented, true);
 });
 
-test('update/mesh/engine/agent are registered but refuse by name until S2–S5', () => {
+test('engine routes as a live group (S3, #90)', () => {
+  assert.deepEqual(dispatch(parse(['engine', 'list'])), { kind: 'group', group: 'engine' });
+  assert.equal(GROUPS.engine.implemented, true);
+});
+
+test('update/mesh/agent are registered but refuse by name until S2/S4/S5', () => {
   const planned: Array<[string, string, number]> = [
     ['update', 'S2', 89],
-    ['engine', 'S3', 90],
     ['mesh', 'S4', 91],
     ['agent', 'S5', 92],
   ];

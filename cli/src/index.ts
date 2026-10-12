@@ -19,6 +19,7 @@ import { dispatch, EXIT_OK, EXIT_USAGE, GROUPS, notImplementedNote } from './dis
 import { groupHelp, topHelp } from './help.js';
 import { runDaemon } from './daemon.js';
 import { runControl } from './control.js';
+import { runEngine } from './engine.js';
 
 export async function main(argv: string[]): Promise<number> {
   const parsed = parseArgv(argv);
@@ -46,6 +47,7 @@ export async function main(argv: string[]): Promise<number> {
   }
 
   if (d.group === 'daemon') return runDaemon(parsed.args, parsed.json);
+  if (d.group === 'engine') return runEngine(parsed.args, parsed.json);
   return runControl(parsed.args, parsed.json);
 }
 

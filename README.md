@@ -49,7 +49,7 @@ Architecture below.
 | 1 | Monorepo, server (Docker), client daemon, career-ops adapter, tests | **Done** — see `npm test`, Docker build |
 | 1.5 | Arbiter deployed to **urza** (2026-09-25) | **Done** — the live path is `scripts/deploy-server.sh` (gate, native amd64 build on urza, host-network container swap, tailnet healthcheck, auto-rollback). Image tag = the commit sha. State + config live under urza's `~/idlefill/` (0700/0600). Dashboard: `http://100.105.225.1:8787` |
 | 2 | urza hardening (compose + traefik route + IP/auth middleware), launchd client, NInfer log ro-mount | **Superseded (retired 2026-10-08)** — the compose + traefik plane never ran (urza is host-networked via the script above; `/mnt/docker/idlefill` never existed). The launchd client IS live (`tauri/install.sh` renders `tauri/IdlefillApp.plist`; the daemon/arbiter plists render from the Rust lifecycle plane) and the Linux client service is exercised (issue #54) |
-| 3 (operator CLI) | One `idlefill` command for update / mesh / engine / agent (+ daemon/control groups) | **S1 landed (2026-10-12)** — `cli/` workspace + the `idlefill` dispatcher + help tree; `daemon`/`control` live as passthrough groups (the `scripts/idlefill-*.mjs` CLIs are shims onto it). Design: `docs/architecture/cli.md`; remaining slices #89–#92 (S2–S5) filed |
+| 3 (operator CLI) | One `idlefill` command for update / mesh / engine / agent (+ daemon/control groups) | **S1 + S3 landed (2026-10-12)** — `cli/` workspace + the `idlefill` dispatcher + help tree; `daemon`/`control` live as passthrough groups (the `scripts/idlefill-*.mjs` CLIs are shims onto it); `idlefill engine` live (#90) — inventory list/add/set/remove over `/api/servers` + the `add --local` co-location pre-flight (mesh.md rule 1: probe `log_glob` against real files, refuse-with-the-rule-named and save nothing on a miss). Design: `docs/architecture/cli.md`; remaining slices #89, #91, #92 (S2/S4/S5) filed |
 
 ## Architecture
 
@@ -824,15 +824,30 @@ connected to, seeded from config (`server_name`, `server_models`,
   `/api/metrics/activity`, so every existing row behaves exactly as before.
 
 ```bash
+idlefill engine list [--json]
+idlefill engine add box-two http://192.168.9.9:11434 [--models a,b] [--peers peer:gpu2]
+idlefill engine add --local box-one http://127.0.0.1:1239 [--log-glob '<glob>']
+idlefill engine set <id> [--name N] [--url U] [--models a,b] [--peers p1]
+idlefill engine remove <id>
+
 node scripts/idlefill-control.mjs servers
 node scripts/idlefill-control.mjs server add box-two http://192.168.9.9:11434 [--models a,b] [--peers peer:gpu2] [--auth TOKEN]
 node scripts/idlefill-control.mjs server set <id> [--name N] [--url U] [--models a,b] [--peers p1] [--auth TOKEN | --auth-clear]
 ```
 
-## The operator CLI (`idlefill`) — design accepted, not yet built
+`idlefill engine add --local` (#90, cli.md D6) pre-flights the ownership
+rule before saving: the arbiter's idle detector reads the engine's log
+file on its OWN host, so a local row must carry a `log_glob` that matches
+a real file here. The CLI probes the glob (same matcher the detector
+uses), and on a miss it refuses with the rule named and saves nothing.
+A remote row added without `--local` stays available and renders
+fail-closed for grants — display + routing metadata, honestly.
 
-Design authority: `docs/architecture/cli.md` (accepted 2026-10-12); waves filed
-as issues #88–#92. One dispatcher over the planes that today live in
+## The operator CLI (`idlefill`) — dispatcher live (S1), engine live (S3)
+
+Design authority: `docs/architecture/cli.md` (accepted 2026-10-12); waves
+filed as issues #88–#92 — S1 (#88) and S3 (#90) have landed. One
+dispatcher over the planes that today live in
 `update.sh` and the `scripts/` control CLIs — a front-end, not a new backend:
 every command calls an existing endpoint, runs an existing script, or is
 named as the wave that adds the one missing piece (mesh join's config flow,

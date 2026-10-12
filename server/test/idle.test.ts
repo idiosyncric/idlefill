@@ -13,7 +13,10 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { IdleDetector } from '../src/idle.js';
+import { mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { IdleDetector, makeRealLogMtimeSource } from '../src/idle.js';
 import type { ActivityEntry } from '../src/types.js';
 
 const T0 = Date.parse('2026-09-25T12:00:00Z');
@@ -159,4 +162,40 @@ test('all-exempt feed is conservative: never claims idle', async () => {
   const d = makeDetector({ entries: [entry(1, 2, 'ip:100.94.165.102')], idleSeconds: 300 });
   const sig = await d.poll(T0, new Set(['100.94.165.102']));
   assert.equal(sig.idle, false, 'exhaustively-exempt feed ⇒ not-idle (conservative)');
+});
+
+// ---------------------------------------------------------------------------
+// makeRealLogMtimeSource — the REAL matcher on a real temp dir.
+// Regression for the `*` escape bug caught by the CLI engine `add --local`
+// probe (#90): pre-fix `*.log` threw (caught → null, silently disabling the
+// log signal) and `strata-*.log` fell through as the quantifier `-*`
+// (matching `strata.log`, missing `strata-a.log`). The contract is a
+// basename glob: `*` matches anything.
+// ---------------------------------------------------------------------------
+
+test('real log-mtime source: basename globs match real files (newest mtime wins)', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'idle-logglob-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const logMtime = makeRealLogMtimeSource();
+
+  writeFileSync(join(dir, 'strata-a.log'), 'x');
+  writeFileSync(join(dir, 'other.txt'), 'x');
+
+  // Leading `*` (the throwing pre-fix case) and a mid-name `*`.
+  const viaPrefix = logMtime(join(dir, '*.log'));
+  assert.ok(viaPrefix !== null, '*.log matches a real .log file (pre-fix: regex threw → null)');
+  assert.equal(viaPrefix, statSync(join(dir, 'strata-a.log')).mtimeMs);
+  assert.ok(logMtime(join(dir, 'strata-*.log')) !== null, 'strata-*.log matches strata-a.log (pre-fix: -* quantifier missed it)');
+
+  // Literal filenames keep working byte-for-byte (the production shape).
+  assert.equal(logMtime(join(dir, 'other.txt')), statSync(join(dir, 'other.txt')).mtimeMs);
+
+  // The newest mtime wins when several match.
+  writeFileSync(join(dir, 'strata-b.log'), 'y');
+  const newer = statSync(join(dir, 'strata-b.log')).mtimeMs;
+  assert.equal(logMtime(join(dir, 'strata-*.log')), newer);
+
+  // No match / missing dir → null (fail-closed: the signal disables, never idles).
+  assert.equal(logMtime(join(dir, 'missing-*.log')), null);
+  assert.equal(logMtime(join(dir, 'nope-dir', '*.log')), null);
 });
