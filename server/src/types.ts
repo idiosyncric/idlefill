@@ -1050,6 +1050,16 @@ export type EventKind =
   | 'model_alias_removed'
   | 'model_alias_reordered'
   /**
+   * Alias↔probe contradiction alert (docs/architecture/alias-stability-and-
+   * slow-engines.md D1): a pair on a probe-SUCCEEDED row whose list lacks the
+   * pair's engine id. The alias still publishes (honestly degraded) — this
+   * ALERTS the operator instead of un-offering. Detail carries
+   * `<alias>: <server_id>/<model>`. Rate-limited per (alias, server_id,
+   * model) once per 15 minutes, at most 10 per tick. Ephemeral markers
+   * (the pair `mismatch` source); the state file stores only this log.
+   */
+  | 'alias_pair_mismatch'
+  /**
    * Engine groups (docs/architecture/engine-health-routing.md D3/D5): an
    * operator group write (upsert) and a group removal. Detail carries the
    * `group_id`. A group carries no secret, so nothing is redacted.

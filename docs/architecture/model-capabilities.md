@@ -80,6 +80,20 @@ of an engine it is not routing to). `GET /api/servers` /
 `/api/state.servers[].models[]` entries gain the same ADD keys from the
 row's last-good probe. The state file is untouched — capabilities are
 ephemeral like every other observed field.
+AMENDMENT (2026-10-12, alias-stability D1 — LOCKED, narrow): the
+winner-only rule stands; the SOURCE widens for an unconfirmed winner. A
+`mismatch` or `declared` winner inherits `context_length` /
+`input_modalities` / `output_modalities` from the LAST-GOOD probe entry
+for ITS OWN row+model (the per-model twin of #67's `lastProbed` map —
+`lastProbed` itself replaces per-row per success, so on a contradiction
+tick it by construction no longer names the contradicted model); absent
+→ keys omitted, exactly as before. This is carried truth (an entry the
+engine really served once), never fabricated — the D1 capture rule
+stands — and the entry carries `degraded: true` so the consumer sees the
+caps rode a last-good observation, not this tick's probe.
+`probedModels()`, pin legality, and the serverView inventory stay exactly
+`lastProbed` — the carry-over map feeds the alias publish and nothing
+else.
 
 ### D3 — `:8800 /v1/models` advertises capabilities, never the variant **LOCKED (owner, 2026-10-11)**
 

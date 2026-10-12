@@ -1350,7 +1350,7 @@ function makeAliasHarness(probeMap: Record<string, (string | ProbedModel)[] | nu
   };
   const arbiter = new Arbiter(store, cfg, new FakeDetector() as never, {
     modelsFetcher: async (url) => {
-      const key = url.includes('alpha') ? 'alpha' : url.includes('beta') ? 'beta' : 'watched';
+      const key = url.includes('alpha') ? 'alpha' : url.includes('beta') ? 'beta' : url.includes('gamma') ? 'gamma' : 'watched';
       const list = probeMap[key];
       if (list === undefined || list === null) throw new Error('probe refused');
       return list.map((e) => (typeof e === 'string' ? { name: e } : e));
@@ -1361,12 +1361,12 @@ function makeAliasHarness(probeMap: Record<string, (string | ProbedModel)[] | nu
   assert.ok(a.ok && b.ok);
   const idA = a.server!.id;
   const idB = b.server!.id;
-  return { dir, store, arbiter, idA, idB };
+  return { dir, store, cfg, arbiter, idA, idB };
 }
 
 // probeCatalog takes no argument; this alias helper drives the shared map.
 function aliasProbe(arbiter: Arbiter, lists: Record<string, (string | ProbedModel)[] | null>, map: Record<string, (string | ProbedModel)[] | null>) {
-  for (const k of ['alpha', 'beta', 'watched']) delete map[k];
+  for (const k of ['alpha', 'beta', 'gamma', 'watched']) delete map[k];
   Object.assign(map, lists);
   return arbiter.probeCatalog();
 }
@@ -1401,18 +1401,25 @@ test('#66 alias pass: pair CONFIRMED by the probe publishes probed; a probe-FALS
   }
 });
 
-test('#66 alias pass: a probe-succeeded row that lacks the id DROPS the pair for the tick — the alias survives on the other pair', async () => {
+test('#66 alias pass (D1 marker rename): a probe-succeeded row that lacks the id marks the pair MISMATCH — the alias survives on the other pair', async () => {
   const map: Record<string, string[] | null> = {};
   const h = makeAliasHarness(map);
   try {
     h.arbiter.putModelAlias({ alias: 'Flagship', pairs: [{ server_id: h.idA, model: 'engine-a-id' }, { server_id: h.idB, model: 'engine-b-id' }] });
 
-    // alpha probes successfully WITHOUT the pair id; beta fails (declared).
+    // alpha probes successfully WITHOUT the pair id (mismatch); beta fails (declared).
     await aliasProbe(h.arbiter, { alpha: ['something-else'] }, map);
     let block = h.arbiter.modelAliases();
-    assert.equal(block.length, 1, 'the alias survives (the alias never drops — the pair does)');
-    assert.equal(block[0]!.server_id, h.idB, 'the dead alpha pair is gone this tick; beta carries the alias');
+    assert.equal(block.length, 1, 'the alias survives (the alias never drops — the pair only gets marked)');
+    assert.equal(block[0]!.server_id, h.idB, 'the contradicted alpha pair is not a first-rank candidate this tick; beta carries the alias');
     assert.equal(block[0]!.catalog_source, 'declared');
+    assert.deepEqual(
+      h.arbiter.aliasRows()[0]!.pairs.map((p) => p.source),
+      ['mismatch', 'declared'],
+      'probe contradiction renames the marker to mismatch; a probe-failed row stays declared',
+    );
+    assert.equal(block[0]!.degraded, true, 'the declared winner is not probe-confirmed → degraded');
+    assert.deepEqual(block[0]!.fallback_targets, [{ server_id: h.idA, url: 'http://alpha.local:8080', engine_model: 'engine-a-id' }], 'the mismatched pair still rides fallback_targets');
 
     // alpha lists it again: the pair returns (stored pairs stand).
     await aliasProbe(h.arbiter, { alpha: ['engine-a-id'] }, map);
@@ -1424,22 +1431,39 @@ test('#66 alias pass: a probe-succeeded row that lacks the id DROPS the pair for
   }
 });
 
-test('#66 alias pass: ALL pairs dead for a tick → the alias is not published at all (never a silent half-name)', async () => {
+test('#66 alias pass (AMENDED by alias-stability D1): ALL pairs contradicted for a tick → the alias STILL publishes degraded (probe contradiction alerts, never un-offers)', async () => {
   const map: Record<string, string[] | null> = {};
   const h = makeAliasHarness(map);
   try {
     h.arbiter.putModelAlias({ alias: 'Flagship', pairs: [{ server_id: h.idA, model: 'engine-a-id' }, { server_id: h.idB, model: 'engine-b-id' }] });
-    // Both rows probe SUCCESSFULLY and neither lists the pair id.
+    // Both rows probe SUCCESSFULLY and neither lists the pair id — the exact
+    // 2026-10-12 cold-start shape. D1: the alias publishes anyway.
     await aliasProbe(h.arbiter, { alpha: ['not-it'], beta: ['not-it-either'] }, map);
-    assert.deepEqual(h.arbiter.modelAliases(), [], 'no surviving pair → the alias is not offered this tick');
-
-    // The stored pairs stand: alpha recovers its probe but WITHOUT the id
-    // (its pair stays dropped), beta lists the id → beta carries the alias.
-    await aliasProbe(h.arbiter, { alpha: ['not-it'], beta: ['engine-b-id'] }, map);
     const block = h.arbiter.modelAliases();
-    assert.equal(block.length, 1);
-    assert.equal(block[0]!.server_id, h.idB, 'stored pairs were never mutated by the drop');
-    assert.equal(block[0]!.catalog_source, 'probed');
+    assert.equal(block.length, 1, 'a probe CONTRADICTION never un-offers the alias (D1)');
+    const entry = block[0]!;
+    assert.equal(entry.server_id, h.idA, 'the chain over mismatch candidates lands the first pair');
+    assert.equal(entry.degraded, true, 'a mismatch winner publishes honestly degraded');
+    assert.equal(entry.catalog_source, 'declared', 'a contradicted pair never claims probe confirmation');
+    assert.deepEqual(entry.fallback_targets, [{ server_id: h.idB, url: 'http://beta.local:9090', engine_model: 'engine-b-id' }], 'the other mismatched pair rides fallback_targets');
+    assert.deepEqual(
+      h.arbiter.aliasRows()[0]!.pairs.map((p) => p.source),
+      ['mismatch', 'mismatch'],
+      'probe contradiction marks pairs mismatch (not dropped)',
+    );
+    assert.ok(
+      h.store.state.events.some((e) => e.kind === 'alias_pair_mismatch' && e.detail === `Flagship: ${h.idA}/engine-a-id`),
+      'the contradiction appends an alias_pair_mismatch alert',
+    );
+
+    // The stored pairs stand: alpha stays contradicted (pair stays mismatch),
+    // beta lists the id → beta carries the alias, no longer degraded.
+    await aliasProbe(h.arbiter, { alpha: ['not-it'], beta: ['engine-b-id'] }, map);
+    const second = h.arbiter.modelAliases();
+    assert.equal(second.length, 1);
+    assert.equal(second[0]!.server_id, h.idB, 'stored pairs were never mutated by the marker');
+    assert.equal(second[0]!.catalog_source, 'probed');
+    assert.equal('degraded' in second[0]!, false, 'a probe-confirmed winner carries no degraded key');
   } finally {
     rmSync(h.dir, { recursive: true, force: true });
   }
@@ -1481,10 +1505,13 @@ test('#66 winner rule (D4): stored pin wins; absent pin / pin row gone / pin pai
   }
 });
 
-// #87 D2: the winner pair's OBSERVED capabilities ride the published entry
-// as ADD keys — capabilities follow the winner (never a losing pair), and a
-// 'declared' winner omits every capability key.
-test('#87 alias block: winner caps ride as ADD keys — they follow the winner and omit on declared', async () => {
+// #87 D2 (AMENDED by alias-stability D1): the winner pair's OBSERVED
+// capabilities ride the published entry as ADD keys — capabilities follow
+// the winner (never a losing pair), and a 'mismatch'/'declared' winner
+// carries the LAST-GOOD caps entry for its row+model when one was ever
+// observed (carried truth, never fabricated; a model never observed with
+// caps on that row still claims nothing).
+test('#87 alias block: winner caps ride as ADD keys — they follow the winner; a declared winner carries its last-good entry (D1)', async () => {
   const map: Record<string, (string | ProbedModel)[] | null> = {};
   const h = makeAliasHarness(map);
   try {
@@ -1517,11 +1544,17 @@ test('#87 alias block: winner caps ride as ADD keys — they follow the winner a
     assert.equal(entry.context_length, 131072);
     assert.deepEqual(entry.input_modalities, ['text']);
 
-    // Both probes blocked: the alias publishes 'declared' — NO capability keys.
+    // Both probes blocked: the winner (pin alpha, 'declared') NOW RIDES its
+    // last-GOOD caps entry — D1's narrow amendment of #87 D2: a caps claim
+    // that was truly observed on that row+model once survives a probe blip
+    // (the same last-good truth #67 keeps for pins; degraded marks it).
     await aliasProbe(h.arbiter, {}, map);
     entry = h.arbiter.modelAliases()[0]!;
     assert.equal(entry.catalog_source, 'declared');
-    assert.ok(!('context_length' in entry) && !('input_modalities' in entry) && !('output_modalities' in entry), 'declared winners claim no capability');
+    assert.equal(entry.degraded, true, 'a declared winner is not probe-confirmed → degraded');
+    assert.equal(entry.context_length, 262144, 'D1 carry-over: the last-GOOD caps entry rides a declared winner');
+    assert.deepEqual(entry.input_modalities, ['text', 'image']);
+    assert.deepEqual(entry.output_modalities, ['text']);
   } finally {
     rmSync(h.dir, { recursive: true, force: true });
   }
@@ -1586,7 +1619,7 @@ test("#66 publish-path sanitizers are drop-don't-reject: a hostile stored key pu
   }
 });
 
-test('#66 aliasRows: per-pair source markers for the dashboard (probed / declared / dropped / unprobed)', async () => {
+test('#66 aliasRows: per-pair source markers for the dashboard (probed / declared / dropped / mismatch / unprobed)', async () => {
   const map: Record<string, string[] | null> = {};
   const h = makeAliasHarness(map);
   try {
@@ -1604,6 +1637,225 @@ test('#66 aliasRows: per-pair source markers for the dashboard (probed / declare
     assert.equal(rows.length, 1);
     assert.deepEqual(rows[0]!.pairs.map((p) => p.source), ['probed', 'dropped'], 'confirmed pair / gone-row pair both render their marker');
     assert.ok(rows[0]!.pairs.every((p) => !('auth_token' in p)), 'the dashboard read carries no secret by construction');
+  } finally {
+    rmSync(h.dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// alias-stability D1 (docs/architecture/alias-stability-and-slow-engines.md,
+// owner posture 2026-10-12) — the incident regression suite. (a) lives in the
+// amended ALL-pairs-contradicted test above (publish anyway + degraded +
+// mismatch markers + the alert event). Here: (b) caps carry-over, (c)
+// fallback_targets shape, (d) event rate limits, (e) the boot seed, (f) the
+// first-rank chain byte-for-byte.
+// ---------------------------------------------------------------------------
+
+test('alias-stability D1 (b): caps ride through a contradiction — a mismatch winner inherits the last-good entry; a never-capped model claims nothing', async () => {
+  const map: Record<string, (string | ProbedModel)[] | null> = {};
+  const h = makeAliasHarness(map);
+  try {
+    h.arbiter.putModelAlias({
+      alias: 'Flagship',
+      pairs: [{ server_id: h.idA, model: 'engine-a-id' }, { server_id: h.idB, model: 'engine-b-id' }],
+      pin: h.idB,
+    });
+    // Tick 1 — alpha answers WITH caps, beta answers the id WITHOUT caps.
+    await aliasProbe(h.arbiter, {
+      alpha: [{ name: 'engine-a-id', context_length: 262144, input_modalities: ['text', 'image'] }],
+      beta: ['engine-b-id'],
+    }, map);
+    let entry = h.arbiter.modelAliases()[0]!;
+    assert.equal(entry.server_id, h.idB, 'tick 1: the probed pin wins (chain over first-rank)');
+    assert.ok(!('degraded' in entry) && !('context_length' in entry), 'probe-confirmed winner, caps never observed for it ⇒ no degraded, no caps');
+
+    // Tick 2 — the incident shape: BOTH rows answer, NEITHER lists the id.
+    await aliasProbe(h.arbiter, { alpha: ['cold-a'], beta: ['cold-b'] }, map);
+    entry = h.arbiter.modelAliases()[0]!;
+    assert.equal(entry.server_id, h.idB, 'the chain over mismatch candidates keeps the healthy pin');
+    assert.equal(entry.degraded, true, 'a mismatch winner publishes degraded');
+    assert.equal(entry.catalog_source, 'declared', 'a contradicted pair never claims probe confirmation');
+    // beta/engine-b-id was only ever observed WITHOUT caps ⇒ every caps key
+    // stays omitted (capture, never fabricate). alpha's caps never leak to
+    // beta's entry (carry-over is per row+model, not per alias).
+    assert.ok(!('context_length' in entry) && !('input_modalities' in entry) && !('output_modalities' in entry), 'no last-good caps entry for THIS row+model ⇒ omitted, never borrowed from the other pair');
+
+    // And the positive ride: pin alpha (last-GOOD caps entry exists for its
+    // model from tick 1) — same contradiction tick, caps RIDE.
+    h.arbiter.putModelAlias({ alias: 'Flagship', pin: h.idA });
+    await aliasProbe(h.arbiter, { alpha: ['cold-a'], beta: ['cold-b'] }, map);
+    entry = h.arbiter.modelAliases()[0]!;
+    assert.equal(entry.server_id, h.idA);
+    assert.equal(entry.degraded, true);
+    assert.equal(entry.context_length, 262144, 'D1 carry-over: the last-good caps entry survives the contradiction — caps ride');
+    assert.deepEqual(entry.input_modalities, ['text', 'image']);
+    assert.ok(!('output_modalities' in entry), 'a key the last-good entry never carried is NEVER fabricated onto the winner');
+  } finally {
+    rmSync(h.dir, { recursive: true, force: true });
+  }
+});
+
+test('alias-stability D1 (c): fallback_targets — survivors AND mismatch in stored order, winner excluded, exactly {server_id,url,engine_model}, no token key or value ever', async () => {
+  const map: Record<string, string[] | null> = {};
+  const h = makeAliasHarness(map);
+  try {
+    const g = h.arbiter.upsertServerConnection({ name: 'gamma', url: 'http://gamma.local:7070', activity_path: '', auth_token: 'tok-gamma', models: ['engine-g-id'] });
+    assert.ok(g.ok, JSON.stringify(g));
+    h.arbiter.putModelAlias({
+      alias: 'Flagship',
+      pairs: [
+        { server_id: h.idA, model: 'engine-a-id' }, // probe FAILS → declared survivor
+        { server_id: h.idB, model: 'engine-b-id' }, // probed WITHOUT the id → mismatch
+        { server_id: g.server!.id, model: 'engine-g-id' }, // probed WITH the id → winner
+      ],
+      pin: g.server!.id,
+    });
+    await aliasProbe(h.arbiter, { beta: ['not-it'], gamma: ['engine-g-id'] }, map);
+    const entry = h.arbiter.modelAliases()[0]!;
+    assert.equal(entry.server_id, g.server!.id, 'the healthy probed pin wins (first-rank chain, byte-for-byte)');
+    assert.ok(!('degraded' in entry), 'probe-confirmed winner ⇒ no degraded key');
+    assert.deepEqual(
+      entry.fallback_targets,
+      [
+        { server_id: h.idA, url: 'http://alpha.local:8080', engine_model: 'engine-a-id' },
+        { server_id: h.idB, url: 'http://beta.local:9090', engine_model: 'engine-b-id' },
+      ],
+      'stored order, declared survivor AND mismatch pair included, winner excluded',
+    );
+    for (const t of entry.fallback_targets!) {
+      assert.deepEqual(Object.keys(t).sort(), ['engine_model', 'server_id', 'url'], 'exactly the three D1 keys — no token field by construction');
+    }
+    const json = JSON.stringify(entry);
+    assert.ok(!json.includes('token'), 'no token-shaped KEY anywhere in the entry');
+    assert.ok(!json.includes('tok-alpha') && !json.includes('tok-gamma'), 'no token VALUE anywhere');
+    // A single-pair alias (winner only) omits the key entirely.
+    h.arbiter.putModelAlias({ alias: 'Flagship', pairs: [{ server_id: g.server!.id, model: 'engine-g-id' }] });
+    await aliasProbe(h.arbiter, { gamma: ['engine-g-id'] }, map);
+    assert.ok(!('fallback_targets' in h.arbiter.modelAliases()[0]!), 'empty ⇒ OMITTED, never an empty array');
+  } finally {
+    rmSync(h.dir, { recursive: true, force: true });
+  }
+});
+
+test('alias-stability D1 (d): alias_pair_mismatch events — at most 10 per tick, at most once per (alias,row,model) per 15 minutes', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'idlefill-alias-events-'));
+  try {
+    const stateFile = join(dir, 'state.json');
+    const store = new StateStore(stateFile);
+    const cfg: ServerConfig = {
+      listen: 0,
+      api_tokens: ['t'],
+      llama_swap_url: 'http://fake',
+      activity_path: '',
+      log_glob: '',
+      idle_seconds: 300,
+      poll_ms: 15000,
+      lease_ttl_seconds: 1800,
+      lease_ttl_safety_factor: 2,
+      lease_ttl_floor_seconds: 60,
+      max_concurrent_leases: 1,
+      job_fail_threshold: 5,
+      job_cooldown_seconds: 300,
+      projects: [],
+      state_file: stateFile,
+    };
+    const arbiter = new Arbiter(store, cfg, new FakeDetector() as never, {
+      // EVERY row answers SUCCESSFULLY and lists NOTHING: every pair is
+      // mismatch on every tick.
+      modelsFetcher: async () => [],
+    });
+    const ids: string[] = [];
+    for (let i = 0; i < 12; i++) {
+      const r = arbiter.upsertServerConnection({ name: `row${i}`, url: `http://row${i}.local:8080`, activity_path: '', models: [`m${i}`] });
+      assert.ok(r.ok, JSON.stringify(r));
+      ids.push(r.server!.id);
+    }
+    arbiter.putModelAlias({ alias: 'Wide', pairs: ids.map((id, i) => ({ server_id: id, model: `m${i}` })) });
+    const mm = () => store.state.events.filter((e) => e.kind === 'alias_pair_mismatch');
+
+    await arbiter.probeCatalog();
+    assert.equal(mm().length, 10, 'twelve contradicted pairs emit AT MOST TEN events this tick (per-tick cap)');
+    assert.ok(
+      mm().every((e) => typeof e.detail === 'string' && e.detail.startsWith('Wide: ') && e.detail.includes('/m')),
+      'every detail is `<alias>: <server_id>/<model>`',
+    );
+    assert.equal(mm().filter((e) => e.detail === `Wide: ${ids[0]}/m0`).length, 1, 'one event per pair');
+
+    // Tick 2 (same minutes): the ten windowed pairs stay silent; the two
+    // over-cap pairs get their FIRST event (never blocked by the window).
+    await arbiter.probeCatalog();
+    assert.equal(mm().length, 12, 'the 15-min window silences what already alerted; the over-cap pairs emit within their own window');
+
+    // Age ONE pair's stamp past 15 minutes: exactly that pair re-alerts.
+    const limiter = (arbiter as unknown as { aliasMismatchEmittedAt: Map<string, number> }).aliasMismatchEmittedAt;
+    limiter.set(`Wide\u0000${ids[0]}\u0000m0`, Date.now() - 16 * 60_000);
+    await arbiter.probeCatalog();
+    assert.equal(mm().length, 13, 'past the window exactly one pair re-alerts');
+    assert.equal(mm().filter((e) => e.detail === `Wide: ${ids[0]}/m0`).length, 2, 'the re-alert is the aged pair only');
+
+    // The event plane carries no secret and the state file gains NO marker key.
+    assert.ok(!JSON.stringify(mm()).includes('auth_token'), 'no token ever rides the event');
+    assert.equal('alias_pair_states' in (store.state as Record<string, unknown>), false, 'the state file gains NO pair-marker key — only the event log (model-capabilities D4 stands)');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('alias-stability D1 (e): boot seed — stored aliases publish NON-EMPTY before any probe tick (all declared, degraded), the first cycle refines', async () => {
+  const map: Record<string, string[] | null> = {};
+  const h = makeAliasHarness(map);
+  try {
+    h.arbiter.putModelAlias({ alias: 'Flagship', pairs: [{ server_id: h.idA, model: 'engine-a-id' }, { server_id: h.idB, model: 'engine-b-id' }] });
+    // COLD START: a fresh Arbiter over the saved state file, ZERO probe ticks.
+    const coldStore = new StateStore(h.cfg.state_file);
+    const cold = new Arbiter(coldStore, h.cfg, new FakeDetector() as never, {
+      modelsFetcher: async (url) => {
+        const key = url.includes('alpha') ? 'alpha' : url.includes('beta') ? 'beta' : 'watched';
+        const list = map[key];
+        if (list === undefined || list === null) throw new Error('engine cold — probe refused');
+        return list.map((e) => (typeof e === 'string' ? { name: e } : e));
+      },
+    });
+    const block = cold.modelAliases(); // BEFORE any probeCatalog / any /api/state answer
+    assert.equal(block.length, 1, 'modelAliases() is NEVER empty while stored aliases stand (D1 boot seed)');
+    const entry = block[0]!;
+    assert.equal(entry.name, 'Flagship');
+    assert.equal(entry.server_id, h.idA, 'no health evidence at seed: the pin-less chain takes the first pair');
+    assert.equal(entry.catalog_source, 'declared', 'the seed carries NO probe evidence — everything declared');
+    assert.equal(entry.degraded, true, 'seed winners are honest-degraded until a real cycle refines them');
+    assert.deepEqual(entry.fallback_targets, [{ server_id: h.idB, url: 'http://beta.local:9090', engine_model: 'engine-b-id' }], 'the seed publishes the failover surface too');
+    assert.ok(!JSON.stringify(block).includes('tok-alpha'), 'the seed block carries no token');
+    assert.ok(!coldStore.state.events.some((e) => e.kind === 'alias_pair_mismatch'), 'an EMPTY probe map at seed time contradicts NOTHING — no events');
+    assert.ok(!JSON.stringify(coldStore.state).includes('mismatch'), 'the state file gains no per-tick marker key');
+    // The boot tickOnce then refines: probe confirmation lifts degraded.
+    await aliasProbe(cold, { alpha: ['engine-a-id'], beta: ['engine-b-id'] }, map);
+    assert.equal(cold.modelAliases()[0]!.catalog_source, 'probed');
+    assert.ok(!('degraded' in cold.modelAliases()[0]!), 'the first real cycle refines the seed');
+  } finally {
+    rmSync(h.dir, { recursive: true, force: true });
+  }
+});
+
+test('alias-stability D1 (f): the first-rank chain runs byte-for-byte while any survivor exists — a mismatch pin never steals the alias', async () => {
+  const map: Record<string, string[] | null> = {};
+  const h = makeAliasHarness(map);
+  try {
+    h.arbiter.putModelAlias({
+      alias: 'Flagship',
+      pairs: [{ server_id: h.idA, model: 'engine-a-id' }, { server_id: h.idB, model: 'engine-b-id' }],
+      pin: h.idA,
+    });
+    // The PINNED pair is contradicted (probed, id missing); the other pair
+    // is a healthy probed survivor. The chain runs over FIRST-RANK only —
+    // the mismatch candidate never gets a turn while a survivor stands.
+    await aliasProbe(h.arbiter, { alpha: ['cold'], beta: ['engine-b-id'] }, map);
+    const entry = h.arbiter.modelAliases()[0]!;
+    assert.equal(entry.server_id, h.idB, 'the survivor carries the alias — engine-health-routing D2 step 2 over first-rank, byte-for-byte');
+    assert.equal(entry.catalog_source, 'probed');
+    assert.ok(!('degraded' in entry), 'probe-confirmed winner ⇒ NO degraded key — the mismatch branch ran zero steps');
+    assert.equal(entry.fallback, true, 'winner ≠ stored pin keeps the D2 fallback semantics exactly');
+    assert.deepEqual(entry.fallback_targets, [{ server_id: h.idA, url: 'http://alpha.local:8080', engine_model: 'engine-a-id' }], 'the contradicted pin stands as a pair — it just never wins this tick');
+    assert.deepEqual(h.arbiter.aliasRows()[0]!.pairs.map((p) => p.source), ['mismatch', 'probed'], 'markers render the contradiction for the dashboard');
   } finally {
     rmSync(h.dir, { recursive: true, force: true });
   }

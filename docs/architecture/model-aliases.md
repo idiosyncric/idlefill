@@ -148,6 +148,19 @@ over the same probe map (`server/src/arbiter.ts:848-866`):
   stand, publish filters. All pairs dead for a tick = the alias is not
   offered by `/v1/models` and not routed that tick. That is exception-
   only, visible on the dashboard, never a silent half-name.
+  AMENDMENT (2026-10-12, alias-stability D1 — LOCKED, owner posture): the
+  "all pairs dead = not offered" exception is REPLACED. A probe-SUCCEEDED
+  row that lacks the pair's id no longer drops the pair: it marks the
+  pair `mismatch` — a probe CONTRADICTION that ALERTS (a rate-limited
+  `alias_pair_mismatch` event: once per (alias, server_id, model) per 15
+  minutes, at most 10 per tick) and never un-publishes. The alias ALWAYS
+  publishes while its stored name passes the sanitizer and at least one
+  pair references an existing row with a usable url; `dropped` REMAINS
+  only for sanitizer drops (hostile id, missing row, blank url — config
+  corruption, not probe contradiction). The pair markers of
+  `aliasPairStates` / `GET /api/aliases` carry the rename
+  ('probed'|'declared'|'dropped'|'mismatch', plus 'unprobed' at the read);
+  `mismatch` is a per-tick ephemeral marker — the state file gains nothing.
 - Precedence: alias > bare union. A bare probed or declared name that no
   alias names publishes exactly as today — additive, never hidden.
 - Name collision between an alias and a bare engine name: THE ALIAS
@@ -183,9 +196,33 @@ Publication shape. `GET /api/state` gains the ADD-key
 ```ts
 // one published entry per ALIAS, winner pair resolved by D4:
 { name, server_id, url, auth_set, engine_model, catalog_source }
+// AMENDED ADD keys (never renames; each absent-when-not-applicable):
+//   fallback: true                     — engine-health-routing D2 (winner ≠ stored pin)
+//   degraded: true                     — alias-stability D1: the winner is NOT
+//                                        probe-confirmed this tick ('mismatch' or
+//                                        'declared' source); omitted on 'probed'
+//   fallback_targets: [ { server_id,
+//                         url,
+//                         engine_model } ]  — D1: the OTHER stored pairs in stored
+//                                        order (survivors OR mismatch, winner
+//                                        excluded, existing rows with a non-empty
+//                                        url), omitted when empty, NO token ever
+//                                        (the client pulls row tokens via
+//                                        /api/server-keys); the D3 failover surface
+//   context_length / input_modalities / output_modalities
+//                                      — model-capabilities D2 (+ D1 carry-over:
+//                                        a 'mismatch'/'declared' winner rides the
+//                                        LAST-GOOD entry for its row+model)
 ```
 
 The existing `catalog` entries are untouched (`server/src/catalog.ts:23-34`).
+AMENDMENT (2026-10-12, alias-stability D1 cold start): the block is SEEDED
+at arbiter construction over the stored config with an EMPTY probe map
+(every pair `declared`, `degraded: true`, no probe evidence yet), so
+`modelAliases()` is NEVER empty while `state.model_aliases` is non-empty —
+before `/api/state` can answer; the boot tick then refines it. The empty
+case is sanitizer-degenerate config only (no pair names an existing row
+with a usable url).
 The router answers `GET /v1/models` from the ALIASES only (the operator's
 curated surface, in priority order — first entry = the default model):
 `{id: alias, object: 'model', owned_by: server_id}` — the
@@ -404,8 +441,10 @@ stores `server_id` + engine id, never a secret).
 
 1. An alias is operator-declared state: name → engine-model pairs + one
    pinned winner. It lives in arbiter state as a top-level ADD-key.
-2. The probe CONFIRMS pairs per row. A vanished pair drops the pair,
-   never the alias. An unprobeable row's pairs publish as 'declared'.
+2. The probe CONFIRMS pairs per row. A probe CONTRADICTION marks the pair
+   `mismatch` (alert, degrade — never un-offer, per alias-stability D1);
+   only sanitizer drops mark a pair `dropped`. An unprobeable row's pairs
+   publish as 'declared'. The alias publishes whenever its config stands.
 3. Aliases layer OVER the bare catalog. Alias beats bare at publish and
    routing. Bare names without aliases behave exactly as #64 built.
 4. The published block gains `model_aliases` as an ADD-key. Existing

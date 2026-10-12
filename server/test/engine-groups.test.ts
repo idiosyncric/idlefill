@@ -184,7 +184,10 @@ test('D2 step 2: a dead pin re-routes to the first healthy pair (the 21:41 fix),
     assert.equal(e.server_id, h.idB, 'traffic moves to the next-best option (step 2)');
     assert.equal(e.catalog_source, 'probed');
     assert.equal(e.fallback, true, 'the winner is not the stored pin → fallback marks the re-route');
-    assert.ok(!JSON.stringify(h.arbiter.modelAliases()).includes('alpha.local'), 'the dead pin never enters the winner fields');
+    assert.ok(
+      !JSON.stringify([e.server_id, e.url, e.engine_model]).includes('alpha.local'),
+      'the dead pin never enters the WINNER fields (D1: the pair may still ride fallback_targets — never a winner)',
+    );
   } finally {
     rmSync(h.dir, { recursive: true, force: true });
   }

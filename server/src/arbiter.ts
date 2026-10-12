@@ -265,14 +265,43 @@ export interface ModelAliasEntry {
    */
   fallback?: boolean;
   /**
+   * D1 (docs/architecture/alias-stability-and-slow-engines.md): TRUE when
+   * the winner pair is NOT probe-confirmed this tick — its source is
+   * 'mismatch' (probe answered and contradicted the stored pair) or
+   * 'declared' (probe blocked / never ran). Omitted on probe-confirmed
+   * winners. ADD-key, ADD-only: the router IGNORES it, the dashboard renders
+   * a degraded chip.
+   */
+  degraded?: boolean;
+  /**
+   * D1: the OTHER stored pairs in insertion order (survivors OR mismatch,
+   * winner excluded, existing rows with a non-empty url only), each
+   * `{ server_id, url, engine_model }` under the same publish sanitizers.
+   * Omitted when empty. This is the client failover surface (D3); the
+   * arbiter never forwards anything itself. NO token ever enters it (the
+   * client pulls row tokens via /api/server-keys).
+   */
+  fallback_targets?: ModelAliasFallbackTarget[];
+  /**
    * #87 D2: capabilities observed on the WINNER pair's engine this tick
    * (docs/architecture/model-capabilities.md). ADD keys, omitted when
    * unknown; never taken from a losing pair — the publish must not claim
-   * a capability of an engine it is not routing to.
+   * a capability of an engine it is not routing to. D1 AMENDMENT
+   * (alias-stability): a 'mismatch'/'declared' winner carries the LAST-GOOD
+   * entry for its row+model (the per-model twin of the #67 `lastProbed`
+   * map) when one exists — carried truth, never fabricated; absent → keys
+   * omitted.
    */
   context_length?: number;
   input_modalities?: string[];
   output_modalities?: string[];
+}
+
+/** One D1 `fallback_targets` row — { server_id, url, engine_model }, never a token. */
+export interface ModelAliasFallbackTarget {
+  server_id: string;
+  url: string;
+  engine_model: string;
 }
 
 /**
@@ -579,12 +608,23 @@ export class Arbiter {
   private aliasPublished: ModelAliasEntry[] = [];
   /**
    * #66: the LAST probe cycle's per-alias pair verdicts (alias -> pairs
-   * with 'probed' | 'declared' | 'dropped'). In-memory like
+   * with 'probed' | 'declared' | 'dropped' | 'mismatch'). In-memory like
    * `aliasPublished`; read by `aliasRows()` for the dashboard's
    * exception-only markers. 'unprobed' renders when the tick never saw the
-   * pair (no cycle run yet).
+   * pair (no cycle run yet). D1 (alias-stability): 'mismatch' replaces
+   * today's 'dropped' for the probe-contradiction case (probe SUCCEEDED,
+   * list lacks the id); 'dropped' REMAINS for sanitizer drops (hostile id,
+   * missing row, blank url) — config corruption, not probe contradiction.
    */
-  private aliasPairStates = new Map<string, { server_id: string; model: string; source: 'probed' | 'declared' | 'dropped' }[]>();
+  private aliasPairStates = new Map<string, { server_id: string; model: string; source: 'probed' | 'declared' | 'dropped' | 'mismatch' }[]>();
+  /**
+   * D1 (alias-stability): the `alias_pair_mismatch` event rate limiter —
+   * pair key (`alias\0server_id\0model`) -> epoch-ms of the last emitted
+   * event. In-memory like `aliasPublished` (ephemeral: a restart re-alerts,
+   * never persisted). At most one event per key per 15 minutes, at most 10
+   * events per tick.
+   */
+  private aliasMismatchEmittedAt = new Map<string, number>();
   /**
    * #67: the per-row model inventory as of the LAST SUCCESSFUL probe of
    * that row (row id -> names; a probe-blocked row keeps its older list,
@@ -598,6 +638,21 @@ export class Arbiter {
   /** When each row's /v1/models probe last answered (epoch-ms). In-memory,
    *  like lastProbed — the dashboard's "last seen" for a row's inventory. */
   private lastProbedAt = new Map<string, number>();
+  /**
+   * D1 (docs/architecture/alias-stability-and-slow-engines.md): the model-
+   * keyed twin of `lastProbed` for the alias capability CARRY-OVER ONLY —
+   * row id -> (model name -> last entry observed for that model on a
+   * SUCCESSFUL probe). `lastProbed` replaces its whole list on every
+   * success, so on the tick a pair becomes 'mismatch' the contradicting
+   * list has BY CONSTRUCTION no entry for the pair's model — a direct
+   * `lastProbed` read could never carry anything for a mismatch winner.
+   * This map keeps the last-GOOD entry per (row, model) so a mismatch /
+   * declared winner rides captured caps; it NEVER feeds `probedModels()`,
+   * pin legality, or the serverView inventory (those stay exactly
+   * `lastProbed` — #67 stands). In-memory like every observed fact: the
+   * state file gains nothing; a row removal drops the row's map.
+   */
+  private lastGoodCaps = new Map<string, Map<string, ProbedModel>>();
   /**
    * Per-server post-revocation reidle gates: server_id -> armed-at epoch-ms.
    * Armed when a lease on that server is revoked/expired; disarmed when a
@@ -651,6 +706,13 @@ export class Arbiter {
     // that went through index.ts: the API/tests construct the arbiter
     // directly. Idempotent — a non-empty state file is left untouched.
     this.ensureServersSeeded();
+    // D1 cold start (docs/architecture/alias-stability-and-slow-engines.md):
+    // seed the publish block over the STORED config with an EMPTY probe map
+    // (every pair 'declared', no probe evidence yet) so `modelAliases()` is
+    // NEVER empty while `store.state.model_aliases` is non-empty — before
+    // /api/state can answer. The boot tickOnce/probeCatalog then refines it;
+    // an empty probe map means no 'mismatch' markers and no events here.
+    this.buildAliasBlock(this.store.state.servers, new Map<string, ProbedModel[]>(), Date.now());
     // Hydrate a detector for every declared server row that lacks one
     // (state file loaded at boot; rows added while the arbiter was down).
     if (this.detectorFactory) {
@@ -1447,6 +1509,21 @@ export class Arbiter {
     // last good list — see lastProbed). The per-tick `probed` map the
     // alias pass uses stays byte-for-byte.
     for (const [id, names] of probed) this.lastProbed.set(id, names);
+    // D1 (alias-stability): feed the per-(row, model) last-GOOD caps twin —
+    // every successful probe updates the models it named; models it no
+    // longer names KEEP their last-good entry (the mismatch carry-over).
+    // Capability keys only ever come from a real observed entry (capture,
+    // never fabricate); this map feeds ONLY the alias carry-over.
+    for (const [id, entries] of probed) {
+      let byModel = this.lastGoodCaps.get(id);
+      if (!byModel) {
+        byModel = new Map<string, ProbedModel>();
+        this.lastGoodCaps.set(id, byModel);
+      }
+      for (const e of entries) {
+        if (e && typeof e.name === 'string') byModel.set(e.name, e);
+      }
+    }
     // #66 D2: the alias pass runs in THIS cycle over the SAME probe map —
     // per-pair confirmation, the D2 health-ordered winner chain (the `now`
     // feeds the D3 group engaged check), the published block.
@@ -1508,133 +1585,210 @@ export class Arbiter {
   }
 
   /**
-   * #66 D2/D3: per-pair confirmation against the same probe map, winner
-   * selection (D4), and the resolved `model_aliases` publish block.
+   * #66 D2/D3 + D1 (docs/architecture/alias-stability-and-slow-engines.md,
+   * owner posture 2026-10-12): an evidence ALERTER over the STORED config,
+   * not a filter — per-pair markers, winner selection, and the resolved
+   * `model_aliases` publish block.
    *
-   * - A pair is CONFIRMED when the row's probed list contains its model id
-   *   (confirmation is per pair, never per alias).
+   * - Publish posture (D1): every stored alias whose name passes the D1
+   *   sanitizer publishes EVERY tick exactly once, as long as at least one
+   *   pair references an existing row with a usable url. Probe evidence
+   *   NEVER un-offers an alias; it only marks pairs and alerts.
+   * - A pair is 'probed' when the row's probe-SUCCEEDED list contains its
+   *   model id (confirmation is per pair, never per alias).
    * - A pair on a probe-FAILED (or never-probed) row stays publishable
    *   with catalog_source 'declared' — never falsely 'probed'.
-   * - A pair on a probe-SUCCEEDED row that does not list the id is dropped
-   *   for the tick. The alias itself never drops — stored pairs stand,
-   *   publish filters. All pairs dead = the alias is not published at all
-   *   that tick (exception-only, never a silent half-name).
-   * - Winner (D4, AMENDED by docs/architecture/engine-health-routing.md
-   *   D2): the health-ordered chain over the surviving pairs, in order —
-   *   (1) the pinned pair when it survives AND its row is healthy this tick
-   *   AND its group has no engaged peer; (2) the FIRST non-pinned pair
-   *   (insertion order) whose row is healthy this tick and whose group has
-   *   no engaged peer — the pin is dead or group-blocked, traffic moves to
-   *   the next-best option in the operator's declared priority; (3) the
-   *   pinned pair when it survives but its row is not healthy (every healthy
-   *   option is gone — the pin still names the engine; honest degradation,
-   *   no silent re-pin); (4) the first surviving pair (no pin applies —
-   *   absent or its pair dropped; today's fall-through). Steps 1-2 consult
-   *   the D3 group filter; steps 3-4 NEVER do (mutual exclusion is a
-   *   preference between live options, never a veto on the only option).
-   *   The chain never unpublishes an alias today publishes: when at least
-   *   one pair survives (a probe failure keeps a pair a survivor), the alias
-   *   still publishes, possibly from a different row. The `fallback` ADD-key
-   *   is TRUE when the published winner is not the stored pin.
-   * - Publish-path sanitizers are drop-don't-reject (D1): a malformed name,
-   *   id, or row reference drops the entry for the tick, never rejects the
-   *   stored row.
+   * - A pair on a probe-SUCCEEDED row that does not list the id is marked
+   *   'mismatch' (D1 renamed the old per-tick 'dropped' for this case): a
+   *   probe CONTRADICTION, alerted via a rate-limited `alias_pair_mismatch`
+   *   event, never a silent un-publish. 'dropped' REMAINS for sanitizer
+   *   drops only (hostile id, missing row, blank url) — config corruption,
+   *   not probe contradiction.
+   * - Winner (engine-health-routing.md D2, UNCHANGED chain): FIRST-RANK
+   *   candidates (probed ∪ declared) run the health-ordered chain BYTE-FOR-
+   *   BYTE — (1) the pinned pair when it survives AND its row is healthy
+   *   this tick AND its group has no engaged peer; (2) the FIRST non-pinned
+   *   pair (insertion order) whose row is healthy this tick and whose group
+   *   has no engaged peer; (3) the pinned pair when it survives but its row
+   *   is not healthy; (4) the first surviving pair. Steps 1-2 consult the
+   *   D3 group filter; steps 3-4 NEVER do. Only when FIRST-RANK is empty
+   *   (today's old unpublish case) does the SAME chain run over the
+   *   'mismatch' candidates — the alias still publishes, honestly degraded.
+   * - ADD-keys (D1): `degraded: true` when the winner pair's source is
+   *   'mismatch' OR 'declared' (not probe-confirmed this tick); omitted on
+   *   'probed'. `fallback_targets`: the OTHER stored pairs in insertion
+   *   order (survivors OR mismatch, winner excluded, existing rows with a
+   *   non-empty url), { server_id, url, engine_model } only, NO token,
+   *   omitted when empty. `fallback` keeps its exact engine-health-routing
+   *   D2 semantics (winner ≠ stored pin).
+   * - Capability carry-over (D1, amends model-capabilities.md D2): a
+   *   'probed' winner carries this tick's entry; a 'mismatch'/'declared'
+   *   winner carries the LAST-GOOD entry for its row+model (the per-model
+   *   twin of the #67 `lastProbed` map — `lastProbed` itself replaces per-
+   *   row, so it can never hold the model a fresh contradiction dropped)
+   *   when one exists — carried truth, never fabricated; absent → omitted.
+   * - Publish-path sanitizers stay drop-don't-reject (D1): a malformed name
+   *   or id drops the ENTRY/pair for the tick, never rejects the stored row.
    *
    * The per-tick pair verdicts also land in `aliasPairStates` for the
-   * dashboard read (`GET /api/aliases`) — exception-only markers.
+   * dashboard read (`GET /api/aliases`). Mismatch alerts append via
+   * `store.appendEvent` (the `mesh_control` plane): per (alias, server_id,
+   * model) at most once per 15 minutes, at most 10 per tick — the in-memory
+   * `aliasMismatchEmittedAt` map is ephemeral like every other observed
+   * fact; the state file gains NO new key (model-capabilities D4 stands).
    */
   private buildAliasBlock(rows: readonly ServerConnection[], probed: ReadonlyMap<string, ProbedModel[]>, now: number): void {
     const byId = new Map(rows.map((r) => [r.id, r]));
     const out: ModelAliasEntry[] = [];
-    const pairStates = new Map<string, { server_id: string; model: string; source: 'probed' | 'declared' | 'dropped' }[]>();
-    // #87 D2: the confirmed probed ENTRY per surviving pair (capability
-    // lookup for the winner); declared-source survivors have no entry.
+    const pairStates = new Map<string, { server_id: string; model: string; source: 'probed' | 'declared' | 'dropped' | 'mismatch' }[]>();
+    // #87 D2: the confirmed probed ENTRY per 'probed' pair (capability
+    // lookup for a probe-confirmed winner); 'declared'/'mismatch' pairs
+    // carry-over from `lastProbed` instead.
     const survivorCaps = new Map<string, ProbedModel>();
+    const usableUrl = (srv: ServerConnection | undefined): string | null =>
+      srv !== undefined && typeof srv.url === 'string' && srv.url.trim() !== '' ? srv.url : null;
     const stored = this.store.state.model_aliases;
+    let mismatchEventsThisTick = 0;
     for (const name of Object.keys(stored ?? {})) {
       if (!ALIAS_NAME_RE.test(name)) continue; // hostile key: unpublished (drop-don't-reject)
       const row = stored[name];
       const pairs = Array.isArray(row?.pairs) ? row.pairs : [];
-      const survivors: { server_id: string; model: string; source: 'probed' | 'declared' }[] = [];
-      const states: { server_id: string; model: string; source: 'probed' | 'declared' | 'dropped' }[] = [];
+      // D1 candidate set: every sanitized pair on an existing row with a
+      // usable url, tagged 'probed' | 'declared' | 'mismatch', stored order.
+      const candidates: { server_id: string; model: string; source: 'probed' | 'declared' | 'mismatch' }[] = [];
+      const states: { server_id: string; model: string; source: 'probed' | 'declared' | 'dropped' | 'mismatch' }[] = [];
       for (const p of pairs) {
         const sid = typeof p?.server_id === 'string' ? p.server_id : '';
         const model = typeof p?.model === 'string' ? p.model : '';
         if (!ALIAS_NAME_RE.test(sid) || !ENGINE_MODEL_RE.test(model)) {
-          states.push({ server_id: sid, model, source: 'dropped' });
+          states.push({ server_id: sid, model, source: 'dropped' }); // sanitizer: config corruption
           continue;
         }
-        const srv = byId.get(sid);
-        if (!srv) {
-          states.push({ server_id: sid, model, source: 'dropped' }); // the row is gone
+        if (usableUrl(byId.get(sid)) === null) {
+          states.push({ server_id: sid, model, source: 'dropped' }); // the row is gone, or its url is blank (corruption)
           continue;
         }
         if (probed.has(sid)) {
           const found = probed.get(sid)!.find((e) => e?.name === model);
           if (!found) {
-            states.push({ server_id: sid, model, source: 'dropped' }); // probed row, id vanished
+            states.push({ server_id: sid, model, source: 'mismatch' }); // probe CONTRADICTION (D1): alert, never un-offer
+            candidates.push({ server_id: sid, model, source: 'mismatch' });
+            if (mismatchEventsThisTick < 10) {
+              const key = `${name}\u0000${sid}\u0000${model}`;
+              const last = this.aliasMismatchEmittedAt.get(key);
+              if (last === undefined || now - last >= 15 * 60_000) {
+                this.store.appendEvent({ kind: 'alias_pair_mismatch', detail: `${name}: ${sid}/${model}` });
+                this.aliasMismatchEmittedAt.set(key, now);
+                mismatchEventsThisTick++;
+              }
+            }
             continue;
           }
-          survivors.push({ server_id: sid, model, source: 'probed' });
+          candidates.push({ server_id: sid, model, source: 'probed' });
           survivorCaps.set(`${sid}\u0000${model}`, found);
         } else {
-          survivors.push({ server_id: sid, model, source: 'declared' }); // probe-blocked: the operator's claim stands
+          candidates.push({ server_id: sid, model, source: 'declared' }); // probe-blocked: the operator's claim stands
         }
-        states.push({ server_id: sid, model, source: survivors[survivors.length - 1]!.source });
+        states.push({ server_id: sid, model, source: candidates[candidates.length - 1]!.source });
       }
       pairStates.set(name, states);
-      if (survivors.length === 0) continue; // all pairs dead this tick: not offered, not routed
+      if (candidates.length === 0) continue; // no pair names a live row with a url at all (config corruption)
       const pin = typeof row?.pinned_server_id === 'string' ? row.pinned_server_id : '';
       // D2 health-ordered chain (docs/architecture/engine-health-routing.md).
       // A row is HEALTHY this tick when the probe answered for it (`probed`
       // present); the D3 group filter (steps 1-2 only) asks whether another
-      // row in the same group is ENGAGED.
+      // row in the same group is ENGAGED. The chain itself is byte-for-byte
+      // the D2 rule; D1 only chooses WHOSE candidate set it runs over.
       const healthy = (sid: string) => probed.has(sid);
       const peerFree = (sid: string) => !this.groupEngagedPeer(sid, now);
-      const pinned = pin !== '' ? survivors.find((p) => p.server_id === pin) : undefined;
-      // Step 1: the pin, when it survives AND is healthy AND its group is free.
-      const step1 = pinned && healthy(pinned.server_id) && peerFree(pinned.server_id) ? pinned : undefined;
-      // Step 2: the first non-pinned healthy, group-free pair (the next-best
-      // option in the operator's declared priority — the 21:41 fix).
-      const step2 = !step1
-        ? survivors.find((p) => p.server_id !== pin && healthy(p.server_id) && peerFree(p.server_id))
-        : undefined;
-      // Step 3: the pin when it survives but is not healthy (honest degrade).
-      const step3 = !step1 && !step2 && pinned ? pinned : undefined;
-      // Step 4: the first survivor (no pin applies — today's fall-through).
-      const winner = step1 ?? step2 ?? step3 ?? survivors[0]!;
-      const srv = byId.get(winner.server_id)!;
-      if (typeof srv.url !== 'string' || srv.url.trim() === '') continue;
-      const caps = survivorCaps.get(`${winner.server_id}\u0000${winner.model}`);
+      const chain = (
+        cands: { server_id: string; model: string; source: 'probed' | 'declared' | 'mismatch' }[],
+      ): { server_id: string; model: string; source: 'probed' | 'declared' | 'mismatch' } | undefined => {
+        const pinned = pin !== '' ? cands.find((p) => p.server_id === pin) : undefined;
+        // Step 1: the pin, when it survives AND is healthy AND its group is free.
+        const step1 = pinned && healthy(pinned.server_id) && peerFree(pinned.server_id) ? pinned : undefined;
+        // Step 2: the first non-pinned healthy, group-free pair (the next-best
+        // option in the operator's declared priority — the 21:41 fix).
+        const step2 = !step1
+          ? cands.find((p) => p.server_id !== pin && healthy(p.server_id) && peerFree(p.server_id))
+          : undefined;
+        // Step 3: the pin when it survives but is not healthy (honest degrade).
+        const step3 = !step1 && !step2 && pinned ? pinned : undefined;
+        // Step 4: the first candidate (no pin applies — today's fall-through).
+        return step1 ?? step2 ?? step3 ?? cands[0];
+      };
+      // D1: FIRST-RANK (survivors = probed ∪ declared) runs first; the chain
+      // over the 'mismatch' candidates runs ONLY when first-rank is empty
+      // (the old unpublish case) — the alias still publishes, degraded.
+      const firstRank = candidates.filter((p) => p.source !== 'mismatch');
+      const winner = firstRank.length > 0 ? chain(firstRank) : chain(candidates);
+      if (!winner) continue; // unreachable while candidates exist; drop-don't-reject parity
+      const url = usableUrl(byId.get(winner.server_id));
+      if (url === null) continue; // byte-parity with the pre-D1 winner-url gate
+      // #87 D2 + D1 carry-over: a probe-confirmed winner rides this tick's
+      // entry; a 'mismatch'/'declared' winner rides the LAST-GOOD entry for
+      // its row+model (`lastGoodCaps`, fed by every successful probe — a
+      // direct `lastProbed` read can never match on a mismatch tick, see
+      // the field doc). Never fabricated, absent = keys omitted.
+      const caps =
+        winner.source === 'probed'
+          ? survivorCaps.get(`${winner.server_id}\u0000${winner.model}`)
+          : this.lastGoodCaps.get(winner.server_id)?.get(winner.model);
+      // D1: the OTHER pairs in stored order (winner excluded by identity),
+      // survivors OR mismatch, existing rows with a non-empty url (already
+      // the candidate filter). NO token by construction.
+      const fallbackTargets: ModelAliasFallbackTarget[] = [];
+      for (const p of candidates) {
+        if (p === winner) continue;
+        const pUrl = usableUrl(byId.get(p.server_id));
+        if (pUrl === null) continue;
+        fallbackTargets.push({ server_id: p.server_id, url: pUrl, engine_model: p.model });
+      }
       out.push({
         name,
         server_id: winner.server_id,
-        url: srv.url,
-        auth_set: srv.auth_token !== undefined && srv.auth_token !== '',
+        url,
+        auth_set: byId.get(winner.server_id)!.auth_token !== undefined && byId.get(winner.server_id)!.auth_token !== '',
         engine_model: winner.model,
-        catalog_source: winner.source,
+        // Honest #64 reading kept byte-for-byte: only a probe-CONFIRMED pair
+        // ever claims 'probed' — a 'mismatch' winner rides 'declared' (the
+        // stored claim), with `degraded` + the pair marker naming why.
+        catalog_source: winner.source === 'probed' ? 'probed' : 'declared',
         // D2 ADD-key: present (true) only when a stored pin exists and the
         // published winner is not it (re-routed). Absent on every pin-matched
         // and pinless entry — the router ignores the key, the dashboard reads
         // it.
         ...(pin !== '' && winner.server_id !== pin ? { fallback: true } : {}),
-        // #87 D2: winner-only capability ADD keys (omitted when the engine
-        // exposes nothing, or the winner rides on 'declared').
+        // D1 ADD-key: the winner is not probe-confirmed this tick.
+        ...(winner.source !== 'probed' ? { degraded: true } : {}),
+        // D1 ADD-key: the client failover surface (D3). Omitted when empty.
+        ...(fallbackTargets.length > 0 ? { fallback_targets: fallbackTargets } : {}),
+        // #87 D2: winner capability ADD keys (omitted when the engine
+        // exposes nothing and no last-good entry exists for the winner).
         ...(caps?.context_length !== undefined ? { context_length: caps.context_length } : {}),
         ...(caps?.input_modalities !== undefined ? { input_modalities: caps.input_modalities } : {}),
         ...(caps?.output_modalities !== undefined ? { output_modalities: caps.output_modalities } : {}),
       });
+    }
+    if (mismatchEventsThisTick > 0) {
+      // The `logMeshControl` plane: events persist alongside every other
+      // state write (trim + save), never a new state key.
+      this.store.trim();
+      this.store.save();
     }
     this.aliasPublished = out;
     this.aliasPairStates = pairStates;
   }
 
   /**
-   * The alias block the last probe cycle published, one RESOLVED entry per
-   * alias with the winner pair applied (D3 shape: name, server_id, url,
-   * auth_set, engine_model, catalog_source). Ephemeral like `catalog`; a
-   * token NEVER enters it. `/api/state` echoes it as the `model_aliases`
-   * ADD-key beside `catalog`.
+   * The alias block the last probe cycle published (SEADED at arbiter
+   * construction over the stored config — D1 cold start — so it is NEVER
+   * empty while `store.state.model_aliases` is non-empty), one RESOLVED
+   * entry per alias with the winner pair applied (D3 shape: name,
+   * server_id, url, auth_set, engine_model, catalog_source + the ADD keys
+   * `fallback`/`degraded`/`fallback_targets` + capability carry-over).
+   * Ephemeral like `catalog`; a token NEVER enters it. `/api/state` echoes
+   * it as the `model_aliases` ADD-key beside `catalog`.
    */
   modelAliases(): ModelAliasEntry[] {
     return this.aliasPublished;
@@ -1652,12 +1806,14 @@ export class Arbiter {
   /**
    * The stored alias rows for the dashboard read (`GET /api/aliases`):
    * pairs verbatim + this-tick per-pair source markers ('probed' renders
-   * nothing; 'declared' / 'dropped' / 'unprobed' mark the exception).
-   * Carries no secret by construction (D1: server_id + engine ids only).
+   * nothing; 'declared' / 'dropped' / 'mismatch' / 'unprobed' mark the
+   * exception — D1: 'mismatch' is a probe CONTRADICTION, 'dropped' is
+   * sanitizer/config corruption). Carries no secret by construction
+   * (D1: server_id + engine ids only).
    */
   aliasRows(): {
     alias: string;
-    pairs: { server_id: string; model: string; source: 'probed' | 'declared' | 'dropped' | 'unprobed' }[];
+    pairs: { server_id: string; model: string; source: 'probed' | 'declared' | 'dropped' | 'mismatch' | 'unprobed' }[];
     pinned_server_id?: string;
     updated_at: number;
   }[] {
@@ -2843,6 +2999,7 @@ export class Arbiter {
     this.detectors.delete(id);
     this.lastProbed.delete(id);
     this.lastProbedAt.delete(id);
+    this.lastGoodCaps.delete(id);
     this.reidleAfter.delete(id);
     this.store.appendEvent({ kind: 'server_connection_removed', detail: `${row.name} (${row.url})` });
     this.store.trim();

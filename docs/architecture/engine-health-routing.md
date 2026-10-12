@@ -159,6 +159,22 @@ survives (and a probe failure keeps a pair a survivor), the alias still
 publishes, now possibly from a different row. The alias still drops only
 when no pair survives (a dead row, a hostile key, a dropped pair),
 exactly today's condition.
+AMENDMENT (2026-10-12, alias-stability D1 — LOCKED): the CHAIN itself is
+byte-for-byte UNCHANGED. What changes is who it runs over and what
+happens when first-rank is empty. The pairs the chain sees split into
+FIRST-RANK candidates (the survivors: probed ∪ declared — steps 1-4 run
+over them exactly as written above, group filter on steps 1-2 only) and
+`mismatch` candidates (probe-SUCCEEDED rows whose list lacks the pair id
+— the case this section used to exclude). The chain runs over first-rank
+every tick; ONLY when first-rank is EMPTY (this section's old "no pair
+survives" case) does the SAME chain run over the `mismatch` candidates,
+and the entry publishes with the ADD-key `degraded: true`. The alias is
+therefore never unpublished by probe evidence; only sanitizer-degenerate
+config (no pair names an existing row with a usable url) publishes
+nothing. `dropped` narrows to sanitizer drops (hostile id, missing row,
+blank url); the pair marker for probe contradiction renames to
+`mismatch`. `fallback` keeps its exact semantics (winner ≠ stored pin)
+on both ranks.
 
 Inserted order is the priority, and the doc's rejected-least-loaded
 decision from the predecessor's D4 stands: no load ranking, no
