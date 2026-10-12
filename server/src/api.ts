@@ -51,6 +51,16 @@ export interface ApiDeps {
    * pre-#52). Display and sample only — never a verdict input.
    */
   loadSignal?: (row: ServerConnection, now: number) => LoadSignalView | null;
+  /**
+   * The scoped mesh config re-read (#91, cli.md D5 — the ONLY new server
+   * surface in the CLI wave): re-read the arbiter's OWN config source
+   * (`loadConfig(entryDir)` in index.ts — file or IDLEFILL_CONFIG, the same
+   * resolution boot uses) and hand back ONLY `mesh_peers` + `peer_token`.
+   * The route applies that through `MeshFederation.applyMeshConfig` — no
+   * restart, no full reload. Absent = the route answers 501 (a build/test
+   * without the wiring stays as-is).
+   */
+  reloadMeshConfig?: () => { mesh_peers: { url: string; name?: string }[]; peer_token: string };
 }
 
 /** Validate a request token against the configured set. */
@@ -321,7 +331,7 @@ function serverView(arbiter: Arbiter, cfg: ServerConfig, now: number, loadSignal
 
 /** Attach the API routes (authed) and the dashboard (public read). */
 export function buildApi(deps: ApiDeps): FastifyInstance {
-  const { arbiter, cfg, publicDir, mesh, metrics, loadSignal } = deps;
+  const { arbiter, cfg, publicDir, mesh, metrics, loadSignal, reloadMeshConfig } = deps;
 
   const app = fastify({ logger: false });
   app.decorate('idlefill', { arbiter, cfg, publicDir });
@@ -1296,6 +1306,56 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       // the coarse-by-construction clause holds.
       collectHostStats(),
     );
+  });
+
+  /**
+   * POST /api/mesh/peers/reload (#91, cli.md D5 — the scoped mesh config
+   * re-read, the ONLY new server surface in the CLI wave). `idlefill mesh
+   * join/leave` writes the `mesh_peers` row into the arbiter's config file
+   * (atomic, timestamped backup); this endpoint re-applies `mesh_peers` +
+   * `peer_token` from the arbiter's OWN config source — no restart, no full
+   * reload. Leases, sessions, detectors, projects, and every other config
+   * key stay exactly as they are; in-flight peer rows keep their observed
+   * instance_id + last snapshot (the view never blanks); the next poll tick
+   * pulls the added rows (`enabled` flips, `refresh` fetches).
+   *
+   * Auth: the local ADMIN plane (a valid api_token) — like /api/mesh/unpair
+   * and the pair ceremony, this is the operator's own machine. The fleet
+   * peer_token never reaches it (the hook scopes it to GET /api/mesh).
+   * A failed config re-read (unreadable/unparseable file) is 500 with the
+   * reason AND applies nothing — the live peer set stands. The response
+   * never carries the peer_token value (display posture: set/unset).
+   */
+  app.post('/api/mesh/peers/reload', async (req, reply) => {
+    if (!mesh) return reply.code(501).send({ error: 'mesh not wired' });
+    if (!reloadMeshConfig) return reply.code(501).send({ error: 'mesh config re-read not wired' });
+    let fresh: { mesh_peers: { url: string; name?: string }[]; peer_token: string };
+    try {
+      fresh = reloadMeshConfig();
+    } catch (err) {
+      return reply.code(500).send({
+        error: 'config_reread_failed',
+        reason: err instanceof Error ? err.message.slice(0, 200) : String(err),
+        hint: 'the live peer set stands — fix the config file (or the IDLEFILL_CONFIG env) and retry',
+      });
+    }
+    const peerCount = mesh.applyMeshConfig(fresh.mesh_peers, fresh.peer_token);
+    // Audit precedent (the unpair/revokeClientKey posture): a named admin-
+    // plane event, coarse detail — the token value never rides the log.
+    const st = arbiter['store'];
+    st.appendEvent({
+      kind: 'mesh_peers_reloaded',
+      detail: `${fresh.mesh_peers.length} configured peer(s); peer_token ${fresh.peer_token ? 'set' : 'unset'}`,
+    });
+    st.trim();
+    st.save();
+    return {
+      ok: true,
+      peers: mesh.view(Date.now()).map((p) => ({ url: p.url, ...(p.name ? { name: p.name } : {}) })),
+      peer_count: peerCount,
+      peer_token: fresh.peer_token ? 'set' : 'unset',
+      poll_ms: cfg.poll_ms,
+    };
   });
 
   // ------------------------------------------------------------------

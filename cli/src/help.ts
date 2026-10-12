@@ -74,11 +74,28 @@ manual path (the locked five-step fail-closed sequence).
 
 export const MESH_USAGE = `idlefill mesh — join / leave / inspect the mesh.
 
-  idlefill mesh status | join <url> [--name N] | leave <name|url> | pair [code]
+  idlefill mesh status [--json]
+  idlefill mesh join <url> [--name N]
+  idlefill mesh leave <name|url>
+  idlefill mesh pair [code]
 
-Planned — S4 (issue #91). Not implemented yet; today joining means
-hand-editing server/config.json (mesh_peers — NOT server_peers) and
-restarting the arbiter.
+status — the merged peer rows with the dashboard's fetch-honesty posture:
+the snapshot age grows, past the 90s window the row names itself offline;
+never fake progress.
+join — probe-then-write: the candidate must answer GET /api/mesh with the
+configured peer_token BEFORE anything is written (unreachable / wrong
+shape / refused token = named refusal, zero mutation). Then the
+mesh_peers row is upserted into server/config.json — atomic write,
+timestamped backup, server_peers (llama-swap backends) untouched — and
+the arbiter re-reads JUST mesh_peers + peer_token (no restart; the next
+poll tick pulls the row).
+leave — drops the row, re-reads the same scoped keys, reports.
+pair — no code: mints a one-time pairing code (this machine becomes the
+controlled end). With a code: redeems a peer's code (this machine
+becomes the controller). Rides the locked #39/#55 ceremony — no new
+handshake, no new credential plane.
+Auth: the arbiter token is read AT RUNTIME from the gitignored config —
+it never appears on a command line.
 `;
 
 export const ENGINE_USAGE = `idlefill engine — the inference-engine inventory (the terminal twin of

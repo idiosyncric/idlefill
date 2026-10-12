@@ -1106,6 +1106,15 @@ export type EventKind =
    */
   | 'mesh_edge_formed'
   /**
+   * Scoped mesh config re-read audit (#91, cli.md D5): the operator ran
+   * POST /api/mesh/peers/reload (`idlefill mesh join/leave` drives it).
+   * The live `mesh_peers` + `peer_token` were re-applied from the
+   * arbiter's own config source — no restart. Detail is coarse: the
+   * configured-peer count + whether a peer_token is set (the VALUE never
+   * rides the log). Admin action, no `source_instance_id`.
+   */
+  | 'mesh_peers_reloaded'
+  /**
    * Scheduled queue rebuild (issue #3): the client's rebuild loop ran since
    * the last heartbeat and reported fresh run state. The arbiter derives the
    * event from the registration payload (no new API surface) so the operator

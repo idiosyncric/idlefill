@@ -24,10 +24,15 @@ test('engine routes as a live group (S3, #90)', () => {
   assert.equal(GROUPS.engine.implemented, true);
 });
 
-test('update/mesh/agent are registered but refuse by name until S2/S4/S5', () => {
+test('mesh routes as a live group (S4, #91)', () => {
+  assert.deepEqual(dispatch(parse(['mesh', 'status'])), { kind: 'group', group: 'mesh' });
+  assert.deepEqual(dispatch(parse(['mesh', 'join', 'http://100.105.225.1:8787'])), { kind: 'group', group: 'mesh' });
+  assert.equal(GROUPS.mesh.implemented, true);
+});
+
+test('update/agent are registered but refuse by name until S2/S5', () => {
   const planned: Array<[string, string, number]> = [
     ['update', 'S2', 89],
-    ['mesh', 'S4', 91],
     ['agent', 'S5', 92],
   ];
   for (const [id, slice, issue] of planned) {

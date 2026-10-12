@@ -25,7 +25,7 @@ import { fileURLToPath } from 'node:url';
 
 import { jsonPayload } from './json.js';
 
-const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+export const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 export const ENGINE_USAGE =
   'usage: idlefill engine [list] | add <name> <url> [--models a,b] [--peers p1] [--local [--log-glob G]] | ' +
@@ -337,7 +337,8 @@ function readJsonConfig(path: string): Record<string, unknown> | null {
   }
 }
 
-function resolveAuth(): { token: string; serverUrl: string } {
+/** Shared by the mesh group (#91) — the same control-group lookup order. */
+export function resolveAuth(): { token: string; serverUrl: string } {
   const parseEnv = (raw: string | undefined): Record<string, unknown> | null => {
     if (!raw) return null;
     try {
@@ -374,7 +375,7 @@ function resolveAuth(): { token: string; serverUrl: string } {
 // The live group
 // ---------------------------------------------------------------------------
 
-class EngineFail extends Error {}
+export class EngineFail extends Error {}
 class EngineUsage extends Error {}
 
 export async function runEngine(argv: string[], json: boolean): Promise<number> {

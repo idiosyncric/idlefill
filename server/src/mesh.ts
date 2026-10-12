@@ -588,11 +588,9 @@ export class MeshFederation {
     this.heartbeatSender = opts.heartbeatSender;
     this.localPublicKey = opts.localPublicKey;
     this.remoteFetcher = opts.remoteMetricsFetcher ?? makeRealRemoteMetricsFetcher();
-    for (const p of cfg.mesh_peers ?? []) {
-      const url = String(p?.url ?? '').trim().replace(/\/+$/, '');
-      if (!url || url === 'self') continue;
-      if (!this.peers.has(url)) {
-        this.peers.set(url, { url, name: p.name?.trim() || undefined, instanceId: null, lastOk: null, lastError: null, snapshot: null });
+    for (const p of normalizePeerRows(cfg.mesh_peers ?? [])) {
+      if (!this.peers.has(p.url)) {
+        this.peers.set(p.url, { url: p.url, name: p.name, instanceId: null, lastOk: null, lastError: null, snapshot: null });
       }
     }
   }
@@ -600,6 +598,48 @@ export class MeshFederation {
   /** True when at least one peer is configured (the tick can skip the work otherwise). */
   get enabled(): boolean {
     return this.peers.size > 0;
+  }
+
+  /**
+   * The scoped mesh config re-read (#91, cli.md D5 — the ONLY new server
+   * surface in the CLI wave): re-apply `mesh_peers` + `peer_token` ONLY, no
+   * restart, no full config reload. Everything else the arbiter carries
+   * (leases, sessions, detectors, projects, the rest of ServerConfig) is
+   * untouched — a full restart to add a peer is wrong on urza (lease drain,
+   * swap machinery). The next poll tick picks the new set up: `enabled`
+   * flips and `refresh` pulls the added rows.
+   *
+   * In-flight state is preserved: a peer whose url stays keeps its observed
+   * instance_id, last snapshot, and fetch ages byte-for-byte — the view
+   * never goes blank under the operator's cursor. A removed config-origin
+   * row is dropped; a fleet-roster-origin row is NEVER touched (the roster
+   * pull owns those, #55 D3). An added row starts honest: never fetched,
+   * offline until its first successful pull (the exception-only posture).
+   *
+   * `peer_token` rides the SAME shared cfg object the auth hook reads live
+   * (isPeerToken(cfg, …)), so a rotated fleet token applies on the next
+   * request without a restart — in either direction (it can also tighten:
+   * a stale token stops working the moment it is replaced).
+   */
+  applyMeshConfig(peers: { url: string; name?: string }[], token: string): number {
+    const clean = normalizePeerRows(peers);
+    // ONLY the two scoped keys of the live config change.
+    this.cfg.mesh_peers = clean.map((p) => ({ url: p.url, ...(p.name ? { name: p.name } : {}) }));
+    this.cfg.peer_token = typeof token === 'string' ? token : '';
+    const desired = new Map(clean.map((p) => [p.url, p]));
+    for (const [url, entry] of [...this.peers.entries()]) {
+      const want = desired.get(url);
+      if (want) {
+        if (entry.rosterOrigin !== true) entry.name = want.name;
+        desired.delete(url); // in-flight state (snapshot/ages/ids) stays untouched
+      } else if (entry.rosterOrigin !== true) {
+        this.peers.delete(url);
+      }
+    }
+    for (const [url, want] of desired) {
+      this.peers.set(url, { url, name: want.name, instanceId: null, lastOk: null, lastError: null, snapshot: null });
+    }
+    return this.peers.size;
   }
 
   /**
@@ -1052,6 +1092,24 @@ export function makeRealRemoteMetricsFetcher(timeoutMs = 10_000): RemoteMetricsF
     if (!res.ok) throw new Error(`remote metrics fetch HTTP ${res.status}`);
     return await res.json();
   };
+}
+
+/**
+ * Normalize the static `mesh_peers` registry (the boot rule, reused by the
+ * scoped re-read #91): trim, strip trailing slashes, drop blank/`self`/
+ * duplicate urls (first row wins), trim names to absent-or-set.
+ */
+function normalizePeerRows(rows: { url: string; name?: string }[]): { url: string; name?: string }[] {
+  const out: { url: string; name?: string }[] = [];
+  const seen = new Set<string>();
+  for (const p of rows) {
+    const url = String(p?.url ?? '').trim().replace(/\/+$/, '');
+    if (!url || url === 'self' || seen.has(url)) continue;
+    seen.add(url);
+    const name = typeof p?.name === 'string' ? p.name.trim() || undefined : undefined;
+    out.push({ url, ...(name ? { name } : {}) });
+  }
+  return out;
 }
 
 function hostOf(url: string): string {

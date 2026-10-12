@@ -292,6 +292,16 @@ async function main(): Promise<void> {
     mesh,
     metrics,
     loadSignal: (row, now) => loadView(row, now),
+    // The scoped mesh config re-read (#91, cli.md D5): re-run the SAME
+    // boot resolution (IDLEFILL_CONFIG env, else config.json next to the
+    // entry) and hand back ONLY mesh_peers + peer_token. The route applies
+    // it through MeshFederation.applyMeshConfig — no restart, the next poll
+    // tick pulls the added rows. A broken config file throws here and the
+    // route applies nothing (the live peer set stands).
+    reloadMeshConfig: () => {
+      const fresh = loadConfig(entryDir);
+      return { mesh_peers: fresh.mesh_peers ?? [], peer_token: fresh.peer_token ?? '' };
+    },
   });
   const wss = attachWebSocket(app, arbiter, cfg);
   const broadcast = (app as unknown as Record<string, unknown>).broadcastWs as (obj: unknown) => void;

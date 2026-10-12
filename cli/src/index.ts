@@ -6,8 +6,9 @@
  *
  * daemon/control are live passthrough groups (behavior byte-identical to
  * scripts/idlefill-daemon.mjs / scripts/idlefill-control.mjs, which are now
- * thin shims onto this entry). update/mesh/engine/agent are registered for
- * S2–S5 (#89–#92) and refuse by name until their slice lands.
+ * thin shims onto this entry). engine (#90) and mesh (#91) are live;
+ * update/agent are registered for S2/S5 (#89/#92) and refuse by name until
+ * their slice lands.
  *
  * Exit codes: 0 ok · 1 action failed · 2 usage.
  * Auth posture (D3): the arbiter token is read AT RUNTIME from the
@@ -20,6 +21,7 @@ import { groupHelp, topHelp } from './help.js';
 import { runDaemon } from './daemon.js';
 import { runControl } from './control.js';
 import { runEngine } from './engine.js';
+import { runMesh } from './mesh.js';
 
 export async function main(argv: string[]): Promise<number> {
   const parsed = parseArgv(argv);
@@ -48,6 +50,7 @@ export async function main(argv: string[]): Promise<number> {
 
   if (d.group === 'daemon') return runDaemon(parsed.args, parsed.json);
   if (d.group === 'engine') return runEngine(parsed.args, parsed.json);
+  if (d.group === 'mesh') return runMesh(parsed.args, parsed.json);
   return runControl(parsed.args, parsed.json);
 }
 
