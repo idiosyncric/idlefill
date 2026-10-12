@@ -31,16 +31,25 @@ import {
   SheetDescription,
 } from "@/components/ui/sheet";
 import { Input } from "@/components/ui/input";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+} from "@/components/ui/dialog";
 import { Sparkline } from "@/components/Sparkline";
 import { Skeleton } from "@/components/ui/skeleton";
 import { copyText } from "@/lib/clipboard";
 import {
   apiToken,
+  getAliases,
   setSessionOverride,
   setSessionPin,
   getSessionTranscript,
   readLocalHermesTranscript,
   patchLocalHermesLifecycle,
+  type AliasRow,
   type HermesLifecyclePatch,
   type HermesTranscriptMessage,
   type HermesTranscriptPage,
@@ -49,6 +58,7 @@ import {
   type StateSnapshot,
 } from "@/lib/api";
 import { ago, durFmt, isOnline, liveWord, sessGateLabelText, sessStateWord, sessStale } from "@/lib/format";
+import { engineEdge, type EngineEdge } from "@/lib/session-edge";
 import { sessionTiles } from "@/lib/session-stats";
 import { StatTiles, TilesSkeleton } from "@/components/stat-tiles";
 
@@ -708,6 +718,23 @@ export function Sessions({ st }: { st: StateSnapshot | null }) {
 function SessionRowView({ s, st }: { s: SessionRow; st: StateSnapshot }) {
   const now = st.now;
   const [viewOpen, setViewOpen] = React.useState(false);
+  const [rerouteOpen, setRerouteOpen] = React.useState(false);
+  // The D4 session→engine edge: the engine row this session routes through
+  // (the operator pin wins once one stands), read through lib/session-edge.
+  // Exception-only honesty: a healthy unpinned row renders byte-for-byte as
+  // before — the annotation and the warn tone appear only when the engine
+  // row names a fact (queue > 0, a stale sample, a degraded/no-signal
+  // posture) and the gate says the session is ACTIVE.
+  const edgeTarget = s.engine_pin?.server_id ?? s.server_id ?? null;
+  const edgeSignal = edgeTarget ? ((st.servers ?? []).find((r) => r.id === edgeTarget)?.signal ?? null) : null;
+  const edge = engineEdge(s, edgeSignal);
+  const edgeTitle = [
+    "the engine this session routes to",
+    edge.pinned ? "operator pin — lands at release time" : null,
+    edge.slow ? `slow: ${edge.slowReasons.join("; ")} (sample age at the arbiter's snapshot)` : null,
+  ]
+    .filter(Boolean)
+    .join(" — ");
   const word = sessStateWord(s, now);
   const stale = sessStale(s, now);
   const shortTok = String(s.token ?? "").slice(0, 8);
@@ -803,11 +830,30 @@ function SessionRowView({ s, st }: { s: SessionRow; st: StateSnapshot }) {
           proxyPort={hostProxyPort(st, s)}
         />
       )}
-      {s.server_id && !s.engine_pin && (
-        <span className="text-[11px] text-dim" title="the engine this session routes to">
-          → {serverName(st, s.server_id)}
+      {edge.target && (
+        <span className={`text-[11px] ${edge.slow ? "text-warn" : "text-dim"}`} title={edgeTitle}>
+          → {serverName(st, edge.target)}
+          {edge.annotation ? ` · ${edge.annotation}` : ""}
         </span>
       )}
+      {edge.slow && (
+        <Button
+          size="xs"
+          variant="outline"
+          className="h-6 border-warn/50 px-2 text-[11px] text-warn"
+          title={`the engine behind this session looks slow — ${edge.slowReasons.join("; ")} — pick one of the model's alias pairs (the EXISTING engine-pin write; lands at release time, a running stream never moves)`}
+          onClick={() => {
+            if (!apiToken()) {
+              toast.error("needs the arbiter API token — paste it in the header first");
+              return;
+            }
+            setRerouteOpen(true);
+          }}
+        >
+          re-route…
+        </Button>
+      )}
+      {rerouteOpen && <RerouteChooser st={st} s={s} onClose={() => setRerouteOpen(false)} />}
       {stale && (
         <Badge variant="outline" className="rounded-pill px-1.5 py-0 text-[10px] font-normal text-dim" title="no heartbeat from this session in the last 90s — the router may have dropped it">
           stale
@@ -888,6 +934,135 @@ function serverName(st: StateSnapshot, id: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// D4 re-route: the pair chooser over the session model's alias pairs — the
+// verbatim GET /api/aliases rows (the same token-gated authoring read the
+// Models tab uses), posting the EXISTING engine-pin write
+// (POST /api/sessions/:token/pin { server_id } — server/src/api.ts, landing
+// on arbiter.setSessionPin: an alias session may only be pinned to one of
+// its alias's pair rows, exactly what this chooser lists). The pin applies
+// through the existing release-time resolver (queued + next-request traffic
+// moves; a running stream never does). NO optimistic state: the 5s poll
+// refresh shows the row's engine_pin. A model with no alias pairs is REFUSED
+// BY NAME; clearing the pin is offered because the same route supports it
+// (server_id: null). Zero new server surface, zero new credential plane.
+// ---------------------------------------------------------------------------
+
+function RerouteChooser({ st, s, onClose }: { st: StateSnapshot; s: SessionRow; onClose: () => void }) {
+  const shortTok = String(s.token ?? "").slice(0, 8);
+  const model = typeof s.history?.model === "string" && s.history.model !== "" ? s.history.model : null;
+  const current = s.engine_pin?.server_id ?? null;
+  const [rows, setRows] = React.useState<AliasRow[] | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+  const [busy, setBusy] = React.useState(false);
+
+  React.useEffect(() => {
+    let live = true;
+    getAliases()
+      .then((a) => live && setRows(a))
+      .catch((e) => live && setError((e as Error).message));
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  const aliasRow = rows !== null && model !== null ? (rows.find((a) => a.alias === model) ?? null) : null;
+  const pairs = aliasRow?.pairs ?? null;
+
+  const post = async (server_id: string | null) => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await setSessionPin(s.token, server_id);
+      toast.success(
+        server_id
+          ? `session ${shortTok} pinned to ${serverName(st, server_id)} — lands at release (a running stream never moves)`
+          : `pin cleared for session ${shortTok}`,
+      );
+      onClose(); // the poll refresh shows the pin — nothing is faked in-page
+    } catch (e) {
+      toast.error(`pin refused: ${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Dialog open onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="max-w-md font-mono text-[12px]">
+        <DialogHeader>
+          <DialogTitle className="text-[13px]">re-route session {shortTok}</DialogTitle>
+          <DialogDescription className="text-[11px]">
+            the engine behind this session looks slow. Picking a pair posts the EXISTING engine-pin write — the
+            standing choice lands at release time (queued + next-request traffic moves; a running stream never
+            does). The row updates on the next poll; nothing is shown optimistically.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="flex flex-col gap-2">
+          {rows === null && error === null && <div className="text-[11px] text-dim">reading the alias pairs…</div>}
+          {error !== null && <div className="text-[11px] text-err">aliases read failed: {error}</div>}
+          {rows !== null && model === null && (
+            <div className="text-[11px] text-dim">
+              the router has not sniffed a model for this session yet — the pair list is model-scoped, so there is
+              nothing to choose by name.
+            </div>
+          )}
+          {rows !== null && model !== null && aliasRow === null && (
+            <div className="text-[11px] text-dim">
+              no alias is declared for <code>{model}</code> — nothing to re-route between. A bare name routes to the
+              row that carries it (the rows-mode pin select names any row that serves it).
+            </div>
+          )}
+          {pairs !== null && (
+            <div className="flex flex-col gap-1">
+              {pairs.map((p, i) => {
+                const isCurrent = current !== null && p.server_id === current;
+                return (
+                  <div key={`${p.server_id}/${p.model}-${i}`} className="flex items-center gap-2 text-[12px]">
+                    <span
+                      className={`size-1.5 shrink-0 rounded-full ${p.source === "probed" ? "bg-ok" : p.source === "dropped" ? "bg-err" : "bg-warn"}`}
+                      title={`pair source: ${p.source}`}
+                    />
+                    <span className="min-w-0 truncate">{serverName(st, p.server_id)}</span>
+                    <span className="min-w-0 truncate text-[11px] text-dim" title="the EXACT model id this row serves">
+                      {p.model}
+                    </span>
+                    <Button
+                      size="xs"
+                      variant={isCurrent ? "ghost" : "outline"}
+                      className="ml-auto h-6 px-2 text-[11px]"
+                      disabled={busy || isCurrent}
+                      onClick={() => void post(p.server_id)}
+                      title={`pin ${serverName(st, p.server_id)} for this session — POST /api/sessions/<token>/pin {server_id} (a mismatch pair is still a legal pin target — the pin is the operator's override)`}
+                    >
+                      {isCurrent ? "current" : "pin"}
+                    </Button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          {s.engine_pin && (
+            <div className="flex items-center gap-2 border-t border-border pt-2 text-[11px] text-dim">
+              pinned to {serverName(st, s.engine_pin.server_id)}
+              <Button
+                size="xs"
+                variant="outline"
+                className="ml-auto h-6 px-2 text-[11px]"
+                disabled={busy}
+                onClick={() => void post(null)}
+                title="clear the pin — the same route with server_id: null (the session routes by the alias winner again)"
+              >
+                clear pin
+              </Button>
+            </div>
+          )}
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // The #67 flow view: the same published payload drawn as a live surface.
 // Left: sessions grouped by the model name they ask for. Right: the engine
 // rows with their load (counts read from the session rows — arbiter truth).
@@ -900,12 +1075,22 @@ function FlowView({ st }: { st: StateSnapshot }) {
   const rows = st.sessions ?? [];
   const engines = (st.servers ?? []).slice().sort((a, b) => a.name.localeCompare(b.name));
 
-  type SessNode = { token: string; short: string; host: string; stale: boolean; group: string; target: string };
+  type SessNode = {
+    token: string;
+    short: string;
+    host: string;
+    stale: boolean;
+    group: string;
+    target: string;
+    edge: EngineEdge;
+  };
   const nodes: SessNode[] = [];
   const groups = new Map<string, SessNode[]>();
   for (const s of rows) {
     const g = s.history?.model ?? "(unseen model)";
     const target = s.engine_pin?.server_id ?? s.server_id ?? engines[0]?.id ?? "";
+    const edgeSignal =
+      (st.servers ?? []).find((r) => r.id === (s.engine_pin?.server_id ?? s.server_id ?? ""))?.signal ?? null;
     const node: SessNode = {
       token: s.token,
       short: String(s.token ?? "").slice(0, 8),
@@ -913,6 +1098,7 @@ function FlowView({ st }: { st: StateSnapshot }) {
       stale: sessStale(s, st.now),
       group: g,
       target,
+      edge: engineEdge(s, edgeSignal),
     };
     nodes.push(node);
     const list = groups.get(g) ?? [];
@@ -952,6 +1138,22 @@ function FlowView({ st }: { st: StateSnapshot }) {
                       <span className={`size-1.5 rounded-full ${s.stale ? "bg-border" : "bg-ok"}`} />
                       <span className="font-mono text-[11px]">{s.short}</span>
                       <span className="text-[11px] text-dim">@{s.host}</span>
+                      {/* D4: the labelled session→engine edge (no graph
+                          library — the engine column carries the posture
+                          word). Warn = the slow heuristic fired. */}
+                      {s.edge.target && (
+                        <span
+                          className={`text-[11px] ${s.edge.slow ? "text-warn" : "text-dim"}`}
+                          title={
+                            s.edge.slow
+                              ? `slow: ${s.edge.slowReasons.join("; ")} — re-route from the rows mode`
+                              : `routes to ${engines.find((e) => e.id === s.edge.target)?.name ?? s.edge.target}`
+                          }
+                        >
+                          → {engines.find((e) => e.id === s.edge.target)?.name ?? s.edge.target}
+                          {s.edge.annotation ? ` · ${s.edge.annotation}` : ""}
+                        </span>
+                      )}
                     </div>
                   ))}
                 </div>

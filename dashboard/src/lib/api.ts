@@ -46,6 +46,12 @@ export type ServerSignal = {
   host_mem_total_bytes?: number;
   model_mem_used_bytes?: number;
   model_mem_max_bytes?: number;
+  // The scheduler queue count (oMLX `waiting_requests` today; llama-swap /
+  // strata name none). ADD key — rides the load reading's spread into the
+  // signal block (serverView), so its freshness stamp is `load_age_s`. The
+  // session→engine edge (alias-stability D4) reads it; absent = the row's
+  // kind names no queue, never a fake zero.
+  queue_depth?: number;
 };
 
 export type ServerRow = {
@@ -288,6 +294,15 @@ export type CatalogEntry = {
   output_modalities?: string[];
 };
 
+// D1 (alias-stability): one entry of the published `fallback_targets` key —
+// the alias's OTHER pairs, the client router's failover surface (D3).
+// { server_id, url, engine_model } ONLY: a token never enters the block.
+export type ModelAliasFallbackTarget = {
+  server_id: string;
+  url: string;
+  engine_model: string;
+};
+
 // The winner-only publish block (anonymous /api/state).
 export type ModelAliasEntry = {
   name: string;
@@ -300,6 +315,15 @@ export type ModelAliasEntry = {
   // is dead (or group-blocked) and traffic moved to the next-best option.
   // Absent on every pin-matched and pinless entry.
   fallback?: boolean;
+  // D1 (alias-stability): the winner is NOT probe-confirmed this tick (its
+  // pair is `mismatch` or `declared`) — the alias publishes honestly
+  // degraded instead of vanishing. Omitted on probe-confirmed winners; the
+  // router IGNORES the key, the dashboard renders it.
+  degraded?: boolean;
+  // D1: the alias's OTHER pairs (stored order, winner excluded, rows that
+  // exist with a non-empty url) — the client's failover surface (D3).
+  // Absent when empty; a token never enters the block.
+  fallback_targets?: ModelAliasFallbackTarget[];
   // #87 D2: winner-pair capability ADD keys (the router/advertise rides
   // them; the dashboard's misalignment chips derive from them + per-pair
   // inventory lookups). Omitted when unknown.
@@ -319,10 +343,14 @@ export type EngineGroup = {
   updated_at: number;
 };
 
-// The stored authoring row (token-gated GET /api/aliases).
+// The stored authoring row (token-gated GET /api/aliases). Pair markers
+// (D1 alias-stability rename): `mismatch` = the row's probe SUCCEEDED but
+// its list lacks this pair's id (probe contradiction — an ALERT, the alias
+// still publishes); `dropped` REMAINS the sanitizer marker (hostile id,
+// missing row, blank url — config corruption).
 export type AliasRow = {
   alias: string;
-  pairs: { server_id: string; model: string; source: "probed" | "declared" | "dropped" | "unprobed" }[];
+  pairs: { server_id: string; model: string; source: "probed" | "declared" | "mismatch" | "dropped" | "unprobed" }[];
   pinned_server_id?: string;
   updated_at: number;
 };

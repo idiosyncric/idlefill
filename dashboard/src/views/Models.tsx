@@ -243,10 +243,22 @@ export function Models({ st }: { st: StateSnapshot | null }) {
 // the winner line, and the pin/unpin + edit controls.
 // ---------------------------------------------------------------------------
 
+// The per-pair source marker (D1 alias-stability rename): `mismatch` is the
+// probe CONTRADICTION — the row's /v1/models probe succeeded but its list
+// lacks this id (the old per-tick `dropped` case, renamed to name it
+// honestly); `dropped` REMAINS the sanitizer marker (config corruption).
 const SOURCE_MARK: Record<string, string> = {
   declared: "declared",
-  dropped: "dropped",
+  mismatch: "probe says no",
+  dropped: "dropped (config)",
   unprobed: "not probed",
+};
+
+const SOURCE_TITLE: Record<string, string> = {
+  declared: "pair source: declared — the row's probe never answered this tick; the stored declaration stands",
+  mismatch: "pair source: mismatch — the row's /v1/models probe SUCCEEDED but its list lacks this id (probe contradiction, D1): an ALERT, not a drop — the alias still publishes, honestly degraded",
+  dropped: "pair source: dropped — sanitizer: hostile id, missing row, or blank url (config corruption, D1)",
+  unprobed: "pair source: unprobed — stored pair the row's probe has never confirmed",
 };
 
 // ---------------------------------------------------------------------------
@@ -435,7 +447,10 @@ function AliasCard({
             const mark = SOURCE_MARK[p.source];
             return (
               <div key={`${p.server_id}/${p.model}-${i}`} className="flex items-center gap-2 text-[12px]">
-                <span className={`size-1.5 shrink-0 rounded-full ${p.source === "probed" ? "bg-ok" : "bg-warn"}`} title={p.source} />
+                <span
+                  className={`size-1.5 shrink-0 rounded-full ${p.source === "probed" ? "bg-ok" : p.source === "dropped" ? "bg-err" : "bg-warn"}`}
+                  title={p.source}
+                />
                 <span className="min-w-0 truncate" title={`engine ${srvName(p.server_id)}`}>
                   {srvName(p.server_id)}
                 </span>
@@ -444,7 +459,11 @@ function AliasCard({
                 </span>
                 <CapsChips caps={capsFor(p.server_id, p.model)} />
                 {mark && (
-                  <Badge variant="outline" className="ml-auto shrink-0 rounded-pill px-1.5 py-0 text-[10px] font-normal text-dim" title={`pair source: ${p.source}`}>
+                  <Badge
+                    variant="outline"
+                    className={`ml-auto shrink-0 rounded-pill px-1.5 py-0 text-[10px] font-normal ${p.source === "mismatch" || p.source === "dropped" ? "text-warn" : "text-dim"}`}
+                    title={SOURCE_TITLE[p.source] ?? `pair source: ${p.source}`}
+                  >
                     {mark}
                   </Badge>
                 )}
@@ -482,6 +501,15 @@ function AliasCard({
               {published?.fallback && (
                 <Badge variant="outline" className="rounded-pill border-err/50 px-1.5 py-0 text-[10px] font-normal text-err" title="the pin is dead (or group-blocked) — traffic moved to the next-best option">
                   re-routed from {srvName(a.pinned_server_id ?? "")}
+                </Badge>
+              )}
+              {published?.degraded && (
+                <Badge
+                  variant="outline"
+                  className="rounded-pill border-warn/50 px-1.5 py-0 text-[10px] font-normal text-warn"
+                  title="the winner is not probe-confirmed this tick (its pair is mismatch or declared) — the alias still publishes, honestly degraded (D1); the pair marker names why"
+                >
+                  degraded
                 </Badge>
               )}
               {!published?.fallback && a.pinned_server_id === eff.server_id && (
@@ -541,6 +569,18 @@ function AliasCard({
               </span>
             );
           })}
+          {/* D1: the alias's OTHER pairs as secondary chips — the client
+              router's failover surface (D3). Read-only here: no token rides
+              the block, and this view opens no write surface for them. */}
+          {(published?.fallback_targets ?? []).map((t) => (
+            <span
+              key={`${t.server_id}/${t.engine_model}`}
+              className="rounded-pill border border-border px-1.5 py-0 text-[10px] text-dim"
+              title={`fallback target (D1): ${srvName(t.server_id)} serves ${t.engine_model} at ${t.url} — the local router's one-shot failover surface if the winner is slow (D3); the arbiter never forwards, and this chip is read-only`}
+            >
+              ↦ {srvName(t.server_id)} / {t.engine_model}
+            </span>
+          ))}
         </span>
       </CardFooter>
     </Card>
