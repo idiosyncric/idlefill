@@ -339,6 +339,13 @@ export interface EngineCounters {
   requests: number;
   tokens_in: number;
   tokens_out: number;
+  /**
+   * Cache-read tokens — prompt tokens served from the engine's cache
+   * (strata `totals.reused`, oMLX `total_cached_tokens`). Optional: a
+   * kind that names no reuse counter contributes no key (absent =
+   * unknown, never a fake zero). ADD key.
+   */
+  tokens_cached?: number;
 }
 
 /** Where a sample's request/token numbers came from (ADD key). */
@@ -1001,6 +1008,22 @@ export interface IdleSignal {
   model_quant?: string;
   /** oMLX pool residency (`/api/status` `models_loaded`; the D8 amendment moved it off `/health`): models loaded in memory (counts models, NOT requests). Display and sample only. Absent = no reading. ADD key. */
   omlx_loaded_count?: number;
+  /**
+   * Engine-host system RAM in use / total (bytes) — the llama-swap
+   * `llamaswap_memory_used/total_bytes` gauges or strata
+   * `hardware.ram_used/ram_total` (verified live 2026-10-11). HOST-level
+   * (the whole engine box — the engine's own gauge, never a per-process
+   * figure). Absent = the read carried no memory gauge. ADD keys.
+   */
+  host_mem_used_bytes?: number;
+  host_mem_total_bytes?: number;
+  /**
+   * oMLX model-pool RAM on Apple unified memory (`/api/status`
+   * `model_memory_used` / `model_memory_max`) — the fleet's only true
+   * per-engine RAM allocation. Absent on llama-swap/strata. ADD keys.
+   */
+  model_mem_used_bytes?: number;
+  model_mem_max_bytes?: number;
 }
 
 export type EventKind =

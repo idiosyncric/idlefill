@@ -13,8 +13,9 @@
  *   omlx    — no feed, no HTTP metrics endpoint. Its usage truth is the
  *             oMLX usage store: ~/.omlx/usage.sqlite3, table
  *             model_usage_hourly (requests, prompt_tokens,
- *             completion_tokens per hour+model; column names verified
- *             against the live store 2026-10-05). The tick reads the
+ *             completion_tokens, cached_tokens per hour+model; column
+ *             names verified against the live store 2026-10-05, re-
+ *             verified 2026-10-11). The tick reads the
  *             table's cumulative SUM and diffs it per sample.
  *
  * Co-located kinds declare co-location: the sqlite store only exists on
@@ -47,30 +48,41 @@ export class CounterDeltaTracker {
   /** Record one successful counter read for a key. */
   observe(key: string, c: EngineCounters): void {
     if (!c || !Number.isFinite(c.requests)) return;
-    this.observed.set(key, { requests: c.requests, tokens_in: c.tokens_in, tokens_out: c.tokens_out });
+    this.observed.set(key, {
+      requests: c.requests,
+      tokens_in: c.tokens_in,
+      tokens_out: c.tokens_out,
+      ...(c.tokens_cached !== undefined ? { tokens_cached: c.tokens_cached } : {}),
+    });
   }
 
   /**
    * Consume the delta since this key's previous sample. First sample and
    * backwards counters (engine restart resets the counters) read as
-   * unknown (null), never negative.
+   * unknown (null), never negative. `tokens_cached_delta` is ABSENT
+   * (undefined, not null) when either side named no cache counter —
+   * the axis doesn't exist for that source, distinct from "unknown".
    */
   delta(key: string): {
     req_delta: number | null;
     tokens_in_delta: number | null;
     tokens_out_delta: number | null;
+    tokens_cached_delta?: number | null;
     last: EngineCounters | null;
   } {
     const cur = this.observed.get(key);
     if (!cur) return { req_delta: null, tokens_in_delta: null, tokens_out_delta: null, last: null };
     const prev = this.baseline.get(key);
     this.baseline.set(key, cur);
-    if (!prev) return { req_delta: null, tokens_in_delta: null, tokens_out_delta: null, last: cur };
     const d = (a: number, b: number): number | null => (a >= b ? a - b : null);
+    if (!prev) return { req_delta: null, tokens_in_delta: null, tokens_out_delta: null, last: cur };
     return {
       req_delta: d(cur.requests, prev.requests),
       tokens_in_delta: d(cur.tokens_in, prev.tokens_in),
       tokens_out_delta: d(cur.tokens_out, prev.tokens_out),
+      ...(cur.tokens_cached !== undefined && prev.tokens_cached !== undefined
+        ? { tokens_cached_delta: d(cur.tokens_cached, prev.tokens_cached) }
+        : {}),
       last: cur,
     };
   }
@@ -126,16 +138,26 @@ export class SqliteOmlxUsageReader implements OmlxUsageReader {
   /**
    * SUM over every hourly row = since-install truth. A missing table
    * (fresh install) or an unreachable store reads null — the sampler
-   * then contributes unknown, never zero.
+   * then contributes unknown, never zero. `cached_tokens` (cache-read
+   * prompt tokens; column verified live in the 2026-10 store schema) is
+   * SUMMED when the column exists — a store whose schema names none
+   * contributes no `tokens_cached` key (absent = no axis, and the
+   * sampler then falls back to the status envelope's `total_cached_tokens`).
    */
   readTotals(): UsageRowSum | null {
     const db = this.open();
     if (!db) return null;
     try {
+      const cols = new Set(
+        (db.prepare('PRAGMA table_info(model_usage_hourly)').all() as { name?: unknown }[]).map((r) => r.name),
+      );
+      if (!cols.has('requests')) return null;
+      const cached = cols.has('cached_tokens') ? 'COALESCE(SUM(cached_tokens),0) AS cached_tokens, ' : '';
       const row = db
         .prepare(
           'SELECT COALESCE(SUM(requests),0) AS requests, ' +
             'COALESCE(SUM(prompt_tokens),0) AS prompt_tokens, ' +
+            cached +
             'COALESCE(SUM(completion_tokens),0) AS completion_tokens ' +
             'FROM model_usage_hourly',
         )
@@ -145,7 +167,12 @@ export class SqliteOmlxUsageReader implements OmlxUsageReader {
         const x = typeof v === 'bigint' ? Number(v) : Number(v);
         return Number.isFinite(x) && x >= 0 ? x : 0;
       };
-      return { requests: n(row.requests), tokens_in: n(row.prompt_tokens), tokens_out: n(row.completion_tokens) };
+      return {
+        requests: n(row.requests),
+        tokens_in: n(row.prompt_tokens),
+        tokens_out: n(row.completion_tokens),
+        ...(row.cached_tokens !== undefined ? { tokens_cached: n(row.cached_tokens) } : {}),
+      };
     } catch {
       return null;
     }

@@ -39,6 +39,13 @@ export type ServerSignal = {
   model_loaded?: string;
   model_quant?: string;
   omlx_loaded_count?: number;
+  // Engine-host system RAM (llama-swap `llamaswap_memory_*` gauges, strata
+  // `hardware.ram_*`) — host-level, and oMLX model-pool RAM on Apple
+  // unified memory. ADD keys — absent when the read carried none.
+  host_mem_used_bytes?: number;
+  host_mem_total_bytes?: number;
+  model_mem_used_bytes?: number;
+  model_mem_max_bytes?: number;
 };
 
 export type ServerRow = {
@@ -561,6 +568,9 @@ export type RawEngineLine = {
   server_id: string;
   tokens_out_delta?: number | null;
   tokens_in_delta?: number | null;
+  // Cache-read deltas (strata `reused`, oMLX `total_cached_tokens`).
+  // null = unknown; ABSENT = the kind names no reuse counter.
+  tokens_cached_delta?: number | null;
 };
 
 export type RawLeaseLine = {

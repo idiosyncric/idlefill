@@ -75,6 +75,14 @@ export interface EngineSampleLine {
   tokens_in_delta?: number | null;
   tokens_out_delta?: number | null;
   /**
+   * Cache-read tokens since the previous sample (strata `totals.reused`,
+   * oMLX usage-store `cached_tokens` — status `total_cached_tokens` as
+   * the fallback on stores whose schema names no column). null = unknown
+   * (first sample, backwards counter); ABSENT = the source names no
+   * reuse counter. ADD key.
+   */
+  tokens_cached_delta?: number | null;
+  /**
    * Load axis (#52 slice 1 — DATA ONLY): the captured engine load reading
    * for this tick, same key names as the signal block (design doc D5:
    * "The #51 engine sample line carries the SAME key names. The sample is
@@ -124,6 +132,16 @@ export interface EngineSampleLine {
   model_loaded?: string;
   model_quant?: string;
   omlx_loaded_count?: number;
+  /**
+   * Engine-host system RAM used/total (bytes; llama-swap `llamaswap_memory_*`
+   * gauges, strata `hardware.ram_*`) and oMLX model-pool RAM
+   * (`model_memory_used/max` on Apple unified memory) — same key names as
+   * the signal block (D5). Absent = the read carried none. ADD keys.
+   */
+  host_mem_used_bytes?: number;
+  host_mem_total_bytes?: number;
+  model_mem_used_bytes?: number;
+  model_mem_max_bytes?: number;
 }
 
 export interface LeaseOutcomeLine {
@@ -168,6 +186,12 @@ export interface EngineHourLine {
   requests_source?: RequestsSource;
   engine_tokens_in?: number | null;
   engine_tokens_out?: number | null;
+  /**
+   * Sum of the raw-line cache-read deltas this hour (strata `reused`,
+   * oMLX `total_cached_tokens`); null = no counter-backed sample
+   * contributed. ADD key.
+   */
+  engine_tokens_cached?: number | null;
 }
 
 export interface LeaseHourLine {
@@ -429,6 +453,7 @@ export class MetricsStore {
         requests_source: l.requests_source,
         engine_tokens_in: null,
         engine_tokens_out: null,
+        engine_tokens_cached: null,
       };
       e.samples += 1;
       if (l.req_delta !== null) e.req_total += l.req_delta;
@@ -437,6 +462,7 @@ export class MetricsStore {
       if (l.requests_source !== undefined) e.requests_source = l.requests_source;
       if (typeof l.tokens_in_delta === 'number') e.engine_tokens_in = (e.engine_tokens_in ?? 0) + l.tokens_in_delta;
       if (typeof l.tokens_out_delta === 'number') e.engine_tokens_out = (e.engine_tokens_out ?? 0) + l.tokens_out_delta;
+      if (typeof l.tokens_cached_delta === 'number') e.engine_tokens_cached = (e.engine_tokens_cached ?? 0) + l.tokens_cached_delta;
       engine.set(l.server_id, e);
     }
     for (const l of inHour) {

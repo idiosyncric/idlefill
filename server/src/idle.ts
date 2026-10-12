@@ -135,7 +135,15 @@ export function readStrataCounters(body: unknown): EngineCounters | null {
   };
   const requests = Number(t.requests);
   if (!Number.isFinite(requests)) return null;
-  return { requests, tokens_in: n(t.prompt_tokens), tokens_out: n(t.output_tokens) };
+  // `reused` — prompt tokens served from strata's cache (the cache-read
+  // axis). Absent when the payload names none: unknown, never a fake zero.
+  const reused = Number(t.reused);
+  return {
+    requests,
+    tokens_in: n(t.prompt_tokens),
+    tokens_out: n(t.output_tokens),
+    ...(Number.isFinite(reused) && reused >= 0 ? { tokens_cached: reused } : {}),
+  };
 }
 
 /**

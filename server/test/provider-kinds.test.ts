@@ -98,7 +98,17 @@ test('parseStrataMetrics: live idle/stopped state adds no entry; garbage body yi
 
 test('readStrataCounters: totals → engine counters; missing/absent → null', () => {
   const c = readStrataCounters(STRATA_BODY);
-  assert.deepEqual(c, { requests: 1235, tokens_in: 109169204, tokens_out: 1280424 });
+  assert.deepEqual(c, { requests: 1235, tokens_in: 109169204, tokens_out: 1280424 }, 'no reused field → no tokens_cached key (absent, never a fake zero)');
+  assert.deepEqual(
+    readStrataCounters({ totals: { requests: 9, prompt_tokens: 100, output_tokens: 40, reused: 75 } }),
+    { requests: 9, tokens_in: 100, tokens_out: 40, tokens_cached: 75 },
+    '`reused` is the cache-read axis (verified live: totals.reused on strata 2026-10-05)',
+  );
+  assert.deepEqual(
+    readStrataCounters({ totals: { requests: 9, prompt_tokens: 100, output_tokens: 40, reused: 'x' } }),
+    { requests: 9, tokens_in: 100, tokens_out: 40 },
+    'a garbage reused drops the KEY only',
+  );
   assert.equal(readStrataCounters({ engine: {} }), null);
   assert.equal(readStrataCounters({ totals: { prompt_tokens: 5 } }), null, 'no requests counter = no counters');
 });
@@ -271,6 +281,25 @@ test('CounterDeltaTracker: first sample unknown, delta computed, restart unknown
   assert.equal(d2.tokens_out_delta, null);
 });
 
+test('CounterDeltaTracker: the cache axis deltas ride when both sides name it, ABSENT when either does not', () => {
+  const t = new CounterDeltaTracker();
+  t.observe('a', { requests: 10, tokens_in: 100, tokens_out: 50, tokens_cached: 400 });
+  t.delta('a'); // first consume establishes the baseline (unknown)
+  t.observe('a', { requests: 12, tokens_in: 180, tokens_out: 70, tokens_cached: 950 });
+  assert.equal(t.delta('a').tokens_cached_delta, 550);
+  // A source that names no reuse counter: the axis is ABSENT (undefined),
+  // distinct from null (unknown) — the tile drops the figure, names why.
+  t.observe('b', { requests: 5, tokens_in: 50, tokens_out: 20 });
+  t.delta('b');
+  t.observe('b', { requests: 7, tokens_in: 90, tokens_out: 30 });
+  assert.equal('tokens_cached_delta' in t.delta('b'), false);
+  // Backwards cached counter (engine restart): unknown, never negative.
+  t.observe('a', { requests: 20, tokens_in: 200, tokens_out: 80, tokens_cached: 10 });
+  const d = t.delta('a');
+  assert.equal(d.req_delta, 8);
+  assert.equal(d.tokens_cached_delta, null);
+});
+
 // ---------------------------------------------------------------------------
 // SqliteOmlxUsageReader against a REAL temp store (node:sqlite, the same
 // table/shape as the live ~/.omlx/usage.sqlite3).
@@ -297,7 +326,21 @@ test('SqliteOmlxUsageReader: sums model_usage_hourly; missing store reads unreac
 
   const r = new SqliteOmlxUsageReader(dbPath);
   assert.equal(r.available(), true);
-  assert.deepEqual(r.readTotals(), { requests: 16, tokens_in: 1355373, tokens_out: 22908 });
+  assert.deepEqual(r.readTotals(), { requests: 16, tokens_in: 1355373, tokens_out: 22908, tokens_cached: 1336672 }, 'the cached_tokens column (verified live 2026-10-11) rides as the cache axis');
+
+  // An older store whose schema names no cached_tokens column: the axis
+  // is ABSENT (the sampler then falls back to the status counters) —
+  // never a fake zero.
+  const legacyPath = join(dir, 'legacy.sqlite3');
+  const legacy = new DatabaseSync(legacyPath);
+  legacy.exec(
+    'CREATE TABLE model_usage_hourly (' +
+      'timestamp_hour INTEGER NOT NULL, model_id TEXT NOT NULL, requests INTEGER NOT NULL, ' +
+      'prompt_tokens INTEGER NOT NULL, completion_tokens INTEGER NOT NULL, PRIMARY KEY (timestamp_hour, model_id)) WITHOUT ROWID',
+  );
+  legacy.prepare('INSERT INTO model_usage_hourly VALUES (?,?,?,?,?)').run(1791219600, 'Model-A', 2, 100, 30);
+  legacy.close();
+  assert.deepEqual(new SqliteOmlxUsageReader(legacyPath).readTotals(), { requests: 2, tokens_in: 100, tokens_out: 30 }, 'no cached_tokens column → no tokens_cached key');
 
   const missing = new SqliteOmlxUsageReader(join(dir, 'nope.sqlite3'));
   assert.equal(missing.available(), false);
@@ -327,8 +370,8 @@ test('rollupHour: requests_source + engine token truth ride the hour line', () =
       requests_source: 'metrics-counter', tokens_in_delta: 100, tokens_out_delta: 40, ...line,
     });
   };
-  sample(hour + 1000, {});
-  sample(hour + 60_000, { tokens_in_delta: 50, tokens_out_delta: 20 });
+  sample(hour + 1000, { tokens_cached_delta: 60 });
+  sample(hour + 60_000, { tokens_in_delta: 50, tokens_out_delta: 20, tokens_cached_delta: 25 });
   store.rollupHour(hour, T0);
   const lines = store.readRange({ series: 'engine', from: hour, to: T0, bucket: 'hour' });
   const h = lines.find((l) => l.kind === 'engine_hour') as Record<string, unknown> | undefined;
@@ -337,6 +380,7 @@ test('rollupHour: requests_source + engine token truth ride the hour line', () =
   assert.equal(h!['req_total'], 10);
   assert.equal(h!['engine_tokens_in'], 150, 'deltas sum across the hour');
   assert.equal(h!['engine_tokens_out'], 60);
+  assert.equal(h!['engine_tokens_cached'], 85, 'the cache axis rolls up too');
   rmSync(dir, { recursive: true, force: true });
 });
 

@@ -38,9 +38,12 @@ function coverage(n: number, total: number): string {
 }
 
 /**
- * The three live load tiles (Fleet decode · Fleet power · Memory in use),
- * summed across the FRESH readings of the fleet's engine rows. Fixed
- * order: decode, power, memory.
+ * The live load tiles (Fleet decode · Fleet power · Memory in use ·
+ * System RAM), summed across the FRESH readings of the fleet's engine
+ * rows. Fixed order: decode, power, GPU memory, host RAM. System RAM is
+ * the engine HOST's own gauge (llama-swap `llamaswap_memory_*`, strata
+ * `hardware.ram_*`) — host-level, never a per-process figure; oMLX
+ * reports no host gauge (its model-pool RAM rides the per-engine card).
  */
 export function fleetLoadTiles(st: StateSnapshot): StatTile[] {
   const signals = freshSignals(st);
@@ -76,34 +79,78 @@ export function fleetLoadTiles(st: StateSnapshot): StatTile[] {
         : "no engine reports GPU memory",
   };
 
-  return [decode, power, memory];
+  const hostUsed = signals
+    .map((s) => s.host_mem_used_bytes)
+    .filter((v): v is number => typeof v === "number" && Number.isFinite(v));
+  const hostTotal = signals
+    .map((s) => s.host_mem_total_bytes)
+    .filter((v): v is number => typeof v === "number" && Number.isFinite(v));
+  const ram: StatTile = {
+    value: hostUsed.length > 0 ? gibfmt(hostUsed.reduce((a, b) => a + b, 0)) : "—",
+    sub:
+      hostUsed.length > 0
+        ? `${coverage(hostUsed.length, rows)} · of ${hostTotal.length > 0 ? gibfmt(hostTotal.reduce((a, b) => a + b, 0)) : "unknown capacity"}`
+        : "no engine reports host RAM",
+  };
+
+  return [decode, power, memory, ram];
 }
 
 /**
- * The Tokens today tile. Engine-reported counter deltas (the raw engine
- * lines' `tokens_out_delta`) win when the fleet's kinds publish them;
- * otherwise the lease-reported totals (finished lease lines + the live
- * tokens_out of the running leases). `fromTs` is the start of the local
- * day. Absent on both sources → "—", never a fake zero.
+ * The Tokens today tile — three figures in a fixed order: prompt
+ * processed · cache-read · decoded (`tokens_in_delta`,
+ * `tokens_cached_delta`, `tokens_out_delta`), absent axes simply drop
+ * from the value and the `sub` names why. Engine-reported counter deltas
+ * win when the fleet's kinds publish them; otherwise the lease-reported
+ * totals (finished lease lines + the live counters of the running
+ * leases) — the leases name no cache counter, so the cache axis drops on
+ * that source. `fromTs` is the start of the local day. Absent on both
+ * sources → "—", never a fake zero.
  */
 export function tokensTodayTile(
   engineLines: RawEngineLine[],
   leaseLines: RawLeaseLine[],
-  activeLeases: { tokens_out: number }[],
+  activeLeases: { tokens_out: number; tokens_in?: number }[],
   fromTs: number,
 ): StatTile {
   const eng = engineLines.filter((l) => l.ts >= fromTs && typeof l.tokens_out_delta === "number");
   if (eng.length > 0) {
-    const sum = eng.reduce((a, l) => a + (l.tokens_out_delta ?? 0), 0);
-    return { value: compact(sum), sub: "engine-reported · since local midnight" };
+    const sumOf = (pick: (l: RawEngineLine) => number | null | undefined): number | null => {
+      const vals = eng.map(pick).filter((v): v is number => typeof v === "number");
+      return vals.length > 0 ? vals.reduce((a, b) => a + b, 0) : null;
+    };
+    const prompt = sumOf((l) => l.tokens_in_delta);
+    const cached = sumOf((l) => l.tokens_cached_delta);
+    const decoded = sumOf((l) => l.tokens_out_delta) ?? 0;
+    const figures = [prompt, cached, decoded].filter((v): v is number => v !== null);
+    const legend = [prompt !== null ? "in" : null, cached !== null ? "cached" : null, "out"].filter(Boolean).join(" · ");
+    return {
+      value: figures.map(compact).join(" · "),
+      sub:
+        `engine-reported · ${legend} · since local midnight` +
+        (cached === null ? " · cache reads not reported" : ""),
+    };
   }
   const ended = leaseLines.filter((l) => l.ts >= fromTs);
-  const live = activeLeases.reduce((a, l) => a + (typeof l.tokens_out === "number" ? l.tokens_out : 0), 0);
-  const sum = ended.reduce((a, l) => a + (l.tokens_out || 0), 0) + live;
-  if (ended.length === 0 && live === 0) {
+  const sumLease = (pick: (l: RawLeaseLine) => number | null | undefined): number | null => {
+    const vals = ended.map(pick).filter((v): v is number => typeof v === "number");
+    return vals.length > 0 ? vals.reduce((a, b) => a + b, 0) : null;
+  };
+  const liveOut = activeLeases.reduce((a, l) => a + (typeof l.tokens_out === "number" ? l.tokens_out : 0), 0);
+  const liveIn = activeLeases.reduce((a, l) => a + (typeof l.tokens_in === "number" ? l.tokens_in : 0), 0);
+  const endedOut = sumLease((l) => l.tokens_out);
+  const endedIn = sumLease((l) => l.tokens_in);
+  const decoded = endedOut === null && liveOut === 0 ? null : (endedOut ?? 0) + liveOut;
+  const prompt = endedIn === null && liveIn === 0 ? null : (endedIn ?? 0) + liveIn;
+  const figures = [prompt, decoded].filter((v): v is number => v !== null);
+  if (figures.length === 0) {
     return { value: "—", sub: "no tokens recorded today" };
   }
-  return { value: compact(sum), sub: "lease-reported · since local midnight" };
+  const legend = [prompt !== null ? "in" : null, decoded !== null ? "out" : null].filter(Boolean).join(" · ");
+  return {
+    value: figures.map(compact).join(" · "),
+    sub: `lease-reported · ${legend} · since local midnight · cache reads not reported`,
+  };
 }
 
 /**
@@ -124,6 +171,10 @@ export type EngineGauges = {
   quant?: string;
   memUsed?: number;
   memTotal?: number;
+  hostMemUsed?: number;
+  hostMemTotal?: number;
+  modelMemUsed?: number;
+  modelMemMax?: number;
   failReason?: string;
 };
 
@@ -145,6 +196,10 @@ export function engineGauges(sig: ServerSignal | null | undefined, staleS: numbe
     ...(typeof sig.model_quant === "string" && sig.model_quant !== "" ? { quant: sig.model_quant } : {}),
     memUsed: num(sig.gpu_mem_used_bytes),
     memTotal: num(sig.gpu_mem_total_bytes),
+    hostMemUsed: num(sig.host_mem_used_bytes),
+    hostMemTotal: num(sig.host_mem_total_bytes),
+    modelMemUsed: num(sig.model_mem_used_bytes),
+    modelMemMax: num(sig.model_mem_max_bytes),
     ...(sig.load_fail_reason ? { failReason: sig.load_fail_reason } : {}),
   };
 }

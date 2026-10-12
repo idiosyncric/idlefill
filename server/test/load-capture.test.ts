@@ -65,6 +65,8 @@ llamaswap_gpu_fan_speed_percent{id="0",name="NVIDIA GeForce RTX 5090",uuid="GPU-
 llamaswap_gpu_power_draw_watts{id="0",name="NVIDIA GeForce RTX 5090",uuid="GPU-ae309ca9-6422-1807-df2a-0850cfa4df1f"} 448.69
 llamaswap_cpu_util_percent{core="20"} 100
 llamaswap_memory_total_bytes 101147738112
+llamaswap_memory_used_bytes 50385125376
+llamaswap_memory_free_bytes 7827619840
 `;
 
 /** llama-swap GET /api/metrics/activity → 200 (captured entry id 69577). */
@@ -171,7 +173,14 @@ test('parseLlamaSwapMetrics: the load-axis gauges from the captured sample', () 
     gpu_mem_used_bytes: 3.2656850944e10,
     gpu_mem_total_bytes: 3.4190917632e10,
     gpu_power_watts: 448.69,
+    host_mem_used_bytes: 50385125376,
+    host_mem_total_bytes: 101147738112,
   });
+});
+
+test('parseLlamaSwapMetrics: the host-RAM gauges alone are a recognized read (the overview RAM tile)', () => {
+  const m = parseLlamaSwapMetrics('llamaswap_memory_used_bytes 50385125376\nllamaswap_memory_total_bytes 101147738112\n');
+  assert.deepEqual(m, { host_mem_used_bytes: 50385125376, host_mem_total_bytes: 101147738112 });
 });
 
 test('parseLlamaSwapMetrics: multi-card power gauges SUM (the host draw, not one card)', () => {
@@ -263,7 +272,10 @@ test('parseOmlxStatus: the idle 0.7.0 envelope → REAL zero counts, model_loade
     in_flight: 0,
     queue_depth: 0,
     omlx_loaded_count: 0,
-  }, 'the payload names no loaded model when nothing is resident (D5/D8)');
+    model_mem_used_bytes: 0,
+    model_mem_max_bytes: 38332312276,
+    counters: { requests: 4211, tokens_in: 8123456, tokens_out: 987654, tokens_cached: 123456 },
+  }, 'the payload names no loaded model when nothing is resident (D5/D8); the mem keys + the internal counters block ride');
 });
 
 test('parseOmlxStatus: a busy envelope → in_flight=active_requests, queue_depth=waiting_requests, real loaded ids + quant', () => {
@@ -282,6 +294,9 @@ test('parseOmlxStatus: a busy envelope → in_flight=active_requests, queue_dept
       model_loaded: 'qwen3.8-flash-next-q2_0',
       model_quant: 'q2_0',
       omlx_loaded_count: 1,
+      model_mem_used_bytes: 12345678,
+      model_mem_max_bytes: 38332312276,
+      counters: { requests: 4211, tokens_in: 8123456, tokens_out: 987654, tokens_cached: 123456 },
     },
   );
 });
@@ -361,6 +376,8 @@ test('llama-swap: no feed rate this tick → tokens_per_second stays absent', as
   const view = c.current(T0)!;
   assert.equal(view.gpu_util_percent, 91);
   assert.equal('tokens_per_second' in view, false);
+  assert.equal(view.host_mem_used_bytes, 50385125376, 'the host-RAM gauges ride the SAME /metrics body');
+  assert.equal(view.host_mem_total_bytes, 101147738112);
 });
 
 test('omlx: /api/status → omlx-status reading with the D8 keys + load_age_s labelling the age', async () => {
@@ -376,6 +393,10 @@ test('omlx: /api/status → omlx-status reading with the D8 keys + load_age_s la
   assert.equal(view.queue_depth, 0, 'queue_depth = waiting_requests — the first queue count in the fleet');
   assert.equal(view.omlx_loaded_count, 0);
   assert.equal('model_loaded' in view, false, 'nothing resident → the payload names no loaded model');
+  assert.equal(view.model_mem_used_bytes, 0, 'the model-pool RAM keys ride the load axis (unified memory)');
+  assert.equal(view.model_mem_max_bytes, 38332312276);
+  assert.equal('omlx_counters' in view, false, 'the since-boot counters are INTERNAL — stripped at publish');
+  assert.deepEqual(c.lastCounters, { requests: 4211, tokens_in: 8123456, tokens_out: 987654, tokens_cached: 123456 }, 'the counter plane rides the load read (no extra HTTP call)');
   // 20s later the SAME reading rides with a labelled age (the stale
   // window gates the veto, not the data).
   const later = c.current(T0 + 20_000)!;
@@ -802,7 +823,10 @@ const STRATA_HARDWARE = JSON.stringify({
     gpu_power: 365.519,
     gpu_power_limit: 450,
     cpu: 8.0,
+    ram_used: 92178898944,
+    ram_total: 101148037120,
     tok_s: 47.5,
+    tok_s_mean: 99.6,
   },
   hardware_static: { gpu_name: 'NVIDIA GeForce RTX 5090', gpu_count: 1 },
 });
@@ -818,6 +842,8 @@ test('strata with the hardware block: the gauges ride the reading under the shar
   assert.equal(view.gpu_mem_used_bytes, 33891942400);
   assert.equal(view.gpu_mem_total_bytes, 34190917632);
   assert.equal(view.gpu_power_watts, 365.519);
+  assert.equal(view.host_mem_used_bytes, 92178898944, 'hardware.ram_used rides as the host gauge (shape re-verified live 2026-10-11)');
+  assert.equal(view.host_mem_total_bytes, 101148037120);
   assert.equal(view.tokens_per_second, 58.2, 'live.tok_s (the current generation rate) wins over hardware.tok_s');
   assert.equal('gpu_temp' in view, false, 'only the mapped subset rides');
 });
@@ -845,7 +871,7 @@ test('strata idle with no live.tok_s: hardware.tok_s is the rate fallback; a pay
   await plain.read(T0, null);
   const pv = plain.current(T0)!;
   assert.ok(pv.load_source);
-  for (const k of ['gpu_util_percent', 'gpu_mem_used_bytes', 'gpu_mem_total_bytes', 'gpu_power_watts', 'tokens_per_second']) {
+  for (const k of ['gpu_util_percent', 'gpu_mem_used_bytes', 'gpu_mem_total_bytes', 'gpu_power_watts', 'host_mem_used_bytes', 'host_mem_total_bytes', 'tokens_per_second']) {
     assert.equal(k in pv, false, `${k} absent when the payload names none`);
   }
 });

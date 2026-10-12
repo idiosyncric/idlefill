@@ -37,8 +37,9 @@ const TONE: Record<string, string> = {
 // ---------------------------------------------------------------------------
 // Overview — the system glance. The header carries the one-word state;
 // this view adds the context: the fleet stat tiles (the sparkDash
-// concept — Fleet decode / Fleet power / Memory in use / Tokens today,
-// computed over idlefill's own load axis + metrics store), the idle
+// concept — Fleet decode / Fleet power / Memory in use / System RAM /
+// Tokens today, computed over idlefill's own load axis + metrics store),
+// the idle
 // detail, the dev-cycle strip (the worker-published rows, rendered
 // verbatim), the throttled jobs (the anti-thrash backstop, each with its
 // operator recovery), the recent events, and the recent leases. Cycles +
@@ -79,7 +80,8 @@ export function Overview({ st }: { st: StateSnapshot | null }) {
 function OverviewSkeleton() {
   return (
     <section className="flex flex-col gap-3">
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
+        <Skeleton className="h-20 rounded-lg" />
         <Skeleton className="h-20 rounded-lg" />
         <Skeleton className="h-20 rounded-lg" />
         <Skeleton className="h-20 rounded-lg" />
@@ -98,8 +100,8 @@ function OverviewSkeleton() {
 // ---------------------------------------------------------------------------
 // FLEET STAT TILES — the sparkDash Overview concept (fleet-wide headline
 // numbers above the fold): Fleet decode, Fleet power, Memory in use,
-// Tokens today. The three load tiles compute from the 5s state poll
-// (fresh load readings only — the same metrics_load_stale_s window that
+// System RAM, Tokens today. The four load tiles compute from the 5s
+// state poll (fresh load readings only — the same metrics_load_stale_s window that
 // gates the LOAD axis, stale is unknown and never counted). The token
 // tile reads the metrics store (bucket=raw, so the in-progress day
 // rides) on its OWN 60s timer — the store's own cadence, not the state
@@ -144,14 +146,19 @@ function FleetStats({ st }: { st: StateSnapshot }) {
     { label: "Fleet power", title: "sum of the engine-reported GPU power draw across the fleet's FRESH load readings", tile: loadTiles[1] },
     { label: "Memory in use", title: "GPU memory used across the fleet's FRESH load readings, against the reported total", tile: loadTiles[2] },
     {
+      label: "System RAM",
+      title: "system memory used across the fleet's engine hosts, from each engine's own gauge (llama-swap / strata host gauges) — host-level, against the reported capacity",
+      tile: loadTiles[3],
+    },
+    {
       label: "Tokens today",
-      title: "output tokens since local midnight — engine-reported counters where the kind publishes them, lease-reported otherwise (incl. running leases)",
+      title: "prompt processed · cache-read · decoded since local midnight — engine-reported counters where the kind publishes them, lease-reported otherwise (incl. running leases; leases name no cache counter)",
       tile: tokenTile ?? { value: "…", sub: "reading the metrics store…" },
     },
   ];
 
   return (
-    <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+    <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
       {tiles.map(({ label, title, tile }) => (
         <Card key={label} className="py-0 shadow-none">
           <CardContent className="flex flex-col gap-0.5 px-4 py-2.5" title={title}>
@@ -169,7 +176,9 @@ function FleetStats({ st }: { st: StateSnapshot }) {
 // ENGINE CARDS — one glance card per declared inference server/engine host
 // (the sparkDash per-unit card): the verdict word + routing dot, the model
 // the engine names as loaded, its own gauges (decode rate · GPU util ·
-// power) and a VRAM bar. The authoring surface (full model lists,
+// power) and memory bars (VRAM, plus RAM — the host box's system gauge,
+// or the oMLX model-pool allocation on unified memory). The authoring
+// surface (full model lists,
 // sparklines, groups, edit/remove) stays on the Resources page — these are
 // the glance. Exception-only: no load axis = the card shows only its word;
 // a failed read names its reason; a stale read dims its values (the last-
@@ -209,11 +218,12 @@ function EngineCard({
     ? liveWord(row.signal ? { idle: row.signal.idle, degraded: row.signal.degraded } : null, running || row.models.some((m) => m.running))
     : liveWord(null, false);
   const g = engineGauges(row.signal, staleS);
-  const vramPct =
-    g?.memUsed !== undefined && g?.memTotal !== undefined && g.memTotal > 0
-      ? Math.min(100, Math.round((g.memUsed / g.memTotal) * 100))
-      : null;
-  const vramBar = vramPct === null ? "bg-accent" : vramPct < 80 ? "bg-accent" : vramPct < 95 ? "bg-warn" : "bg-err";
+  // RAM: oMLX names its model pool's allocation on Apple unified memory
+  // (the true per-engine figure); llama-swap/strata name their host box's
+  // RAM (the label says so). Nothing named = no line — never a fake zero.
+  const ramIsModel = g?.modelMemUsed !== undefined;
+  const ramUsed = ramIsModel ? g?.modelMemUsed : g?.hostMemUsed;
+  const ramTotal = ramIsModel ? g?.modelMemMax : g?.hostMemTotal;
   return (
     <Card className="py-0 shadow-none">
       <CardContent className="flex flex-col gap-1.5 px-3 py-2.5">
@@ -241,15 +251,26 @@ function EngineCard({
           </div>
         )}
         {g?.memUsed !== undefined && g?.memTotal !== undefined && g.memTotal > 0 && (
-          <div className={`flex flex-col gap-1 ${g.stale ? "opacity-60" : ""}`} title={`GPU memory ${gibfmt(g.memUsed)} used of ${gibfmt(g.memTotal)} (${vramPct}%)${g.stale ? " — stale read" : ""}`}>
-            <div className="flex items-center justify-between text-[10px] text-dim">
-              <span>vram</span>
-              <span>{gibfmt(g.memUsed)} / {gibfmt(g.memTotal)}</span>
-            </div>
-            <div className="h-1 overflow-hidden rounded-full bg-muted">
-              <div className={`h-1 rounded-full ${vramBar}`} style={{ width: `${vramPct}%` }} />
-            </div>
-          </div>
+          <MemBar
+            label="vram"
+            used={g.memUsed}
+            total={g.memTotal}
+            stale={g.stale}
+            note={`GPU memory ${gibfmt(g.memUsed)} used of ${gibfmt(g.memTotal)}`}
+          />
+        )}
+        {ramUsed !== undefined && (
+          <MemBar
+            label={ramIsModel ? "model mem" : "ram"}
+            used={ramUsed}
+            total={ramTotal}
+            stale={g?.stale ?? false}
+            note={
+              ramIsModel
+                ? `oMLX model pool on unified memory: ${gibfmt(ramUsed)} used${ramTotal !== undefined ? ` of ${gibfmt(ramTotal)} ceiling` : " (ceiling unknown)"}`
+                : `system RAM on this engine's host box: ${gibfmt(ramUsed)} used${ramTotal !== undefined ? ` of ${gibfmt(ramTotal)}` : " (capacity unknown)"}`
+            }
+          />
         )}
         {g?.failReason && <div className="text-[11px] text-warn" title="the last engine load read failed — this is why the gauges are missing">{g.failReason}</div>}
         <div className="flex items-center justify-between gap-3 text-[11px] text-dim">
@@ -260,6 +281,27 @@ function EngineCard({
         </div>
       </CardContent>
     </Card>
+  );
+}
+
+// One memory bar on the engine card (vram / model mem / host ram): used
+// against total, tone at the same thresholds everywhere, dimmed when the
+// load reading is stale (last-known truth, labelled).
+function MemBar({ label, used, total, stale, note }: { label: string; used: number; total?: number; stale: boolean; note: string }) {
+  const pct = total !== undefined && total > 0 ? Math.min(100, Math.round((used / total) * 100)) : null;
+  const tone = pct === null ? "bg-accent" : pct < 80 ? "bg-accent" : pct < 95 ? "bg-warn" : "bg-err";
+  return (
+    <div className={`flex flex-col gap-1 ${stale ? "opacity-60" : ""}`} title={`${note}${pct !== null ? ` (${pct}%)` : ""}${stale ? " — stale read" : ""}`}>
+      <div className="flex items-center justify-between text-[10px] text-dim">
+        <span>{label}</span>
+        <span>{gibfmt(used)}{total !== undefined ? ` / ${gibfmt(total)}` : ""}</span>
+      </div>
+      {pct !== null && (
+        <div className="h-1 overflow-hidden rounded-full bg-muted">
+          <div className={`h-1 rounded-full ${tone}`} style={{ width: `${pct}%` }} />
+        </div>
+      )}
+    </div>
   );
 }
 

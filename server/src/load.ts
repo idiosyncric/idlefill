@@ -42,7 +42,7 @@
  * feed-degraded fail-closed.
  */
 
-import type { ActivityEntry, ServerProvider } from './types.js';
+import type { ActivityEntry, EngineCounters, ServerProvider } from './types.js';
 
 /**
  * One captured reading (ADD keys — absent = unset). `read_at` is the
@@ -66,6 +66,23 @@ export interface LoadReading {
   /** Best-effort quant identity parsed from `model_loaded` (D5: absent when not parseable). */
   model_quant?: string;
   omlx_loaded_count?: number;
+  /** Engine-host system RAM in use (bytes) — llama-swap `llamaswap_memory_used_bytes` gauge or the strata `hardware.ram_used` field. Host-level, NOT a per-process figure. ADD key. */
+  host_mem_used_bytes?: number;
+  /** Engine-host system RAM total (bytes) — same sources as above. ADD key. */
+  host_mem_total_bytes?: number;
+  /** oMLX `/api/status` `model_memory_used` — the model pool's RAM allocation on Apple unified memory. ADD key. */
+  model_mem_used_bytes?: number;
+  /** oMLX `/api/status` `model_memory_max` — the model pool's RAM ceiling. ADD key. */
+  model_mem_max_bytes?: number;
+  /**
+   * The oMLX status envelope's since-boot counters (`total_requests`,
+   * `total_prompt_tokens`, `total_completion_tokens`,
+   * `total_cached_tokens`) — INTERNAL basis (stripped at publish like
+   * `strata_live_state`); the LoadCollector exposes it via `lastCounters`
+   * so the counter plane rides the load read with NO extra HTTP call
+   * (same D5 posture as the strata totals).
+   */
+  omlx_counters?: EngineCounters;
   read_at: number;
 }
 
@@ -111,6 +128,24 @@ export interface LoadSignalView {
   model_loaded?: string;
   model_quant?: string;
   omlx_loaded_count?: number;
+  /**
+   * Engine-host system RAM in use / total (bytes) — the llama-swap
+   * `llamaswap_memory_used/total_bytes` Prometheus gauges or the strata
+   * `hardware.ram_used/ram_total` fields (verified live 2026-10-11).
+   * HOST-level (the whole engine box), never a per-process figure — the
+   * engine's own gauge is the source, same as every other load key.
+   * Absent = the read carried no memory gauge. ADD keys.
+   */
+  host_mem_used_bytes?: number;
+  host_mem_total_bytes?: number;
+  /**
+   * oMLX model-pool RAM on Apple unified memory (`/api/status`
+   * `model_memory_used` / `model_memory_max`) — the closest thing in the
+   * fleet to a per-engine RAM allocation. Absent on llama-swap/strata.
+   * ADD keys.
+   */
+  model_mem_used_bytes?: number;
+  model_mem_max_bytes?: number;
 }
 
 /** Minimal response shape the collectors need (a real fetch Response fits). */
@@ -165,8 +200,8 @@ export function parsePrometheusGauges(text: string): Map<string, number[]> {
  * and #52 left on the table — the Fleet power tile rides it). Power is
  * SUMMED across the per-card series (a multi-GPU host reports one series
  * per card; the row-level number is the whole host's draw). Returns null
- * when NONE of the four gauges is present — a 200 body that carries no
- * recognized gauge (an engine rebuild that renamed the metrics) is a
+ * when NONE of the recognized gauges is present — a 200 body that carries
+ * no recognized gauge (an engine rebuild that renamed the metrics) is a
  * failed read, not a zero-filled one.
  */
 export function parseLlamaSwapMetrics(text: string): {
@@ -174,6 +209,8 @@ export function parseLlamaSwapMetrics(text: string): {
   gpu_mem_used_bytes?: number;
   gpu_mem_total_bytes?: number;
   gpu_power_watts?: number;
+  host_mem_used_bytes?: number;
+  host_mem_total_bytes?: number;
 } | null {
   const g = parsePrometheusGauges(text);
   const first = (name: string): number | undefined => g.get(name)?.[0];
@@ -182,12 +219,21 @@ export function parseLlamaSwapMetrics(text: string): {
   const total = first('llamaswap_gpu_memory_total_bytes');
   const powerSeries = g.get('llamaswap_gpu_power_draw_watts') ?? [];
   const power = powerSeries.length > 0 ? powerSeries.reduce((a, b) => a + b, 0) : undefined;
-  if (util === undefined && used === undefined && total === undefined && power === undefined) return null;
+  // Engine-host system RAM gauges (in the SAME body the GPU gauges came
+  // from — the verbatim capture names them). Host-level: the engine box's
+  // RAM, not a per-process figure.
+  const memUsed = first('llamaswap_memory_used_bytes');
+  const memTotal = first('llamaswap_memory_total_bytes');
+  if (util === undefined && used === undefined && total === undefined && power === undefined && memUsed === undefined && memTotal === undefined) {
+    return null;
+  }
   return {
     ...(util !== undefined ? { gpu_util_percent: util } : {}),
     ...(used !== undefined ? { gpu_mem_used_bytes: used } : {}),
     ...(total !== undefined ? { gpu_mem_total_bytes: total } : {}),
     ...(power !== undefined ? { gpu_power_watts: power } : {}),
+    ...(memUsed !== undefined ? { host_mem_used_bytes: memUsed } : {}),
+    ...(memTotal !== undefined ? { host_mem_total_bytes: memTotal } : {}),
   };
 }
 
@@ -237,6 +283,10 @@ export function parseOmlxStatus(body: unknown): {
   model_loaded?: string;
   model_quant?: string;
   omlx_loaded_count?: number;
+  model_mem_used_bytes?: number;
+  model_mem_max_bytes?: number;
+  /** INTERNAL (stripped at publish): the status envelope's since-boot counters. */
+  counters?: EngineCounters;
 } | null {
   const j = (body ?? {}) as Record<string, unknown>;
   const count = (v: unknown): number | undefined =>
@@ -252,12 +302,39 @@ export function parseOmlxStatus(body: unknown): {
   if (active === undefined && waiting === undefined && resident === undefined && ids.length === 0) return null;
   const quants = ids.map((id) => modelQuantFromName(id));
   const quant = quants.length > 0 && quants[0] !== undefined && quants.every((q) => q === quants[0]) ? quants[0] : undefined;
+  const totalReqs = count(j.total_requests);
+  const totalCached = count(j.total_cached_tokens);
+  const totalPrompt = count(j.total_prompt_tokens);
+  const totalCompletion = count(j.total_completion_tokens);
+  // strata's readStrataCounters does the same: the in/out counters
+  // default to 0 when the envelope omits them — never consumed as token
+  // truth for this kind (the sqlite store is), only the cache axis rides
+  // this family, and it stays ABSENT when `total_cached_tokens` is not
+  // named (unknown, never a fake zero).
+  const counters: EngineCounters | undefined =
+    totalReqs !== undefined
+      ? {
+          requests: totalReqs,
+          tokens_in: totalPrompt ?? 0,
+          tokens_out: totalCompletion ?? 0,
+          ...(totalCached !== undefined ? { tokens_cached: totalCached } : {}),
+        }
+      : undefined;
   return {
     ...(active !== undefined ? { in_flight: active } : {}),
     ...(waiting !== undefined ? { queue_depth: waiting } : {}),
     ...(ids.length > 0 ? { model_loaded: ids.join(',') } : {}),
     ...(quant !== undefined ? { model_quant: quant } : {}),
     ...(resident !== undefined ? { omlx_loaded_count: resident } : {}),
+    ...(() => {
+      const memUsed = count(j.model_memory_used);
+      const memMax = count(j.model_memory_max);
+      return {
+        ...(memUsed !== undefined ? { model_mem_used_bytes: memUsed } : {}),
+        ...(memMax !== undefined ? { model_mem_max_bytes: memMax } : {}),
+      };
+    })(),
+    ...(counters ? { counters } : {}),
   };
 }
 
@@ -300,16 +377,17 @@ export function parseStrataLoadState(body: unknown): string | null {
  * https://strata.samwarth.com /metrics, 2026-10-11: gpu_util,
  * gpu_mem_used/gpu_mem_total (bytes), gpu_power/gpu_power_limit (W),
  * tok_s/tok_s_mean/prefill_tok_s_mean, cpu/ram/disk — plus `live.tok_s`
- * and per-slot rates on the generation block). The tile-relevant subset
- * maps onto the existing keys; `tok_s` is the engine-wide decode rate,
- * `live.tok_s` the current generation's rate (preferred when
+ * and per-slot rates on the generation block; the `ram_used`/`ram_total`
+ * sub-keys (bytes) were re-verified live 2026-10-11). The tile-relevant
+ * subset maps onto the existing keys; `tok_s` is the engine-wide decode
+ * rate, `live.tok_s` the current generation's rate (preferred when
  * generating). Tolerant per KEY (a non-finite/negative value drops that
  * key, never a fake zero); no/empty `hardware` block AND no `live.tok_s`
  * = {} — the row reads exactly as the pre-hardware strata row.
  */
 export function parseStrataHardware(body: unknown): Pick<
   LoadReading,
-  'gpu_util_percent' | 'gpu_mem_used_bytes' | 'gpu_mem_total_bytes' | 'gpu_power_watts' | 'tokens_per_second'
+  'gpu_util_percent' | 'gpu_mem_used_bytes' | 'gpu_mem_total_bytes' | 'gpu_power_watts' | 'tokens_per_second' | 'host_mem_used_bytes' | 'host_mem_total_bytes'
 > {
   const j = (body ?? {}) as Record<string, unknown>;
   const hw = (j.hardware && typeof j.hardware === 'object' ? j.hardware : {}) as Record<string, unknown>;
@@ -318,7 +396,7 @@ export function parseStrataHardware(body: unknown): Pick<
     typeof v === 'number' && Number.isFinite(v) && v >= min ? v : undefined;
   const out: Pick<
     LoadReading,
-    'gpu_util_percent' | 'gpu_mem_used_bytes' | 'gpu_mem_total_bytes' | 'gpu_power_watts' | 'tokens_per_second'
+    'gpu_util_percent' | 'gpu_mem_used_bytes' | 'gpu_mem_total_bytes' | 'gpu_power_watts' | 'tokens_per_second' | 'host_mem_used_bytes' | 'host_mem_total_bytes'
   > = {};
   const util = num(hw.gpu_util);
   if (util !== undefined) out.gpu_util_percent = util;
@@ -328,6 +406,10 @@ export function parseStrataHardware(body: unknown): Pick<
   if (total !== undefined) out.gpu_mem_total_bytes = total;
   const power = num(hw.gpu_power);
   if (power !== undefined) out.gpu_power_watts = power;
+  const ramUsed = num(hw.ram_used);
+  if (ramUsed !== undefined) out.host_mem_used_bytes = ramUsed;
+  const ramTotal = num(hw.ram_total);
+  if (ramTotal !== undefined) out.host_mem_total_bytes = ramTotal;
   const tps = num(live.tok_s) ?? num(hw.tok_s);
   if (tps !== undefined) out.tokens_per_second = tps;
   return out;
@@ -429,6 +511,18 @@ export class LoadCollector {
   }
 
   /**
+   * The since-boot counters captured on the LAST good oMLX status read
+   * (requests / prompt / completion / cached), or null. The counter plane
+   * rides the load read — no extra HTTP call (the D5 posture that keeps
+   * the strata totals out of a second fetch). Other kinds publish no
+   * counters here: strata's totals arrive via the feed fetcher,
+   * llama-swap has no counters.
+   */
+  get lastCounters(): EngineCounters | null {
+    return this.reading?.omlx_counters ?? null;
+  }
+
+  /**
    * The kind's load surface, or null when no load collector is wired
    * for the kind. Absent = the row's signal block carries no load keys
    * at all (a pre-#52 row reads unchanged).
@@ -504,7 +598,15 @@ export class LoadCollector {
         // model info is a failed read (null), never a zero-filled one, and
         // never a fake idle (the D4 predicate would read UNKNOWN).
         const parsed = parseOmlxStatus(JSON.parse(text));
-        if (parsed) reading = { ...parsed, load_source: spec.source, read_at: now };
+        if (parsed) {
+          const { counters, ...loadKeys } = parsed;
+          reading = {
+            ...loadKeys,
+            ...(counters ? { omlx_counters: counters } : {}),
+            load_source: spec.source,
+            read_at: now,
+          };
+        }
       } else if (this.o.provider === 'strata') {
         // The strata /metrics JSON (the feed adapter's own payload): the
         // single in-flight generation state is the D4 busy input. `live`
@@ -615,7 +717,7 @@ export class LoadCollector {
     // instead of a silent absence. A row that never ran (or never failed)
     // has no reason → null, exactly as pre-#52.
     if (!this.reading) return this.failReason ? { load_fail_reason: this.failReason } : null;
-    const { read_at, strata_live_state, ...rest } = this.reading;
+    const { read_at, strata_live_state, omlx_counters, ...rest } = this.reading;
     const ageS = Math.max(0, Math.round((now - read_at) / 1000));
     const view: LoadSignalView = { ...rest, load_age_s: ageS };
     // Freshness (D3): within the window. No window configured → no veto

@@ -63,6 +63,14 @@ async function main(): Promise<void> {
   // negative.
   const counterDelta = new CounterDeltaTracker();
   const omlxReaders = new OmlxUsageReaders(log);
+  // oMLX status-envelope counters (since-boot total_requests/prompt/
+  // completion/CACHED): captured by the row's LoadCollector on the load
+  // read (no extra HTTP call), diffed on the sample tick. SEPARATE from
+  // counterDelta: the sqlite usage SUM (since-install) and the status
+  // totals (since-boot) are different counter families — mixing them in
+  // one tracker would diff apples against oranges. The cached axis only
+  // exists on the status family (the sqlite hourly table names none).
+  const statusCounters = new CounterDeltaTracker();
   // One wrapped fetch per provider kind (#60 B, #62): the kind selects the
   // PARSE (llama-swap feed contract vs strata /metrics); the transport,
   // the credential header, and the delta observers are shared.
@@ -313,6 +321,7 @@ async function main(): Promise<void> {
       let requests_source: RequestsSource = 'feed-delta';
       let tokens_in_delta: number | null | undefined = undefined;
       let tokens_out_delta: number | null | undefined = undefined;
+      let tokens_cached_delta: number | null | undefined = undefined;
 
       if (kind === 'omlx') {
         // Engine truth from the usage store, diffed like a counter. The
@@ -325,6 +334,15 @@ async function main(): Promise<void> {
         tokens_in_delta = d.tokens_in_delta;
         tokens_out_delta = d.tokens_out_delta;
         requests_source = 'sqlite';
+        // The cache axis: the usage store's `cached_tokens` column (same
+        // since-install family as in/out, survives engine restarts). An
+        // older store whose schema names no such column falls back to the
+        // status envelope's `total_cached_tokens` — captured on this row's
+        // load read, no extra HTTP call. Neither named → axis absent.
+        const st = loadCollectors.get(row.id)?.lastCounters;
+        if (st) statusCounters.observe(row.id, st);
+        tokens_cached_delta =
+          d.tokens_cached_delta !== undefined ? d.tokens_cached_delta : statusCounters.delta(row.id).tokens_cached_delta;
       } else if (kind === 'strata') {
         // The strata fetcher observed /metrics totals on this same poll;
         // the feed-id delta rides as unknown because the adapter's ids
@@ -333,6 +351,7 @@ async function main(): Promise<void> {
         req_delta = d.req_delta;
         tokens_in_delta = d.tokens_in_delta;
         tokens_out_delta = d.tokens_out_delta;
+        tokens_cached_delta = d.tokens_cached_delta;
         requests_source = 'metrics-counter';
       } else {
         const fd = feedDelta.delta(url);
@@ -364,6 +383,7 @@ async function main(): Promise<void> {
         active_sessions: activeSessions,
         requests_source,
         ...(tokens_in_delta !== undefined ? { tokens_in_delta, tokens_out_delta } : {}),
+        ...(tokens_cached_delta !== undefined ? { tokens_cached_delta } : {}),
         ...(load ? { ...load } : {}),
       });
     }
