@@ -29,6 +29,7 @@ import {
   parseLlamaSwapMetrics,
   parseOmlxStatus,
   parsePrometheusGauges,
+  parseStrataHardware,
   newestFeedTps,
   modelQuantFromName,
 } from '../src/load.js';
@@ -777,6 +778,86 @@ test('strata D4 predicate: a fresh generating read → load_busy true; a fresh i
   await cIdle.read(T0, null);
   assert.equal(cIdle.current(T0)!.load_busy, false, 'fresh live.state=idle → the D4 predicate is FALSE');
   assert.equal(cIdle.current(T0)!.in_flight, 0);
+});
+
+// ---------------------------------------------------------------------------
+// strata's hardware block: the engine's own host gauges ride the load
+// axis under the llama-swap key names (verified live against
+// https://strata.samwarth.com/metrics, 2026-10-11 — the #52 inventory
+// pinned the payload BEFORE these fields existed). This is what fills
+// the Overview decode/power/memory tiles on a strata fleet.
+
+/** A strata /metrics payload with the live hardware block (values from the 2026-10-11 capture). */
+const STRATA_HARDWARE = JSON.stringify({
+  time: 1791560962,
+  engine: { model: 'qwen3.8-flash-next-iq3_s' },
+  live: { state: 'generating', queued: 0, tok_s: 58.2, running: 1 },
+  requests: [],
+  totals: { since: 1, requests: 5096, prompt_tokens: 456307504, reused: 440256769, output_tokens: 3791319 },
+  hardware: {
+    gpu_util: 100,
+    gpu_mem_used: 33891942400,
+    gpu_mem_total: 34190917632,
+    gpu_temp: 66,
+    gpu_power: 365.519,
+    gpu_power_limit: 450,
+    cpu: 8.0,
+    tok_s: 47.5,
+  },
+  hardware_static: { gpu_name: 'NVIDIA GeForce RTX 5090', gpu_count: 1 },
+});
+
+test('strata with the hardware block: the gauges ride the reading under the shared key names (live.tok_s preferred)', async () => {
+  const { transport } = fakeTransport((url) =>
+    url === 'http://10.10.10.6:8080/metrics' ? { ok: true, status: 200, text: STRATA_HARDWARE } : { ok: false, status: 404 },
+  );
+  const c = new LoadCollector({ url: 'http://10.10.10.6:8080', provider: 'strata', auth_token: 'k', stale_window_ms: 45_000, transport });
+  await c.read(T0, null);
+  const view = c.current(T0)!;
+  assert.equal(view.gpu_util_percent, 100);
+  assert.equal(view.gpu_mem_used_bytes, 33891942400);
+  assert.equal(view.gpu_mem_total_bytes, 34190917632);
+  assert.equal(view.gpu_power_watts, 365.519);
+  assert.equal(view.tokens_per_second, 58.2, 'live.tok_s (the current generation rate) wins over hardware.tok_s');
+  assert.equal('gpu_temp' in view, false, 'only the mapped subset rides');
+});
+
+test('strata idle with no live.tok_s: hardware.tok_s is the rate fallback; a payload WITHOUT hardware reads byte-for-byte as before', async () => {
+  const idleWithHw = JSON.stringify({
+    live: { state: 'idle' },
+    hardware: { gpu_util: 0, gpu_mem_used: 1, gpu_mem_total: 2, gpu_power: 44.5, tok_s: 47.5 },
+  });
+  const { transport } = fakeTransport((url) =>
+    url === 'http://10.10.10.6:8080/metrics' ? { ok: true, status: 200, text: idleWithHw } : { ok: false, status: 404 },
+  );
+  const c = new LoadCollector({ url: 'http://10.10.10.6:8080', provider: 'strata', auth_token: 'k', stale_window_ms: 45_000, transport });
+  await c.read(T0, null);
+  const view = c.current(T0)!;
+  assert.equal(view.tokens_per_second, 47.5, 'no live generation → the engine-wide rate rides');
+  assert.equal(view.gpu_power_watts, 44.5);
+  // The pre-hardware payload (STRATA_IDLE): no gpu_* keys at all.
+  const plain = new LoadCollector({
+    url: 'http://10.10.10.6:8080',
+    provider: 'strata',
+    auth_token: 'k',
+    transport: (async () => ({ status: 200, ok: true, text: async () => STRATA_IDLE })) as never,
+  });
+  await plain.read(T0, null);
+  const pv = plain.current(T0)!;
+  assert.ok(pv.load_source);
+  for (const k of ['gpu_util_percent', 'gpu_mem_used_bytes', 'gpu_mem_total_bytes', 'gpu_power_watts', 'tokens_per_second']) {
+    assert.equal(k in pv, false, `${k} absent when the payload names none`);
+  }
+});
+
+test('parseStrataHardware: tolerant per key — garbage drops the KEY, never a fake zero; nothing named is {}', () => {
+  assert.deepEqual(parseStrataHardware({}), {});
+  assert.deepEqual(parseStrataHardware(null), {});
+  assert.deepEqual(
+    parseStrataHardware({ live: { state: 'generating', tok_s: 'fast' }, hardware: { gpu_util: 'x', gpu_mem_used: 3.4e10, gpu_power: -5, tok_s: NaN } }),
+    { gpu_mem_used_bytes: 3.4e10 },
+    'garbage/negative/NaN values drop their own key only',
+  );
 });
 
 test('a 200 strata read with no live.state (data-absent) sets NO fail reason (pre-#52 posture preserved)', async () => {

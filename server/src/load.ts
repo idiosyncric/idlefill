@@ -98,7 +98,7 @@ export interface LoadSignalView {
   gpu_util_percent?: number;
   gpu_mem_used_bytes?: number;
   gpu_mem_total_bytes?: number;
-  /** llama-swap `/metrics` power gauge (watts), SUMMED across cards on a multi-GPU host. Absent = the read carried no power gauge. ADD key. */
+  /** GPU power draw (watts) — llama-swap `/metrics` power gauge (SUMMED across cards on a multi-GPU host) or the strata `hardware.gpu_power` block. Absent = the read carried no power gauge. ADD key. */
   gpu_power_watts?: number;
   tokens_per_second?: number;
   in_flight?: number;
@@ -294,6 +294,46 @@ export function parseStrataLoadState(body: unknown): string | null {
 }
 
 /**
+ * The strata `hardware` block — the engine's own host gauges, same key
+ * names as the llama-swap Prometheus path. The #52 inventory pinned the
+ * payload before these existed (verified live against
+ * https://strata.samwarth.com /metrics, 2026-10-11: gpu_util,
+ * gpu_mem_used/gpu_mem_total (bytes), gpu_power/gpu_power_limit (W),
+ * tok_s/tok_s_mean/prefill_tok_s_mean, cpu/ram/disk — plus `live.tok_s`
+ * and per-slot rates on the generation block). The tile-relevant subset
+ * maps onto the existing keys; `tok_s` is the engine-wide decode rate,
+ * `live.tok_s` the current generation's rate (preferred when
+ * generating). Tolerant per KEY (a non-finite/negative value drops that
+ * key, never a fake zero); no/empty `hardware` block AND no `live.tok_s`
+ * = {} — the row reads exactly as the pre-hardware strata row.
+ */
+export function parseStrataHardware(body: unknown): Pick<
+  LoadReading,
+  'gpu_util_percent' | 'gpu_mem_used_bytes' | 'gpu_mem_total_bytes' | 'gpu_power_watts' | 'tokens_per_second'
+> {
+  const j = (body ?? {}) as Record<string, unknown>;
+  const hw = (j.hardware && typeof j.hardware === 'object' ? j.hardware : {}) as Record<string, unknown>;
+  const live = (j.live && typeof j.live === 'object' ? j.live : {}) as Record<string, unknown>;
+  const num = (v: unknown, min = 0): number | undefined =>
+    typeof v === 'number' && Number.isFinite(v) && v >= min ? v : undefined;
+  const out: Pick<
+    LoadReading,
+    'gpu_util_percent' | 'gpu_mem_used_bytes' | 'gpu_mem_total_bytes' | 'gpu_power_watts' | 'tokens_per_second'
+  > = {};
+  const util = num(hw.gpu_util);
+  if (util !== undefined) out.gpu_util_percent = util;
+  const used = num(hw.gpu_mem_used);
+  if (used !== undefined) out.gpu_mem_used_bytes = used;
+  const total = num(hw.gpu_mem_total);
+  if (total !== undefined) out.gpu_mem_total_bytes = total;
+  const power = num(hw.gpu_power);
+  if (power !== undefined) out.gpu_power_watts = power;
+  const tps = num(live.tok_s) ?? num(hw.tok_s);
+  if (tps !== undefined) out.tokens_per_second = tps;
+  return out;
+}
+
+/**
  * The D4 busy predicate, per kind, on a CAPTURED reading. Returns:
  *   true  — a fresh read fired the predicate (the engine reads busy);
  *   false — a fresh read says not busy (the engine reads not busy);
@@ -469,13 +509,18 @@ export class LoadCollector {
         // The strata /metrics JSON (the feed adapter's own payload): the
         // single in-flight generation state is the D4 busy input. `live`
         // absent or empty = the payload names no state → UNKNOWN (no
-        // reading), never a fake idle.
-        const state = parseStrataLoadState(JSON.parse(text));
+        // reading), never a fake idle. The engine's own `hardware` block
+        // (util/VRAM/power/decode rate — verified live 2026-10-11) rides
+        // the SAME reading under the llama-swap key names, per-key
+        // tolerant; a payload without it reads byte-for-byte as before.
+        const body = JSON.parse(text) as unknown;
+        const state = parseStrataLoadState(body);
         if (state !== null) {
           reading = {
             strata_live_state: state,
             // The single live slot (D5): 1 while generating, 0 otherwise.
             in_flight: state === 'idle' || state === 'stopped' || state === 'none' ? 0 : 1,
+            ...parseStrataHardware(body),
             load_source: spec.source,
             read_at: now,
           };
