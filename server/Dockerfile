@@ -19,10 +19,9 @@ RUN npm install --omit=dev --no-audit --no-fund
 COPY --from=build /app/dist ./dist
 # The served dashboard: the React workspace's committed built output
 # (cutover 2026-10-08). server/src/index.ts dashboardDir() resolves
-# /app/dashboard/dist from the entry dir; ../public (the retired legacy
-# page) stays as the fail-safe if the dist is ever missing.
+# /app/dashboard/dist from the entry dir; the retired legacy page has no
+# fail-safe copy — a missing dist is a deploy-gate failure.
 COPY dashboard/dist/ ./dashboard/dist/
-COPY public/ ./public/
 
 # Non-root runtime user. State lives in /data (scripts/deploy-server.sh
 # mounts the host's state dir there; for a bare `docker run` the
