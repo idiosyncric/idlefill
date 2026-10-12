@@ -62,10 +62,17 @@ if (!base) die("config missing arbiter_url (the LOCAL arbiter, e.g. http://127.0
 if (!token) die("config missing token (the local arbiter api_token)");
 if (!command) die("config missing command — this machine's documented update command (mesh-update.md D3: an unconfigured helper never executes anything)");
 
+// content-type ONLY when a body rides: Fastify answers a body-less POST
+// that declares application/json with a 400 "Body cannot be empty" (the
+// live-caused claim refusal, 2026-10-12) — never a silent anything.
 const api = async (path, init = {}) =>
   fetch(`${base}${path}`, {
     ...init,
-    headers: { authorization: `Bearer ${token}`, "content-type": "application/json", ...(init.headers ?? {}) },
+    headers: {
+      authorization: `Bearer ${token}`,
+      ...(init.body ? { "content-type": "application/json" } : {}),
+      ...(init.headers ?? {}),
+    },
     signal: AbortSignal.timeout(15_000),
   });
 
