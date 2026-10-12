@@ -12,7 +12,12 @@
  *     IN-MEMORY key table (pull-scoped loopback route #64 D2 — tokens
  *     are never persisted, never logged, never re-published);
  *   - falls back to the machine's default `llm_target` (exact today
- *     behavior) for an unknown/absent model or an empty catalog;
+ *     behavior) for an unknown/absent model or an empty catalog —
+ *     NARROWED by alias-stability D2 (2026-10-12): a name this process
+ *     has EVER seen in a published `model_aliases` block, resolving in
+ *     neither the alias map nor the bare catalog, NEVER falls through —
+ *     it answers local 503 `model_unavailable` (OpenAI body, zero bytes
+ *     upstream, before the gate);
  *   - runs 8800 traffic through the SAME gate (D5: one shared slot cap —
  *     a second gate instance would double the cap against shared engines).
  *
@@ -260,6 +265,17 @@ export function startAggregateRouter(opts: {
   // bare catalog entry of the same name (alias > bare precedence).
   let aliases: AggregateAliasEntry[] = [];
   const aliasByName = new Map<string, AggregateAliasEntry>();
+  /**
+   * alias-stability D2 (2026-10-12): the fence memory. Every alias name EVER
+   * accepted into the routing map, process-lifetime, MONOTONIC — never
+   * removed. An empty/absent publish block still CLEARS the routing map
+   * (no stale pin), but it must not wipe the memory that this name is
+   * CONFIGURED on the machine: a configured alias never silently falls
+   * through to `llm_target` (the incident shape — arbiter cold start
+   * published `model_aliases: []`, the request fell to oMLX :8000 with the
+   * agent key stripped → 401 from an unrelated engine).
+   */
+  const configuredAliasNames = new Set<string>();
   /** In-memory engine keys (#64 D2) — never persisted, never logged. */
   let keys = new Map<string, string>();
   /**
@@ -601,9 +617,34 @@ export function startAggregateRouter(opts: {
     const dispatch = (model: string | undefined): void => {
       // #66 D2 precedence: the alias map WINS over a bare catalog entry of
       // the same name — at routing as well as at publish. An unknown or
-      // absent model leaves the machine `llm_target` untouched (D6 fence).
+      // absent model leaves the machine `llm_target` untouched (D6 fence,
+      // NARROWED by alias-stability D2 below).
       const alias = model ? aliasByName.get(model) : undefined;
       const entry = alias ?? (model ? catalogByName.get(model) : undefined);
+      // alias-stability D2 — the default-target fence: a name this process
+      // has EVER seen published, resolving in NEITHER map (alias map cleared
+      // by an empty/absent block, no bare catalog row either), answers
+      // LOCALLY with 503 `model_unavailable` — BEFORE the gate (no slot
+      // consumed), before `onSessionRoute`, and with ZERO bytes to any
+      // upstream (never `llm_target`, never another engine's 401 — the
+      // 2026-10-12 shape). A bare catalog row of the same name DOES resolve
+      // → routes normally (that is not a machine-default fall-through);
+      // genuinely unknown names keep the D6 fall-through byte-for-byte.
+      if (model && !entry && configuredAliasNames.has(model)) {
+        log(`aggregate: fence ${model} — configured alias with no resolvable entry (503 model_unavailable)`);
+        res.writeHead(503, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            error: {
+              message: `model "${model}" is configured on this machine but no engine currently serves it`,
+              type: 'model_unavailable',
+              code: 'model_unavailable',
+              model,
+            },
+          }),
+        );
+        return;
+      }
       const key = headerKey ?? model;
       if (entry && key) opts.onSessionRoute?.(key, entry.server_id);
       // #67: the forward seam resolves its entry AT CALL TIME — at
@@ -678,7 +719,10 @@ export function startAggregateRouter(opts: {
       // Same defensive posture as updateCatalog: a malformed entry is
       // dropped, a repeated alias name keeps its FIRST entry. An empty /
       // absent block clears the map (the arbiter stopped publishing it —
-      // every alias unpublished this tick, not a stale pin).
+      // every alias unpublished this tick, not a stale pin). The D2 fence
+      // memory is MONOTONIC: every name ACCEPTED into the map (malformed
+      // entries dropped → never named) is remembered for the process
+      // lifetime; clearing the map never clears the fence.
       aliases = [];
       aliasByName.clear();
       for (const e of Array.isArray(entries) ? entries : []) {
@@ -689,6 +733,7 @@ export function startAggregateRouter(opts: {
         if (aliasByName.has(e.name)) continue;
         aliasByName.set(e.name, e);
         aliases.push(e);
+        configuredAliasNames.add(e.name);
       }
     },
     updateKeys(rows, clientKeyHashes) {

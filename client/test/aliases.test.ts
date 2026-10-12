@@ -29,7 +29,9 @@
  *   - over-cap aliased body → 413 before any engine byte (bounded cap)
  *   - re-pin propagation: updateAliases (simulating the next poll) → the
  *     next request serves the OTHER winner row
- *   - unknown/absent model: the machine default target untouched (D6)
+ *   - unknown/absent model: the machine default target untouched (D6,
+ *     NARROWED by alias-stability D2: an EVER-published alias name with a
+ *     cleared map is FENCED — local 503 model_unavailable, never llm_target)
  */
 
 import { test, after } from 'node:test';
@@ -452,7 +454,7 @@ test('#66 re-pin propagation: updateAliases (the next poll lands) → the next r
   assert.deepEqual(routes, [[ALIAS_NAME, 'srv-a'], [ALIAS_NAME, 'srv-b']], 'heartbeats follow the new engine honestly (D6)');
 });
 
-test('#66 D6 fence: unknown model + absent model + cleared aliases all fall to the machine default target untouched', async () => {
+test('#66 D6 fence (NARROWED by alias-stability D2): unknown model → default untouched; a CLEARED alias name is FENCED with 503 model_unavailable, never llm_target', async () => {
   const def = await startEcho('default');
   const eng = await startEcho('engine-A');
   cleanup.push(() => def.close());
@@ -463,14 +465,20 @@ test('#66 D6 fence: unknown model + absent model + cleared aliases all fall to t
   });
 
   const unknown = await postChat(r.base_url, chatBody('NoSuchAlias'));
-  assert.equal(((await unknown.json()) as { model: string }).model, 'default', 'unknown model → llm_target (untouched fence)');
+  assert.equal(((await unknown.json()) as { model: string }).model, 'default', 'unknown model → llm_target (the narrowed D6 fence still stands for genuinely unknown names)');
   assert.ok(def.hits[0]!.raw.toString('utf8').includes('NoSuchAlias'), 'the unknown body forwarded untouched');
 
-  r.updateAliases([]); // the arbiter published no aliases this tick
+  r.updateAliases([]); // the arbiter published no aliases this tick (the 2026-10-12 cold-start shape)
   assert.equal(r.aliasSize(), 0, 'an empty block CLEARS the alias map (no stale pin)');
-  const nowBare = await postChat(r.base_url, chatBody(ALIAS_NAME));
-  assert.equal(((await nowBare.json()) as { model: string }).model, 'default', 'a vanished alias is not routed (all-pairs-dead posture)');
+  const fenced = await postChat(r.base_url, chatBody(ALIAS_NAME));
+  assert.equal(fenced.status, 503, 'an EVER-published alias name resolves in neither map → local 503, NOT the default-target fall-through (D2)');
+  const err = (await fenced.json()) as { error: { message: string; type: string; code: string; model: string } };
+  assert.equal(err.error.type, 'model_unavailable');
+  assert.equal(err.error.code, 'model_unavailable');
+  assert.equal(err.error.model, ALIAS_NAME, 'the fenced name echoed');
+  assert.equal(err.error.message, `model "${ALIAS_NAME}" is configured on this machine but no engine currently serves it`);
   assert.equal(eng.hits.length, 0, 'the alias engine never served after the block cleared');
+  assert.equal(def.hits.length, 1, 'the fenced name never crossed to the default target (only the unknown-name request did)');
 });
 
 test('#66 updateAliases defensive posture: malformed entries dropped, a repeated name keeps the first', () => {

@@ -27,6 +27,11 @@
  *     11435 /s/<token> session on the SAME gate (D5 — a second gate would
  *     double the cap)
  *   - engineBase strips an operator-pasted /v1 suffix
+ *   - alias-stability D2 fence: an EVER-published alias name with an empty
+ *     published block answers local 503 model_unavailable (exact body, zero
+ *     upstream bytes, before the gate); unknown names keep the llm_target
+ *     fall-through; a same-name bare catalog row routes; a republished
+ *     block restores routing; the empty-block /v1/models list stays empty
  */
 
 import { test, after } from 'node:test';
@@ -688,4 +693,147 @@ test('#68 plane OFF (no digests): the any-caller pass-through stays byte-for-byt
   const res = await postChat(r.base_url, '/v1/chat/completions', 'M', { authorization: BEARER('whatever-the-client-sends') });
   assert.equal(res.status, 200);
   assert.equal(engine.hits[0]!.auth, BEARER('whatever-the-client-sends'), 'the caller header passes through untouched (today behavior)');
+});
+
+// ---------------------------------------------------------------------------
+// alias-stability D2 (2026-10-12) — the DEFAULT-TARGET FENCE. The incident:
+// the arbiter cold-started and published `model_aliases: []` for its first
+// ~15s; updateAliases([]) cleared the router's alias map, and the next
+// request naming `Qwen3.8-Flash-Next` fell to `llm_target` (oMLX :8000) with
+// the agent key STRIPPED → 401 "API key required" from an unrelated engine.
+// Posture now: every alias name EVER accepted into the routing map is
+// remembered for the process lifetime (monotonic); such a name resolving in
+// NEITHER map answers local 503 model_unavailable — before the gate, no
+// onSessionRoute, ZERO bytes to any upstream. Unknown names keep the D6
+// fall-through byte-for-byte; a bare catalog row of the same name still
+// routes; a republished block restores normal routing; /v1/models keeps its
+// empty-block posture.
+// ---------------------------------------------------------------------------
+
+const FENCE_ALIAS = 'Qwen3.8-Flash-Next'; // the exact incident name
+const FENCE_BODY = (name: string): string =>
+  JSON.stringify({
+    error: {
+      message: `model "${name}" is configured on this machine but no engine currently serves it`,
+      type: 'model_unavailable',
+      code: 'model_unavailable',
+      model: name,
+    },
+  });
+const bytesTo = (hits: { body: string }[]): number => hits.reduce((n, h) => n + Buffer.byteLength(h.body), 0);
+
+test('D2 fence (the incident shape): alias published once, empty block published → 503 model_unavailable, ZERO llm_target bytes', async () => {
+  const def = await startEngine('default'); // the oMLX :8000 stand-in
+  const eng = await startEngine('engine'); // the row that used to serve the alias
+  cleanup.push(() => def.close());
+  cleanup.push(() => eng.close());
+  const routes: [string, string][] = [];
+  const r = await startRouter({
+    defaultTarget: def.url,
+    onSessionRoute: (key, serverId) => routes.push([key, serverId]),
+  });
+  r.updateAliases([{ name: FENCE_ALIAS, server_id: 'srv-omlx', url: eng.url, auth_set: false, engine_model: FENCE_ALIAS, catalog_source: 'probed' }]);
+  r.updateAliases([]); // the arbiter cold start: model_aliases: [] published
+  assert.equal(r.aliasSize(), 0, 'the empty block still CLEARS the routing map (no stale pin)');
+
+  const res = await postChat(r.base_url, '/v1/chat/completions', FENCE_ALIAS);
+  assert.equal(res.status, 503, 'a configured-but-unresolvable alias NEVER falls through to llm_target');
+  assert.equal(res.headers.get('content-type'), 'application/json');
+  assert.equal(await res.text(), FENCE_BODY(FENCE_ALIAS), 'the exact OpenAI-style body, error.model echoes the name');
+  assert.equal(def.hits.length, 0, 'the default target recorded ZERO requests');
+  assert.equal(bytesTo(def.hits), 0, 'ZERO bytes ever crossed to the default target');
+  assert.equal(eng.hits.length, 0, 'no engine saw a byte either');
+  assert.equal(routes.length, 0, 'no onSessionRoute fires for a fenced request (no register heartbeat, no slot)');
+});
+
+test('D2 fence: fires BEFORE the gate — no slot consumed, no registration, on a gated router', async () => {
+  const def = await startEngine('default');
+  const eng = await startEngine('engine');
+  cleanup.push(() => def.close());
+  cleanup.push(() => eng.close());
+  const { gate, registered } = makeGate(1); // cap 1: a gate leak would show as queue/registration
+  const routes: [string, string][] = [];
+  const r = await startRouter({
+    defaultTarget: def.url,
+    gate,
+    onSessionRoute: (key, serverId) => routes.push([key, serverId]),
+  });
+  r.updateAliases([{ name: FENCE_ALIAS, server_id: 'srv-omlx', url: eng.url, auth_set: false, engine_model: FENCE_ALIAS, catalog_source: 'probed' }]);
+  r.updateAliases([]);
+
+  const res = await postChat(r.base_url, '/v1/chat/completions', FENCE_ALIAS, { 'x-hermes-session-id': 'conv-fenced' });
+  assert.equal(res.status, 503);
+  assert.equal(await res.text(), FENCE_BODY(FENCE_ALIAS));
+  assert.equal(registered.length, 0, 'the gate never saw the request — no registration');
+  assert.equal(gate.queueDepth, 0, 'no slot consumed, nothing parked');
+  assert.equal(routes.length, 0, 'onSessionRoute never fired');
+  assert.equal(def.hits.length, 0, 'still zero bytes to the default target');
+  assert.equal(eng.hits.length, 0);
+});
+
+test('D2 fence scope: a genuinely unknown name with an empty published block still forwards to the default target (D6 stand)', async () => {
+  const def = await startEngine('default');
+  cleanup.push(() => def.close());
+  const r = await startRouter({ defaultTarget: def.url });
+  r.updateAliases([]); // empty published block — the fence knows NO names yet
+
+  const res = await postChat(r.base_url, '/v1/chat/completions', 'NoSuchNameAnywhere');
+  assert.equal(res.status, 200, 'today fall-through byte-for-byte: unknown names ride llm_target');
+  assert.equal(((await res.json()) as { model: string }).model, 'default');
+  assert.match(def.hits[0]!.body, /NoSuchNameAnywhere/, 'the body forwarded untouched to the default target');
+});
+
+test('D2 fence scope: alias map cleared but a bare catalog row of the same name → routes to that row, not fenced, not default', async () => {
+  const def = await startEngine('default');
+  const eng = await startEngine('engine');
+  cleanup.push(() => def.close());
+  cleanup.push(() => eng.close());
+  const r = await startRouter({
+    defaultTarget: def.url,
+    catalog: [{ name: FENCE_ALIAS, server_id: 'srv-omlx', url: eng.url, auth_set: false }],
+  });
+  r.updateAliases([{ name: FENCE_ALIAS, server_id: 'srv-omlx', url: eng.url, auth_set: false, engine_model: FENCE_ALIAS, catalog_source: 'probed' }]);
+  r.updateAliases([]); // the block vanishes; the BARE row remains
+
+  const res = await postChat(r.base_url, '/v1/chat/completions', FENCE_ALIAS);
+  assert.equal(res.status, 200, 'the bare-name route is not a machine-default fall-through — no fence');
+  assert.equal(((await res.json()) as { model: string }).model, 'engine', 'the catalog row served the name');
+  assert.equal(eng.hits.length, 1);
+  assert.equal(def.hits.length, 0, 'the default target stayed untouched');
+});
+
+test('D2 fence never poisons a healthy block: republishing the alias after a 503 restores normal routing', async () => {
+  const def = await startEngine('default');
+  const eng = await startEngine('engine');
+  cleanup.push(() => def.close());
+  cleanup.push(() => eng.close());
+  const r = await startRouter({ defaultTarget: def.url });
+  const pair = [{ name: FENCE_ALIAS, server_id: 'srv-omlx', url: eng.url, auth_set: false, engine_model: 'engine-own-id', catalog_source: 'probed' as const }];
+
+  r.updateAliases(pair);
+  r.updateAliases([]);
+  const fenced = await postChat(r.base_url, '/v1/chat/completions', FENCE_ALIAS);
+  assert.equal(fenced.status, 503);
+
+  r.updateAliases(pair); // the next poll republishes the healthy block
+  const ok = await postChat(r.base_url, '/v1/chat/completions', FENCE_ALIAS);
+  assert.equal(ok.status, 200, 'the fence memory never poisons a live alias map — normal routing restored');
+  await waitFor(() => eng.hits.length === 1, 3000, 'alias engine hit');
+  assert.match(eng.hits[0]!.body, /"model":"engine-own-id"/, 'the #66 splice stands on the restored route');
+  assert.equal(def.hits.length, 0, 'the default target still untouched');
+});
+
+test('D2 posture: GET /v1/models with an empty published block still answers the EMPTY list (fence does not resurrect it)', async () => {
+  const def = await startEngine('default');
+  cleanup.push(() => def.close());
+  const r = await startRouter({ defaultTarget: def.url });
+  r.updateAliases([{ name: FENCE_ALIAS, server_id: 'srv-omlx', url: 'http://127.0.0.1:9', auth_set: false, engine_model: FENCE_ALIAS, catalog_source: 'probed' }]);
+  r.updateAliases([]); // cold-start empty block
+
+  const res = await fetch(`${r.base_url}/v1/models`);
+  assert.equal(res.status, 200);
+  const list = (await res.json()) as { object: string; data: unknown[] };
+  assert.equal(list.object, 'list');
+  assert.deepEqual(list.data, [], 'the published empty block still means an empty advertised list (unchanged posture)');
+  assert.equal(def.hits.length, 0, 'the router never probes an engine to answer (D1)');
 });

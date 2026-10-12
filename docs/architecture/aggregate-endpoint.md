@@ -486,3 +486,34 @@ providers:
       Qwen3.8-Flash-Next: {}
     models_discovered: true
 ```
+
+## The D6 fall-through NARROWED — the default-target fence (2026-10-12, alias-stability D2)
+
+**LOCKED (owner, 2026-10-12).** `docs/architecture/alias-stability-and-slow-engines.md`
+D2 narrows this doc's rule "With the catalog empty or the model unknown, the
+router forwards to the machine's default `llm_target` exactly as today": a
+configured alias name is no longer "unknown/absent".
+
+- The router keeps a process-lifetime MONOTONIC set of every alias name EVER
+  accepted into the routing map (`updateAliases` adds accepted names; never
+  removed — an empty/absent `model_aliases` block still clears the routing
+  map itself, it just no longer wipes the fence memory).
+- At dispatch, a requested name IN that set resolving in NEITHER the alias
+  map NOR the bare catalog answers LOCALLY with `503` and an OpenAI-style
+  body — `{"error":{"message":"model \"<name>\" is configured on this
+  machine but no engine currently serves it","type":"model_unavailable",
+  "code":"model_unavailable","model":"<name>"}}` — BEFORE the gate (no slot
+  consumed), before `onSessionRoute`, and with ZERO bytes written to any
+  upstream. Never `llm_target`, never a stripped-agent-key hop to an
+  unrelated engine (the 2026-10-12 incident: an arbiter cold start published
+  `model_aliases: []`, the request fell to oMLX :8000 → 401 "API key
+  required").
+- Unchanged postures: a bare catalog row of the same name resolves → routes
+  normally with that row; genuinely unknown names keep the `llm_target`
+  fall-through byte-for-byte; `GET /v1/models` with an empty published block
+  still answers the empty list; the GET/DELETE/HEAD no-model passthrough is
+  untouched.
+- Honesty limit (documented, not fixed): a client process cold-started while
+  the arbiter published nothing for a name has never SEEN it — the fence can
+  only fence what it has seen. Alias-stability D1 removes that server-side
+  window.
