@@ -86,13 +86,57 @@ export interface AggregateAliasEntry {
   context_length?: number;
   input_modalities?: string[];
   output_modalities?: string[];
-  /**
-   * Health-ordered fall-through (docs/architecture/engine-health-routing.md
-   * D2): present (true) when the published winner is NOT the stored pin.
-   * The router ignores it; it rides the same poll for the dashboard.
-   */
+   /**
+    * Health-ordered fall-through (docs/architecture/engine-health-routing.md
+    * D2): present (true) when the published winner is NOT the stored pin.
+    * The router ignores it; it rides the same poll for the dashboard.
+    */
   fallback?: boolean;
+  /**
+   * alias-stability D1/D3: the arbiter-published failover surface — the
+   * OTHER alias pairs (stored order, winner excluded), each exactly
+   * `{server_id, url, engine_model}` and NO token by construction (the
+   * client already pulls per-row tokens via /api/server-keys). The D3
+   * watchdog failover consumes this; `updateAliases` validates every
+   * element (malformed elements drop; a malformed array = the key is
+   * absent — the entry itself still routes on its winner pair).
+   */
+  fallback_targets?: AggregateAliasFallbackTarget[];
 }
+
+/** One published failover target (alias-stability D1 shape; token never). */
+export interface AggregateAliasFallbackTarget {
+  server_id: string;
+  url: string;
+  engine_model: string;
+}
+
+/**
+ * alias-stability D3: validate the published `fallback_targets` array
+ * (drop-don't-reject, the established posture): a non-array = undefined
+ * (the key is absent); a malformed element drops individually; an empty
+ * result normalizes to absent (the arbiter omits empty too).
+ */
+export function sanitizeAliasFallbackTargets(v: unknown): AggregateAliasFallbackTarget[] | undefined {
+  if (!Array.isArray(v)) return undefined;
+  const out: AggregateAliasFallbackTarget[] = [];
+  for (const t of v) {
+    if (!t || typeof t !== 'object') continue;
+    const e = t as Record<string, unknown>;
+    if (typeof e.server_id !== 'string' || e.server_id === '') continue;
+    if (typeof e.url !== 'string' || e.url === '') continue;
+    if (typeof e.engine_model !== 'string' || e.engine_model === '') continue;
+    out.push({ server_id: e.server_id, url: e.url, engine_model: e.engine_model });
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+/**
+ * alias-stability D3: how fresh a queue digest entry may be to count as
+ * live evidence ("the engine is demonstrably still working"). Older =
+ * unknown = the failover decision ignores it.
+ */
+export const QUEUE_DIGEST_FRESH_MS = 20_000;
 
 /**
  * #66 Q3 (owner-approved 2026-10-06): the aliased forward buffers the FULL
@@ -136,6 +180,16 @@ export interface AggregateRouter {
    * any caller on this loopback listener passes.
    */
   updateKeys(rows: ServerKeyRow[], clientKeyHashes?: string[]): void;
+  /**
+   * alias-stability D3: replace the per-server queue-depth digest
+   * (`server_id → {depth, observed_at}`), fed from the arbiter's published
+   * load row on the SAME /api/state poll. A row whose `queue_depth` is
+   * absent (non-oMLX engines) stores NO entry; a poll FAILURE leaves the
+   * last digest in place — staleness is handled by AGE (≤ QUEUE_DIGEST_FRESH_MS
+   * counts as live evidence), never by clearing. `observedAt` is a test
+   * seam (the digest stamp defaults to Date.now()); production never passes it.
+   */
+  updateQueueDepths(rows: { server_id: string; queue_depth?: number }[], observedAt?: number): void;
   /** Current catalog size (tests + live check). */
   catalogSize(): number;
   /** Current alias size (tests + live check). */
@@ -254,9 +308,39 @@ export function startAggregateRouter(opts: {
    * ALIAS_BODY_BUFFER_CAP). Production callers never pass it.
    */
   aliasBodyCapBytes?: number;
+  /**
+   * alias-stability D3: slow-engine policy from the client config
+   * (`aggregate_slow_handling`). `'wait'` (default) = today's flow
+   * byte-for-byte — NO timer is ever installed. `'failover'` arms the
+   * TTFB watchdog on the BUFFERED aliased forward only.
+   */
+  slowHandling?: 'wait' | 'failover';
+  /**
+   * alias-stability D3: `aggregate_ttfb_timeout_ms` — time to first
+   * upstream response headers before the watchdog fires. Absent/0/garbage
+   * = the watchdog is OFF (even in `failover` mode: both keys must agree).
+   */
+  ttfbTimeoutMs?: number;
+  /**
+   * alias-stability D3: `aggregate_queue_depth_cap` — queue-suppression
+   * cap; a FRESH digest with 0 < depth < cap means the engine is
+   * demonstrably still working → extend the wait, never fail over.
+   */
+  queueDepthCap?: number;
 }): AggregateRouter {
   const log = opts.log ?? (() => {});
   const bodyCap = opts.aliasBodyCapBytes ?? ALIAS_BODY_BUFFER_CAP;
+  const slowHandling: 'wait' | 'failover' = opts.slowHandling === 'failover' ? 'failover' : 'wait';
+  const ttfbTimeoutMs =
+    typeof opts.ttfbTimeoutMs === 'number' && Number.isFinite(opts.ttfbTimeoutMs) && opts.ttfbTimeoutMs > 0
+      ? Math.floor(opts.ttfbTimeoutMs)
+      : 0;
+  const queueDepthCap =
+    typeof opts.queueDepthCap === 'number' && Number.isFinite(opts.queueDepthCap)
+      ? Math.max(0, Math.floor(opts.queueDepthCap))
+      : 3;
+  /** D3: the watchdog runs only when BOTH knobs agree (failover + a real deadline). */
+  const watchdogActive = slowHandling === 'failover' && ttfbTimeoutMs > 0;
   const target = new URL(opts.defaultTarget);
   let catalog: AggregateCatalogEntry[] = [];
   const catalogByName = new Map<string, AggregateCatalogEntry>();
@@ -289,6 +373,15 @@ export function startAggregateRouter(opts: {
    * any caller passes).
    */
   let clientKeyDigests = new Set<string>();
+
+  /**
+   * alias-stability D3: the per-server queue-depth digest
+   * (`server_id → {depth, at}`), fed from the arbiter's published load row
+   * on the same /api/state poll. A poll FAILURE leaves the last digest —
+   * staleness is handled by AGE (`at`, fresh ≤ QUEUE_DIGEST_FRESH_MS). Read
+   * only by the watchdog's queue-suppression decision (failover mode).
+   */
+  let queueDigest = new Map<string, { depth: number; at: number }>();
 
   /** The Bearer token a caller presented (null = none / not a Bearer). */
   const bearerOf = (req: http.IncomingMessage): string | null => {
@@ -337,6 +430,19 @@ export function startAggregateRouter(opts: {
     return headers;
   };
 
+  /**
+   * The upstream credential for one server row (#64 D2 + #68): row
+   * credential wins; keyless row + agent-key plane ON = `null` (STRIP the
+   * caller's idlefill key — it is IDLEFILL's credential, never the
+   * engine's); keyless row + plane OFF = `undefined` (pass-through,
+   * today's posture). Shared by the dispatch seam and the D3 failover
+   * rebuild — the retry authenticates EXACTLY like the primary would.
+   */
+  const authFor = (serverId: string): string | null | undefined => {
+    const token = keys.get(serverId);
+    return token !== undefined && token !== '' ? token : clientKeyDigests.size > 0 ? null : undefined;
+  };
+
   const upstreamOpts = (base: URL, req: http.IncomingMessage, headers: Record<string, string | string[]>) => ({
     protocol: base.protocol,
     hostname: base.hostname,
@@ -377,6 +483,51 @@ export function startAggregateRouter(opts: {
    * engine never sees a byte of it. Everything before and after the match
    * rides byte-for-byte (the D1 id bounds keep the JSON quoting intact).
    */
+  /**
+   * One buffered dispatch: recomputed content-length (a length of the OLD
+   * size would truncate/mangle a spliced body; transfer-encoding must not
+   * ride alongside a length), transport per protocol, body written whole.
+   * Shared by today's plain forward AND the D3 watchdog retry — the
+   * replay rebuilds with the SAME machinery, only a different base/body/
+   * credential.
+   */
+  const sendBuffered = (
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    rawUrl: string,
+    base: URL,
+    authToken: string | null | undefined,
+    body: Buffer,
+    onResponse?: (up: http.IncomingMessage) => void,
+    onError?: (err: Error) => void,
+  ): http.ClientRequest => {
+    const headers = copyRequestHeaders(req, authToken);
+    delete headers['content-length'];
+    delete headers['transfer-encoding'];
+    delete headers['Content-Length'];
+    delete headers['Transfer-Encoding'];
+    headers['content-length'] = String(body.length);
+    const transport = base.protocol === 'https:' ? https : http;
+    const upstream = transport.request(
+      { ...upstreamOpts(base, req, headers), path: rawUrl },
+      onResponse ?? ((up) => relayUpstream(up, res)),
+    );
+    upstream.on('error', onError ?? ((err) => {
+      if (!res.headersSent) {
+        res.writeHead(502, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'llm target down', detail: `${base.hostname}: ${err.message}` }));
+      } else {
+        try {
+          res.destroy();
+        } catch {
+          /* ignore */
+        }
+      }
+    }));
+    upstream.end(body);
+    return upstream;
+  };
+
   const forwardBuffered = (
     req: http.IncomingMessage,
     res: http.ServerResponse,
@@ -385,6 +536,13 @@ export function startAggregateRouter(opts: {
     authToken: string | null | undefined,
     fromModel: string,
     toModel: string,
+    /**
+     * alias-stability D3: the failover context for this dispatch — the
+     * chosen row's server_id (queue-digest lookup) and, for an ALIAS entry,
+     * its published `fallback_targets`. Absent = the watchdog may still
+     * WATCH (the body is replayable) but there is nothing to fail over to.
+     */
+    failoverCtx?: { serverId: string; fallbackTargets?: AggregateAliasFallbackTarget[] },
   ): void => {
     const chunks: Buffer[] = [];
     let total = 0;
@@ -418,33 +576,117 @@ export function startAggregateRouter(opts: {
       }
       const body = Buffer.concat(chunks);
       const spliced = spliceModelName(body, fromModel, toModel);
-      const headers = copyRequestHeaders(req, authToken);
-      // The recomputed length replaces whatever the client sent (a
-      // content-length of the OLD size would truncate/mangle the spliced
-      // body; transfer-encoding must not ride alongside a length).
-      delete headers['content-length'];
-      delete headers['transfer-encoding'];
-      delete headers['Content-Length'];
-      delete headers['Transfer-Encoding'];
-      headers['content-length'] = String(spliced.length);
-      const transport = base.protocol === 'https:' ? https : http;
-      const upstream = transport.request(
-        { ...upstreamOpts(base, req, headers), path: rawUrl },
-        (up) => relayUpstream(up, res),
-      );
-      upstream.on('error', (err) => {
-        if (!res.headersSent) {
-          res.writeHead(502, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: 'llm target down', detail: `${base.hostname}: ${err.message}` }));
-        } else {
+      if (!watchdogActive) {
+        // BYTE-FOR-BYTE fence (D3 rule 6): `wait` mode or watchdog-off
+        // installs NO timer — today's flow exactly, socket errors only.
+        sendBuffered(req, res, rawUrl, base, authToken, spliced);
+        return;
+      }
+      // alias-stability D3 — the TTFB watchdog, THIS forward only (the
+      // aliased body is fully buffered, so it is replayable; `forwardTo`
+      // pipes bytes that are not). The timer starts at dispatch and is
+      // cleared FOREVER once ANY upstream response (even an error status)
+      // arrives: never retry after the first byte.
+      let timer: NodeJS.Timeout | undefined;
+      let failoverUsed = 0; // exactly ONE retry, no chains
+      // Identity, not a flag: replacing the object silences every callback
+      // of an abandoned dispatch (its error must not answer a 502 mid-
+      // failover, its response must not relay over a newer attempt).
+      let ctx: { serverId?: string } = failoverCtx ? { serverId: failoverCtx.serverId } : {};
+      let current: http.ClientRequest | undefined;
+
+      const clearTimer = (): void => {
+        if (timer) {
+          clearTimeout(timer);
+          timer = undefined;
+        }
+      };
+      const timeoutBody = (): string =>
+        JSON.stringify({
+          error: {
+            message: `model "${fromModel}" upstream timed out before the first byte (${ttfbTimeoutMs}ms)`,
+            type: 'upstream_timeout',
+            code: 'upstream_timeout',
+            model: fromModel,
+          },
+        });
+      const dispatch = (b: URL, sentBody: Buffer, auth: string | null | undefined, serverId?: string): void => {
+        ctx = serverId !== undefined ? { serverId } : {};
+        const self = ctx;
+        current = sendBuffered(
+          req,
+          res,
+          rawUrl,
+          b,
+          auth,
+          sentBody,
+          (up) => {
+            if (ctx !== self) return; // an abandoned dispatch never relays over a newer one
+            clearTimer(); // response headers — the watchdog is DISARMED forever, the relay stands
+            relayUpstream(up, res);
+          },
+          (err) => {
+            if (ctx !== self) return; // destroyed by failover: its error is silence, not our event
+            clearTimer();
+            if (!res.headersSent) {
+              res.writeHead(502, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({ error: 'llm target down', detail: `${b.hostname}: ${err.message}` }));
+            } else {
+              try {
+                res.destroy();
+              } catch {
+                /* ignore */
+              }
+            }
+          },
+        );
+        timer = setTimeout(onFire, ttfbTimeoutMs);
+        timer.unref?.();
+      };
+      const onFire = (): void => {
+        // Queue suppression FIRST: a FRESH digest with 0 < depth < cap
+        // proves the engine is demonstrably working — extend the wait,
+        // repeatable, never fail over. Stale/zero/over-cap → failover
+        // eligible.
+        const d = ctx.serverId ? queueDigest.get(ctx.serverId) : undefined;
+        if (d && Date.now() - d.at <= QUEUE_DIGEST_FRESH_MS && d.depth > 0 && d.depth < queueDepthCap) {
+          log(`aggregate: alias ${fromModel} queue depth ${d.depth} — extending wait`);
+          timer = setTimeout(onFire, ttfbTimeoutMs);
+          timer.unref?.();
+          return;
+        }
+        const fb = (failoverCtx?.fallbackTargets ?? []).find((t) => typeof t.url === 'string' && t.url !== '');
+        if (current) {
+          ctx = {}; // identity swap: every callback of the doomed dispatch goes silent
           try {
-            res.destroy();
+            current.destroy();
           } catch {
             /* ignore */
           }
         }
-      });
-      upstream.end(spliced);
+        if (!fb || failoverUsed >= 1) {
+          // No usable target at fire time (or the ONE retry already spent):
+          // a clean local 504 — headers not yet sent, nothing consumed.
+          if (!res.headersSent) {
+            res.writeHead(504, { 'content-type': 'application/json' });
+            res.end(timeoutBody());
+          } else {
+            try {
+              res.destroy();
+            } catch {
+              /* ignore */
+            }
+          }
+          return;
+        }
+        failoverUsed += 1;
+        log(`aggregate: alias ${fromModel} ttfb > ${ttfbTimeoutMs}ms → failover ${fb.server_id}/${fb.engine_model}`);
+        // The SAME already-buffered body, spliced from the requested name
+        // to THAT entry's engine_model, authenticated exactly like the
+        // primary (row token > #68 null-strip > pass-through).
+        dispatch(new URL(engineBase(fb.url) + '/'), spliceModelName(body, fromModel, fb.engine_model), authFor(fb.server_id), fb.server_id);
+      };
+      dispatch(base, spliced, authToken, failoverCtx?.serverId);
     });
     // The peek paused the stream (the #45 posture); a plain `data`
     // listener does NOT resume a paused stream (only pipe()/resume() do)
@@ -509,16 +751,25 @@ export function startAggregateRouter(opts: {
       const entry = entryFor();
       if (entry) {
       const base = new URL(engineBase(entry.url) + '/');
-      const token = keys.get(entry.server_id);
       // Row credential wins (#64). Keyless row + #68 plane ON: `null`
       // strips the caller's agent key from the upstream hop (idlefill
       // authenticates to the engine with the ROW's credential — or with
       // none; the agent's key never leaves the machine). Keyless row +
       // plane OFF: `undefined` = today's pass-through, byte-for-byte.
-      const auth = token !== undefined && token !== '' ? token : clientKeyDigests.size > 0 ? null : undefined;
+      const auth = authFor(entry.server_id);
       const engineModel = 'engine_model' in entry ? entry.engine_model : undefined;
       if (engineModel !== undefined && requestedName !== undefined && engineModel !== requestedName) {
-        forwardBuffered(req, res, path, base, auth, requestedName, engineModel);
+        // alias-stability D3: the buffered forward carries the row's
+        // failover context — an ALIAS entry its published `fallback_targets`
+        // (a PIN entry watched only: its pin IS the operator's override,
+        // the alias's other pairs are not its fallback surface).
+        // (Catalog rows and pin blocks never carry the key — only an
+        // alias entry can, so the cast reads an absent key as undefined.)
+        const targets = (entry as AggregateAliasEntry).fallback_targets;
+        forwardBuffered(req, res, path, base, auth, requestedName, engineModel, {
+          serverId: entry.server_id,
+          ...(targets ? { fallbackTargets: targets } : {}),
+        });
         return;
       }
       forwardTo(req, res, path, base, auth);
@@ -731,9 +982,17 @@ export function startAggregateRouter(opts: {
         if (typeof e.url !== 'string' || e.url === '') continue;
         if (typeof e.engine_model !== 'string' || e.engine_model === '') continue;
         if (aliasByName.has(e.name)) continue;
-        aliasByName.set(e.name, e);
-        aliases.push(e);
-        configuredAliasNames.add(e.name);
+        // alias-stability D3 (as published by D1): the failover surface is
+        // validated INDEPENDENTLY of the entry — a malformed element drops,
+        // a malformed array makes the KEY absent, and either way the entry
+        // itself still routes on its winner pair (the fence never turns a
+        // corrupt ADD key into an un-published alias).
+        const targets = sanitizeAliasFallbackTargets(e.fallback_targets);
+        const kept: AggregateAliasEntry = targets ? { ...e, fallback_targets: targets } : { ...e };
+        if (!targets) delete kept.fallback_targets;
+        aliasByName.set(kept.name, kept);
+        aliases.push(kept);
+        configuredAliasNames.add(kept.name);
       }
     },
     updateKeys(rows, clientKeyHashes) {
@@ -749,6 +1008,22 @@ export function startAggregateRouter(opts: {
       clientKeyDigests = new Set<string>(
         Array.isArray(clientKeyHashes) ? clientKeyHashes.filter((h) => typeof h === 'string' && h !== '') : [],
       );
+    },
+    updateQueueDepths(rows, observedAt) {
+      // alias-stability D3: whole-digest swap on every successful poll
+      // (same posture as the key table). A row with an absent/garbage
+      // queue_depth stores NO entry (the arbiter only carries the count
+      // for kinds that expose one — oMLX today); staleness of an ABSENT
+      // digest is the age of the last swap, judged at fire time. A poll
+      // FAILURE never calls this — the last digest stands.
+      const at = typeof observedAt === 'number' && Number.isFinite(observedAt) ? observedAt : Date.now();
+      const next = new Map<string, { depth: number; at: number }>();
+      for (const r of Array.isArray(rows) ? rows : []) {
+        if (!r || typeof r.server_id !== 'string' || r.server_id === '') continue;
+        if (typeof r.queue_depth !== 'number' || !Number.isFinite(r.queue_depth) || r.queue_depth < 0) continue;
+        next.set(r.server_id, { depth: Math.floor(r.queue_depth), at });
+      }
+      queueDigest = next;
     },
     catalogSize() {
       return catalog.length;

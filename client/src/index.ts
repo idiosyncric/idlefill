@@ -1588,6 +1588,13 @@ export class ClientDaemon {
       // `catalog`; absent on an old arbiter — an old arbiter simply has no
       // aliases, so clearing on absence is the correct reading).
       model_aliases?: AggregateAliasEntry[];
+      // alias-stability D3 (READ-ONLY, never persisted): the per-row load
+      // facts feed the aggregate router's queue digest. The published
+      // serverView SPREADS the load keys into `signal` (server/src/api.ts
+      // `loadSignal` spread — `signal.queue_depth` is the wire truth today);
+      // the flat `load.queue_depth` shape is read too for the doc-named
+      // posture. A row without the key = no queue count (non-oMLX kinds).
+      servers?: { id: string; load?: { queue_depth?: number }; signal?: { queue_depth?: number } }[];
     }>(this.cfg, 'GET', '/api/state');
     if (status !== 200) {
       this.log.info(`state poll HTTP ${status}`);
@@ -1612,6 +1619,16 @@ export class ClientDaemon {
       // An absent block clears the map (an old arbiter has no aliases; a
       // re-pin lands the same way a pause/force override does).
       this.aggregate.updateAliases(st.model_aliases ?? []);
+      // alias-stability D3: the queue digest rides the SAME successful
+      // poll (serverView's load keys, spread into `signal`). A poll
+      // FAILURE never calls this — the last digest stands and the
+      // watchdog judges it by AGE (≤ 20s fresh), never by clearing.
+      this.aggregate.updateQueueDepths(
+        (st.servers ?? []).map((s) => ({
+          server_id: s.id,
+          queue_depth: s.load?.queue_depth ?? s.signal?.queue_depth,
+        })),
+      );
       void this.refreshServerKeys();
     }
 
@@ -2034,10 +2051,21 @@ export class ClientDaemon {
           this.aggregateServers.set(key, serverId);
         },
         log: (m) => this.log.info(m),
+        // alias-stability D3: slow-engine policy (opt-in; defaults keep
+        // today's flow — `wait` + no deadline = NO timer ever installed).
+        slowHandling: this.cfg.aggregate_slow_handling ?? 'wait',
+        ttfbTimeoutMs: this.cfg.aggregate_ttfb_timeout_ms ?? 0,
+        queueDepthCap: this.cfg.aggregate_queue_depth_cap ?? 3,
       });
       try {
         await waitProxyReady(this.aggregate.server);
-        this.log.info(`aggregate endpoint up: ${this.aggregate.base_url}/v1 → catalog-routed (default ${this.cfg.llm_target})`);
+        this.log.info(
+          `aggregate endpoint up: ${this.aggregate.base_url}/v1 → catalog-routed (default ${this.cfg.llm_target})${
+            this.cfg.aggregate_slow_handling === 'failover' && this.cfg.aggregate_ttfb_timeout_ms
+              ? ` (slow handling: failover, ttfb ${this.cfg.aggregate_ttfb_timeout_ms}ms, queue cap ${this.cfg.aggregate_queue_depth_cap ?? 3})`
+              : ''
+          }`,
+        );
       } catch {
         // Port taken / bind never completed: the aggregate endpoint is
         // OFF this run. It never wedges the daemon — 11435 + leases stand.

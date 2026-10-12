@@ -517,3 +517,58 @@ configured alias name is no longer "unknown/absent".
   the arbiter published nothing for a name has never SEEN it — the fence can
   only fence what it has seen. Alias-stability D1 removes that server-side
   window.
+
+## The D3 slow-engine policy SHIPPED — TTFB watchdog + pre-first-byte failover (2026-10-12)
+
+**Shipped (owner posture LOCKED in `alias-stability-and-slow-engines.md` D3;
+worker D of the alias-stability wave, after D1's `fallback_targets` publish
+and D2's fence).** Three OPT-IN client keys (ADD posture, flat snake_case
+beside `aggregate_port`; defaults keep this doc's flow byte-for-byte):
+
+| key | default | meaning |
+| --- | --- | --- |
+| `aggregate_slow_handling` | `"wait"` | `wait` = today (NO timer installed anywhere); `failover` arms the watchdog. Anything invalid → `wait` |
+| `aggregate_ttfb_timeout_ms` | absent = OFF | deadline (ms) to first upstream RESPONSE headers. Absent/0/garbage = OFF — `failover` mode alone arms nothing |
+| `aggregate_queue_depth_cap` | `3` | queue-suppression cap (read only in failover mode); negative floors to 0 |
+
+- Watchdog scope: the BUFFERED aliased forward (`forwardBuffered`) ONLY —
+  the aliased body is fully buffered, so it is replayable. `forwardTo`
+  (piped bodies: bare names, same-id aliases, the default target, the
+  GET/DELETE passthrough) never gets a timer; those bytes are not
+  replayable. A PIN-resolved splice forward routes through the same
+  buffered path and is watched, but a pin carries no `fallback_targets` —
+  its pin is the operator's override, the alias's other pairs are not its
+  fallback surface.
+- The timer starts when the upstream request dispatches and is cleared
+  FOREVER once ANY upstream response (even an error status) delivers its
+  headers: the relay stands, never a retry after the first byte.
+- Queue awareness: the router keeps a per-server digest
+  (`server_id → {depth, observed_at}`, `updateQueueDepths`) fed from the
+  arbiter's published load keys on the SAME successful `/api/state` poll
+  (serverView SPREADS the load reading into `signal` — `servers[].signal
+  .queue_depth` is the wire today; only the oMLX kind carries a count). A
+  poll FAILURE leaves the last digest; staleness is handled by AGE
+  (`QUEUE_DIGEST_FRESH_MS` = 20 s), never by clearing.
+- On fire — decision table, in order: (1) the target's digest FRESH,
+  `0 < depth < cap` → the engine is demonstrably still working → log
+  `aggregate: alias <name> queue depth N — extending wait`, RE-ARM (no
+  failover, repeatable); (2) stale/zero/over-cap AND a usable
+  `fallback_targets` entry AND the one retry unspent → destroy the doomed
+  upstream, retry ONCE against the FIRST usable entry — the SAME buffered
+  body re-spliced from the requested name to THAT entry's `engine_model`,
+  authenticated by the SAME resolution as the primary (`keys.get
+  (entry.server_id)` wins; keyless + #68 plane ON = null-strip; keyless +
+  plane OFF = pass-through), content-length recomputed; log `aggregate:
+  alias <name> ttfb > <ms>ms → failover <server_id>/<engine_model>`;
+  (3) no usable target, or the single retry ALREADY spent (it also timed
+  out) → `504` OpenAI body `{"error":{"message":"model \"<name>\"
+  upstream timed out before the first byte (<ms>)","type":
+  "upstream_timeout","code":"upstream_timeout","model":"<name>"}}` —
+  headers not yet sent, so it is clean. Exactly ONE retry, no chains, ever.
+- `updateAliases` keeps D1's `fallback_targets` with the established
+  drop-don't-reject posture: each element's three fields validated,
+  malformed elements drop individually, a malformed array makes the KEY
+  absent — either way the entry itself still routes on its winner pair.
+- `wait` (default) or watchdog-off: NO timer is installed and the forward
+  is byte-for-byte the flow this doc has always described — the existing
+  suite's posture, pinned by a dedicated regression test.

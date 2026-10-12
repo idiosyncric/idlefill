@@ -123,6 +123,29 @@ export interface ClientConfig {
    */
   aggregate_port: number;
   /**
+   * alias-stability D3 (2026-10-12): slow-engine policy at the aggregate
+   * listener. `wait` (default) = today's flow byte-for-byte (socket errors
+   * only, no abort, no retry); `failover` arms the TTFB watchdog on the
+   * BUFFERED aliased forward (pre-first-byte failover into the published
+   * `fallback_targets`, exactly one retry). ADD key; optional so hand-built
+   * ClientConfig fixtures stay valid; the loader always sets it (anything
+   * invalid → `wait`).
+   */
+  aggregate_slow_handling?: 'wait' | 'failover';
+  /**
+   * alias-stability D3: time to first upstream RESPONSE headers before the
+   * watchdog fires (ms). Absent/0/garbage = the watchdog is OFF even in
+   * `failover` mode. ADD key; never persisted anywhere but this config.
+   */
+  aggregate_ttfb_timeout_ms?: number;
+  /**
+   * alias-stability D3: queue-suppression cap (read only in `failover`
+   * mode): a fresh queue digest with 0 < depth < cap means the engine is
+   * demonstrably still working → extend the wait, never fail over.
+   * Default 3; a negative value floors to 0. ADD key.
+   */
+  aggregate_queue_depth_cap?: number;
+  /**
    * Session gate (issue #9 Part A): when true (default) the loopback proxy
    * also acts as the per-Mac router/gate for interactive agent traffic on
    * `/s/<token>/v1/...` — self-registration, capacity-limited admission,
@@ -211,6 +234,12 @@ const DEFAULTS = {
   llm_target: 'http://100.105.225.1:11434',
   // Aggregate endpoint port (#64 D1, owner decision 4: 8800 fleet-wide).
   aggregate_port: 8800,
+  // alias-stability D3: slow-engine policy — OPT-IN. `wait` (default) is
+  // today's byte-for-byte flow; the TTFB watchdog stays OFF unless
+  // `aggregate_slow_handling: "failover"` AND a positive
+  // `aggregate_ttfb_timeout_ms` are both set (intentionally UNSET here).
+  aggregate_slow_handling: 'wait',
+  aggregate_queue_depth_cap: 3,
   session_gate: true,
   max_active_agent_sessions: 2,
   session_hold_cap_ms: 120_000,
@@ -280,6 +309,16 @@ export function loadClientConfig(
     // Aggregate endpoint (#64): `0` disables the second listener; a
     // garbage/negative value falls back to the default.
     aggregate_port: Math.max(0, Math.floor(num(r.aggregate_port, DEFAULTS.aggregate_port))),
+    // alias-stability D3 (slow-engine policy): ADD-key posture, defaults
+    // byte-for-byte today's flow. Anything but the literal "failover" is
+    // `wait` (invalid → default, drop-don't-reject). The TTFB deadline is
+    // honored only as a finite positive integer — absent/0/garbage = the
+    // watchdog is OFF (the key simply isn't set). The queue cap floors at 0.
+    aggregate_slow_handling: r.aggregate_slow_handling === 'failover' ? 'failover' : 'wait',
+    ...(typeof r.aggregate_ttfb_timeout_ms === 'number' && Number.isFinite(r.aggregate_ttfb_timeout_ms) && r.aggregate_ttfb_timeout_ms > 0
+      ? { aggregate_ttfb_timeout_ms: Math.floor(r.aggregate_ttfb_timeout_ms) }
+      : {}),
+    aggregate_queue_depth_cap: Math.max(0, Math.floor(num(r.aggregate_queue_depth_cap, DEFAULTS.aggregate_queue_depth_cap))),
     // Session gate (issue #9 Part A). `session_gate` accepts an explicit
     // boolean; anything else falls back to the default (true).
     session_gate: typeof r.session_gate === 'boolean' ? r.session_gate : DEFAULTS.session_gate,

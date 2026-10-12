@@ -32,16 +32,26 @@
  *     upstream bytes, before the gate); unknown names keep the llm_target
  *     fall-through; a same-name bare catalog row routes; a republished
  *     block restores routing; the empty-block /v1/models list stays empty
+ *   - alias-stability D3 slow-engine policy: wait (default) installs NO
+ *     timer byte-for-byte; failover arms a TTFB watchdog on the buffered
+ *     aliased forward only — ONE retry into fallback_targets (re-spliced
+ *     body, fallback row token), fresh 0<depth<cap queue digests extend the
+ *     wait instead, no-target/no-chain cases answer a clean 504
+ *     upstream_timeout, and the config keys sanitize (invalid → wait,
+ *     absent/0 deadline → OFF)
  */
 
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { createHash } from 'node:crypto';
-import { startAggregateRouter, engineBase, type AggregateRouter, type AggregateCatalogEntry } from '../src/aggregate.js';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { startAggregateRouter, engineBase, type AggregateRouter, type AggregateCatalogEntry, type AggregateAliasEntry } from '../src/aggregate.js';
 import { startLlmProxy, waitProxyReady, type LlmProxy } from '../src/proxy.js';
 import { SessionGate, type SessionGateSnapshot, type SessionHistory } from '../src/session-gate.js';
 
+const testDir = dirname(fileURLToPath(import.meta.url));
 const cleanup: Array<() => Promise<void> | void> = [];
 after(async () => {
   for (const fn of cleanup.splice(0)) await fn();
@@ -132,12 +142,22 @@ async function startRouter(opts: {
   keys?: { id: string; name: string; url: string; auth_token: string }[];
   keyHashes?: string[]; // #68 agent-key digests (the plane-ON switch)
   onSessionRoute?: (key: string, serverId: string) => void;
+  /** D3: capture the router's log lines (failover/queue-extension proofs). */
+  logs?: string[];
+  /** D3: slow-engine policy under test (defaults keep today's posture). */
+  slowHandling?: 'wait' | 'failover';
+  ttfbTimeoutMs?: number;
+  queueDepthCap?: number;
 }): Promise<AggregateRouter> {
   const r = startAggregateRouter({
     port: 0,
     defaultTarget: opts.defaultTarget,
     ...(opts.gate !== undefined ? { gate: opts.gate } : {}),
     ...(opts.onSessionRoute ? { onSessionRoute: opts.onSessionRoute } : {}),
+    ...(opts.logs ? { log: (m: string) => opts.logs!.push(m) } : {}),
+    ...(opts.slowHandling ? { slowHandling: opts.slowHandling } : {}),
+    ...(opts.ttfbTimeoutMs !== undefined ? { ttfbTimeoutMs: opts.ttfbTimeoutMs } : {}),
+    ...(opts.queueDepthCap !== undefined ? { queueDepthCap: opts.queueDepthCap } : {}),
   });
   cleanup.push(() => r.stop());
   await waitProxyReady(r.server);
@@ -836,4 +856,290 @@ test('D2 posture: GET /v1/models with an empty published block still answers the
   assert.equal(list.object, 'list');
   assert.deepEqual(list.data, [], 'the published empty block still means an empty advertised list (unchanged posture)');
   assert.equal(def.hits.length, 0, 'the router never probes an engine to answer (D1)');
+});
+
+// ---------------------------------------------------------------------------
+// alias-stability D3 (2026-10-12) — the SLOW-ENGINE POLICY: TTFB watchdog,
+// pre-first-byte failover, queue awareness. Opt-in: `wait` (default) or an
+// absent/0 deadline installs NO timer (byte-for-byte today's flow); the
+// watchdog lives ONLY in the buffered aliased forward (replayable body),
+// ANY upstream response disarms it forever, exactly ONE retry into the
+// published fallback_targets (row token from the key plane, the body
+// re-spliced to the fallback's engine_model), and a FRESH queue digest with
+// 0 < depth < cap means "still working" → extend, never fail over.
+// ---------------------------------------------------------------------------
+
+const D3_ALIAS = 'D3Model';
+const D3_PRIMARY_ID = 'd3-primary-id';
+const D3_FALLBACK_ID = 'd3-fallback-id';
+const d3TimeoutBody = (ms: number): string =>
+  JSON.stringify({
+    error: {
+      message: `model "${D3_ALIAS}" upstream timed out before the first byte (${ms}ms)`,
+      type: 'upstream_timeout',
+      code: 'upstream_timeout',
+      model: D3_ALIAS,
+    },
+  });
+
+/** Engine that answers `delayMs` after the body lands (late-but-real). */
+function startDelayedEngine(delayMs: number, marker: string): Promise<{
+  url: string;
+  hits: { body: string; auth: string | undefined }[];
+  close: () => Promise<void>;
+}> {
+  const hits: { body: string; auth: string | undefined }[] = [];
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      hits.push({ body, auth: req.headers.authorization });
+      setTimeout(() => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ id: 'chatcmpl-d3', model: marker, choices: [{ message: { content: marker } }] }));
+      }, delayMs);
+    });
+  });
+  return new Promise((resolveP) => {
+    server.listen(0, '127.0.0.1', () => {
+      const port = (server.address() as { port: number }).port;
+      resolveP({
+        url: `http://127.0.0.1:${port}`,
+        hits,
+        close: () =>
+          new Promise<void>((r) => {
+            server.closeAllConnections?.();
+            server.close(() => r());
+          }),
+      });
+    });
+  });
+}
+
+const d3Alias = (primaryUrl: string, fallbacks?: unknown[]): AggregateAliasEntry => ({
+  name: D3_ALIAS,
+  server_id: 'srv-a',
+  url: primaryUrl,
+  auth_set: true,
+  engine_model: D3_PRIMARY_ID,
+  catalog_source: 'probed',
+  ...(fallbacks !== undefined ? { fallback_targets: fallbacks as AggregateAliasEntry['fallback_targets'] } : {}),
+});
+const d3Fallback = (url: string): Record<string, unknown> => ({
+  server_id: 'srv-b',
+  url,
+  engine_model: D3_FALLBACK_ID,
+});
+
+test('D3 wait (the default fence): a slow aliased engine is waited on byte-for-byte — no timer, no 504, no failover', async () => {
+  const def = await startEngine('default');
+  const slow = await startHeldEngine(); // responds only when released (400ms in)
+  const fb = await startEngine('fallback-should-never-be-hit');
+  cleanup.push(() => def.close());
+  cleanup.push(() => slow.close());
+  cleanup.push(() => fb.close());
+  const logs: string[] = [];
+  // Even a configured ttfb deadline must NOT arm anything while handling
+  // is `wait` — and a plain default router (no keys at all) is the same.
+  const r = await startRouter({ defaultTarget: def.url, logs, slowHandling: 'wait', ttfbTimeoutMs: 100, queueDepthCap: 3 });
+  r.updateAliases([d3Alias(slow.url, [d3Fallback(fb.url)])]);
+  const p = postChat(r.base_url, '/v1/chat/completions', D3_ALIAS);
+  await new Promise((res) => setTimeout(res, 400)); // WAY past the would-be 100ms deadline
+  slow.release(); // the slow engine finally answers
+  const res = await p;
+  assert.equal(res.status, 200, 'wait mode: the slow engine is waited on — the relay stands, no 504');
+  assert.equal(JSON.parse(await res.text()).model, 'd3-primary-id', 'the aliased splice stands (held engine echoes the body model)');
+  assert.equal(fb.hits.length, 0, 'the fallback surface was never touched in wait mode');
+  assert.equal(logs.filter((l) => l.includes('failover') || l.includes('extending wait')).length, 0, 'NO watchdog log — no timer was ever installed');
+});
+
+test('D3 failover happy path: the primary never answers, the watchdog switches ONCE to the fallback — spliced body + the fallback row token', async () => {
+  const def = await startEngine('default');
+  const slow = await startHeldEngine(); // never released: never answers
+  const fb = await startEngine('fallback-engine');
+  cleanup.push(() => def.close());
+  cleanup.push(() => slow.close());
+  cleanup.push(() => fb.close());
+  const logs: string[] = [];
+  const r = await startRouter({
+    defaultTarget: def.url,
+    logs,
+    slowHandling: 'failover',
+    ttfbTimeoutMs: 200,
+    keys: [
+      { id: 'srv-a', name: 'a', url: slow.url, auth_token: 'ROW-A-SECRET' },
+      { id: 'srv-b', name: 'b', url: fb.url, auth_token: 'ROW-B-SECRET' },
+    ],
+  });
+  r.updateAliases([d3Alias(slow.url, [d3Fallback(fb.url)])]);
+  const res = await postChat(r.base_url, '/v1/chat/completions', D3_ALIAS);
+  assert.equal(res.status, 200, 'the caller sees ONE continuous response — the fallback answered');
+  assert.equal(((await res.json()) as { model: string }).model, 'fallback-engine');
+  assert.equal(slow.hits.length, 1, 'the primary saw exactly one request (the doomed one)');
+  assert.equal(fb.hits.length, 1, 'exactly one failover attempt — no chains');
+  assert.equal(JSON.parse(fb.hits[0]!.body).model, D3_FALLBACK_ID, 'the SAME buffered body, re-spliced to the FALLBACK engine_model');
+  assert.equal(fb.hits[0]!.auth, `Bearer ROW-B-SECRET`, 'the fallback ROW token from the key plane (not the primary row, not the caller)');
+  const switchLogs = logs.filter((l) => l.includes('failover'));
+  assert.equal(switchLogs.length, 1, 'exactly one switch log');
+  assert.ok(switchLogs[0]!.includes('aggregate: alias D3Model ttfb > 200ms → failover srv-b/d3-fallback-id'), `the exact switch voice, got: ${switchLogs[0]}`);
+  assert.equal(def.hits.length, 0, 'failover never touches the machine default target');
+});
+
+test('D3 queue suppression: fresh digest depth 1 (< cap 3) — the watchdog extends the wait, the slow primary answers, zero failover', async () => {
+  const def = await startEngine('default');
+  const slow = await startHeldEngine(); // answers at ~450ms via the release below
+  const fb = await startEngine('fallback-never-hit');
+  cleanup.push(() => def.close());
+  cleanup.push(() => slow.close());
+  cleanup.push(() => fb.close());
+  const logs: string[] = [];
+  const r = await startRouter({ defaultTarget: def.url, logs, slowHandling: 'failover', ttfbTimeoutMs: 150, queueDepthCap: 3 });
+  r.updateAliases([d3Alias(slow.url, [d3Fallback(fb.url)])]);
+  r.updateQueueDepths([{ server_id: 'srv-a', queue_depth: 1 }]); // FRESH: the engine is demonstrably working
+  const p = postChat(r.base_url, '/v1/chat/completions', D3_ALIAS);
+  setTimeout(() => slow.release(), 450); // answers between the 2nd and 3rd fire
+  const res = await p;
+  assert.equal(res.status, 200, 'the wait was EXTENDED, not failed over — the primary answered');
+  assert.equal(fb.hits.length, 0, 'the fallback surface was never touched');
+  const extendLogs = logs.filter((l) => l.includes('aggregate: alias D3Model queue depth 1 — extending wait'));
+  assert.ok(extendLogs.length >= 1, 'the extension is logged (repeatable)');
+  assert.equal(logs.filter((l) => l.includes('failover')).length, 0, 'no failover — fresh 0<depth<cap means still working');
+});
+
+test('D3 queue depth >= cap: the engine may be working, but it is OVER the cap — failover proceeds', async () => {
+  const def = await startEngine('default');
+  const slow = await startHeldEngine(); // never answers
+  const fb = await startEngine('fallback-engine');
+  cleanup.push(() => def.close());
+  cleanup.push(() => slow.close());
+  cleanup.push(() => fb.close());
+  const logs: string[] = [];
+  const r = await startRouter({ defaultTarget: def.url, logs, slowHandling: 'failover', ttfbTimeoutMs: 150, queueDepthCap: 3 });
+  r.updateAliases([d3Alias(slow.url, [d3Fallback(fb.url)])]);
+  r.updateQueueDepths([{ server_id: 'srv-a', queue_depth: 3 }]); // fresh, but depth == cap → eligible
+  const res = await postChat(r.base_url, '/v1/chat/completions', D3_ALIAS);
+  assert.equal(res.status, 200);
+  assert.equal(fb.hits.length, 1, 'depth >= cap → failover proceeded');
+  assert.equal(logs.filter((l) => l.includes('extending wait')).length, 0, 'no extension at/over the cap');
+});
+
+test('D3 stale queue digest (> 20s): the evidence is unknown, not "working" — failover proceeds', async () => {
+  const def = await startEngine('default');
+  const slow = await startHeldEngine(); // never answers
+  const fb = await startEngine('fallback-engine');
+  cleanup.push(() => def.close());
+  cleanup.push(() => slow.close());
+  cleanup.push(() => fb.close());
+  const logs: string[] = [];
+  const r = await startRouter({ defaultTarget: def.url, logs, slowHandling: 'failover', ttfbTimeoutMs: 150, queueDepthCap: 3 });
+  r.updateAliases([d3Alias(slow.url, [d3Fallback(fb.url)])]);
+  // The test seam (updateQueueDepths observedAt): the reading is 21s old —
+  // older than QUEUE_DIGEST_FRESH_MS, so the depth carries no evidence.
+  r.updateQueueDepths([{ server_id: 'srv-a', queue_depth: 1 }], Date.now() - 21_000);
+  const res = await postChat(r.base_url, '/v1/chat/completions', D3_ALIAS);
+  assert.equal(res.status, 200);
+  assert.equal(fb.hits.length, 1, 'stale digest → failover proceeded');
+  assert.equal(logs.filter((l) => l.includes('extending wait')).length, 0, 'a stale reading is unknown, never "still working"');
+});
+
+test('D3 watchdog fire with no fallback_targets → clean 504 upstream_timeout (OpenAI body, error.model echoed, headers unsent)', async () => {
+  const def = await startEngine('default');
+  const slow = await startHeldEngine(); // never answers
+  cleanup.push(() => def.close());
+  cleanup.push(() => slow.close());
+  const r = await startRouter({ defaultTarget: def.url, slowHandling: 'failover', ttfbTimeoutMs: 150 });
+  r.updateAliases([d3Alias(slow.url)]); // no fallback_targets at all
+  const res = await postChat(r.base_url, '/v1/chat/completions', D3_ALIAS);
+  assert.equal(res.status, 504, 'no usable target at fire time → 504 upstream_timeout');
+  assert.equal(res.headers.get('content-type'), 'application/json');
+  assert.equal(await res.text(), d3TimeoutBody(150), 'the exact OpenAI-style body, error.model echoes the alias name');
+  assert.equal(def.hits.length, 0, 'the timeout never smuggles the request to the default target');
+  assert.equal(slow.hits.length, 1, 'the primary saw exactly one request');
+});
+
+test('D3 both engines slow → exactly ONE upstream retry then 504 — no chains (upstream request count pinned)', async () => {
+  const def = await startEngine('default');
+  const slowA = await startHeldEngine(); // never answers
+  const slowB = await startHeldEngine(); // the fallback — also never answers
+  cleanup.push(() => def.close());
+  cleanup.push(() => slowA.close());
+  cleanup.push(() => slowB.close());
+  const logs: string[] = [];
+  const r = await startRouter({ defaultTarget: def.url, logs, slowHandling: 'failover', ttfbTimeoutMs: 150 });
+  r.updateAliases([d3Alias(slowA.url, [d3Fallback(slowB.url)])]);
+  const res = await postChat(r.base_url, '/v1/chat/completions', D3_ALIAS);
+  assert.equal(res.status, 504, 'the retry ALSO timed out → same 504, no further failover');
+  assert.equal(await res.text(), d3TimeoutBody(150));
+  assert.equal(slowA.hits.length, 1, 'the primary saw exactly one request');
+  assert.equal(slowB.hits.length, 1, 'the fallback saw exactly one request — ONE retry, no chains');
+  assert.equal(logs.filter((l) => l.includes('failover')).length, 1, 'exactly one switch log, ever');
+});
+
+test('D3 headers late-but-before-deadline → normal relay, the watchdog is disarmed forever (never retries after first byte)', async () => {
+  const def = await startEngine('default');
+  const late = await startDelayedEngine(300, 'late-primary'); // answers at 300ms, deadline 1000ms
+  const fb = await startEngine('fallback-never-hit');
+  cleanup.push(() => def.close());
+  cleanup.push(() => late.close());
+  cleanup.push(() => fb.close());
+  const logs: string[] = [];
+  const r = await startRouter({ defaultTarget: def.url, logs, slowHandling: 'failover', ttfbTimeoutMs: 1000 });
+  r.updateAliases([d3Alias(late.url, [d3Fallback(fb.url)])]);
+  const res = await postChat(r.base_url, '/v1/chat/completions', D3_ALIAS);
+  assert.equal(res.status, 200, 'the late-but-legal response relays normally');
+  assert.equal(((await res.json()) as { model: string }).model, 'late-primary');
+  assert.equal(late.hits.length, 1, 'one request, one response — no second attempt');
+  assert.equal(fb.hits.length, 0, 'the fallback was never touched');
+  assert.equal(logs.filter((l) => l.includes('failover') || l.includes('extending wait')).length, 0, 'the watchdog never fired');
+});
+
+test('D3 updateAliases keeps fallback_targets: valid elements preserved, malformed elements dropped, malformed array = key absent, the entry still routes', async () => {
+  const primary = await startDelayedEngine(5, 'primary');
+  const fb = await startEngine('fallback-engine');
+  cleanup.push(() => primary.close());
+  cleanup.push(() => fb.close());
+  const r = await startRouter({ defaultTarget: 'http://127.0.0.1:1' });
+
+  // A malformed element (no url) drops; the valid one survives → failover
+  // (if it ever fires) uses the valid entry. Behavioral proof: both a
+  // mixed array and a clean array route the SAME way.
+  r.updateAliases([d3Alias(primary.url, [{ server_id: 'srv-x' }, d3Fallback(fb.url), 'not-an-object', d3Fallback('')])]);
+  const res = await postChat(r.base_url, '/v1/chat/completions', D3_ALIAS);
+  assert.equal(res.status, 200, 'the entry itself routes on its winner pair regardless of the ADD key posture');
+  assert.equal(JSON.parse(primary.hits[0]!.body).model, D3_PRIMARY_ID, 'the winner splice rode byte-for-byte');
+
+  // Pure sanitizer posture.
+  const { sanitizeAliasFallbackTargets } = await import('../src/aggregate.js');
+  assert.deepEqual(
+    sanitizeAliasFallbackTargets([{ server_id: 'srv-b', url: 'http://b', engine_model: 'm-b' }, { server_id: 'srv-c' }, null, 7]),
+    [{ server_id: 'srv-b', url: 'http://b', engine_model: 'm-b' }],
+    'valid element preserved (three fields), malformed elements dropped individually',
+  );
+  assert.equal(sanitizeAliasFallbackTargets('nope'), undefined, 'a malformed array = the key absent');
+  assert.equal(sanitizeAliasFallbackTargets([]), undefined, 'an empty array normalizes to absent (the arbiter omits empty too)');
+});
+
+test('D3 config posture: keys absent → wait/off/cap 3; invalid handling → wait; 0 deadline stays OFF; garbage floors', async () => {
+  const { loadClientConfig } = await import('../src/config.js');
+  const env = (json: string): NodeJS.ProcessEnv => ({ IDLEFILL_CLIENT_CONFIG: json });
+
+  const bare = loadClientConfig(join(testDir, '..', 'src'), env('{}'));
+  assert.equal(bare.aggregate_slow_handling, 'wait', 'absent → wait (today byte-for-byte)');
+  assert.equal(bare.aggregate_ttfb_timeout_ms, undefined, 'absent deadline → the watchdog is OFF');
+  assert.equal(bare.aggregate_queue_depth_cap, 3, 'absent cap → 3');
+
+  const bad = loadClientConfig(join(testDir, '..', 'src'), env('{"aggregate_slow_handling": "sideways", "aggregate_ttfb_timeout_ms": 0}'));
+  assert.equal(bad.aggregate_slow_handling, 'wait', 'anything invalid reads as wait (drop-don\'t-reject)');
+  assert.equal(bad.aggregate_ttfb_timeout_ms, undefined, '0 deadline → OFF (key not set)');
+
+  const wired = loadClientConfig(
+    join(testDir, '..', 'src'),
+    env('{"aggregate_slow_handling": "failover", "aggregate_ttfb_timeout_ms": 2500.7, "aggregate_queue_depth_cap": -4}'),
+  );
+  assert.equal(wired.aggregate_slow_handling, 'failover');
+  assert.equal(wired.aggregate_ttfb_timeout_ms, 2500, 'a finite positive deadline floors to an int');
+  assert.equal(wired.aggregate_queue_depth_cap, 0, 'a negative cap floors at 0');
+
+  const junkCap = loadClientConfig(join(testDir, '..', 'src'), env('{"aggregate_queue_depth_cap": "three"}'));
+  assert.equal(junkCap.aggregate_queue_depth_cap, 3, 'garbage cap → the default 3');
 });

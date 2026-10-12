@@ -8,7 +8,13 @@
   "session_gate": true,
   "max_active_agent_sessions": 2,
   "session_hold_cap_ms": 120000,
+  "aggregate_slow_handling": "wait",
+  "aggregate_ttfb_timeout_ms": 0,
+  "aggregate_queue_depth_cap": 3,
   "_docs": {
+    "aggregate_slow_handling": "Alias-stability D3 (OPT-IN, docs/architecture/alias-stability-and-slow-engines.md): the :8800 slow-engine policy. 'wait' (DEFAULT) is today byte-for-byte — a slow engine is simply waited on, no timer installed. 'failover' arms a TTFB watchdog on the buffered ALIASED forward only: if no upstream response headers arrive within aggregate_ttfb_timeout_ms, the request is answered from the alias's published fallback_targets (pre-first-byte only, exactly ONE retry, the row token from the arbiter key plane, the body re-spliced to the fallback's engine_model). Anything invalid reads as 'wait'.",
+    "aggregate_ttfb_timeout_ms": "The watchdog deadline in ms. Absent or 0 = OFF (even in failover mode both keys must agree). Cleared forever the moment ANY upstream response (even an error status) arrives — never a retry after the first byte.",
+    "aggregate_queue_depth_cap": "Queue-suppression cap (default 3, read only in failover mode): when the watchdog fires and that engine's FRESH (<=20s) arbiter-published queue depth is > 0 and < this cap, the engine is demonstrably still working — the wait is extended (logged, repeatable) instead of failing over. Stale/zero/over-cap makes failover eligible.",
     "config": "Copy this file to client/config.json (untracked/local). Relative paths (queue_file, results_file) resolve against the client/ package dir — e.g. '../data/queue.jsonl' → <repo>/data/queue.jsonl.",
     "executor": "Command template run via bash -c. Placeholders: {payload_file}, {result_file}, and {repo} — expanded to the TRUE idlefill repo root in both layouts (dev: tsx client/src/index.ts; packaged: client/dist), so 'node {repo}/adapters/career-ops/eval.mjs …' finds the adapter at <repo>/adapters/career-ops/eval.mjs. At startup the client checks the expanded script path exists and refuses to request leases (staying registered/online-but-inactive, FATAL in the log) if it is missing — a broken executor template must not burn job attempts.",
     "adapter": "Alternative to hand-writing 'executor' (issue #13): name a registered adapter (e.g. \"career-ops\", \"noop\") and the client resolves the executor template, payload_fields, estimated_seconds, and timeout_seconds from its manifest at <repo>/adapters/<name>/package.json (the \"idlefill\" key). Precedence: an explicit 'executor' here wins over the manifest; an unknown adapter name is FATAL at startup (same online-but-inactive posture as a missing script). cwd stays config-only — it is machine-specific, never manifest material.",

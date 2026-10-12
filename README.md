@@ -130,6 +130,22 @@ Detection-to-move latency: one arbiter tick (15 s) + one router poll
 `docs/architecture/aggregate-endpoint.md`, `model-aliases.md`,
 `engine-health-routing.md`, `session-gate/`.
 
+**Slow-engine knobs** (2026-10-12, alias-stability D3 — OPT-IN, same
+`client/config.json`; defaults keep today's flow byte-for-byte):
+
+| key | default | meaning |
+| --- | --- | --- |
+| `aggregate_slow_handling` | `"wait"` | `wait` = today (a slow engine is waited on; no timer installed). `failover` arms the TTFB watchdog on the buffered ALIASED forward only — anything invalid reads as `wait` |
+| `aggregate_ttfb_timeout_ms` | absent = OFF | watchdog deadline (ms) to first upstream RESPONSE headers; needs `failover` too. Cleared forever the moment any response arrives — never a retry after the first byte |
+| `aggregate_queue_depth_cap` | `3` | queue suppression: when the watchdog fires and that engine's FRESH (≤20 s) arbiter-published queue depth is `0 < depth < cap`, the engine is demonstrably working → the wait is extended instead of failing over |
+
+In `failover` mode with a deadline set: on fire, a slow aliased request
+retries exactly ONCE onto the alias's published `fallback_targets` (pre-
+first-byte only, the fallback's own engine_model spliced into the
+buffered body, its row token from the arbiter key plane) — or a clean
+`504 upstream_timeout` when there is nothing to fail over to. One retry,
+no chains.
+
 ### How background work gets an engine (leases) — and the self-traffic trap
 
 ```
