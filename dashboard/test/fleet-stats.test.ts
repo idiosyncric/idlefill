@@ -6,7 +6,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { fleetLoadTiles, tokensTodayTile, engineGauges, gibfmt, compact } from "../src/lib/fleet-stats.js";
+import { fleetLoadTiles, tokensTodayTile, engineGauges, engineTiles, ramAxis, gibfmt, compact } from "../src/lib/fleet-stats.js";
 import type { RawEngineLine, RawLeaseLine, StateSnapshot } from "../src/lib/api.js";
 
 function sig(over: Record<string, unknown> = {}) {
@@ -152,4 +152,47 @@ test("formatters keep the tile value one word", () => {  assert.equal(gibfmt(3.2
   assert.equal(gibfmt(3.42e11), "319 GiB");
   assert.equal(compact(1_234_567), "1.2M");
   assert.equal(compact(500), "500");
+});
+
+// The Resources tiles: declared/watched coverage, the idle verdict over
+// WATCHED rows only (a not-watched row claims no verdict — the count
+// names coverage), routing health, and the engaged direct count (0 is
+// truth there).
+test("engineTiles: coverage-named glance counts, engaged is a direct count", () => {
+  const s = st([
+    { id: "a", watched: true, signal: sig({ idle: true, degraded: false }), model_source: "probed", engaged: true, models: [] },
+    { id: "b", watched: true, signal: sig({ idle: false, degraded: true }), model_source: "declared", models: [] },
+    { id: "c", watched: false, model_source: "probed", models: [{ name: "m", running: true }] },
+  ]);
+  const [declared, idle, routing, engaged] = engineTiles(s);
+  assert.deepEqual([declared.value, idle.value, routing.value, engaged.value], ["3", "1 of 2", "2 of 3", "2"]);
+  assert.equal(declared.sub, "2 of 3 watched for idle/busy");
+  assert.equal(idle.sub, "watched engines idle · 1 degraded");
+  assert.equal(engaged.sub, "a lease or session holds an engine slot");
+});
+
+// Nothing declared → every tile em-dashes with the named reason; engaged
+// (a direct count) still reads 0.
+test("engineTiles: empty fleet is named absence, never a confident zero", () => {
+  const [declared, idle, routing, engaged] = engineTiles(st([]));
+  assert.deepEqual([declared.value, idle.value, routing.value], ["—", "—", "—"]);
+  assert.equal(declared.sub, "no inference servers declared");
+  assert.equal(idle.sub, "no inference servers declared");
+  assert.equal(engaged.value, "0", "engaged is a direct count — 0 is the truth");
+});
+
+// The RAM axis rule: oMLX's model pool beats the host box (labelled
+// "model mem"); llama-swap/strata name host RAM ("ram"); nothing named
+// → null (no bar, never a fake zero).
+test("ramAxis: model pool beats host box; labels name the source; absent is null", () => {
+  const g = (over: Record<string, unknown>) =>
+    engineGauges(sig({ load_source: "x", load_age_s: 1, ...over }), 45);
+  const omlx = ramAxis(g({ model_mem_used_bytes: 3.0e10, model_mem_max_bytes: 6.8e10, host_mem_used_bytes: 9.2e10 }));
+  assert.deepEqual([omlx?.label, omlx?.used, omlx?.total], ["model mem", 3.0e10, 6.8e10]);
+  assert.match(omlx?.note ?? "", /oMLX model pool on unified memory/);
+  const strata = ramAxis(g({ host_mem_used_bytes: 9.2e10, host_mem_total_bytes: 1.01e11 }));
+  assert.deepEqual([strata?.label, strata?.used, strata?.total], ["ram", 9.2e10, 1.01e11]);
+  assert.match(strata?.note ?? "", /system RAM on this engine's host box/);
+  assert.equal(ramAxis(g({ gpu_util_percent: 10 })), null, "no memory figure named → no bar");
+  assert.equal(ramAxis(null), null);
 });

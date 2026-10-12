@@ -9,6 +9,7 @@ import {
 } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Sparkline } from "@/components/Sparkline";
+import { StatTiles, TilesSkeleton } from "@/components/stat-tiles";
 import { ago, durFmt, fmt, liveWord, type StateWord } from "@/lib/format";
 import { hostLine, intentWord, meshTiles, peerVerdict, relayOutcome } from "@/lib/mesh-stats";
 import { buildRemoteRows, type RemoteRow } from "@/lib/remote-metrics";
@@ -75,12 +76,7 @@ export function Machines({ st }: { st: StateSnapshot | null }) {
   if (!st) {
     return (
       <section className="flex flex-col gap-3">
-        <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-          <Skeleton className="h-20 rounded-lg" />
-          <Skeleton className="h-20 rounded-lg" />
-          <Skeleton className="h-20 rounded-lg" />
-          <Skeleton className="h-20 rounded-lg" />
-        </div>
+        <TilesSkeleton cols={4} />
         <Skeleton className="h-32 rounded-lg" />
       </section>
     );
@@ -90,19 +86,14 @@ export function Machines({ st }: { st: StateSnapshot | null }) {
   return (
     <section className="flex flex-col gap-3">
       {peers.length > 0 && (
-        <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-          {meshTiles(peers).map((tile, i) => (
-            <Card key={i} className="py-0 shadow-none">
-              <CardContent className="flex flex-col gap-0.5 px-4 py-2.5" title={TILE_TITLES[i]}>
-                <span className="text-[11px] font-semibold uppercase tracking-wide text-dim">
-                  {["Peers online", "Queued across mesh", "Running across mesh", "Engines idle"][i]}
-                </span>
-                <span className="text-[16px] font-semibold">{tile.value}</span>
-                <span className="text-[11px] text-dim">{tile.sub}</span>
-              </CardContent>
-            </Card>
-          ))}
-        </div>
+        <StatTiles
+          cols={4}
+          tiles={meshTiles(peers).map((tile, i) => ({
+            label: ["Peers online", "Queued across mesh", "Running across mesh", "Engines idle"][i],
+            title: TILE_TITLES[i],
+            tile,
+          }))}
+        />
       )}
       <div className="flex items-center gap-3">
         <h2 className="text-[12px] font-semibold uppercase tracking-wide text-dim">Machines</h2>

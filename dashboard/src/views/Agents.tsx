@@ -35,6 +35,8 @@ import {
   type AgentRosterRow,
 } from "@/lib/api";
 import { ago } from "@/lib/format";
+import { agentTiles } from "@/lib/agent-stats";
+import { StatTiles, TilesSkeleton } from "@/components/stat-tiles";
 
 // ---------------------------------------------------------------------------
 // Agent keys (#68 server plane, #72 dashboard flow): idlefill's own
@@ -99,6 +101,9 @@ function configBlock(url: string, model: string): string {
 
 export function Agents({ st }: { st: StateSnapshotLike | null }) {
   const [keys, setKeys] = React.useState<AgentKeyRow[]>([]);
+  // The tile's honesty axis: null = the token-gated list was never fetched
+  // (the tile renders "—" naming that); a number = the list answered.
+  const [keyCount, setKeyCount] = React.useState<number | null>(null);
   const [endpoints, setEndpoints] = React.useState<AgentEndpoint[]>([]);
   // The local Hermes profile roster (#80): `null` = not fetched yet / no
   // token (roster card hidden); `[]` = the route answered with no roster
@@ -120,7 +125,9 @@ export function Agents({ st }: { st: StateSnapshotLike | null }) {
   const refresh = React.useCallback(async () => {
     if (!apiToken()) return;
     try {
-      setKeys(await getAgentKeys());
+      const list = await getAgentKeys();
+      setKeys(list);
+      setKeyCount(list.length);
     } catch {
       /* the pane keeps its last good rows */
     }
@@ -180,6 +187,22 @@ export function Agents({ st }: { st: StateSnapshotLike | null }) {
           + new agent key
         </Button>
       </div>
+
+      {keyCount === null && roster === null ? (
+        <TilesSkeleton cols={2} />
+      ) : (
+        <StatTiles
+          cols={2}
+          tiles={agentTiles(keyCount, roster).map((tile, i) => ({
+            label: ["Agent keys", "Profiles adopted"][i],
+            title: [
+              "agent-inference credentials minted on this arbiter — the list is token-gated, so it reads — until a token is pasted",
+              "Hermes profiles on this machine that already route through idlefill (exact key-label match, never fuzzy)",
+            ][i],
+            tile,
+          }))}
+        />
+      )}
 
       {hasToken && roster && roster.length > 0 && (
         <RosterCard roster={roster} keys={keys} onMint={(name) => { setPrefillLabel(name); setModal(true); }} />

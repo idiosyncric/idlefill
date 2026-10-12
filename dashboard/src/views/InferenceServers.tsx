@@ -41,6 +41,9 @@ import {
   type EngineGroup,
 } from "@/lib/api";
 import { ago, fmt, fmtCtx, liveWord, probeWord, PROVIDER_CHOICES } from "@/lib/format";
+import { engineGauges, engineTiles, gibfmt, ramAxis } from "@/lib/fleet-stats";
+import { MemBar } from "@/components/mem-bar";
+import { StatTiles, TilesSkeleton } from "@/components/stat-tiles";
 import { loadRead, LOAD_FRESHNESS_DEFAULT_S } from "@/lib/load-read";
 
 const METRICS_24H = 24 * 3600_000; // the card's sparkline window
@@ -165,6 +168,24 @@ export function InferenceServers({ st }: { st: StateSnapshot | null }) {
           + add server
         </Button>
       </div>
+
+      {st === null ? (
+        <TilesSkeleton cols={4} />
+      ) : (
+        <StatTiles
+          cols={4}
+          tiles={engineTiles(st).map((tile, i) => ({
+            label: ["Declared", "Idle", "Routing", "Engaged"][i],
+            title: [
+              "inference servers declared on this arbiter, and how many are watched for idle/busy",
+              "watched engines whose signal reads idle — a row the core has no idle detector for claims no verdict",
+              "rows whose /v1/models probe answered this tick (routing green) versus declared-list rows (routing red)",
+              "rows an active lease or session currently holds a slot on",
+            ][i],
+            tile,
+          }))}
+        />
+      )}
 
       <GroupPanel
         groups={groups}
@@ -492,6 +513,11 @@ function ServerCard({
   // is the measurement (two axes, never merged into one word). Absent read
   // (load_source missing) = null = render nothing.
   const load = loadRead(s.signal, staleS);
+  // The memory axes (same rule as the Overview card, lib/fleet-stats.ts
+  // ramAxis): vram when the provider names GPU memory, the RAM axis when
+  // it names a model pool or host box. Nothing named = no bar.
+  const g = engineGauges(s.signal, staleS);
+  const ram = ramAxis(g);
   const [armed, setArmed] = React.useState(false);
   const armTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -574,6 +600,21 @@ function ServerCard({
 
       <CardContent className="px-3 py-2 flex flex-col gap-2">
         <ModelList s={s} now={now} />
+        {g?.memUsed !== undefined && g?.memTotal !== undefined && g.memTotal > 0 && (
+          <MemBar
+            label="vram"
+            used={g.memUsed}
+            total={g.memTotal}
+            stale={g.stale}
+            note={`GPU memory ${gibfmt(g.memUsed)} used of ${gibfmt(g.memTotal)}`}
+          />
+        )}
+        {ram && <MemBar label={ram.label} used={ram.used} total={ram.total} stale={g?.stale ?? false} note={ram.note} />}
+        {g?.failReason && (
+          <div className="text-[11px] text-warn" title="the last engine load read failed — this is why the gauges are missing">
+            {g.failReason}
+          </div>
+        )}
         <Separator />
         <MetricRows points={points} />
       </CardContent>

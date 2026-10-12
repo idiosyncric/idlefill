@@ -11,6 +11,9 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
+import { Skeleton } from "@/components/ui/skeleton";
+import { StatTiles, TilesSkeleton } from "@/components/stat-tiles";
+import { projectTiles } from "@/lib/project-stats";
 import {
   Dialog,
   DialogContent,
@@ -55,11 +58,9 @@ export function Projects({ st }: { st: StateSnapshot | null }) {
 
   if (!st) {
     return (
-      <section>
-        <h2 className="text-[12px] font-semibold uppercase tracking-wide text-dim mb-3">Projects</h2>
-        <Card className="py-4 shadow-none">
-          <CardContent className="px-4 text-[12px] text-dim">waiting for state…</CardContent>
-        </Card>
+      <section className="flex flex-col gap-3">
+        <TilesSkeleton cols={4} />
+        <Skeleton className="h-24 rounded-lg" />
       </section>
     );
   }
@@ -81,6 +82,20 @@ export function Projects({ st }: { st: StateSnapshot | null }) {
           title="substring match across every worker's published queue preview (first 100 queued per worker) — read-only, no API call"
         />
       </div>
+
+      <StatTiles
+        cols={4}
+        tiles={projectTiles(st).map((tile, i) => ({
+          label: ["Queued", "Running", "Throttled", "Finished today"][i],
+          title: [
+            "jobs waiting across every worker's published queue depth — coverage matters: a deep queue behind no online workers is not a working queue",
+            "leases the arbiter is holding right now",
+            "projects whose gate is throttled — no new grants until an operator unthrottles (Overview)",
+            "jobs finished since local midnight, per the workers' counters",
+          ][i],
+          tile,
+        }))}
+      />
 
       {query.trim() !== "" && (
         <QueueSearchResults projects={projects} query={query.trim()} />

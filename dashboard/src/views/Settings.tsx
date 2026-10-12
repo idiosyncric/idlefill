@@ -95,7 +95,7 @@ export function Settings({ st }: { st: StateSnapshot | null }) {
       </div>
       <Card>
         <CardHeader>
-          <CardTitle>Color scheme</CardTitle>
+          <CardTitle className="text-[12px] font-semibold uppercase tracking-wide text-dim">Color scheme</CardTitle>
           <CardAction className="flex items-center gap-2">
             <Button
               size="xs"
@@ -276,7 +276,7 @@ function HermesGatewayEditor({ name, port }: { name: string; port: number }) {
   return (
     <Card>
       <CardHeader>
-        <CardTitle>{name}</CardTitle>
+        <CardTitle className="text-[13px] font-semibold">{name}</CardTitle>
         <CardAction className="flex items-center gap-2">
           <label className="flex items-center gap-1.5 text-[12px]">
             <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />

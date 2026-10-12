@@ -32,6 +32,7 @@ import {
 } from "@/components/ui/sheet";
 import { Input } from "@/components/ui/input";
 import { Sparkline } from "@/components/Sparkline";
+import { Skeleton } from "@/components/ui/skeleton";
 import { copyText } from "@/lib/clipboard";
 import {
   apiToken,
@@ -47,7 +48,9 @@ import {
   type SessionTranscript,
   type StateSnapshot,
 } from "@/lib/api";
-import { ago, isOnline, sessGateLabelText, sessStateWord, sessStale } from "@/lib/format";
+import { ago, durFmt, isOnline, liveWord, sessGateLabelText, sessStateWord, sessStale } from "@/lib/format";
+import { sessionTiles } from "@/lib/session-stats";
+import { StatTiles, TilesSkeleton } from "@/components/stat-tiles";
 
 const TONE: Record<string, string> = {
   ok: "text-ok",
@@ -59,6 +62,14 @@ const TONE: Record<string, string> = {
 
 const MINT_KEY = "idlefill.mintedSessions";
 const MODE_KEY = "idlefill.sessMode";
+
+// Tile tooltips — same order as lib/session-stats.ts sessionTiles().
+const SESSION_TILE_TITLES = [
+  "sessions the routers self-registered — a router registers one on its first request",
+  "sessions the router gate holds behind another session's slot",
+  "sessions under an operator pause override — the router holds their traffic",
+  "rows whose 90 s heartbeat lapsed — the router may have dropped them",
+];
 
 type MintedLine = { port: number; token: string };
 
@@ -625,10 +636,8 @@ export function Sessions({ st }: { st: StateSnapshot | null }) {
   if (!st) {
     return (
       <section className="flex flex-col gap-3">
-        <h2 className="text-[12px] font-semibold uppercase tracking-wide text-dim">Sessions</h2>
-        <Card className="py-4 shadow-none">
-          <CardContent className="px-4 text-[12px] text-dim">no sessions registered</CardContent>
-        </Card>
+        <TilesSkeleton cols={4} />
+        <Skeleton className="h-24 rounded-lg" />
       </section>
     );
   }
@@ -643,6 +652,14 @@ export function Sessions({ st }: { st: StateSnapshot | null }) {
 
   return (
     <section className="flex flex-col gap-3">
+      <StatTiles
+        cols={4}
+        tiles={sessionTiles(sessions, st.now).map((tile, i) => ({
+          label: ["Sessions", "At the gate", "Paused", "Stale"][i],
+          title: SESSION_TILE_TITLES[i],
+          tile,
+        }))}
+      />
       <div className="flex items-center gap-3">
         <h2 className="text-[12px] font-semibold uppercase tracking-wide text-dim">Sessions</h2>
         {sessions.length > 0 && (
@@ -947,15 +964,21 @@ function FlowView({ st }: { st: StateSnapshot }) {
           {engines.map((e) => {
             const l = load.get(e.id) ?? { active: 0, queued: 0 };
             const sig = e.signal;
-            const sigWord = sig ? (sig.idle ? `idle ${sig.idle_for_s ?? "—"}s` : "busy") : "";
+            const w = liveWord(sig ? { idle: sig.idle, degraded: sig.degraded } : null, l.active > 0);
             return (
               <div key={e.id} className="flex items-center gap-2 text-[12px]">
-                <span className={`size-1.5 rounded-full ${sig && !sig.idle ? "bg-ok" : "bg-border"}`} />
+                <span
+                  className={`size-1.5 shrink-0 rounded-full ${sig?.degraded ? "bg-err" : sig ? (sig.idle ? "bg-border" : "bg-accent") : "bg-border"}`}
+                  title={`${e.name}: ${w.label}`}
+                />
                 <span className="font-semibold">{e.name}</span>
                 <span className="ml-auto text-[11px] text-dim" title="sessions routing here: active / queued">
                   {l.active} act · {l.queued} q
                 </span>
-                {sigWord && <span className="text-[11px] text-dim">{sigWord}</span>}
+                <span className={`whitespace-nowrap text-[11px] font-semibold ${TONE[w.tone]}`} title={w.note}>
+                  {w.label}
+                  {sig?.idle && sig.idle_for_s != null ? ` · ${durFmt(sig.idle_for_s)}` : ""}
+                </span>
               </div>
             );
           })}

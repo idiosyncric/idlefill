@@ -10,6 +10,8 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
+import { StatTiles, TilesSkeleton } from "@/components/stat-tiles";
+import { MemBar } from "@/components/mem-bar";
 import {
   apiToken,
   getRawLines,
@@ -22,7 +24,7 @@ import {
   type ThrottledJob,
 } from "@/lib/api";
 import { ago, cycleTone, durFmt, fmt, liveWord, minSec } from "@/lib/format";
-import { engineGauges, fleetLoadTiles, gibfmt, tokensTodayTile, type StatTile } from "@/lib/fleet-stats";
+import { engineGauges, fleetLoadTiles, gibfmt, ramAxis, tokensTodayTile, type StatTile } from "@/lib/fleet-stats";
 import { LOAD_FRESHNESS_DEFAULT_S } from "@/lib/load-read";
 import { HERMES_JOBS_LABEL, collectHermesJobGroups, type HermesJobGroup } from "@/lib/hermes-jobs";
 
@@ -80,13 +82,7 @@ export function Overview({ st }: { st: StateSnapshot | null }) {
 function OverviewSkeleton() {
   return (
     <section className="flex flex-col gap-3">
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
-        <Skeleton className="h-20 rounded-lg" />
-        <Skeleton className="h-20 rounded-lg" />
-        <Skeleton className="h-20 rounded-lg" />
-        <Skeleton className="h-20 rounded-lg" />
-        <Skeleton className="h-20 rounded-lg" />
-      </div>
+      <TilesSkeleton cols={5} />
       <Skeleton className="h-24 rounded-lg" />
       <div className="grid gap-3 lg:grid-cols-2">
         <Skeleton className="h-32 rounded-lg" />
@@ -100,7 +96,9 @@ function OverviewSkeleton() {
 // ---------------------------------------------------------------------------
 // FLEET STAT TILES — the sparkDash Overview concept (fleet-wide headline
 // numbers above the fold): Fleet decode, Fleet power, Memory in use,
-// System RAM, Tokens today. The four load tiles compute from the 5s
+// System RAM, Tokens today — rendered by the shared StatTiles component
+// (components/stat-tiles.tsx) every tab's headline row now uses. The four
+// load tiles compute from the 5s
 // state poll (fresh load readings only — the same metrics_load_stale_s window that
 // gates the LOAD axis, stale is unknown and never counted). The token
 // tile reads the metrics store (bucket=raw, so the in-progress day
@@ -157,19 +155,7 @@ function FleetStats({ st }: { st: StateSnapshot }) {
     },
   ];
 
-  return (
-    <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
-      {tiles.map(({ label, title, tile }) => (
-        <Card key={label} className="py-0 shadow-none">
-          <CardContent className="flex flex-col gap-0.5 px-4 py-2.5" title={title}>
-            <span className="text-[11px] font-semibold uppercase tracking-wide text-dim">{label}</span>
-            <span className="text-[16px] font-semibold">{tile.value}</span>
-            <span className="text-[11px] text-dim">{tile.sub}</span>
-          </CardContent>
-        </Card>
-      ))}
-    </div>
-  );
+  return <StatTiles tiles={tiles} cols={5} />;
 }
 
 // ---------------------------------------------------------------------------
@@ -218,12 +204,11 @@ function EngineCard({
     ? liveWord(row.signal ? { idle: row.signal.idle, degraded: row.signal.degraded } : null, running || row.models.some((m) => m.running))
     : liveWord(null, false);
   const g = engineGauges(row.signal, staleS);
-  // RAM: oMLX names its model pool's allocation on Apple unified memory
-  // (the true per-engine figure); llama-swap/strata name their host box's
-  // RAM (the label says so). Nothing named = no line — never a fake zero.
-  const ramIsModel = g?.modelMemUsed !== undefined;
-  const ramUsed = ramIsModel ? g?.modelMemUsed : g?.hostMemUsed;
-  const ramTotal = ramIsModel ? g?.modelMemMax : g?.hostMemTotal;
+  // RAM: the shared axis rule (lib/fleet-stats.ts ramAxis) — oMLX names
+  // its model pool's allocation on Apple unified memory (the true
+  // per-engine figure); llama-swap/strata name their host box's RAM (the
+  // label says so). Nothing named = no bar — never a fake zero.
+  const ram = ramAxis(g);
   return (
     <Card className="py-0 shadow-none">
       <CardContent className="flex flex-col gap-1.5 px-3 py-2.5">
@@ -259,18 +244,8 @@ function EngineCard({
             note={`GPU memory ${gibfmt(g.memUsed)} used of ${gibfmt(g.memTotal)}`}
           />
         )}
-        {ramUsed !== undefined && (
-          <MemBar
-            label={ramIsModel ? "model mem" : "ram"}
-            used={ramUsed}
-            total={ramTotal}
-            stale={g?.stale ?? false}
-            note={
-              ramIsModel
-                ? `oMLX model pool on unified memory: ${gibfmt(ramUsed)} used${ramTotal !== undefined ? ` of ${gibfmt(ramTotal)} ceiling` : " (ceiling unknown)"}`
-                : `system RAM on this engine's host box: ${gibfmt(ramUsed)} used${ramTotal !== undefined ? ` of ${gibfmt(ramTotal)}` : " (capacity unknown)"}`
-            }
-          />
+        {ram && (
+          <MemBar label={ram.label} used={ram.used} total={ram.total} stale={g?.stale ?? false} note={ram.note} />
         )}
         {g?.failReason && <div className="text-[11px] text-warn" title="the last engine load read failed — this is why the gauges are missing">{g.failReason}</div>}
         <div className="flex items-center justify-between gap-3 text-[11px] text-dim">
@@ -284,26 +259,9 @@ function EngineCard({
   );
 }
 
-// One memory bar on the engine card (vram / model mem / host ram): used
-// against total, tone at the same thresholds everywhere, dimmed when the
-// load reading is stale (last-known truth, labelled).
-function MemBar({ label, used, total, stale, note }: { label: string; used: number; total?: number; stale: boolean; note: string }) {
-  const pct = total !== undefined && total > 0 ? Math.min(100, Math.round((used / total) * 100)) : null;
-  const tone = pct === null ? "bg-accent" : pct < 80 ? "bg-accent" : pct < 95 ? "bg-warn" : "bg-err";
-  return (
-    <div className={`flex flex-col gap-1 ${stale ? "opacity-60" : ""}`} title={`${note}${pct !== null ? ` (${pct}%)` : ""}${stale ? " — stale read" : ""}`}>
-      <div className="flex items-center justify-between text-[10px] text-dim">
-        <span>{label}</span>
-        <span>{gibfmt(used)}{total !== undefined ? ` / ${gibfmt(total)}` : ""}</span>
-      </div>
-      {pct !== null && (
-        <div className="h-1 overflow-hidden rounded-full bg-muted">
-          <div className={`h-1 rounded-full ${tone}`} style={{ width: `${pct}%` }} />
-        </div>
-      )}
-    </div>
-  );
-}
+// The memory bars (components/mem-bar.tsx) and the RAM axis rule
+// (lib/fleet-stats.ts ramAxis) are shared with the Resources cards — the
+// same thresholds, the same labels, on both surfaces.
 
 // The system card: the global idle verdict with its context.
 function SystemCard({ st }: { st: StateSnapshot }) {

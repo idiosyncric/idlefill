@@ -37,7 +37,7 @@ export default function Glance() {
 
   return (
     <div className="p-[10px_12px] select-none">
-      <div className={`font-semibold mb-[2px]${s.red ? " text-err" : ""}`}>{s.word}</div>
+      <div className={`text-[15px] leading-tight font-semibold mb-[2px]${s.red ? " text-err" : ""}`}>{s.word}</div>
       {s.sessionsCount && <div className="text-dim my-[8px_0_2px]">{s.sessionsCount}</div>}
       {s.exceptionLines.map((line, i) => (
         <div key={i} className="text-warn my-[2px_0]">

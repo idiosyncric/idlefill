@@ -37,6 +37,8 @@ import {
   type StateSnapshot,
 } from "@/lib/api";
 import { ago, fmtCtx, probeWord } from "@/lib/format";
+import { modelTiles } from "@/lib/model-stats";
+import { StatTiles, TilesSkeleton } from "@/components/stat-tiles";
 
 // ---------------------------------------------------------------------------
 // Models — the operator-declared model aliases (#66). One card per alias:
@@ -150,6 +152,24 @@ export function Models({ st }: { st: StateSnapshot | null }) {
           + add alias
         </Button>
       </div>
+
+      {st === null ? (
+        <TilesSkeleton cols={4} />
+      ) : (
+        <StatTiles
+          cols={4}
+          tiles={modelTiles(st).map((tile, i) => ({
+            label: ["Aliases", "Routing", "Re-routed", "First alias"][i],
+            title: [
+              "operator aliases with a resolved winner this tick — what the router publishes to every agent",
+              "how many winners came from a live /v1/models probe (green) rather than a declared list (red)",
+              "aliases whose stored pin or group block was dead — traffic moved to the next-best pair",
+              "the alias /v1/models leads with — the machine's advertised default",
+            ][i],
+            tile,
+          }))}
+        />
+      )}
 
       {!hasToken ? (
         <Card className="py-4 shadow-none">

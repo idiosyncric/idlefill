@@ -142,7 +142,7 @@ export default function Settings() {
 
   return (
     <div className="p-[16px_18px]">
-      <h2 className="text-[14px] font-semibold mb-[10px]">LaunchAgents</h2>
+      <h2 className="text-[12px] font-semibold uppercase tracking-wide text-dim mb-[10px]">LaunchAgents</h2>
       <div className="flex flex-col">
         <SettingsRow
           id="daemon"
@@ -163,7 +163,7 @@ export default function Settings() {
         />
       </div>
 
-      <h2 className="text-[14px] font-semibold mt-[18px] mb-[10px]">Arbiter</h2>
+      <h2 className="text-[12px] font-semibold uppercase tracking-wide text-dim mt-[18px] mb-[10px]">Arbiter</h2>
       <div className="flex items-center gap-[10px]">
         {/* Exception-Only (DESIGN.md): the stopped row renders ONLY in
             the loaded-but-exited state. */}
@@ -185,7 +185,7 @@ export default function Settings() {
         )}
       </div>
 
-      <h2 className="text-[14px] font-semibold mt-[18px] mb-[10px]">Update</h2>
+      <h2 className="text-[12px] font-semibold uppercase tracking-wide text-dim mt-[18px] mb-[10px]">Update</h2>
       <div className="flex items-center gap-[10px]">
         {/* D6: the check is GUI-triggered — the button is the ONLY
             trigger (no check at launch, no timer). `inert` = the

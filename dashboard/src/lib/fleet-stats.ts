@@ -204,6 +204,83 @@ export function engineGauges(sig: ServerSignal | null | undefined, staleS: numbe
   };
 }
 
+/**
+ * The Resources → Inference servers tiles (the sparkDash headline row on
+ * the authoring page — the glance counts, not the fleet sums the Overview
+ * owns). Fixed order: declared, idle verdict, routing health, engaged.
+ * The idle/routing tiles read WATCHED rows (a row the core has no idle
+ * detector for claims no verdict — the count names the coverage), absent
+ * = "—" with the reason, never a fake zero. Engaged is a direct count:
+ * 0 is the truth there, not an absence.
+ */
+export function engineTiles(st: StateSnapshot): StatTile[] {
+  const rows = st.servers ?? [];
+  const n = rows.length;
+  const declared: StatTile = {
+    value: n > 0 ? String(n) : "—",
+    sub: n > 0 ? `${rows.filter((r) => r.watched).length} of ${n} watched for idle/busy` : "no inference servers declared",
+  };
+
+  const watched = rows.filter((r) => r.watched && r.signal);
+  const idleCount = watched.filter((r) => r.signal!.idle && !r.signal!.degraded).length;
+  const degraded = rows.filter((r) => r.signal?.degraded).length;
+  const idle: StatTile =
+    watched.length > 0
+      ? {
+          value: `${idleCount} of ${watched.length}`,
+          sub: `watched engines idle${degraded > 0 ? ` · ${degraded} degraded` : ""}`,
+        }
+      : { value: "—", sub: n > 0 ? "no watched engine carries a signal" : declared.sub };
+
+  const probed = rows.filter((r) => r.model_source === "probed").length;
+  const routing: StatTile =
+    n > 0
+      ? { value: `${probed} of ${n}`, sub: "the /v1/models probe answered this tick — the routing green" }
+      : { value: "—", sub: declared.sub };
+
+  const engaged = rows.filter((r) => r.engaged === true || r.models.some((m) => m.running)).length;
+  const engagedTile: StatTile = {
+    value: String(engaged),
+    sub: "a lease or session holds an engine slot",
+  };
+
+  return [declared, idle, routing, engagedTile];
+}
+
+/**
+ * The RAM axis of the per-engine card (shared by the Overview card and the
+ * Resources card): oMLX names its model pool's allocation on Apple unified
+ * memory (the true per-engine figure — labelled "model mem"); llama-swap
+ * and strata name their host box's RAM (labelled "ram"). Nothing named =
+ * null: the card shows no bar — never a fake zero.
+ */
+export type RamAxis = { label: "model mem" | "ram"; used: number; total?: number; note: string };
+
+export function ramAxis(g: EngineGauges | null | undefined): RamAxis | null {
+  if (!g) return null;
+  if (g.modelMemUsed !== undefined) {
+    return {
+      label: "model mem",
+      used: g.modelMemUsed,
+      ...(g.modelMemMax !== undefined ? { total: g.modelMemMax } : {}),
+      note:
+        `oMLX model pool on unified memory: ${gibfmt(g.modelMemUsed)} used` +
+        (g.modelMemMax !== undefined ? ` of ${gibfmt(g.modelMemMax)} ceiling` : " (ceiling unknown)"),
+    };
+  }
+  if (g.hostMemUsed !== undefined) {
+    return {
+      label: "ram",
+      used: g.hostMemUsed,
+      ...(g.hostMemTotal !== undefined ? { total: g.hostMemTotal } : {}),
+      note:
+        `system RAM on this engine's host box: ${gibfmt(g.hostMemUsed)} used` +
+        (g.hostMemTotal !== undefined ? ` of ${gibfmt(g.hostMemTotal)}` : " (capacity unknown)"),
+    };
+  }
+  return null;
+}
+
 // 30.4 GiB (one decimal under 100, none above — the tile line stays one
 // word).
 export function gibfmt(bytes: number): string {

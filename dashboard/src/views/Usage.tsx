@@ -2,6 +2,8 @@ import * as React from "react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Sparkline } from "@/components/Sparkline";
+import { StatTiles, TilesSkeleton } from "@/components/stat-tiles";
+import { usageTiles, type UsageTile } from "@/lib/usage-stats";
 import {
   getMetrics,
   type MetricsSeries,
@@ -124,6 +126,7 @@ function usageRow(
 
 export function Usage() {
   const [rows, setRows] = React.useState<UsageRow[] | null>(null);
+  const [tiles, setTiles] = React.useState<UsageTile[] | null>(null);
   const [err, setErr] = React.useState<string | null>(null);
   const [loadedAt, setLoadedAt] = React.useState<number | null>(null);
 
@@ -135,6 +138,7 @@ export function Usage() {
     try {
       const [eng, lease] = await Promise.all([getMetrics("engine", from, now), getMetrics("lease", from, now)]);
       const built = buildRows(eng, lease);
+      setTiles(usageTiles(eng, lease));
       if (built.length === 0) {
         setRows([]);
         setErr(null);
@@ -167,6 +171,25 @@ export function Usage() {
           refresh
         </Button>
       </div>
+
+      {tiles === null && !err ? (
+        <TilesSkeleton cols={3} />
+      ) : (
+        tiles && (
+          <StatTiles
+            cols={3}
+            tiles={tiles.map((tile, i) => ({
+              label: ["Requests", "Tokens out", "Idle share"][i],
+              title: [
+                "requests the engines served over the 7-day window — counted from the engine series",
+                "output tokens over the 7-day window — engine counters when the engines publish them, lease reports otherwise",
+                "share of sampled time the engines sat idle over the 7-day window",
+              ][i],
+              tile,
+            }))}
+          />
+        )
+      )}
 
       <Card className="py-0 shadow-none">
         <CardContent className="flex flex-col gap-1 px-4 py-3">
