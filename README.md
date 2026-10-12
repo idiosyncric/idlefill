@@ -49,7 +49,7 @@ Architecture below.
 | 1 | Monorepo, server (Docker), client daemon, career-ops adapter, tests | **Done** — see `npm test`, Docker build |
 | 1.5 | Arbiter deployed to **urza** (2026-09-25) | **Done** — the live path is `scripts/deploy-server.sh` (gate, native amd64 build on urza, host-network container swap, tailnet healthcheck, auto-rollback). Image tag = the commit sha. State + config live under urza's `~/idlefill/` (0700/0600). Dashboard: `http://100.105.225.1:8787` |
 | 2 | urza hardening (compose + traefik route + IP/auth middleware), launchd client, NInfer log ro-mount | **Superseded (retired 2026-10-08)** — the compose + traefik plane never ran (urza is host-networked via the script above; `/mnt/docker/idlefill` never existed). The launchd client IS live (`tauri/install.sh` renders `tauri/IdlefillApp.plist`; the daemon/arbiter plists render from the Rust lifecycle plane) and the Linux client service is exercised (issue #54) |
-| 3 (operator CLI) | One `idlefill` command for update / mesh / engine / agent (+ daemon/control groups) | **Design accepted (2026-10-12)** — `docs/architecture/cli.md`; implementation filed as issues #88–#92 (S1–S5) |
+| 3 (operator CLI) | One `idlefill` command for update / mesh / engine / agent (+ daemon/control groups) | **S1 landed (2026-10-12)** — `cli/` workspace + the `idlefill` dispatcher + help tree; `daemon`/`control` live as passthrough groups (the `scripts/idlefill-*.mjs` CLIs are shims onto it). Design: `docs/architecture/cli.md`; remaining slices #89–#92 (S2–S5) filed |
 
 ## Architecture
 
@@ -222,12 +222,15 @@ client/     Mac daemon — register, lease loop, loopback proxy, executor
             supervision, usage reporting, crash-safe queue handling
 adapters/   per-project executors (career-ops: queue builder + JD evaluator
             + the idlefill MCP server, idlefill-mcp.mjs)
-scripts/    thin CLI wrappers (build-careerops-queue.mjs, the control
+scripts/    thin CLI wrappers (build-careerops-queue.mjs + the control
             CLIs: idlefill-control.mjs arbiter-side, idlefill-daemon.mjs
-            daemon-side — platform-portable, systemd-aware on Linux)
-cli/        (planned, #88–#92) the `idlefill` operator CLI — one dispatcher
-            over update / mesh / engine / agent + the daemon/control
-            groups (docs/architecture/cli.md)
+            daemon-side — since #88 these two are shims onto cli/, kept so
+            every citation and muscle memory keeps working)
+cli/        the `idlefill` operator CLI (#88–#92) — one dispatcher over
+            update / mesh / engine / agent + the daemon/control passthrough
+            groups (docs/architecture/cli.md). S1 live: `npx idlefill`
+            (daemon/control byte-identical to the old scripts, --json on
+            reads); S2–S5 refuse by name until they land
 deploy/     launchd templates (com.sam.idlefill.client.plist,
             com.sam.idlefill.server.plist) + systemd/ + install-client-service.sh
             = the Linux client service (issue #54 — exercised, see below).

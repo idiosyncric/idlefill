@@ -1,0 +1,22 @@
+{
+  "name": "idlefill-cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "idlefill operator CLI — one dispatcher over update/mesh/engine/agent + the daemon/control passthrough groups (docs/architecture/cli.md)",
+  "main": "dist/index.js",
+  "bin": {
+    "idlefill": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && chmod +x dist/index.js",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "test": "tsx --test --test-timeout=20000 --test-force-exit test/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0"
+  }
+}
