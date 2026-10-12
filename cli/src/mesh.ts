@@ -331,9 +331,14 @@ async function apiCall(
   body?: unknown,
   timeoutMs = 10_000,
 ): Promise<{ status: number; payload: ArbiterAnswer | null; text: string }> {
+  // A JSON body rides the content-type; a body-less POST sends NO content-type
+  // (Fastify 400s an application/json request with an empty body — the
+  // reload/pair/code calls are body-less POSTs).
+  const headers: Record<string, string> = { authorization: `Bearer ${token}` };
+  if (body !== undefined) headers['content-type'] = 'application/json';
   const res = await fetch(serverUrl + path, {
     method,
-    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    headers,
     body: body === undefined ? undefined : JSON.stringify(body),
     signal: AbortSignal.timeout(timeoutMs),
   }).catch((err: Error) => {
