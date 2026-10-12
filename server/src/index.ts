@@ -18,6 +18,7 @@ import type { LoadSignalView } from './load.js';
 import { FeedDeltaTracker, MetricsStore, HOUR_MS, instrumentArbiterForMetrics } from './metrics.js';
 import { CounterDeltaTracker, OmlxUsageReaders } from './omlx.js';
 import { buildRosterFetcher, buildHeartbeatSender, MeshFederation, makeRealMeshFetcher } from './mesh.js';
+import { bootRevision } from './revision.js';
 import { StateStore } from './state.js';
 import type { ActivityEntry, EngineCounters, RequestsSource, ServerConnection, ServerProvider } from './types.js';
 
@@ -48,6 +49,13 @@ function dashboardDir(from: string): string {
 async function main(): Promise<void> {
   const cfg = loadConfig(entryDir);
   const log = (msg: string) => console.log(`[${new Date().toISOString()}] ${msg}`);
+
+  // The build-gap fact (owner ask 2026-10-12): the git commit THIS
+  // process's code was loaded from (IDLEFILL_REVISION env first — the
+  // git-less container path bakes it at deploy). One value per boot:
+  // it publishes at GET /api/mesh AND lets this arbiter count how far
+  // behind its peers are, both through the same identity.
+  const serverRevision = bootRevision(entryDir);
 
   const store = new StateStore(cfg.state_file);
 
@@ -219,6 +227,11 @@ async function main(): Promise<void> {
     // (the Service-down rule).
     heartbeatSender: buildHeartbeatSender(cfg, arbiter.identity()),
     localPublicKey: () => arbiter.identity().publicKeyB64url,
+    // The build-gap observer side (owner ask 2026-10-12): view() counts
+    // each peer's reported boot revision against THIS instance's, on the
+    // local checkout's history. A git-less host (urza's container) gets
+    // no `build` key — honestly absent, never a fake number.
+    localRevision: () => serverRevision,
     edgeFiller: (localId, edge, peerKey, peerName, direction) => {
       // The caller of the filler is this machine; the peer is the OTHER
       // end of the directed edge (the roster dedupe already skipped
@@ -302,6 +315,8 @@ async function main(): Promise<void> {
       const fresh = loadConfig(entryDir);
       return { mesh_peers: fresh.mesh_peers ?? [], peer_token: fresh.peer_token ?? '' };
     },
+    // The /api/mesh snapshot's boot revision (build-gap publisher side).
+    serverRevision,
   });
   const wss = attachWebSocket(app, arbiter, cfg);
   const broadcast = (app as unknown as Record<string, unknown>).broadcastWs as (obj: unknown) => void;

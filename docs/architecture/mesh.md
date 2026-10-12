@@ -95,6 +95,34 @@ Three auth planes, locked:
   CONTROL. The ceremony is out of scope here; the identity model it plugs
   into is locked above.
 
+### Build gap — `revision` + `build` ADD keys (owner ask 2026-10-12)
+
+> "Since we are still tracking updates against the current commit hash,
+> can we just show a counter for how many commits behind a peer is?"
+
+Yes, and it rides the same read plane:
+
+- The snapshot gains `revision` — the git commit the publishing arbiter's
+  code was loaded from (the arbiter twin of the client daemon's #49 boot
+  fact: `git rev-parse HEAD` at the checkout it runs from; a git-less
+  container publishes what the deploy baked into `IDLEFILL_REVISION`,
+  and both deploy scripts bake it at swap). Shape-gated both directions:
+  a hex sha or the key stays absent — never a fake build identity.
+- The OBSERVER adds `build` to its own `mesh.peers[]` rows: the local
+  arbiter counts with `git rev-list --count <peer>..<local>` /
+  `<local>..<peer>` on ITS OWN checkout — no remote fetch, cached per
+  revision pair. `behind` = the peer's build lacks N commits this
+  machine already runs (the word that makes the Machines-tab update
+  button worth pressing); `ahead` = the honest mirror (the viewer's
+  machine is the stale one); `diverged` = neither is a fast-forward of
+  the other; `same` rides the wire — "up to date" is a confirmed answer,
+  not a silence.
+- The claims are LOCAL-relative and honestly bounded: "N behind" counts
+  commits between the two builds, not behind origin (neither side needs
+  a remote). An unorderable pair (a git-less observer, or shas from
+  histories that never met) renders "builds differ" — never a number.
+  Either side silent about its build = key absent, never a fake zero.
+
 ## D3 — Surfaces: every arbiter serves the dashboard; local-first
 
 - Every arbiter serves the dashboard and `/api/state`. The mesh view is

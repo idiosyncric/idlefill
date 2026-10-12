@@ -12,6 +12,9 @@
  *   - instance_id persists across a restart; peer snapshots NEVER touch
  *     state.json (ephemeral by design)
  *   - the snapshot is coarse: no job ids, titles, URLs, or payloads
+ *   - the build gap (2026-10-12): the `revision` snapshot key (publish +
+ *     sanitize gates), the decideBuildGap table, a real-repo rev-list
+ *     counter, and the `build` key on the peer view
  *
  * Hermetic: a real Fastify app on an ephemeral loopback port + an injected
  * fake fetcher. No network.
@@ -20,7 +23,8 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createPublicKey, generateKeyPairSync, randomBytes, verify } from 'node:crypto';
-import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -40,8 +44,11 @@ import {
   mintInstanceId,
   buildRosterFetcher,
   buildHeartbeatSender,
+  decideBuildGap,
+  makeRevListCounter,
   type MeshFetcher,
   type MeshSnapshot,
+  type GapCounter,
   type RosterFetcher,
   type RosterEdgeRow,
   type EdgeFiller,
@@ -1687,4 +1694,137 @@ test('slice 9: a peer the roster stops reporting is dropped on the next pull (th
   // The instance leaves the fleet (no row for it at all).
   await m.pullRoster(async () => rosterEnvelope([]), T0 + ROSTER_PULL_MS);
   assert.deepEqual(m.view(T0 + ROSTER_PULL_MS).map((v) => v.url), ['http://live:8787'], 'a pull that returns no rows does NOT clear the set — an unreachable service leaves the last-known peers standing');
+});
+
+// ---------------------------------------------------------------------------
+// Build gap (owner ask 2026-10-12) — the `revision` snapshot key + the
+// observer-side git count (`build` on the peer row).
+// ---------------------------------------------------------------------------
+
+test('build gap: buildMeshSnapshot publishes ONLY a shaped sha', () => {
+  const full = '0f3a9c1e2b4d6a8c0f3a9c1e2b4d6a8c0f3a9c1e';
+  const s = buildMeshSnapshot('m-1', 'n', [], 0, 0, 0, T0, undefined, undefined, undefined, undefined, full);
+  assert.equal(s.revision, full);
+  const short = buildMeshSnapshot('m-1', 'n', [], 0, 0, 0, T0, undefined, undefined, undefined, undefined, '0f3a9c1');
+  assert.equal(short.revision, '0f3a9c1');
+  for (const garbage of ['not-a-sha', 'XYZ123456789012345678901234567890123456789', '0f', '0f3g', 'zzzz']) {
+    const g = buildMeshSnapshot('m-1', 'n', [], 0, 0, 0, T0, undefined, undefined, undefined, undefined, garbage);
+    assert.equal(g.revision, undefined, `garbage revision "${garbage}" never rides the wire`);
+  }
+  const none = buildMeshSnapshot('m-1', 'n', [], 0, 0, 0, T0);
+  assert.equal(none.revision, undefined);
+});
+
+test('build gap: sanitizeSnapshot keeps a shaped remote sha and drops garbage', () => {
+  const ok = sanitizeSnapshot({ instance_id: 'm-1', ts: T0, revision: '0f3a9c1e2b4d' });
+  assert.equal(ok?.revision, '0f3a9c1e2b4d');
+  const bad = sanitizeSnapshot({ instance_id: 'm-1', ts: T0, revision: 'rm -rf /' });
+  assert.equal(bad?.revision, undefined);
+  const huge = sanitizeSnapshot({ instance_id: 'm-1', ts: T0, revision: 'a'.repeat(200) });
+  assert.equal(huge?.revision, undefined, 'over-long is hostile, drop the key');
+});
+
+test('build gap: decideBuildGap — the decision table (injected counter)', () => {
+  const counter: GapCounter = (range) => {
+    if (range === 'bbbbbbb..aaaaaaa') return 3; // 3 commits in LOCAL the peer lacks → peer BEHIND 3
+    if (range === 'aaaaaaa..bbbbbbb') return 0;
+    if (range === 'ccccccc..aaaaaaa') return 1; // diverged: 1 behind, 2 ahead
+    if (range === 'aaaaaaa..ccccccc') return 2;
+    return null;
+  };
+  assert.deepEqual(decideBuildGap('aaaaaaa', 'aaaaaaa', counter), { relation: 'same' });
+  // Prefix equality (full local sha vs the baked short the container bakes):
+  assert.deepEqual(decideBuildGap('0f3a9c1e2b4d6a8c', '0f3a9c1', counter), { relation: 'same' });
+  assert.deepEqual(decideBuildGap('aaaaaaa', 'bbbbbbb', counter), { relation: 'behind', behind: 3 });
+  assert.deepEqual(decideBuildGap('bbbbbbb', 'aaaaaaa', counter), { relation: 'ahead', ahead: 3 });
+  assert.deepEqual(decideBuildGap('aaaaaaa', 'ccccccc', counter), { relation: 'diverged', behind: 1, ahead: 2 });
+  // Uncountable (unknown object / no git here): honest `unknown`, never a zero.
+  assert.deepEqual(decideBuildGap('aaaaaaa', 'ddddddd', counter), { relation: 'unknown' });
+  // Garbage on either side is unknown without ever touching the counter.
+  let touched = false;
+  const never: GapCounter = () => {
+    touched = true;
+    return 0;
+  };
+  assert.equal(decideBuildGap('aaaaaaa', 'not-a-sha', never).relation, 'unknown');
+  assert.equal(touched, false, 'a garbage sha never reaches git');
+});
+
+test('build gap: makeRevListCounter counts on a REAL throwaway repo, and unknown objects are null', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mesh-gap-repo-'));
+  const git = (args: string[]) => {
+    const r = spawnSync('git', ['-C', dir, ...args], { encoding: 'utf-8' });
+    assert.equal(r.status, 0, `git ${args.join(' ')}: ${r.stderr}`);
+    return String(r.stdout).trim();
+  };
+  try {
+    git(['init', '-q']);
+    git(['config', 'user.email', 'test@idlefill.invalid']);
+    git(['config', 'user.name', 'mesh gap test']);
+    writeFileSync(join(dir, 'a.txt'), '1');
+    git(['add', '.']);
+    git(['commit', '-qm', 'one']);
+    const first = git(['rev-parse', 'HEAD']);
+    writeFileSync(join(dir, 'a.txt'), '2');
+    git(['add', '.']);
+    git(['commit', '-qm', 'two']);
+    writeFileSync(join(dir, 'a.txt'), '3');
+    git(['add', '.']);
+    git(['commit', '-qm', 'three']);
+    const head = git(['rev-parse', 'HEAD']);
+    const count = makeRevListCounter(dir);
+    assert.equal(count(`${first}..${head}`), 2, 'two commits between the builds');
+    assert.equal(count(`${head}..${first}`), 0, 'none the other way');
+    assert.equal(count(`${head}..0000000000000000`), null, 'an object this repo has never seen is not countable');
+    assert.equal(count(`${first}..${head}; rm -rf`), null, 'the shape gate runs before git argv');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('build gap: the peer view carries `build` only when BOTH sides report, and the gap is cached per pair', async () => {
+  const cfg = baseCfg(await mkTmp(), { mesh_peers: [{ url: 'http://peer-a:8787' }] });
+  let counts = 0;
+  const m = new MeshFederation(cfg, async () => ({ ...snap(), revision: 'bbbbbbb' }), {
+    localRevision: () => 'aaaaaaa',
+    revList: (range) => {
+      counts++;
+      return range === 'aaaaaaa..bbbbbbb' ? 0 : 4; // bbbbbbb is 4 behind aaaaaaa
+    },
+  });
+  await m.refresh(T0);
+  const v1 = m.view(T0)[0]!;
+  assert.equal(v1.snapshot?.revision, 'bbbbbbb', 'the remote sha rides through sanitize onto the row');
+  assert.deepEqual(v1.build, { relation: 'behind', behind: 4 });
+  const v2 = m.view(T0 + 1000)[0]!;
+  assert.deepEqual(v2.build, { relation: 'behind', behind: 4 });
+  assert.equal(counts, 2, 'one pair of git calls per view — cached per (local|peer), not per row field');
+  // Same build → the word rides (up-to-date is an answer, not a silence).
+  const same = new MeshFederation(cfg, async () => ({ ...snap(), revision: 'aaaaaaa' }), {
+    localRevision: () => 'aaaaaaa12345678',
+    revList: () => {
+      throw new Error('prefix equality must short-circuit before any count');
+    },
+  });
+  await same.refresh(T0);
+  assert.deepEqual(same.view(T0)[0]!.build, { relation: 'same' });
+  // No local boot revision → the key is absent (nothing provable).
+  const nolocal = new MeshFederation(cfg, async () => ({ ...snap(), revision: 'bbbbbbb' }));
+  await nolocal.refresh(T0);
+  assert.equal(nolocal.view(T0)[0]!.build, undefined);
+});
+
+test('build gap: GET /api/mesh carries the wired serverRevision, and never when unwired', async () => {
+  const cfg = baseCfg(await mkTmp());
+  // Unwired (every pre-existing buildApi caller): byte-for-byte the pre-key shape.
+  const unwired = mkApp(cfg);
+  const off = await unwired.app.inject({ method: 'GET', url: '/api/mesh', headers: { authorization: `Bearer ${ADMIN}` } });
+  assert.equal(off.json().revision, undefined);
+  // Wired at boot (index.ts posture): the sha rides the snapshot.
+  const store = new StateStore(cfg.state_file);
+  const det = new IdleDetector({ fetchActivity: async () => [], logMtime: () => null, llama_swap_url: cfg.llama_swap_url, activity_path: cfg.activity_path, log_glob: '', idle_seconds: cfg.idle_seconds });
+  const arbiter = new Arbiter(store, cfg, det);
+  const app = buildApi({ arbiter, cfg, publicDir: join(import.meta.dirname, '..', 'public'), serverRevision: '0f3a9c1e2b4d' });
+  const on = await app.inject({ method: 'GET', url: '/api/mesh', headers: { authorization: `Bearer ${ADMIN}` } });
+  assert.equal(on.json().revision, '0f3a9c1e2b4d');
 });

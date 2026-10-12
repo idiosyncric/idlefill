@@ -17,6 +17,7 @@ import { join } from 'node:path';
 
 import {
   backupPathFor,
+  buildGapLine,
   explainPairError,
   normalizePeerUrl,
   parseMeshArgs,
@@ -274,6 +275,32 @@ test('renderPeerRows puts the name, url, and observed instance id on the header 
   const out = renderPeerRows([row({}), row({ url: 'http://x:1', name: 'x', instance_id: null, snapshot: null })]);
   assert.match(out[0], /^urza {2}http:\/\/100\.105\.225\.1:8787 {2}\[m-abc123\]$/);
   assert.ok(out.some((l) => l.includes('http://x:1') && !l.includes('[null]')));
+});
+
+// ---------------------------------------------------------------------------
+// the build gap (owner ask 2026-10-12) — "N commits behind" as a plain word
+// ---------------------------------------------------------------------------
+
+test('buildGapLine names the gap, or says nothing when the peer reports no build', () => {
+  const withRev = (over: Partial<PeerViewRow> = {}): PeerViewRow =>
+    row({ snapshot: { ...(row({}).snapshot ?? {}), revision: '0f3a9c1e2b4d6a8c' }, ...over });
+  assert.equal(buildGapLine(row({})), null, 'no revision reported — nothing to say, never a fake zero');
+  assert.equal(
+    buildGapLine(withRev({ build: { relation: 'behind', behind: 3 } })),
+    'build 0f3a9c1 · 3 behind this machine',
+  );
+  assert.equal(buildGapLine(withRev({ build: { relation: 'same' } })), 'build 0f3a9c1 · up to date');
+  assert.equal(buildGapLine(withRev({ build: { relation: 'ahead', ahead: 1 } })), 'build 0f3a9c1 · 1 ahead of this machine');
+  assert.equal(buildGapLine(withRev({ build: { relation: 'diverged', behind: 2, ahead: 5 } })), 'build 0f3a9c1 · builds diverged');
+  assert.equal(buildGapLine(withRev({ build: { relation: 'unknown' } })), 'build 0f3a9c1 · builds differ');
+  assert.equal(buildGapLine(withRev()), 'build 0f3a9c1', 'sha reported, no local count — sha only, no gap word');
+});
+
+test('renderPeerRows puts the build line under the header', () => {
+  const out = renderPeerRows([
+    row({ snapshot: { ...(row({}).snapshot ?? {}), revision: '0f3a9c1e2b4d6a8c' }, build: { relation: 'behind', behind: 2 } }),
+  ]);
+  assert.equal(out[1], '  build 0f3a9c1 · 2 behind this machine');
 });
 
 // ---------------------------------------------------------------------------

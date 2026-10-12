@@ -61,6 +61,13 @@ export interface ApiDeps {
    * without the wiring stays as-is).
    */
   reloadMeshConfig?: () => { mesh_peers: { url: string; name?: string }[]; peer_token: string };
+  /**
+   * The arbiter's boot revision (build-gap publisher side, owner ask
+   * 2026-10-12). Optional so existing callers/tests stay byte-for-byte
+   * valid; absent = the /api/mesh snapshot carries no `revision` key
+   * (peers then honestly show "no build reported", never a fake sha).
+   */
+  serverRevision?: string;
 }
 
 /** Validate a request token against the configured set. */
@@ -331,7 +338,7 @@ function serverView(arbiter: Arbiter, cfg: ServerConfig, now: number, loadSignal
 
 /** Attach the API routes (authed) and the dashboard (public read). */
 export function buildApi(deps: ApiDeps): FastifyInstance {
-  const { arbiter, cfg, publicDir, mesh, metrics, loadSignal, reloadMeshConfig } = deps;
+  const { arbiter, cfg, publicDir, mesh, metrics, loadSignal, reloadMeshConfig, serverRevision } = deps;
 
   const app = fastify({ logger: false });
   app.decorate('idlefill', { arbiter, cfg, publicDir });
@@ -1305,6 +1312,11 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       // uptime for THIS machine, read live from node:os. Aggregate only —
       // the coarse-by-construction clause holds.
       collectHostStats(),
+      // Boot revision (the build-gap publisher side): the commit THIS
+      // arbiter's code was loaded from. Injected at boot (index.ts);
+      // absent = the key stays off the wire (pre-key tests and a build
+      // that cannot see its own checkout byte-for-byte).
+      serverRevision,
     );
   });
 

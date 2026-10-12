@@ -177,3 +177,45 @@ export function relayOutcome(relay: { status: number; target: { ok?: boolean; in
   const why = relay.target.error ?? `HTTP ${relay.status}`;
   return { label: why, tone: "err", note: relay.target.hint ?? "the peer refused the update — the answer is its own, named" };
 }
+
+// ---------------------------------------------------------------------------
+// Build gap (owner ask 2026-10-12) — the peer card's "how far behind is
+// that machine?" line. The peer reports the commit its arbiter booted
+// from (snapshot.revision); the LOCAL arbiter counts the git gap against
+// this machine's checkout (peer row `build`, git rev-list — cached per
+// revision pair). The line is what the update button needs to be worth
+// pressing: a named number when the peer's build lacks commits this
+// machine runs, honest words when no number is provable.
+// ---------------------------------------------------------------------------
+
+/**
+ * The peer card's build line: null = the peer never reported a build
+ * (an arbiter that predates the key, or one that cannot see its own
+ * checkout — never a fake sha). A reported build shows the short sha;
+ * the counted gap adds its word: `up to date` (the confirmed zero),
+ * `N behind` (the update word — warn), `N ahead of here` (the honest
+ * mirror — THIS machine is the old one), `builds diverged` (neither is
+ * a fast-forward of the other), `builds differ` (the shas cannot be
+ * ordered from here — a git-less observer, or histories that never met;
+ * never a fake number).
+ */
+export function buildGapLine(p: MeshPeer): { text: string; tone: "warn" | "dim" } | null {
+  const rev = p.snapshot?.revision;
+  if (!rev) return null;
+  const short = rev.slice(0, 7);
+  const g = p.build;
+  if (!g) return { text: `build ${short}`, tone: "dim" };
+  switch (g.relation) {
+    case "same":
+      return { text: `build ${short} · up to date`, tone: "dim" };
+    case "behind":
+      return { text: `build ${short} · ${g.behind ?? 0} behind`, tone: "warn" };
+    case "ahead":
+      return { text: `build ${short} · ${g.ahead ?? 0} ahead of here`, tone: "dim" };
+    case "diverged":
+      return { text: `build ${short} · builds diverged`, tone: "warn" };
+    case "unknown":
+      return { text: `build ${short} · builds differ`, tone: "dim" };
+  }
+  return { text: `build ${short}`, tone: "dim" };
+}

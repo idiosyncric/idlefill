@@ -11,7 +11,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Sparkline } from "@/components/Sparkline";
 import { StatTiles, TilesSkeleton } from "@/components/stat-tiles";
 import { ago, durFmt, fmt, liveWord, type StateWord } from "@/lib/format";
-import { hostLine, intentWord, meshTiles, peerVerdict, relayOutcome } from "@/lib/mesh-stats";
+import { buildGapLine, hostLine, intentWord, meshTiles, peerVerdict, relayOutcome } from "@/lib/mesh-stats";
 import { buildRemoteRows, type RemoteRow } from "@/lib/remote-metrics";
 import { apiToken, getRemoteMetrics, requestPeerUpdate, type MeshPeer, type StateSnapshot } from "@/lib/api";
 
@@ -284,6 +284,11 @@ function PeerCard({ p, now }: { p: MeshPeer; now: number }) {
               {hostLine(snap.host) && (
                 <div className="text-[10px] text-dim" title="coarse host counters as THAT machine's arbiter reported them (load/memory/uptime — absent on a peer that predates the key)">
                   {hostLine(snap.host)}
+                </div>
+              )}
+              {buildGapLine(p) && (
+                <div className={`text-[10px] ${TONE[buildGapLine(p)!.tone]}`} title="the git commit that machine's arbiter booted from, and how far its build sits from this machine's (counted with git rev-list on this checkout — 'behind' is why the update button exists; 'differ' = the two shas cannot be ordered from here; absent = that machine does not report a build)">
+                  {buildGapLine(p)!.text}
                 </div>
               )}
             </div>

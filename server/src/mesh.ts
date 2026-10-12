@@ -29,8 +29,12 @@
  */
 
 import { randomBytes } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { FleetClient, enrollmentFileOf, type FleetClientConfig } from './fleet-client.js';
 import { Identity } from './identity.js';
+import { REVISION_RE } from './revision.js';
 import type { MetricsBucket, MetricsSeries } from './metrics.js';
 import { sanitizeHostStats, type HostStats } from './host.js';
 import type { ServerConfig } from './types.js';
@@ -91,6 +95,15 @@ export interface MeshSnapshot {
   ts: number;
   /** Version handshake facts (display-only, exception-only). */
   version?: string;
+  /**
+   * The git commit this arbiter's code was loaded from (boot revision —
+   * the arbiter twin of the client #49 handshake fact; mesh build-gap,
+   * owner ask 2026-10-12). ADD key: absent = not reported (an arbiter
+   * that predates the key, or one that cannot see its own checkout —
+   * urza's git-less container only reports it when the deploy bakes
+   * IDLEFILL_REVISION into the run). Lowercase hex, short or full.
+   */
+  revision?: string;
   /** The publisher's ed25519 public key (#55 D1) — ADD key; absent = unset. */
   public_key?: string;
   /**
@@ -138,6 +151,20 @@ export interface PeerView {
   error?: string;
   /** The last snapshot pulled (null = never succeeded). */
   snapshot: MeshSnapshot | null;
+  /**
+   * The git gap between this peer's reported boot revision and THIS
+   * machine's checkout (mesh build-gap, owner ask 2026-10-12). ADD key —
+   * present when BOTH sides reported a revision and this side has one to
+   * compare with; absent = nothing provable (either side never reported,
+   * or this host has no boot revision of its own). `same` RIDES the wire
+   * ("up to date" is the confirmation the counter exists for); the
+   * `unknown` relation = both sides named a sha this checkout has never
+   * seen or cannot count (a git-less observer, or different histories) —
+   * "builds differ", never a fake number. Counted by `git rev-list` on
+   * the LOCAL checkout, so "N behind" means N commits between the two
+   * builds, not N behind origin.
+   */
+  build?: BuildGap;
   /**
    * #79 D3: facts about this peer's EPHEMERAL remote-metrics pull cache —
    * an ADD key, present only after the first successful remote metrics
@@ -532,6 +559,77 @@ interface PeerEntry {
   rosterOrigin?: boolean;
 }
 
+// ---------------------------------------------------------------------------
+// The build-gap layer (owner ask 2026-10-12) — "how far behind is that
+// machine?" The publisher reports its boot revision (buildMeshSnapshot /
+// sanitizeSnapshot); the OBSERVER counts the git gap against its own
+// checkout with `git rev-list --count <peer>..<local>` / `<local>..<peer>`.
+// The count is a fact of LOCAL history — never fetched, never remote.
+// ---------------------------------------------------------------------------
+
+/**
+ * The relation between a peer's reported build and this machine's:
+ * `behind` = the peer's build lacks N of this checkout's commits (the
+ * "needs an update" word); `ahead` = the peer runs NEWER code than this
+ * machine (the honest mirror — this machine is the stale one);
+ * `diverged` = both gaps nonzero (neither is a fast-forward of the
+ * other); `unknown` = both sides named a sha this checkout cannot
+ * order (never seen — no fake number). `same` is decided here too: the
+ * federation OMITS the whole `build` key for it (exception-only).
+ */
+export interface BuildGap {
+  relation: 'same' | 'behind' | 'ahead' | 'diverged' | 'unknown';
+  behind?: number;
+  ahead?: number;
+}
+
+/** Count the commits in a `<sha>..<sha>` range on the local checkout.
+ *  Injectable for tests; null = not countable here (no git / unknown object). */
+export type GapCounter = (range: string) => number | null;
+
+const RANGE_RE = /^[0-9a-f]{4,64}\.\.[0-9a-f]{4,64}$/;
+
+/**
+ * The decision table (pure over an injected counter). Prefix equality
+ * (>= 7 hex, one sha a prefix of the other) counts as `same` without
+ * any git call — the full-sha-vs-baked-short-sha case (a container
+ * reports the deploy's `--short` sha, a checkout reports the full one).
+ */
+export function decideBuildGap(local: string, peer: string, count: GapCounter): BuildGap {
+  const a = local.toLowerCase();
+  const b = peer.toLowerCase();
+  if (!REVISION_RE.test(a) || !REVISION_RE.test(b)) return { relation: 'unknown' };
+  if (a === b || (Math.min(a.length, b.length) >= 7 && (a.startsWith(b) || b.startsWith(a)))) {
+    return { relation: 'same' };
+  }
+  const behind = count(`${b}..${a}`);
+  const ahead = count(`${a}..${b}`);
+  if (behind === null || ahead === null) return { relation: 'unknown' };
+  if (behind === 0 && ahead === 0) return { relation: 'same' };
+  if (behind > 0 && ahead === 0) return { relation: 'behind', behind };
+  if (ahead > 0 && behind === 0) return { relation: 'ahead', ahead };
+  return { relation: 'diverged', behind, ahead };
+}
+
+/** The real counter: `git -C <repoDir> rev-list --count <range>`, no
+ *  shell, strict shape gate before anything reaches git's argv. Any
+ *  failure (no git, not a repo, unknown object, non-numeric answer) is
+ *  a null — the caller answers `unknown`, never a fake zero. */
+export function makeRevListCounter(repoDir: string, gitPath: string = 'git'): GapCounter {
+  return (range) => {
+    if (!RANGE_RE.test(range)) return null;
+    let r: ReturnType<typeof spawnSync>;
+    try {
+      r = spawnSync(gitPath, ['-C', repoDir, 'rev-list', '--count', range], { encoding: 'utf-8', timeout: 5000 });
+    } catch {
+      return null;
+    }
+    if (r.error || r.status !== 0) return null;
+    const n = Number.parseInt(String(r.stdout ?? '').trim(), 10);
+    return Number.isFinite(n) && n >= 0 ? n : null;
+  };
+}
+
 /** Optional federation wiring (all absent = byte-for-byte the old behavior). */
 export interface FederationOptions {
   /** The LOCAL instance id (for the roster edge fill). Absent = no fill. */
@@ -550,6 +648,12 @@ export interface FederationOptions {
   localPublicKey?: () => string;
   /** The remote-metrics fetcher (#79 D2). Absent = `makeRealRemoteMetricsFetcher`. */
   remoteMetricsFetcher?: RemoteMetricsFetcher;
+  /** THIS instance's boot revision (the build-gap observer side, owner ask
+   *  2026-10-12). Absent / undefined result = NO `build` key on any row. */
+  localRevision?: () => string | undefined;
+  /** Range counter for the build gap (tests inject a decision table).
+   *  Absent = `makeRevListCounter` on the checkout this module runs from. */
+  revList?: GapCounter;
 }
 
 export class MeshFederation {
@@ -560,6 +664,15 @@ export class MeshFederation {
   private readonly heartbeatSender?: HeartbeatSender;
   private readonly localPublicKey?: () => string;
   private readonly remoteFetcher: RemoteMetricsFetcher;
+  /** THIS instance's boot revision (build-gap observer side). Absent = no
+   *  `build` key on any peer row, ever. */
+  private readonly localRevision?: () => string | undefined;
+  /** The local range counter (git rev-list) for the build gap. */
+  private readonly revList: GapCounter;
+  /** (local|peer) -> gap, so the git calls run once per revision PAIR,
+   *  not once per view. A restart clears it; a machine update changes the
+   *  local side, so the pairs re-count naturally. */
+  private readonly gapCache = new Map<string, BuildGap>();
   private readonly peers = new Map<string, PeerEntry>();
   /**
    * The EPHEMERAL remote-metrics pull cache (#79 D3): one entry per
@@ -588,6 +701,12 @@ export class MeshFederation {
     this.heartbeatSender = opts.heartbeatSender;
     this.localPublicKey = opts.localPublicKey;
     this.remoteFetcher = opts.remoteMetricsFetcher ?? makeRealRemoteMetricsFetcher();
+    this.localRevision = opts.localRevision;
+    // The default counter counts on the checkout this module runs from
+    // (server/src or server/dist -> the repo root, the revision.ts
+    // anchor). A git-less host yields null for every range — the gap
+    // answers `unknown`, never a fake number.
+    this.revList = opts.revList ?? makeRevListCounter(join(dirname(fileURLToPath(import.meta.url)), '..', '..'));
     for (const p of normalizePeerRows(cfg.mesh_peers ?? [])) {
       if (!this.peers.has(p.url)) {
         this.peers.set(p.url, { url: p.url, name: p.name, instanceId: null, lastOk: null, lastError: null, snapshot: null });
@@ -858,22 +977,55 @@ export class MeshFederation {
 
   /** The merged peer view for /api/state (local machine is NOT a row here). */
   view(now: number): PeerView[] {
-    return [...this.peers.values()].map((p) => ({
-      url: p.url,
-      name: p.name ?? p.snapshot?.name ?? hostOf(p.url),
-      instance_id: p.instanceId,
-      online: p.lastOk !== null && now - p.lastOk < PEER_STALE_MS,
-      fetch_age_s: p.lastOk === null ? null : Math.max(0, Math.round((now - p.lastOk) / 1000)),
-      ...(p.lastError ? { error: p.lastError } : {}),
-      snapshot: p.snapshot,
-      // #79 D3: the EPHEMERAL remote-metrics cache view for this peer —
-      // ADD key, absent until the first successful pull. Counts only: no
-      // line ever rides the view (the non-persistence clause, and the
-      // coarse-by-construction rule for what /api/state carries).
-      ...(this.metricsCache.size > 0 && this.cacheEntriesFor(p.url) > 0
-        ? { metrics_cache: { entries: this.cacheEntriesFor(p.url), last_pulled_at: this.lastMetricsPullAt.get(p.url) ?? now } }
-        : {}),
-    }));
+    return [...this.peers.values()].map((p) => {
+      const build = this.buildGapFor(p.snapshot);
+      return {
+        url: p.url,
+        name: p.name ?? p.snapshot?.name ?? hostOf(p.url),
+        instance_id: p.instanceId,
+        online: p.lastOk !== null && now - p.lastOk < PEER_STALE_MS,
+        fetch_age_s: p.lastOk === null ? null : Math.max(0, Math.round((now - p.lastOk) / 1000)),
+        ...(p.lastError ? { error: p.lastError } : {}),
+        snapshot: p.snapshot,
+        // The build gap (owner ask 2026-10-12) — ADD key: absent only
+        // when nothing is provable (either side never reported a build,
+        // or this side has no boot revision of its own). `same` rides the
+        // wire — "up to date" is an answer, not a silence.
+        ...(build ? { build } : {}),
+        // #79 D3: the EPHEMERAL remote-metrics cache view for this peer —
+        // ADD key, absent until the first successful pull. Counts only: no
+        // line ever rides the view (the non-persistence clause, and the
+        // coarse-by-construction rule for what /api/state carries).
+        ...(this.metricsCache.size > 0 && this.cacheEntriesFor(p.url) > 0
+          ? { metrics_cache: { entries: this.cacheEntriesFor(p.url), last_pulled_at: this.lastMetricsPullAt.get(p.url) ?? now } }
+          : {}),
+      };
+    });
+  }
+
+  /**
+   * The git gap between a peer's reported boot revision and THIS
+   * instance's, counted on the local checkout and cached per revision
+   * pair (the git calls run once per pair, not per view; a restart or a
+   * machine update changes a side and the pair re-counts). `same` rides
+   * the wire — an up-to-date peer is a confirmed answer, not a silence.
+   * No peer revision, or no local boot revision to compare with = null:
+   * the key is absent, never a fake zero.
+   */
+  private buildGapFor(snapshot: MeshSnapshot | null): BuildGap | null {
+    const peer = snapshot?.revision;
+    const reader = this.localRevision;
+    if (!peer || !reader) return null;
+    const local = reader();
+    if (!local) return null;
+    const key = `${local}|${peer}`;
+    let gap = this.gapCache.get(key);
+    if (gap === undefined) {
+      gap = decideBuildGap(local, peer, this.revList);
+      if (this.gapCache.size >= 64) this.gapCache.clear();
+      this.gapCache.set(key, gap);
+    }
+    return gap;
   }
 
   /**
@@ -976,6 +1128,8 @@ export function buildMeshSnapshot(
   fleetId?: string,
   /** Coarse host counters (host.ts) — ADD key, absent = not published. */
   host?: HostStats,
+  /** Boot revision (revision.ts) — ADD key, absent = not reported. */
+  revision?: string,
 ): MeshSnapshot {
   const snap: MeshSnapshot = {
     instance_id: instanceId,
@@ -1004,6 +1158,10 @@ export function buildMeshSnapshot(
   // ABSENT otherwise; a pre-key peer's snapshot parses byte-for-byte
   // unchanged on this side.
   if (host) snap.host = host;
+  // Boot revision (the build-gap publisher side): ADD key — present when
+  // this process knows its own build, ABSENT otherwise; old readers ignore
+  // it. Shape-gated: only a real hex sha rides the wire, never garbage.
+  if (typeof revision === 'string' && REVISION_RE.test(revision)) snap.revision = revision.slice(0, 64);
   return snap;
 }
 
@@ -1057,6 +1215,9 @@ export function sanitizeSnapshot(raw: unknown): MeshSnapshot | null {
   // zero). Absent on pre-key peers.
   const host = sanitizeHostStats(r.host);
   if (host) out.host = host;
+  // Boot revision — ADD key, untrusted input: strict shape gate (a hex
+  // sha or nothing — a hostile peer cannot plant a fake build identity).
+  if (typeof r.revision === 'string' && REVISION_RE.test(r.revision)) out.revision = r.revision.slice(0, 64);
   return out;
 }
 

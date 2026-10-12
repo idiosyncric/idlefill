@@ -451,7 +451,25 @@ export type MeshPeerSnapshot = {
   sessions: number;
   active_leases: number;
   version?: string;
+  // The git commit THAT machine's arbiter booted from (ADD key; absent on
+  // a peer that predates the key or cannot see its own build — never a
+  // fake sha).
+  revision?: string;
   host?: HostStats;
+};
+
+// The build gap the LOCAL arbiter counts for one peer (ADD key on
+// mesh.peers rows, owner ask 2026-10-12): git rev-list between the
+// peer's reported build and this machine's checkout. Exception-only —
+// ABSENT when the builds match, when either side never reported one, or
+// when this host has no git to count with. `behind` = that peer's build
+// lacks N commits this machine already runs (the "needs an update"
+// word); `ahead` = it runs newer code than here; `unknown` = both sides
+// named a build this checkout cannot order — builds differ, no number.
+export type MeshBuildGap = {
+  relation: "same" | "behind" | "ahead" | "diverged" | "unknown";
+  behind?: number;
+  ahead?: number;
 };
 
 // One machine-update intent (mesh-update.md D2) — the coarse block
@@ -477,6 +495,9 @@ export type MeshPeer = {
   fetch_age_s: number | null;
   error?: string;
   snapshot: MeshPeerSnapshot | null;
+  // The local build gap (ADD key; absent = nothing to say — see
+  // MeshBuildGap). Never a number the local checkout cannot prove.
+  build?: MeshBuildGap;
   // mesh-update.md D4: the LOCAL edge store's role for this peer (ADD keys,
   // absent when the edge does not say so). `i_control` = this machine may
   // relay control to THAT peer — the ONLY condition under which the

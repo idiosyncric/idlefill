@@ -83,12 +83,13 @@ UID_GID="$(id -u):$(id -g)"
 echo "==> swapping container (previous image: ${PREV:-none})"
 docker stop "$CONTAINER" >/dev/null 2>&1 || true
 docker rm "$CONTAINER" >/dev/null 2>&1 || true
-docker run -d --name "$CONTAINER" --restart unless-stopped --network host \
-  --user "$UID_GID" \
-  -v "$HOME_DIR/data:/data" \
-  -v "$CONFIG:/app/config.json:ro" \
-  -e IDLEFILL_STATE=/data/state.json \
-  "$TAG" >/dev/null
+  docker run -d --name "$CONTAINER" --restart unless-stopped --network host \
+    --user "$UID_GID" \
+    -v "$HOME_DIR/data:/data" \
+    -v "$CONFIG:/app/config.json:ro" \
+    -e IDLEFILL_STATE=/data/state.json \
+    -e IDLEFILL_REVISION="${TAG##*:}" \
+    "$TAG" >/dev/null
 
 # --- healthcheck + rollback -------------------------------------------------
 echo "==> healthcheck $HEALTH_URL (up to ~25s)"
@@ -125,6 +126,7 @@ if [ "$ok" -ne 1 ]; then
       -v "$HOME_DIR/data:/data" \
       -e "IDLEFILL_CONFIG=$CONFIG_JSON" \
       -e IDLEFILL_STATE=/data/state.json \
+      -e IDLEFILL_REVISION="${PREV##*:}" \
       "$PREV" >/dev/null
     echo "rolled back to $PREV — inspect: docker logs --tail 50 $CONTAINER" >&2
   else

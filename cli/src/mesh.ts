@@ -256,8 +256,11 @@ export interface PeerViewRow {
   online: boolean;
   fetch_age_s: number | null;
   error?: string;
+  /** The local build gap for this peer (ADD key; absent = nothing to say). */
+  build?: { relation: 'same' | 'behind' | 'ahead' | 'diverged' | 'unknown'; behind?: number; ahead?: number };
   snapshot?: {
     name?: string;
+    revision?: string;
     servers?: { name: string; idle: boolean; idle_for_s: number | null; degraded: boolean }[];
     queue_depth?: number;
     sessions?: number;
@@ -286,11 +289,38 @@ export function peerStatusLine(p: PeerViewRow): string {
   return `${base} — the last snapshot is not shown as current`;
 }
 
+/** The one-line honesty note for one peer's build (the local arbiter
+ *  counted it — git rev-list between the two machines' boot revisions).
+ *  null = the peer never reported a build (an old arbiter, or one that
+ *  cannot see its own checkout) — say nothing, never a fake zero. */
+export function buildGapLine(p: PeerViewRow): string | null {
+  const rev = p.snapshot?.revision;
+  if (!rev) return null;
+  const short = rev.slice(0, 7);
+  const g = p.build;
+  if (!g) return `build ${short}`;
+  switch (g.relation) {
+    case 'same':
+      return `build ${short} · up to date`;
+    case 'behind':
+      return `build ${short} · ${g.behind ?? 0} behind this machine`;
+    case 'ahead':
+      return `build ${short} · ${g.ahead ?? 0} ahead of this machine`;
+    case 'diverged':
+      return `build ${short} · builds diverged`;
+    case 'unknown':
+      return `build ${short} · builds differ`;
+  }
+  return `build ${short}`;
+}
+
 export function renderPeerRows(peers: PeerViewRow[]): string[] {
   const out: string[] = [];
   for (const p of peers) {
     const id = p.instance_id ? `  [${p.instance_id}]` : '';
     out.push(`${p.name}  ${p.url}${id}`);
+    const bl = buildGapLine(p);
+    if (bl) out.push(`  ${bl}`);
     for (const line of peerStatusLine(p).split('\n')) out.push(`  ${line}`);
   }
   return out;

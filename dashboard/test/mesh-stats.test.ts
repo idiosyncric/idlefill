@@ -7,7 +7,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { freshPeers, hostLine, intentWord, meshTiles, peerVerdict, relayOutcome } from "../src/lib/mesh-stats.js";
+import { buildGapLine, freshPeers, hostLine, intentWord, meshTiles, peerVerdict, relayOutcome } from "../src/lib/mesh-stats.js";
 import type { MeshPeer, UpdateIntent } from "../src/lib/api.js";
 
 function peer(over: Record<string, unknown> = {}): MeshPeer {
@@ -152,4 +152,30 @@ test("relayOutcome passes the peer's answer through named", () => {
   assert.equal(denied.note, "the signature did not verify");
   const raw = relayOutcome({ status: 500, target: {} });
   assert.equal(raw.label, "HTTP 500", "a body-less answer is still a named status, never a silent success");
+});
+
+// ---------------------------------------------------------------------------
+// The build gap (owner ask 2026-10-12) — the card's "how far behind is
+// that machine?" line. The number is the LOCAL arbiter's git count; the
+// words stay honest when no number is provable.
+// ---------------------------------------------------------------------------
+
+test("buildGapLine — the counter word, and the honest words when counting is impossible", () => {
+  const withRev = (over: Record<string, unknown> = {}): MeshPeer =>
+    peer({ snapshot: { ...(peer().snapshot as object), revision: "0f3a9c1e2b4d6a8c" }, ...over });
+  assert.equal(buildGapLine(peer()), null, "no revision reported — no line, never a fake build");
+  assert.equal(buildGapLine(withRev())?.text, "build 0f3a9c1", "sha alone — no local count, no gap word");
+  assert.deepEqual(
+    buildGapLine(withRev({ build: { relation: "behind", behind: 3 } })),
+    { text: "build 0f3a9c1 · 3 behind", tone: "warn" },
+    "the update word is warn — this is the whole point of the surface",
+  );
+  assert.deepEqual(buildGapLine(withRev({ build: { relation: "same" } })), { text: "build 0f3a9c1 · up to date", tone: "dim" });
+  assert.deepEqual(
+    buildGapLine(withRev({ build: { relation: "ahead", ahead: 1 } })),
+    { text: "build 0f3a9c1 · 1 ahead of here", tone: "dim" },
+    "the honest mirror: the viewer's machine is the stale one",
+  );
+  assert.deepEqual(buildGapLine(withRev({ build: { relation: "diverged", behind: 2, ahead: 5 } })), { text: "build 0f3a9c1 · builds diverged", tone: "warn" });
+  assert.deepEqual(buildGapLine(withRev({ build: { relation: "unknown" } })), { text: "build 0f3a9c1 · builds differ", tone: "dim" }, "no number when none is provable");
 });

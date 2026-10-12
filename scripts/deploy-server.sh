@@ -150,6 +150,7 @@ docker run -d --name "$CONTAINER" --restart unless-stopped --network host \
   -v "$REMOTE_HOME/data:/data" \
   -v "$REMOTE_HOME/config.json:/app/config.json:ro" \
   -e IDLEFILL_STATE=/data/state.json \
+  -e IDLEFILL_REVISION="${TAG##*:}" \
   "$TAG" >/dev/null
 REMOTE
 
@@ -188,6 +189,7 @@ docker run -d --name "$CONTAINER" --restart unless-stopped --network host \
   -v "$REMOTE_HOME/data:/data" \
   -e "IDLEFILL_CONFIG=$CONFIG_JSON" \
   -e IDLEFILL_STATE=/data/state.json \
+  -e IDLEFILL_REVISION="${PREV##*:}" \
   "$PREV" >/dev/null
 REMOTE
   echo "rolled back to ${PREV:-?} — inspect: ssh $URZA 'docker logs --tail 50 $CONTAINER'" >&2
