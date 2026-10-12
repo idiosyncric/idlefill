@@ -27,6 +27,31 @@ export function pidExists(...needles) {
 }
 
 /**
+ * @param {number} pgid — the process group to probe (a detached child's
+ * group id IS its pid).
+ * @returns {boolean} true when ANY live process still sits in that group.
+ * Hermetic by construction: it can never see another test's tree — the
+ * substring probe above matches every `sleep 30` on the machine, which
+ * collides once top-level tests run concurrently (the Node 26 test runner
+ * does; the Node 22 one does not).
+ */
+export function groupAlive(pgid) {
+  try {
+    const out = execFileSync('ps', ['-eo', 'pid,pgid,command'], { encoding: 'utf-8', timeout: 5000 });
+    for (const line of out.split('\n')) {
+      const m = line.trim().match(/^(\d+)\s+(\d+)\s/);
+      if (!m) continue;
+      if (Number(m[2]) !== pgid) continue;
+      if (line.includes('ps -eo')) continue; // the probe itself
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * @param {number} pid
  * @param {string} sig
  * @returns {void}

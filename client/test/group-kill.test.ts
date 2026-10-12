@@ -17,7 +17,7 @@ import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { runExecutor } from '../src/index.js';
 // @ts-expect-error plain-JS helper (no types) — ps-based process probes
-import { pidExists } from './pid-utils.js';
+import { groupAlive } from './pid-utils.js';
 
 function waitFor(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -42,14 +42,16 @@ test('group SIGKILL reaches the bash wrapper AND its forked child (no orphans)',
   assert.ok(outcome.signal === 'SIGKILL' || outcome.exitCode !== 0, `the child was killed, got ${JSON.stringify(outcome)}`);
 
   // The regression: after a group SIGKILL, NOTHING of the tree is alive.
-  // Poll briefly for any leftover `sleep 30` process.
+  // The probe is PGID-scoped (hermetic): a survivor of the killed tree
+  // still carries pgid == the detached child's pid; no other test's tree
+  // can match, and nothing on the rest of the machine is watched.
   let orphaned = false;
   for (let i = 0; i < 10; i++) {
     if (existsSync(marker)) {
       orphaned = true; // bash survived (it would have written the marker)
       break;
     }
-    if (pidExists('sleep', '30')) {
+    if (groupAlive(ex.child.pid!)) {
       orphaned = true;
       break;
     }
