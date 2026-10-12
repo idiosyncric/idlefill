@@ -585,12 +585,20 @@ The manual path is `./update.sh` — one command, fail-closed at every step:
 1. refuse a checkout with uncommitted tracked changes;
 2. fast-forward `main` (`--no-pull` skips the pull and rebuilds the
    current commit — e.g. a pinned checkout);
-3. `tauri/build.sh` with `IDLEFILL_BUILD_MARKER=<short sha>` so the
+3. rebuild the `cli/` workspace (`npm run build --workspace cli`) so a
+   pulled `cli/src` change can never run against a stale dist under the
+   PATH shim;
+4. `tauri/build.sh` with `IDLEFILL_BUILD_MARKER=<short sha>` so the
    bundle proves its own origin;
-4. stage the bundle into `/Applications/Idlefill.app` (a rename swap —
+5. `scripts/install-cli.sh` puts the `idlefill` operator CLI on PATH —
+   a linked shim at `~/.local/bin/idlefill` exec'ing THIS checkout's
+   `cli/dist` (owner ask 2026-10-12; the CLI stays out of the bundle,
+   cli.md D8 + amendment). It runs BEFORE the app: a refusal aborts
+   with `/Applications` still untouched;
+6. stage the bundle into `/Applications/Idlefill.app` (a rename swap —
    an rsync/cp over a running app's binary fails with ETXTBSY, a rename
    never does; the staged copy must pass `--version` before it lands);
-5. `tauri/install.sh --reinstall` re-pointed at the `/Applications`
+7. `tauri/install.sh --reinstall` re-pointed at the `/Applications`
    copy, and settle on the PROCESS: the label is verified live only when
    a process running the NEW binary path exists (launchd's bootout is
    async — a `launchctl print` check at the drain window reads a doomed
@@ -878,6 +886,14 @@ idlefill agent  [list] | connect <profile> | disconnect <profile>
 idlefill daemon status | start | stop | restart | logs | diagnose
 idlefill control clients | pause | force | clear | projects | servers …
 ```
+
+**On PATH** (owner ask 2026-10-12): `./update.sh` rebuilds the `cli/`
+workspace and runs `scripts/install-cli.sh`, leaving a linked shim at
+`~/.local/bin/idlefill` that execs THIS checkout's `cli/dist` — the CLI
+still stays OUT of the Tauri bundle (cli.md D8 + dated amendment). The
+shim re-points for free on every update; `scripts/install-cli.sh` is the
+standalone entry (also for fresh checkouts): idempotent, render-before-
+decide, and it refuses by name to touch an `idlefill` it did not render.
 
 Standing rules: the token is read at runtime from the gitignored config — it
 never appears on a command line; every read takes `--json`; failures name

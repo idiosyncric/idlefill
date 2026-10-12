@@ -10,12 +10,18 @@
 #   1. refuse to move a checkout with uncommitted tracked changes
 #   2. fast-forward main (--no-pull skips steps 1-2: rebuild at the current
 #      commit, e.g. after a manual checkout/pin)
-#   3. tauri/build.sh with IDLEFILL_BUILD_MARKER=<short sha> so
+#   3. rebuild the cli/ workspace so a pulled cli/src change can never ship
+#      a stale dist under the PATH shim
+#   4. tauri/build.sh with IDLEFILL_BUILD_MARKER=<short sha> so
 #      `idlefill-app --version` reports the commit the bundle was built from
 #      (build.sh's own gate 4 byte-verifies the bundle's Info.plist)
-#   4. rsync the bundle to /Applications/Idlefill.app so the app shows in
+#   5. scripts/install-cli.sh — the `idlefill` operator CLI shim on PATH
+#      (~/.local/bin, linked to THIS checkout's cli/dist; owner ask
+#      2026-10-12, cli.md D8 amendment). Runs BEFORE the app is touched:
+#      a shim refusal aborts while /Applications is still untouched.
+#   6. rsync the bundle to /Applications/Idlefill.app so the app shows in
 #      Launchpad/Spotlight/Finder like a normal Mac app
-#   5. tauri/install.sh --reinstall with IDLEFILL_APP_PROG pointed at the
+#   7. tauri/install.sh --reinstall with IDLEFILL_APP_PROG pointed at the
 #      /Applications copy (render-before-bootout fail-closed, then bootstrap;
 #      touches ONLY the com.sam.idlefill.app label — never the daemon's or
 #      the arbiter's)
@@ -40,9 +46,21 @@ if [ "$PULL" -eq 1 ]; then
   git pull --ff-only
 fi
 
+# Rebuild the cli/ workspace right after the pull: the PATH shim (step 5)
+# execs THIS checkout's cli/dist, so a pulled cli/src change must never run
+# against a stale dist. NODE_ENV= clears the production trap (AGENTS.md).
+echo "==> rebuilding the cli/ workspace"
+NODE_ENV= npm run build --workspace cli
+
 MARKER="$(git rev-parse --short HEAD)"
 echo "==> building Idlefill.app at $MARKER"
 IDLEFILL_BUILD_MARKER="$MARKER" bash tauri/build.sh
+
+# The operator CLI ships with the app install (owner ask 2026-10-12): the
+# linked shim goes onto PATH BEFORE anything in /Applications is touched —
+# a refusal there aborts fail-closed with the app still untouched.
+echo "==> installing the idlefill CLI shim on PATH"
+bash scripts/install-cli.sh
 
 # Stage the bundle in /Applications so the app sits in the Applications
 # folder like a normal Mac app (Launchpad/Spotlight/Finder). The swap is a

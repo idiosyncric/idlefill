@@ -173,6 +173,15 @@ grants, exactly as the ownership rule intends.
 - No Rust CLI (D1 rationale); no CLI inside the Tauri bundle; no SaaS auth
   planes; no `mesh update <peer>` (the intent plane stays the dashboard's for
   now); no new dashboard surfaces; no changes to lease/idle semantics.
+  - **Amendment (dated 2026-10-12, owner ask "make sure the CLI is included
+    when installing the app"):** the lock STANDS — the CLI stays OUT of the
+    Tauri bundle. The ask is met at the install layer: `update.sh` rebuilds
+    the `cli/` workspace and runs `scripts/install-cli.sh`, which writes a
+    linked shim `~/.local/bin/idlefill` exec'ing this checkout's
+    `cli/dist/index.js`. Build-from-checkout is the product model
+    (tauri-cutover D7), so the linked shim updates for free on every
+    `./update.sh`; the installer is idempotent and refuses by name to
+    overwrite anything it did not render.
 - MCP stays the scheduling plane (README "Scheduling work") — the CLI is the
   OPERATOR plane; they share the arbiter API, not each other's job.
 
