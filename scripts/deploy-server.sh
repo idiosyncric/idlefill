@@ -127,8 +127,11 @@ tar -xf "$REMOTE_HOME/server-src-$SHA.tar" -C "$build"
 # git archive wrote server/ + dashboard/dist/ side by side; the docker
 # context is server/, so move the dashboard inside it.
 [ -f "$build/dashboard/dist/index.html" ] || { echo "dashboard/dist missing from the archive — rebuild + commit it" >&2; exit 1; }
-mkdir -p "$build/server/dashboard"
+# mv RENAMES into the absent destination. A mkdir -p BEFORE the mv would make
+# mv move dashboard INSIDE server/dashboard (double-nested dist, COPY never
+# finds it — the bug that pinned urza at a pre-cutover image).
 mv "$build/dashboard" "$build/server/dashboard"
+[ -f "$build/server/dashboard/dist/index.html" ] || { echo "staging failed: server/dashboard/dist/index.html absent in the build context" >&2; exit 1; }
 docker build -q -t "$TAG" "$build/server"
 rm -rf "$build" "$REMOTE_HOME/server-src-$SHA.tar"
 echo "built $TAG"
