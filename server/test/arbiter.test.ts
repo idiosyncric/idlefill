@@ -23,6 +23,7 @@ import { join } from 'node:path';
 import { Arbiter, utcDay, computeLeaseTtl } from '../src/arbiter.js';
 import { srcKey } from '../src/idle.js';
 import { StateStore } from '../src/state.js';
+import type { ProbedModel } from '../src/catalog.js';
 import type { ActivityEntry, IdleSignal, ServerConfig } from '../src/types.js';
 
 const T0 = Date.parse('2026-09-25T12:00:00Z'); // UTC noon
@@ -1327,7 +1328,7 @@ test('results: projectResults orders newest-first and honors limit + job_id filt
  * cycle with the given per-row model lists (an entry omitted or null = the
  * probe FAILS for that row).
  */
-function makeAliasHarness(probeMap: Record<string, string[] | null> = {}) {
+function makeAliasHarness(probeMap: Record<string, (string | ProbedModel)[] | null> = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'idlefill-alias-'));
   const store = new StateStore(join(dir, 'state.json'));
   const cfg: ServerConfig = {
@@ -1352,7 +1353,7 @@ function makeAliasHarness(probeMap: Record<string, string[] | null> = {}) {
       const key = url.includes('alpha') ? 'alpha' : url.includes('beta') ? 'beta' : 'watched';
       const list = probeMap[key];
       if (list === undefined || list === null) throw new Error('probe refused');
-      return list;
+      return list.map((e) => (typeof e === 'string' ? { name: e } : e));
     },
   });
   const a = arbiter.upsertServerConnection({ name: 'alpha', url: 'http://alpha.local:8080', activity_path: '', auth_token: 'tok-alpha', models: ['engine-a-id'] });
@@ -1364,7 +1365,7 @@ function makeAliasHarness(probeMap: Record<string, string[] | null> = {}) {
 }
 
 // probeCatalog takes no argument; this alias helper drives the shared map.
-function aliasProbe(arbiter: Arbiter, lists: Record<string, string[] | null>, map: Record<string, string[] | null>) {
+function aliasProbe(arbiter: Arbiter, lists: Record<string, (string | ProbedModel)[] | null>, map: Record<string, (string | ProbedModel)[] | null>) {
   for (const k of ['alpha', 'beta', 'watched']) delete map[k];
   Object.assign(map, lists);
   return arbiter.probeCatalog();
@@ -1475,6 +1476,52 @@ test('#66 winner rule (D4): stored pin wins; absent pin / pin row gone / pin pai
     const block = h.arbiter.modelAliases();
     assert.equal(block.length, 1, 'the alias survives the dead pin');
     assert.equal(block[0]!.server_id, h.idB, 'a pin pointing at a GONE row falls through to the surviving pair');
+  } finally {
+    rmSync(h.dir, { recursive: true, force: true });
+  }
+});
+
+// #87 D2: the winner pair's OBSERVED capabilities ride the published entry
+// as ADD keys — capabilities follow the winner (never a losing pair), and a
+// 'declared' winner omits every capability key.
+test('#87 alias block: winner caps ride as ADD keys — they follow the winner and omit on declared', async () => {
+  const map: Record<string, (string | ProbedModel)[] | null> = {};
+  const h = makeAliasHarness(map);
+  try {
+    const put = h.arbiter.putModelAlias({
+      alias: 'Flagship',
+      pairs: [{ server_id: h.idA, model: 'engine-a-id' }, { server_id: h.idB, model: 'engine-b-id' }],
+      pin: h.idA,
+    });
+    assert.ok(put.ok, JSON.stringify(put));
+
+    await aliasProbe(h.arbiter, {
+      alpha: [{ name: 'engine-a-id', context_length: 262144, input_modalities: ['text', 'image'], output_modalities: ['text'] }],
+      beta: [{ name: 'engine-b-id', context_length: 131072, input_modalities: ['text'] }],
+    }, map);
+    let entry = h.arbiter.modelAliases()[0]!;
+    assert.equal(entry.server_id, h.idA);
+    assert.equal(entry.context_length, 262144, 'the WINNER pair caps publish');
+    assert.deepEqual(entry.input_modalities, ['text', 'image']);
+    assert.deepEqual(entry.output_modalities, ['text']);
+    assert.ok(!JSON.stringify(h.arbiter.modelAliases()).includes('131072'), 'a LOSING pair never leaks its caps into the publish');
+
+    // Pin pair vanishes from a successful probe: the alias re-routes to beta
+    // and the caps FOLLOW the winner (never stale from the old winner).
+    await aliasProbe(h.arbiter, {
+      alpha: ['something-else'],
+      beta: [{ name: 'engine-b-id', context_length: 131072, input_modalities: ['text'] }],
+    }, map);
+    entry = h.arbiter.modelAliases()[0]!;
+    assert.equal(entry.server_id, h.idB);
+    assert.equal(entry.context_length, 131072);
+    assert.deepEqual(entry.input_modalities, ['text']);
+
+    // Both probes blocked: the alias publishes 'declared' — NO capability keys.
+    await aliasProbe(h.arbiter, {}, map);
+    entry = h.arbiter.modelAliases()[0]!;
+    assert.equal(entry.catalog_source, 'declared');
+    assert.ok(!('context_length' in entry) && !('input_modalities' in entry) && !('output_modalities' in entry), 'declared winners claim no capability');
   } finally {
     rmSync(h.dir, { recursive: true, force: true });
   }

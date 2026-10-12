@@ -40,7 +40,7 @@ import {
   type MetricPoint,
   type EngineGroup,
 } from "@/lib/api";
-import { ago, fmt, liveWord, probeWord, PROVIDER_CHOICES } from "@/lib/format";
+import { ago, fmt, fmtCtx, liveWord, probeWord, PROVIDER_CHOICES } from "@/lib/format";
 import { loadRead, LOAD_FRESHNESS_DEFAULT_S } from "@/lib/load-read";
 
 const METRICS_24H = 24 * 3600_000; // the card's sparkline window
@@ -626,17 +626,34 @@ function ModelList({ s, now }: { s: ServerRow; now: number }) {
   }
   return (
     <div className="flex flex-wrap gap-1">
-      {s.models.map((m) => (
-        <Badge
-          key={m.name}
-          variant="outline"
-          title={s.model_source === "probed" ? "advertised via /v1/models" : "operator-declared (the probe never answered)"}
-          className="max-w-full gap-1.5 rounded-pill px-2 py-0 text-[11px] font-normal"
-        >
-          {m.running && <span className="size-1.5 rounded-full bg-accent" title="a lease is running on this model" />}
-          <span className="truncate">{m.name}</span>
-        </Badge>
-      ))}
+      {s.models.map((m) => {
+        // #87 D2: capability ADD keys from the probe — appended to the chip
+        // label only when the engine exposed them (never claimed for
+        // declared rows).
+        const mods = (m.input_modalities ?? []).filter((x) => x !== "text");
+        const capsSuffix = [m.context_length !== undefined ? fmtCtx(m.context_length) : null, ...mods]
+          .filter((x): x is string => Boolean(x))
+          .join(" · ");
+        const capsTitle = [
+          m.context_length !== undefined ? `context ${m.context_length}` : null,
+          m.input_modalities ? `inputs: ${m.input_modalities.join(", ")}` : null,
+          m.output_modalities ? `outputs: ${m.output_modalities.join(", ")}` : null,
+        ]
+          .filter(Boolean)
+          .join(" · ");
+        return (
+          <Badge
+            key={m.name}
+            variant="outline"
+            title={[s.model_source === "probed" ? "advertised via /v1/models" : "operator-declared (the probe never answered)", capsTitle].filter(Boolean).join(" — ")}
+            className="max-w-full gap-1.5 rounded-pill px-2 py-0 text-[11px] font-normal"
+          >
+            {m.running && <span className="size-1.5 rounded-full bg-accent" title="a lease is running on this model" />}
+            <span className="truncate">{m.name}</span>
+            {capsSuffix && <span className="shrink-0 text-[10px] text-dim">{capsSuffix}</span>}
+          </Badge>
+        );
+      })}
       {s.model_source === "declared" && (
         <span className="self-center text-[10px] text-dim" title="the /v1/models probe never answered for this row">
           declared, not probed{s.probed_at === null ? "" : ` · last probe ${ago(now - s.probed_at)}`}

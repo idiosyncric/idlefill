@@ -231,6 +231,30 @@ test('#66 /v1/models: the alias list order is the PRIORITY order (first alias fi
   assert.deepEqual(list.data.map((d) => d.id), ['AliasB', 'AliasA'], 'the advertised order is the publish block order, not the creation order');
 });
 
+test('#87 /v1/models: winner caps ride as ADD keys; unknown caps omit; the variant id is NEVER disclosed', async () => {
+  const def = await startEcho('default');
+  cleanup.push(() => def.close());
+  const r = await startRouter({
+    defaultTarget: def.url,
+    catalog: [],
+    aliases: [
+      { name: 'CapAliased', server_id: 'srv-cap', url: 'http://127.0.0.1:7', auth_set: true, engine_model: 'engine-variant-xyz', catalog_source: 'probed', context_length: 262144, input_modalities: ['text', 'image'], output_modalities: ['text'] },
+      { name: 'PlainAliased', server_id: 'srv-plain', url: 'http://127.0.0.1:6', auth_set: false, engine_model: 'engine-plain', catalog_source: 'declared' },
+    ],
+  });
+  const res = await fetch(`${r.base_url}/v1/models`);
+  assert.equal(res.status, 200);
+  const list = (await res.json()) as { data: Record<string, unknown>[] };
+  assert.deepEqual(list.data.map((d) => d.id), ['CapAliased', 'PlainAliased']);
+  const cap = list.data[0]!;
+  assert.equal(cap.context_length, 262144, '#87 D3: observed context advertises');
+  assert.deepEqual(cap.input_modalities, ['text', 'image'], '#87 D3: modalities advertise (the vision question, answered)');
+  assert.deepEqual(cap.output_modalities, ['text']);
+  const plain = list.data[1]!;
+  assert.ok(!('context_length' in plain) && !('input_modalities' in plain) && !('output_modalities' in plain), 'unknown caps are OMITTED, never guessed');
+  assert.ok(!JSON.stringify(list.data).includes('engine-variant-xyz'), 'the variant id the alias routes to stays dashboard-only (D3)');
+});
+
 test('#66 routing: the alias name reaches the WINNER engine with the row Authorization; the alias beats a bare entry of the same name', async () => {
   const def = await startEcho('default');
   const win = await startEcho('engine-A');

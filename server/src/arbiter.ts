@@ -52,7 +52,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import type { IdleDetector } from './idle.js';
 import { activeLeaseExemptIps, defaultActivityPathFor } from './idle.js';
 import type { LoadSignalView } from './load.js';
-import { buildCatalog, modelsProbeUrl, type CatalogEntry, type ModelsFetcher } from './catalog.js';
+import { buildCatalog, modelsProbeUrl, type CatalogEntry, type ModelsFetcher, type ProbedModel } from './catalog.js';
 import { mintInstanceId } from './mesh.js';
 import { Identity } from './identity.js';
 import { EdgeStore, edgesFileOf } from './edges.js';
@@ -264,6 +264,15 @@ export interface ModelAliasEntry {
    * ignores the key; the dashboard renders "re-routed from <pin>").
    */
   fallback?: boolean;
+  /**
+   * #87 D2: capabilities observed on the WINNER pair's engine this tick
+   * (docs/architecture/model-capabilities.md). ADD keys, omitted when
+   * unknown; never taken from a losing pair — the publish must not claim
+   * a capability of an engine it is not routing to.
+   */
+  context_length?: number;
+  input_modalities?: string[];
+  output_modalities?: string[];
 }
 
 /**
@@ -585,7 +594,7 @@ export class Arbiter {
    * replace would. The catalog/alias publishes stay per-tick (their
    * drop-for-the-tick rules are deliberate; this one is not).
    */
-  private lastProbed = new Map<string, string[]>();
+  private lastProbed = new Map<string, ProbedModel[]>();
   /** When each row's /v1/models probe last answered (epoch-ms). In-memory,
    *  like lastProbed — the dashboard's "last seen" for a row's inventory. */
   private lastProbedAt = new Map<string, number>();
@@ -1409,22 +1418,22 @@ export class Arbiter {
    */
   async probeCatalog(): Promise<CatalogEntry[]> {
     const rows = this.store.state.servers;
-    const probed = new Map<string, string[]>();
+    const probed = new Map<string, ProbedModel[]>();
     const nowMs = Date.now();
     if (this.modelsFetcher) {
       const fetcher = this.modelsFetcher;
       await Promise.all(
         rows.map(async (row) => {
           try {
-            const names = await fetcher(modelsProbeUrl(row.url), row.auth_token);
+            const entries = await fetcher(modelsProbeUrl(row.url), row.auth_token);
             // Keep an EMPTY successful list in the map: the alias pass
             // (#66 D2) must tell "probe succeeded, listed nothing" from
             // "probe failed" — a pair on a probe-succeeded row that lacks
             // the id DROPS for the tick, a pair on a probe-FAILED row
             // publishes 'declared'. buildCatalog ignores empty lists (its
             // `length > 0` gate), so the bare-name block is byte-identical.
-            if (Array.isArray(names)) {
-              probed.set(row.id, names);
+            if (Array.isArray(entries)) {
+              probed.set(row.id, entries);
               this.lastProbedAt.set(row.id, nowMs);
             }
           } catch {
@@ -1534,10 +1543,13 @@ export class Arbiter {
    * The per-tick pair verdicts also land in `aliasPairStates` for the
    * dashboard read (`GET /api/aliases`) — exception-only markers.
    */
-  private buildAliasBlock(rows: readonly ServerConnection[], probed: ReadonlyMap<string, string[]>, now: number): void {
+  private buildAliasBlock(rows: readonly ServerConnection[], probed: ReadonlyMap<string, ProbedModel[]>, now: number): void {
     const byId = new Map(rows.map((r) => [r.id, r]));
     const out: ModelAliasEntry[] = [];
     const pairStates = new Map<string, { server_id: string; model: string; source: 'probed' | 'declared' | 'dropped' }[]>();
+    // #87 D2: the confirmed probed ENTRY per surviving pair (capability
+    // lookup for the winner); declared-source survivors have no entry.
+    const survivorCaps = new Map<string, ProbedModel>();
     const stored = this.store.state.model_aliases;
     for (const name of Object.keys(stored ?? {})) {
       if (!ALIAS_NAME_RE.test(name)) continue; // hostile key: unpublished (drop-don't-reject)
@@ -1558,11 +1570,13 @@ export class Arbiter {
           continue;
         }
         if (probed.has(sid)) {
-          if (!probed.get(sid)!.includes(model)) {
+          const found = probed.get(sid)!.find((e) => e?.name === model);
+          if (!found) {
             states.push({ server_id: sid, model, source: 'dropped' }); // probed row, id vanished
             continue;
           }
           survivors.push({ server_id: sid, model, source: 'probed' });
+          survivorCaps.set(`${sid}\u0000${model}`, found);
         } else {
           survivors.push({ server_id: sid, model, source: 'declared' }); // probe-blocked: the operator's claim stands
         }
@@ -1591,6 +1605,7 @@ export class Arbiter {
       const winner = step1 ?? step2 ?? step3 ?? survivors[0]!;
       const srv = byId.get(winner.server_id)!;
       if (typeof srv.url !== 'string' || srv.url.trim() === '') continue;
+      const caps = survivorCaps.get(`${winner.server_id}\u0000${winner.model}`);
       out.push({
         name,
         server_id: winner.server_id,
@@ -1603,6 +1618,11 @@ export class Arbiter {
         // and pinless entry — the router ignores the key, the dashboard reads
         // it.
         ...(pin !== '' && winner.server_id !== pin ? { fallback: true } : {}),
+        // #87 D2: winner-only capability ADD keys (omitted when the engine
+        // exposes nothing, or the winner rides on 'declared').
+        ...(caps?.context_length !== undefined ? { context_length: caps.context_length } : {}),
+        ...(caps?.input_modalities !== undefined ? { input_modalities: caps.input_modalities } : {}),
+        ...(caps?.output_modalities !== undefined ? { output_modalities: caps.output_modalities } : {}),
       });
     }
     this.aliasPublished = out;
@@ -2219,8 +2239,9 @@ export class Arbiter {
       } else {
         // Bare-name session: the row must carry the name in its inventory
         // (last successful probe; probe-blocked falls back to declared).
-        const inventory = this.lastProbed.get(row.id) ?? row.models ?? [];
-        if (!inventory.includes(model)) {
+        const probed = this.lastProbed.get(row.id);
+        const names = probed ? probed.map((m) => m.name) : (row.models ?? []);
+        if (!names.includes(model)) {
           return { ok: false, reason: 'row_lacks_model' };
         }
       }
@@ -2905,8 +2926,8 @@ export class Arbiter {
     return { ok: true, revoked: id };
   }
 
-  /** The last probe-confirmed model list for a row (null = never probed). */
-  probedModels(id: string): string[] | null {
+  /** The last probe-confirmed model entries for a row (null = never probed). */
+  probedModels(id: string): ProbedModel[] | null {
     return this.lastProbed.get(id) ?? null;
   }
 

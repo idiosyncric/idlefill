@@ -36,7 +36,7 @@ import {
   type ServerRow,
   type StateSnapshot,
 } from "@/lib/api";
-import { ago, probeWord } from "@/lib/format";
+import { ago, fmtCtx, probeWord } from "@/lib/format";
 
 // ---------------------------------------------------------------------------
 // Models — the operator-declared model aliases (#66). One card per alias:
@@ -179,6 +179,7 @@ export function Models({ st }: { st: StateSnapshot | null }) {
                 published={st?.model_aliases.find((m) => m.name === a.alias) ?? null}
                 onMove={(dir) => move(i, dir)}
                 srvName={srvName}
+                servers={servers}
                 now={st?.now ?? Date.now()}
                 onEdit={() => {
                   if (apiToken()) setEditName(a.alias);
@@ -228,6 +229,43 @@ const SOURCE_MARK: Record<string, string> = {
   unprobed: "not probed",
 };
 
+// ---------------------------------------------------------------------------
+// #87 D4: capability + misalignment display helpers. Capabilities are DERIVED
+// from the published facts — each pair's engine entry looked up in its row's
+// probed inventory (never claimed for declared rows), the winner's variant id
+// read straight off the published entry. No new arbiter state.
+// ---------------------------------------------------------------------------
+
+export type ModelCaps = { context_length?: number; input_modalities?: string[]; output_modalities?: string[] };
+
+const nonTextInputs = (c: ModelCaps | undefined): string[] =>
+  (c?.input_modalities ?? []).filter((m) => m !== "text");
+
+/** Compact capability chip set for one engine entry: ctx + non-text inputs. */
+function CapsChips({ caps }: { caps: ModelCaps | undefined }) {
+  const mods = nonTextInputs(caps);
+  if (!caps || (caps.context_length === undefined && mods.length === 0)) return null;
+  const title = [
+    caps.context_length !== undefined ? `context ${caps.context_length}` : null,
+    caps.input_modalities ? `inputs: ${caps.input_modalities.join(", ")}` : null,
+    caps.output_modalities ? `outputs: ${caps.output_modalities.join(", ")}` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  return (
+    <span className="flex shrink-0 items-center gap-1" title={title}>
+      {caps.context_length !== undefined && (
+        <span className="rounded-pill border border-border px-1.5 py-0 text-[10px] text-dim">{fmtCtx(caps.context_length)}</span>
+      )}
+      {mods.map((m) => (
+        <span key={m} className="rounded-pill border border-accent/50 px-1.5 py-0 text-[10px] text-accent">
+          {m}
+        </span>
+      ))}
+    </span>
+  );
+}
+
 function AliasCard({
   a,
   index,
@@ -235,6 +273,7 @@ function AliasCard({
   published,
   onMove,
   srvName,
+  servers,
   now,
   onEdit,
 }: {
@@ -242,12 +281,13 @@ function AliasCard({
   index: number;
   total: number;
   // The arbiter's RESOLVED winner for this tick (the published model_aliases
-  // entry joined by name). It is the routing truth — the stored pin when the
-  // pin is healthy and group-free, else the next-best option (fallback).
-  // Null until the first state poll lands.
+  // entry joined by name). It is the routing truth — the pin when healthy and
+  // group-free, else the next-best option (fallback). Null until the first
+  // state poll lands.
   published: ModelAliasEntry | null;
   onMove: (dir: -1 | 1) => void;
   srvName: (id: string) => string;
+  servers: ServerRow[];
   now: number;
   onEdit: () => void;
 }) {
@@ -274,6 +314,21 @@ function AliasCard({
           source: (winnerPair.source === "probed" ? "probed" : "declared") as "probed" | "declared",
         }
       : null;
+
+  // #87 D4: per-pair capability lookup from the row's PROBED inventory
+  // (declared rows know nothing — no chips). Modality divergence across
+  // the pairs of one alias is derived here, never stored.
+  const capsFor = (server_id: string, model: string): ModelCaps | undefined =>
+    servers.find((s) => s.id === server_id)?.models.find((m) => m.name === model);
+  const knownPairs = a.pairs.filter((p) => capsFor(p.server_id, p.model)?.input_modalities !== undefined);
+  const modRows = new Map<string, Set<string>>();
+  for (const p of knownPairs) {
+    for (const m of nonTextInputs(capsFor(p.server_id, p.model))) {
+      if (!modRows.has(m)) modRows.set(m, new Set());
+      modRows.get(m)!.add(`${srvName(p.server_id)} / ${p.model}`);
+    }
+  }
+  const divergences = [...modRows.entries()].filter(([, rows]) => rows.size < knownPairs.length);
 
   const pin = async (server_id: string | null) => {
     if (!apiToken()) {
@@ -367,6 +422,7 @@ function AliasCard({
                 <span className="min-w-0 truncate font-mono text-[11px] text-dim" title="the EXACT model id this row serves">
                   {p.model}
                 </span>
+                <CapsChips caps={capsFor(p.server_id, p.model)} />
                 {mark && (
                   <Badge variant="outline" className="ml-auto shrink-0 rounded-pill px-1.5 py-0 text-[10px] font-normal text-dim" title={`pair source: ${p.source}`}>
                     {mark}
@@ -382,7 +438,23 @@ function AliasCard({
           {eff ? (
             <>
               <span className="font-semibold">{srvName(eff.server_id)}</span>
-              <code className="min-w-0 truncate text-[11px] text-dim">{eff.model}</code>
+              <code
+                className={`min-w-0 truncate text-[11px] ${eff.model !== a.alias ? "text-warn" : "text-dim"}`}
+                title={
+                  eff.model !== a.alias
+                    ? "mis-aligned with the alias name: the engine answers under its OWN id — the router splices this id into the body"
+                    : "the engine's own model id"
+                }
+              >
+                {eff.model}
+              </code>
+              <CapsChips
+                caps={
+                  published
+                    ? { context_length: published.context_length, input_modalities: published.input_modalities, output_modalities: published.output_modalities }
+                    : capsFor(eff.server_id, eff.model)
+                }
+              />
               <span
                 className={`size-1.5 shrink-0 rounded-full ${eff.source === "probed" ? "bg-ok" : "bg-err"}`}
                 title={probeWord(eff.source).note}
@@ -428,8 +500,27 @@ function AliasCard({
       </CardContent>
 
       <CardFooter className="border-t border-border px-3 py-1.5 text-[11px] text-dim">
-        <span title="pairs list EVERY engine that can answer this name; the winner answers with that pair's own model id">
-          {a.pairs.length} pair{a.pairs.length === 1 ? "" : "s"}
+        <span className="flex flex-wrap items-center gap-2">
+          <span title="pairs list EVERY engine that can answer this name; the winner answers with that pair's own model id">
+            {a.pairs.length} pair{a.pairs.length === 1 ? "" : "s"}
+          </span>
+          {/* #87 D4: a modality SOME known pairs serve and others do not —
+              routing to a pair that cannot see the input is the misalignment
+              the operator must see before pinning multimodal traffic. */}
+          {divergences.map(([mod, rows]) => {
+            const missing = knownPairs
+              .filter((p) => !nonTextInputs(capsFor(p.server_id, p.model)).includes(mod))
+              .map((p) => `${srvName(p.server_id)} / ${p.model}`);
+            return (
+              <span
+                key={mod}
+                className="rounded-pill border border-warn/50 px-1.5 py-0 text-[10px] text-warn"
+                title={`${mod}: served by ${rows.size}/${knownPairs.length} probed pairs — missing on ${missing.join(", ")}`}
+              >
+                {mod} {rows.size}/{knownPairs.length}
+              </span>
+            );
+          })}
         </span>
       </CardFooter>
     </Card>
@@ -486,12 +577,21 @@ function AliasFormDialog({
   // eslint-disable-next-line react-hooks/exhaustive-deps
 
   // The probed inventory for a row (the pick-list), plus any stored value
-  // the probe never confirmed (it round-trips verbatim, marked).
+  // the probe never confirmed (it round-trips verbatim, marked). #87: the
+  // pick labels carry the observed caps (ctx + non-text inputs) so the
+  // operator cannot pin a pair blind to a modality gap.
   const modelOptions = (server_id: string, keep: string): { value: string; label: string }[] => {
     const opts: { value: string; label: string }[] = [{ value: "", label: "— model id —" }];
-    const inv = servers.find((s) => s.id === server_id)?.models.map((m) => m.name) ?? [];
-    if (keep && !inv.includes(keep)) opts.push({ value: keep, label: `${keep} (not probed — stored)` });
-    for (const m of inv) opts.push({ value: m, label: m });
+    const inv = servers.find((s) => s.id === server_id)?.models ?? [];
+    const label = (m: { name: string; context_length?: number; input_modalities?: string[] }): string => {
+      const mods = nonTextInputs(m);
+      const suffix = [m.context_length !== undefined ? fmtCtx(m.context_length) : null, ...mods]
+        .filter((x): x is string => Boolean(x))
+        .join(" · ");
+      return suffix ? `${m.name}  (${suffix})` : m.name;
+    };
+    if (keep && !inv.some((m) => m.name === keep)) opts.push({ value: keep, label: `${keep} (not probed — stored)` });
+    for (const m of inv) opts.push({ value: m.name, label: label(m) });
     if (inv.length === 0 && !keep) opts.push({ value: "", label: "(no probed inventory for that row)" });
     return opts;
   };

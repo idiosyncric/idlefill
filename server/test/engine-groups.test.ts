@@ -111,7 +111,7 @@ function makeGroupHarness() {
       const key = url.includes('alpha') ? 'alpha' : url.includes('beta') ? 'beta' : url.includes('gamma') ? 'gamma' : 'none';
       const list = probeMap[key];
       if (list === undefined || list === null) throw new Error('probe refused');
-      return list;
+      return list.map((name) => ({ name }));
     },
   });
   arbiter.registerClient('mac', undefined, '100.94.165.102');

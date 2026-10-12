@@ -52,6 +52,10 @@ export interface AggregateCatalogEntry {
   url: string;
   auth_set: boolean;
   catalog_source?: 'probed' | 'declared';
+  /** #87 D2: observed capabilities, ADD keys, omitted when unknown. */
+  context_length?: number;
+  input_modalities?: string[];
+  output_modalities?: string[];
 }
 
 /**
@@ -69,6 +73,20 @@ export interface AggregateAliasEntry {
   auth_set: boolean;
   engine_model: string;
   catalog_source: 'probed' | 'declared';
+  /**
+   * #87 D2/D3: winner-pair capabilities as the arbiter observed them,
+   * ADD keys, omitted when unknown. The advertised /v1/models entry
+   * carries them; the winner's variant id stays dashboard-only (D3).
+   */
+  context_length?: number;
+  input_modalities?: string[];
+  output_modalities?: string[];
+  /**
+   * Health-ordered fall-through (docs/architecture/engine-health-routing.md
+   * D2): present (true) when the published winner is NOT the stored pin.
+   * The router ignores it; it rides the same poll for the dashboard.
+   */
+  fallback?: boolean;
 }
 
 /**
@@ -550,7 +568,16 @@ export function startAggregateRouter(opts: {
     // the machine advertises nothing (a chat request still routes by name,
     // and the unknown-model fallback stands). The router still NEVER probes
     // an engine to answer (D1).
-    const data = aliases.map((a) => ({ id: a.name, object: 'model', owned_by: a.server_id }));
+    // #87 D3: winner-pair capabilities ride as ADD keys when the arbiter
+    // observed them; the variant id the alias routes to stays dashboard-only.
+    const data = aliases.map((a) => ({
+      id: a.name,
+      object: 'model',
+      owned_by: a.server_id,
+      ...(a.context_length !== undefined ? { context_length: a.context_length } : {}),
+      ...(a.input_modalities !== undefined ? { input_modalities: a.input_modalities } : {}),
+      ...(a.output_modalities !== undefined ? { output_modalities: a.output_modalities } : {}),
+    }));
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ object: 'list', data }));
   };

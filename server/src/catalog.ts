@@ -31,14 +31,37 @@ export interface CatalogEntry {
   /** 'probed' = this name came from a live /v1/models probe this tick;
    *  'declared' = it came from the operator-declared row (incl. a probe-blocked row). */
   catalog_source: 'probed' | 'declared';
+  /**
+   * #87 D2: observed capabilities from THIS tick's probe, ADD keys,
+   * omitted when the engine does not expose them (and never present on a
+   * 'declared' entry — a declaration is a routing claim, not a capability
+   * claim).
+   */
+  context_length?: number;
+  input_modalities?: string[];
+  output_modalities?: string[];
+}
+
+/**
+ * #87 D1: one probed model — the bare name plus the capability fields the
+ * engine itself published (best-effort, drop-don't-reject): llama-family
+ * `meta.n_ctx` / omlx `max_model_len` become `context_length`;
+ * `architecture.input_modalities` / `architecture.output_modalities` ride
+ * verbatim. A declared (operator-listed) name is a name ONLY.
+ */
+export interface ProbedModel {
+  name: string;
+  context_length?: number;
+  input_modalities?: string[];
+  output_modalities?: string[];
 }
 
 /**
  * Per-row /v1/models probe transport (injectable for tests — the exact
  * shape of the #60 B credentialed feed fetchers in idle.ts). Rejects on
- * any HTTP/network failure; resolves to the bare model names.
+ * any HTTP/network failure; resolves to the probed model entries.
  */
-export type ModelsFetcher = (url: string, auth?: string) => Promise<string[]>;
+export type ModelsFetcher = (url: string, auth?: string) => Promise<ProbedModel[]>;
 
 /**
  * Probe URL for a row: origin + '/v1/models'. A row whose url already
@@ -51,19 +74,46 @@ export function modelsProbeUrl(rowUrl: string): string {
 }
 
 /**
- * Parse an OpenAI-style models payload into bare names: {data:[{id}]}
- * (llama-swap / oMLX), tolerating {models:[...]} or a bare array of
- * name strings. Non-string / blank names are dropped.
+ * Parse an OpenAI-style models payload into probed model entries:
+ * {data:[{id}]} (llama-swap / oMLX), tolerating {models:[...]} or a bare
+ * array of name strings. Non-string / blank names are dropped. #87 D1:
+ * capability fields are captured best-effort — llama-family `meta.n_ctx`
+ * and omlx `max_model_len` (first positive finite wins) become
+ * `context_length`; `architecture.input_modalities` /
+ * `architecture.output_modalities` (string arrays, trimmed, empties
+ * dropped) ride verbatim. A malformed field is dropped, never fatal.
  */
-export function parseModelsPayload(body: unknown): string[] {
-  const out: string[] = [];
+export function parseModelsPayload(body: unknown): ProbedModel[] {
+  const out: ProbedModel[] = [];
   const seen = new Set<string>();
   const add = (v: unknown): void => {
-    if (typeof v !== 'string') return;
-    const s = v.trim();
-    if (s === '' || seen.has(s)) return;
-    seen.add(s);
-    out.push(s);
+    if (typeof v === 'string') {
+      const s = v.trim();
+      if (s === '' || seen.has(s)) return;
+      seen.add(s);
+      out.push({ name: s });
+      return;
+    }
+    if (!v || typeof v !== 'object') return;
+    const it = v as Record<string, unknown>;
+    const name = typeof it.id === 'string' ? it.id.trim() : typeof it.name === 'string' ? it.name.trim() : '';
+    if (name === '' || seen.has(name)) return;
+    seen.add(name);
+    const entry: ProbedModel = { name };
+    const meta = it.meta && typeof it.meta === 'object' ? (it.meta as Record<string, unknown>) : undefined;
+    const ctx = typeof meta?.n_ctx === 'number' ? meta.n_ctx : typeof it.max_model_len === 'number' ? it.max_model_len : undefined;
+    if (ctx !== undefined && Number.isFinite(ctx) && ctx > 0) entry.context_length = Math.floor(ctx);
+    const arch = it.architecture && typeof it.architecture === 'object' ? (it.architecture as Record<string, unknown>) : undefined;
+    const mods = (v: unknown): string[] | undefined => {
+      if (!Array.isArray(v)) return undefined;
+      const list = v.filter((m): m is string => typeof m === 'string' && m.trim() !== '').map((m) => m.trim());
+      return list.length > 0 ? list : undefined;
+    };
+    const inMod = mods(arch?.input_modalities);
+    if (inMod) entry.input_modalities = inMod;
+    const outMod = mods(arch?.output_modalities);
+    if (outMod) entry.output_modalities = outMod;
+    out.push(entry);
   };
   const arrays: unknown[][] = [];
   if (Array.isArray(body)) arrays.push(body);
@@ -73,13 +123,7 @@ export function parseModelsPayload(body: unknown): string[] {
     if (Array.isArray(j.models)) arrays.push(j.models);
   }
   for (const arr of arrays) {
-    for (const item of arr) {
-      if (typeof item === 'string') add(item);
-      else if (item && typeof item === 'object') {
-        const it = item as Record<string, unknown>;
-        add(typeof it.id === 'string' ? it.id : typeof it.name === 'string' ? it.name : undefined);
-      }
-    }
+    for (const item of arr) add(item);
   }
   return out;
 }
@@ -113,25 +157,34 @@ export function makeRealModelsFetcher(): ModelsFetcher {
  */
 export function buildCatalog(
   rows: readonly ServerConnection[],
-  probed: ReadonlyMap<string, string[]>,
+  probed: ReadonlyMap<string, ProbedModel[]>,
 ): CatalogEntry[] {
   const out: CatalogEntry[] = [];
   const seen = new Set<string>();
   for (const row of rows) {
     const p = probed.get(row.id);
     const useProbe = p !== undefined && p.length > 0;
-    const list = useProbe ? p : row.models;
     const source: CatalogEntry['catalog_source'] = useProbe ? 'probed' : 'declared';
-    for (const name of list) {
-      if (typeof name !== 'string' || name.trim() === '' || seen.has(name)) continue;
+    const list: ProbedModel[] = useProbe ? p : row.models.map((name) => ({ name }));
+    for (const m of list) {
+      const name = typeof m?.name === 'string' ? m.name.trim() : '';
+      if (name === '' || seen.has(name)) continue;
       seen.add(name);
-      out.push({
+      const entry: CatalogEntry = {
         name,
         server_id: row.id,
         url: row.url,
         auth_set: row.auth_token !== undefined && row.auth_token !== '',
         catalog_source: source,
-      });
+      };
+      // #87 D2: capability ADD keys ride only from a probed entry — a
+      // declared name never claims a capability.
+      if (useProbe) {
+        if (m.context_length !== undefined) entry.context_length = m.context_length;
+        if (m.input_modalities !== undefined) entry.input_modalities = m.input_modalities;
+        if (m.output_modalities !== undefined) entry.output_modalities = m.output_modalities;
+      }
+      out.push(entry);
     }
   }
   return out;

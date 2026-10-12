@@ -5,6 +5,11 @@ export type ServerModel = {
   name: string;
   running: boolean;
   queued: number;
+  // #87 D2: capability ADD keys from the last good /v1/models probe —
+  // absent when the engine exposes nothing (never present on declared rows).
+  context_length?: number;
+  input_modalities?: string[];
+  output_modalities?: string[];
 };
 
 export type ServerSignal = {
@@ -270,6 +275,10 @@ export type CatalogEntry = {
   url: string;
   auth_set: boolean;
   catalog_source: "probed" | "declared";
+  // #87 D2: observed capability ADD keys, omitted when unknown.
+  context_length?: number;
+  input_modalities?: string[];
+  output_modalities?: string[];
 };
 
 // The winner-only publish block (anonymous /api/state).
@@ -284,6 +293,12 @@ export type ModelAliasEntry = {
   // is dead (or group-blocked) and traffic moved to the next-best option.
   // Absent on every pin-matched and pinless entry.
   fallback?: boolean;
+  // #87 D2: winner-pair capability ADD keys (the router/advertise rides
+  // them; the dashboard's misalignment chips derive from them + per-pair
+  // inventory lookups). Omitted when unknown.
+  context_length?: number;
+  input_modalities?: string[];
+  output_modalities?: string[];
 };
 
 // One operator-declared engine group (same-host mutual exclusion, D3).

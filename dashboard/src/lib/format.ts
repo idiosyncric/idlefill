@@ -53,6 +53,11 @@ export function probeWord(source: "probed" | "declared"): StateWord {
   return { label: "declared", tone: "err", note: "the /v1/models probe never answered — the declared list stands (routing red)" };
 }
 
+// #87: compact context-length word for capability chips (262144 -> "256k").
+export function fmtCtx(n: number): string {
+  return n >= 1024 ? `${Math.round(n / 1024)}k` : String(n);
+}
+
 export const PROVIDER_CHOICES: [string, string][] = [
   ["llama-swap", "llama-swap (activity feed)"],
   ["strata", "strata (/metrics counters — works remote)"],

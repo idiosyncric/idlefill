@@ -13,6 +13,7 @@
 
 import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve, extname } from 'node:path';
+import { randomBytes } from 'node:crypto';
 import os from 'node:os';
 import fastify, { type FastifyInstance, type FastifyReply } from 'fastify';
 import { WebSocketServer } from 'ws';
@@ -20,7 +21,8 @@ import { utcDay, type Arbiter, WATCHED_SERVER_ID } from './arbiter.js';
 import { seriesKeyOf, type MetricsBucket, type MetricsSeries, type MetricsStore } from './metrics.js';
 import { buildMeshSnapshot, type MeshFederation } from './mesh.js';
 import { collectHostStats } from './host.js';
-import { verifyRequester, NonceReplayStore, EDGE_TS_SKEW_MS, type EdgeSignaturePayload } from './edges.js';
+import { UpdateIntents, intentsFileOf, UPDATE_INTENT_TTL_S } from './update.js';
+import { verifyRequester, signEdgePayload, NonceReplayStore, EDGE_TS_SKEW_MS, type EdgeSignaturePayload } from './edges.js';
 import { isLoopbackAddress } from './catalog.js';
 import type { LoadSignalView } from './load.js';
 import type { ClientRecord, CycleStatusRow, HermesJobRow, ProjectAllocation, QueuePreviewRow, RebuildRunState, ServerConfig, ServerConnection } from './types.js';
@@ -278,7 +280,10 @@ function serverView(arbiter: Arbiter, cfg: ServerConfig, now: number, loadSignal
     // names which one the row shows; probed_at is the "last seen" for the
     // inventory (null = the probe never answered since boot). ADD keys.
     const probed = arbiter.probedModels(row.id);
-    const inventory = probed ?? row.models;
+    // #87 D2: the probed list carries capability entries; the declared
+    // fallback is names only (a declaration never claims a capability).
+    const inventory: { name: string; context_length?: number; input_modalities?: string[]; output_modalities?: string[] }[] =
+      probed ?? row.models.map((name) => ({ name }));
     // The row is echoed verbatim — so the credential (#60 B) is STRIPPED
     // here. auth_token is write-only: this view feeds GET /api/servers AND
     // the anonymous /api/state, and the dashboard renders both. A boolean
@@ -292,7 +297,15 @@ function serverView(arbiter: Arbiter, cfg: ServerConfig, now: number, loadSignal
       signal,
       model_source: probed !== null ? 'probed' : 'declared',
       probed_at: arbiter.probedAt(row.id),
-      models: inventory.map((m) => ({ name: m, running: runningModels.has(m), queued: queuedByModel.get(m) ?? 0 })),
+      models: inventory.map((m) => ({
+        name: m.name,
+        running: runningModels.has(m.name),
+        queued: queuedByModel.get(m.name) ?? 0,
+        // #87 D2: capability ADD keys from the last good probe, omitted when unknown.
+        ...(m.context_length !== undefined ? { context_length: m.context_length } : {}),
+        ...(m.input_modalities !== undefined ? { input_modalities: m.input_modalities } : {}),
+        ...(m.output_modalities !== undefined ? { output_modalities: m.output_modalities } : {}),
+      })),
       // Engine-group plane (docs/architecture/engine-health-routing.md D3/D5):
       // which group (if any) this row belongs to + its live ENGAGED marker
       // (an active lease or an active session holds an engine slot here). ADD
@@ -318,6 +331,15 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   // Ephemeral by construction (D2): a restart clears it, and the signed-ts
   // skew window keeps a captured signature dead once its ts ages out.
   const nonceReplay = new NonceReplayStore();
+
+  // Machine-update intents (mesh-update.md D2): the target-side record
+  // the `update` control verb creates and the host updater helper claims.
+  // Persisted next to the state file (0600, capped, TTL). An intent left
+  // RUNNING by an arbiter restart is ambiguous truth — marked failed with
+  // the named reason at boot (the deploy may well have happened; never
+  // silently re-queued).
+  const updateIntents = new UpdateIntents(intentsFileOf(cfg.state_file));
+  updateIntents.markRunningAbandoned(Date.now());
 
   // --- auth guard for /api/* (except the documented public read paths) ---
   app.addHook('onRequest', async (req, reply) => {
@@ -1496,9 +1518,37 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       order?: unknown;
     };
     const action = typeof body.action === 'string' ? body.action.trim() : '';
-    const ACTIONS = new Set(['pause', 'resume', 'force', 'clear', 'reorder']);
+    const ACTIONS = new Set(['pause', 'resume', 'force', 'clear', 'reorder', 'update']);
     if (!ACTIONS.has(action)) {
-      return reply.code(400).send({ error: 'bad_action', hint: 'action must be one of: pause, resume, force, clear, reorder' });
+      return reply.code(400).send({ error: 'bad_action', hint: 'action must be one of: pause, resume, force, clear, reorder, update' });
+    }
+    if (action === 'update') {
+      // mesh-update.md (LOCKED 2026-10-12): the machine-update verb. It
+      // creates a persisted INTENT, never executes anything — the host
+      // helper (scripts/host-updater.mjs) claims and runs the machine's
+      // own documented update command. Nothing executable crossed the
+      // wire: the verb is the entire payload.
+      const now = Date.now();
+      const intent = updateIntents.add(env.instanceId, now);
+      if (!intent) {
+        const live = updateIntents.live(now);
+        return reply.code(409).send({
+          error: 'update_in_flight',
+          intent_id: live?.id ?? null,
+          state: live?.state ?? null,
+          hint: 'one live update intent at a time — the operator waits for it to finish or go stale',
+        });
+      }
+      arbiter.logMeshControl(env.instanceId, 'update', 'machine');
+      return reply.code(202).send({
+        ok: true,
+        action: 'update',
+        intent_id: intent.id,
+        state: intent.state,
+        ttl_s: UPDATE_INTENT_TTL_S,
+        source_instance_id: env.instanceId,
+        hint: 'the host updater helper claims queued intents; without one the intent goes stale at the TTL',
+      });
     }
     if (action === 'reorder') {
       // D4 names reorder in the action set; its wire shape (promote/demote
@@ -1568,6 +1618,106 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       until: res.override?.until ?? null,
       source_instance_id: env.instanceId,
     };
+  });
+
+  /**
+   * POST /api/mesh/control/:peer_instance_id (#39 relay + mesh-update.md
+   * D1 — the LOCAL requester side). The dashboard's machine card presses
+   * update; the local arbiter signs the #39 envelope with its OWN
+   * identity (path-bound ts + single-use nonce) and relays it to the
+   * peer's signature-plane route. Auth: the local ADMIN plane (an
+   * api_token) — the credential to press the button is the operator's
+   * own token; the credential to RECEIVE it stays the signed edge.
+   *
+   * Fail-closed chain, each denial named:
+   *   - no LOCAL edge record for the peer → 403 `not_paired`;
+   *   - the edge must be `i_control` (D5: this machine controls THAT
+   *     peer) → 403 `direction_denied` (a controls_me record means the
+   *     peer controls US — the button would be upside down);
+   *   - only the `update` verb relays — this is NOT a general control
+   *     proxy (mesh-update.md D1); the row-level verbs keep their own
+   *     UI decisions;
+   *   - the peer url comes from the federation's observed instance_id →
+   *     url map (#79 precedent) — unknown id → 502 `peer_url_unknown`.
+   *
+   * The peer's answer (202 + intent / 409 in-flight / its own named
+   * denials) is passed through with its status. The hop is fetched with
+   * a 10 s timeout; a transport failure is 502 `peer_unreachable`.
+   */
+  app.post<{ Params: { peer_instance_id: string } }>('/api/mesh/control/:peer_instance_id', async (req, reply) => {
+    const peerId = req.params.peer_instance_id;
+    const edge = arbiter.edges().get(peerId);
+    if (!edge) {
+      return reply.code(403).send({ error: 'not_paired', reason: 'unknown_instance_id', hint: 'no local edge record for that instance — pair the machines first (mesh_edges.json / the pairing ceremony)' });
+    }
+    if (edge.direction !== 'i_control') {
+      return reply.code(403).send({ error: 'direction_denied', reason: `the local edge for ${peerId} is ${edge.direction} — this machine can only relay control over an i_control edge (D5)` });
+    }
+    const body = (req.body ?? {}) as { action?: unknown };
+    const action = typeof body.action === 'string' ? body.action.trim() : '';
+    if (action !== 'update') {
+      return reply.code(400).send({ error: 'bad_action', hint: 'the local relay admits only the update verb (mesh-update.md D1)' });
+    }
+    const url = mesh?.peerUrlFor(peerId) ?? null;
+    if (!url) {
+      return reply.code(502).send({ error: 'peer_url_unknown', hint: 'no configured peer resolves to that instance id — the mesh pull must have seen it first' });
+    }
+    const payload: EdgeSignaturePayload = {
+      instance_id: arbiter.instanceId(),
+      path: '/api/mesh/control',
+      ts: Date.now(),
+      nonce: randomBytes(16).toString('hex'),
+    };
+    const { signatureB64url } = signEdgePayload(arbiter.identity(), payload);
+    let res: Response;
+    try {
+      res = await fetch(`${url}/api/mesh/control`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-idlefill-instance-id': payload.instance_id,
+          'x-idlefill-signature': signatureB64url,
+          'x-idlefill-nonce': payload.nonce,
+          'x-idlefill-ts': String(payload.ts),
+        },
+        body: JSON.stringify({ action }),
+        signal: AbortSignal.timeout(10_000),
+      });
+    } catch (e) {
+      return reply.code(502).send({ error: 'peer_unreachable', hint: e instanceof Error ? e.message.slice(0, 200) : String(e) });
+    }
+    const answer = await res.json().catch(() => ({ ok: false, error: 'non_json_answer' })) as Record<string, unknown>;
+    arbiter.logMeshControl(peerId, 'update_relayed', 'peer');
+    return { relayed: true, peer: edge.peer_name ?? peerId, status: res.status, target: answer };
+  });
+
+  /**
+   * The host updater helper's plane (mesh-update.md D3) — local ADMIN
+   * token only (the helper runs on THIS machine with the local token in
+   * its 0600 config; the credential never crosses a wire beyond loopback
+   * at most). GET lists intents (TTL-swept on read); claim is atomic by
+   * the single-flight invariant; result reports the named outcome.
+   */
+  app.get('/api/update-intents', async () => {
+    return { intents: updateIntents.list(Date.now()) };
+  });
+
+  app.post<{ Params: { id: string } }>('/api/update-intents/:id/claim', async (req, reply) => {
+    const it = updateIntents.claim(req.params.id, Date.now());
+    if (!it) return reply.code(404).send({ error: 'not_claimable', hint: 'no queued intent with that id (gone, stale, or already claimed)' });
+    arbiter.logMeshControl('host', 'update_started', it.id);
+    return { intent: it };
+  });
+
+  app.post<{ Params: { id: string } }>('/api/update-intents/:id/result', async (req, reply) => {
+    const body = (req.body ?? {}) as { ok?: unknown; detail?: unknown };
+    if (typeof body.ok !== 'boolean') {
+      return reply.code(400).send({ error: 'bad_body', hint: 'ok must be an exact boolean' });
+    }
+    const it = updateIntents.finish(req.params.id, body.ok, typeof body.detail === 'string' ? body.detail : undefined, Date.now());
+    if (!it) return reply.code(404).send({ error: 'not_reportable', hint: 'no RUNNING intent with that id' });
+    arbiter.logMeshControl('host', body.ok ? 'update_done' : 'update_failed', it.id);
+    return { intent: it };
   });
 
   /**
@@ -1978,7 +2128,27 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       // view. ADD key (the /api/state shape contract: add, never rename).
       // Ephemeral — peer snapshots never touch state.json. Absent when no
       // federation is wired (a build without the mesh module stays as-is).
-      ...(mesh ? { mesh: { instance_id: arbiter.instanceId(), peers: mesh.view(now) } } : {}),
+      // The per-peer edge booleans (mesh-update.md D4) come from the LOCAL
+      // edge store — the dashboard gates the update button on `i_control`
+      // from the same records the relay will enforce (display and
+      // enforcement read ONE source).
+      ...(mesh
+        ? {
+            mesh: {
+              instance_id: arbiter.instanceId(),
+              peers: mesh.view(now).map((p) => ({
+                ...p,
+                ...(p.instance_id && arbiter.edges().allows(p.instance_id, 'i_control') ? { i_control: true } : {}),
+                ...(p.instance_id && arbiter.edges().allows(p.instance_id, 'controls_me') ? { controls_me: true } : {}),
+              })),
+            },
+          }
+        : {}),
+      // The machine-update intents (mesh-update.md D4): the last few coarse
+      // records (state word, source id, ages) so the dashboard can show
+      // queued/running/done/stale truth. ADD key; anonymous-readable like
+      // the rest of the state — no secrets ride it (instance ids + words).
+      update_intents: updateIntents.list(now).slice(-4),
       projects: projectView(arbiter, cfg, s.clients, day, now, todayTotals(s.leases, day)),
       servers: serverView(arbiter, cfg, now, loadSignal),
       // Aggregate endpoint catalog (#64 D4): the arbiter-built, deduped

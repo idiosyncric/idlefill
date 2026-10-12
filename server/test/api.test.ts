@@ -1926,7 +1926,7 @@ test('#64 catalog merge rules (buildCatalog): probe replaces, dedup pins row ord
     models, peers: [], configured_at: now, updated_at: now,
   });
   const rows = [mk('row-a', 'http://a.local:8000', ['Shared', 'AOnly'], 'tok-a'), mk('row-b', 'http://b.local:8080', ['Shared', 'BOnly'])];
-  const cat = buildCatalog(rows, new Map([['row-a', ['NewOnly', 'Shared']]]));
+  const cat = buildCatalog(rows, new Map([['row-a', [{ name: 'NewOnly', context_length: 32768, input_modalities: ['text', 'image'] }, { name: 'Shared' }]]]));
   const byName = new Map(cat.map((e) => [e.name, e]));
   assert.deepEqual([...byName.keys()].sort(), ['BOnly', 'NewOnly', 'Shared'], 'bare names dedup');
   assert.equal(byName.get('Shared')!.server_id, 'row-a', 'first row in declaration order owns the collision');
@@ -1935,6 +1935,10 @@ test('#64 catalog merge rules (buildCatalog): probe replaces, dedup pins row ord
   assert.equal(byName.get('BOnly')!.catalog_source, 'declared', 'an unprobed row is never falsely probed');
   assert.equal(byName.get('NewOnly')!.auth_set, true);
   assert.equal(byName.get('BOnly')!.auth_set, false);
+  assert.equal(byName.get('NewOnly')!.context_length, 32768, '#87 D2: observed caps ride probed entries');
+  assert.deepEqual(byName.get('NewOnly')!.input_modalities, ['text', 'image']);
+  assert.ok(!('input_modalities' in byName.get('Shared')!), 'a probed entry with no caps omits the keys');
+  assert.ok(!('context_length' in byName.get('BOnly')!), 'a declared entry NEVER claims a capability');
   for (const e of cat) assert.ok(!('auth_token' in e), 'no catalog entry carries the token');
 });
 
@@ -1942,10 +1946,27 @@ test('#64 modelsProbeUrl / parseModelsPayload / isLoopbackAddress helpers', () =
   assert.equal(modelsProbeUrl('http://h:8000'), 'http://h:8000/v1/models');
   assert.equal(modelsProbeUrl('http://h:8000/'), 'http://h:8000/v1/models');
   assert.equal(modelsProbeUrl('https://strata.example/v1'), 'https://strata.example/v1/models');
-  assert.deepEqual(parseModelsPayload({ data: [{ id: 'a' }, { name: 'c' }, null, 3] }), ['a', 'c']);
-  assert.deepEqual(parseModelsPayload({ models: ['x', 'x', ' y '] }), ['x', 'y']);
-  assert.deepEqual(parseModelsPayload(['p', 'q']), ['p', 'q']);
+  assert.deepEqual(parseModelsPayload({ data: [{ id: 'a' }, { name: 'c' }, null, 3] }), [{ name: 'a' }, { name: 'c' }]);
+  assert.deepEqual(parseModelsPayload({ models: ['x', 'x', ' y '] }), [{ name: 'x' }, { name: 'y' }]);
+  assert.deepEqual(parseModelsPayload(['p', 'q']), [{ name: 'p' }, { name: 'q' }]);
   assert.deepEqual(parseModelsPayload(null), []);
+  // #87 D1: capability capture is best-effort — llama-family meta.n_ctx and
+  // omlx max_model_len become context_length; architecture modalities ride;
+  // malformed fields drop without dropping the entry.
+  assert.deepEqual(
+    parseModelsPayload({
+      data: [
+        { id: 'q', object: 'model', status: { value: 'loaded' }, meta: { n_ctx: 262144 }, architecture: { input_modalities: ['text', 'image'], output_modalities: ['text'] } },
+        { id: 'om', max_model_len: 131072.9 },
+        { id: 'bad', meta: { n_ctx: 'nope' }, architecture: { input_modalities: [3, ' img ', ''], output_modalities: [] } },
+      ],
+    }),
+    [
+      { name: 'q', context_length: 262144, input_modalities: ['text', 'image'], output_modalities: ['text'] },
+      { name: 'om', context_length: 131072 },
+      { name: 'bad', input_modalities: ['img'] },
+    ],
+  );
   for (const loop of ['127.0.0.1', '127.42.1.7', '::1', '::ffff:127.0.0.1']) assert.ok(isLoopbackAddress(loop), `${loop} is loopback`);
   for (const away of ['100.105.225.1', '10.10.10.241', '::ffff:10.10.10.241', undefined]) assert.ok(!isLoopbackAddress(away), `${away} is not loopback`);
 });
@@ -1959,7 +1980,7 @@ test('#64 probeCatalog: blocked probe keeps the declared list (never falsely pro
       modelsFetcher: async (url, auth) => {
         seen.push({ url, auth });
         if (url.includes('omlx')) throw new Error('probe HTTP 401');
-        return ['WatchedProbed'];
+        return [{ name: 'WatchedProbed' }];
       },
     });
     const up = aggArbiter.upsertServerConnection({
@@ -1989,7 +2010,7 @@ test('#64 /api/state catalog ADD-key: shape + auth_set, and no token anywhere (a
     const aggArbiter = new Arbiter(new StateStore(aggCfg.state_file), aggCfg, det, {
       modelsFetcher: async (url) => {
         if (url.includes('omlx')) throw new Error('probe HTTP 401');
-        return ['WatchedProbed'];
+        return [{ name: 'WatchedProbed' }];
       },
     });
     aggArbiter.upsertServerConnection({ name: 'omlx', url: 'http://omlx.local:8000', models: ['MlxDeclared'], activity_path: '', auth_token: 'sekret-omlx-token' });
@@ -2017,6 +2038,38 @@ test('#64 /api/state catalog ADD-key: shape + auth_set, and no token anywhere (a
         assert.ok(!res.body.includes('auth_token'), 'the field name auth_token never appears in the state view');
         assert.ok(!res.body.includes('sekret-omlx-token'), 'the token VALUE never appears in the state view');
       }
+    } finally {
+      await aggApp.close();
+    }
+  } finally {
+    rmSync(aggDir, { recursive: true, force: true });
+  }
+});
+
+test('#87 servers[].models: observed caps ride the row inventory as ADD keys; declared entries omit them', async () => {
+  const aggDir = mkdtempSync(join(tmpdir(), 'idlefill-caps-inv-'));
+  try {
+    const aggCfg: ServerConfig = { ...cfg, api_tokens: [AGG_TOKEN], state_file: join(aggDir, 'state.json') };
+    const aggArbiter = new Arbiter(new StateStore(aggCfg.state_file), aggCfg, det, {
+      modelsFetcher: async (url) => {
+        if (url.includes('omlx')) throw new Error('probe HTTP 401');
+        return [{ name: 'WatchedProbed', context_length: 262144, input_modalities: ['text', 'image'], output_modalities: ['text'] }];
+      },
+    });
+    aggArbiter.upsertServerConnection({ name: 'omlx', url: 'http://omlx.local:8000', models: ['MlxDeclared'], activity_path: '', auth_token: 'sekret-omlx-token' });
+    await aggArbiter.probeCatalog();
+    const aggApp = buildApi({ arbiter: aggArbiter, cfg: aggCfg, publicDir: join(__dirname, 'fixtures', 'dashboard') });
+    await aggApp.ready();
+    try {
+      const res = await aggApp.inject({ method: 'GET', url: '/api/state' });
+      const st = res.json() as { servers: { url: string; models: Record<string, unknown>[] }[] };
+      const watched = st.servers.find((s) => s.url.includes('fake'))!;
+      const probed = watched.models.find((m) => m.name === 'WatchedProbed')!;
+      assert.equal(probed.context_length, 262144, '#87 D2: caps ride the row inventory from the last good probe');
+      assert.deepEqual(probed.input_modalities, ['text', 'image']);
+      const omlx = st.servers.find((s) => s.url.includes('omlx'))!;
+      const declared = omlx.models.find((m) => m.name === 'MlxDeclared')!;
+      assert.ok(!('context_length' in declared) && !('input_modalities' in declared) && !('output_modalities' in declared), 'declared inventory claims no capability');
     } finally {
       await aggApp.close();
     }
@@ -2273,7 +2326,7 @@ test('#66 alias beats bare AT PUBLISH: the alias resolves to the paired row; the
   try {
     const aggCfg: ServerConfig = { ...cfg, api_tokens: [AGG_TOKEN], state_file: join(aggDir, 'state.json') };
     const aggArbiter = new Arbiter(new StateStore(aggCfg.state_file), aggCfg, det, {
-      modelsFetcher: async (url) => (url.includes('omlx') ? ['Shared-Name'] : ['Shared-Name']),
+      modelsFetcher: async (url) => (url.includes('omlx') ? [{ name: 'Shared-Name' }] : [{ name: 'Shared-Name' }]),
     });
     const watched = aggArbiter.upsertServerConnection({ name: 'watched', url: 'http://fake', models: ['Shared-Name'], activity_path: '' });
     const omlx = aggArbiter.upsertServerConnection({ name: 'omlx', url: 'http://omlx.local:8000', models: ['Shared-Name'], activity_path: '', auth_token: 'sekret-omlx-token' });
@@ -2316,7 +2369,7 @@ test('#66 /api/state model_aliases ADD-key: present beside an untouched catalog 
       modelsFetcher: async (url) => {
         // omlx's probe FAILS (401 shape): its pair stands as 'declared'.
         if (url.includes('omlx')) throw new Error('probe HTTP 401');
-        return ['Qwen3.8-27B'];
+        return [{ name: 'Qwen3.8-27B' }];
       },
     });
     const up = aggArbiter.upsertServerConnection({ name: 'omlx', url: 'http://omlx.local:8000', models: ['MlxDeclared'], activity_path: '', auth_token: 'sekret-omlx-token' });
