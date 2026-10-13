@@ -844,6 +844,9 @@ pub fn build() -> tauri::Result<()> {
         last_launchd_live: Mutex::new(None),
     });
 
+    // `mut` is needed only where the #[cfg(debug_assertions)] plugin
+    // block below reassigns the builder; silence it on release builds.
+    #[cfg_attr(not(debug_assertions), allow(unused_mut))]
     let mut builder = tauri::Builder::default()
         // Single instance FIRST with the deep-link feature (the
         // docs-documented desktop chain the spike verified). A second
