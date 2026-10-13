@@ -430,7 +430,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   // ------------------------------------------------------------------
 
   app.post('/api/clients/register', async (req, reply) => {
-    const body = (req.body ?? {}) as { name?: string; ip?: string; projects?: ProjectAllocation[]; version?: unknown; protocol?: unknown; revision?: unknown; gate_posture?: unknown; proxy_port?: unknown; aggregate_port?: unknown; daemon_behind?: unknown; client_log?: unknown; agent_roster?: unknown; hermes_version?: unknown; gateway_reachable?: unknown; hermes_jobs?: unknown; hermes_host_facts?: unknown; hermes_skills?: unknown; hermes_toolsets?: unknown };
+    const body = (req.body ?? {}) as { name?: string; ip?: string; projects?: ProjectAllocation[]; version?: unknown; protocol?: unknown; revision?: unknown; gate_posture?: unknown; proxy_port?: unknown; aggregate_port?: unknown; daemon_behind?: unknown; client_log?: unknown; agent_roster?: unknown; hermes_version?: unknown; gateway_reachable?: unknown; hermes_jobs?: unknown; hermes_host_facts?: unknown; hermes_skills?: unknown; hermes_toolsets?: unknown; hermes_models?: unknown; hermes_model_options?: unknown };
     const name = typeof body.name === 'string' ? body.name.trim() : '';
     if (!name) return reply.code(400).send({ error: 'name required' });
     const remote = (req.ip ?? '').split(':').pop() ?? 'unknown';
@@ -606,14 +606,21 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     // absent NEVER clears a stored block.
     const hermes_skills = Array.isArray(body.hermes_skills) ? (body.hermes_skills as unknown) : undefined;
     const hermes_toolsets = Array.isArray(body.hermes_toolsets) ? (body.hermes_toolsets as unknown) : undefined;
+    // #85 slice C: the per-profile model-access blocks (`hermes_models` +
+    // `hermes_model_options` — the gateway's /v1/models + /api/model/options
+    // inventories harvested once per connector round). Same plain array
+    // pass-through posture; the arbiter re-sanitizes via
+    // cleanHermesModels/cleanHermesModelOptions. Absent on old clients.
+    const hermes_models = Array.isArray(body.hermes_models) ? (body.hermes_models as unknown) : undefined;
+    const hermes_model_options = Array.isArray(body.hermes_model_options) ? (body.hermes_model_options as unknown) : undefined;
     const res = arbiter.registerClient(
       name,
       typeof body.ip === 'string' && body.ip.trim() ? body.ip.trim() : undefined,
       remote,
       projects,
       undefined,
-      version !== undefined || protocol !== undefined || revision !== undefined || gate_posture !== undefined || proxy_port !== undefined || aggregate_port !== undefined || daemon_behind !== undefined || client_log !== undefined || agent_roster !== undefined || hermes_version !== undefined || gateway_reachable !== undefined || hermes_jobs !== undefined || hermes_host_facts !== undefined || hermes_skills !== undefined || hermes_toolsets !== undefined
-        ? { version, protocol, revision, gate_posture, proxy_port, aggregate_port, daemon_behind, client_log, agent_roster, hermes_version, gateway_reachable, hermes_jobs, hermes_host_facts, hermes_skills, hermes_toolsets }
+      version !== undefined || protocol !== undefined || revision !== undefined || gate_posture !== undefined || proxy_port !== undefined || aggregate_port !== undefined || daemon_behind !== undefined || client_log !== undefined || agent_roster !== undefined || hermes_version !== undefined || gateway_reachable !== undefined || hermes_jobs !== undefined || hermes_host_facts !== undefined || hermes_skills !== undefined || hermes_toolsets !== undefined || hermes_models !== undefined || hermes_model_options !== undefined
+        ? { version, protocol, revision, gate_posture, proxy_port, aggregate_port, daemon_behind, client_log, agent_roster, hermes_version, gateway_reachable, hermes_jobs, hermes_host_facts, hermes_skills, hermes_toolsets, hermes_models, hermes_model_options }
         : undefined,
     );
     return reply.code(200).send({ client_id: res.client_id, created: res.created });

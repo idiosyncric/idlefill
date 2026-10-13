@@ -36,6 +36,15 @@ import {
   type ServerRow,
   type StateSnapshot,
 } from "@/lib/api";
+import {
+  HERMES_MODEL_ACCESS_LABEL,
+  currentProviderOf,
+  groupModelsByProfile,
+  groupProvidersByProfile,
+  hasModelAccess,
+  idlefillWiredNames,
+  servedModelGaps,
+} from "@/lib/hermes-model-access";
 import { ago, fmtCtx, probeWord } from "@/lib/format";
 import { modelTiles } from "@/lib/model-stats";
 import { StatTiles, TilesSkeleton } from "@/components/stat-tiles";
@@ -209,6 +218,8 @@ export function Models({ st }: { st: StateSnapshot | null }) {
           </div>
         </>
       )}
+
+      <HermesModelAccess st={st} />
 
       <AliasFormDialog
         open={adding}
@@ -878,5 +889,126 @@ function AliasFormDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// #85 slice C: HERMES MODEL ACCESS — the read-only cross-check strip. What
+// each client's Hermes gateway SERVES (`GET /v1/models`) and what each
+// profile could SWITCH TO (`GET /api/model/options?include_unconfigured=
+// false`) arrive as the `hermes_models`/`hermes_model_options` ADD-keys on
+// the register heartbeat (harvested at most once per connector round,
+// sanitized client-side AND at the arbiter edge) and ride /api/state's
+// client rows. Exception-only: a machine whose client never reported the
+// blocks (old client, connector off, gateway outage) renders NOTHING —
+// never an empty list pretending to be truth.
+//
+// The only diff-style claim is per SERVED model id: a model the gateway
+// answers as that idlefill never wires (no alias names it, no engine
+// inventory carries it — EXACT match only, the #66 D5 posture) shows as a
+// warn chip. The provider catalog is the profile's SWITCH vocabulary —
+// rendered as counts/names, never name-by-name diffed against GGUF ids
+// (different vocabularies; a 100-name wall is noise, not signal). READ-
+// ONLY: zero buttons/onClick — the model set/switch verbs are not in
+// idlefill's surface at all.
+// ---------------------------------------------------------------------------
+
+const NAMES_INLINE = 6; // model names shown under the current provider before "+N more"
+
+function HermesModelAccess({ st }: { st: StateSnapshot | null }) {
+  const clients = (st?.clients ?? []).filter((c) => hasModelAccess(c));
+  if (clients.length === 0) return null;
+  const wired = idlefillWiredNames(st);
+  return (
+    <div className="mt-4">
+      <h2 className="mb-1 text-[12px] font-semibold uppercase tracking-wide text-dim">{HERMES_MODEL_ACCESS_LABEL}</h2>
+      <p className="mb-2 text-[11px] text-dim">
+        what each machine’s Hermes gateway serves and what its profiles could switch to (gateway read once per
+        connector round — read-only, no switch verb here); served models idlefill never wires are named in warn.
+      </p>
+      <div className="grid gap-2.5 [grid-template-columns:repeat(auto-fit,minmax(340px,1fr))]">
+        {clients.map((c) => (
+          <ClientModelCard key={c.client_id} c={c} wired={wired} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ClientModelCard({ c, wired }: { c: NonNullable<StateSnapshot["clients"]>[number]; wired: Set<string> }) {
+  const servedByProfile = groupModelsByProfile(c.hermes_models);
+  const providersByProfile = groupProvidersByProfile(c.hermes_model_options);
+  const profiles = [...new Set([...servedByProfile.keys(), ...providersByProfile.keys()])].sort();
+  return (
+    <Card className="py-3 shadow-none">
+      <CardHeader className="px-4 pb-1">
+        <CardTitle className="text-[12px]">{c.name}</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-2 px-4">
+        {profiles.map((profile) => {
+          const served = servedByProfile.get(profile) ?? [];
+          const providers = providersByProfile.get(profile) ?? [];
+          const gaps = servedModelGaps(served, wired);
+          const current = currentProviderOf(providers);
+          const others = providers.filter((p) => p !== current);
+          return (
+            <div key={profile} className="flex flex-wrap items-center gap-1 text-[11px]">
+              <span className="text-[10px] font-semibold uppercase text-dim" title="the Hermes profile these rows belong to (stamped by the connector)">
+                {profile}
+              </span>
+              {served.map((m) => (
+                <span
+                  key={`m:${m.id}`}
+                  className={`rounded-pill border px-1.5 py-0 text-[10px] ${gaps.includes(m.id) ? "border-warn/50 text-warn" : "border-border text-dim"}`}
+                  title={[
+                    `served model ${m.id}${m.root ? ` (root: ${m.root})` : ""}`,
+                    gaps.includes(m.id) ? "— not wired in idlefill (no alias name, no engine inventory id matches)" : "— an alias or engine inventory names it",
+                    "(gateway /v1/models — read-only)",
+                  ].join(" ")}
+                >
+                  {m.id}
+                </span>
+              ))}
+              {current && (
+                <span
+                  key={`p:${current.slug}`}
+                  className="rounded-pill border border-border bg-background/40 px-1.5 py-0 text-[10px] text-dim"
+                  title={[
+                    `current provider: ${current.slug}`,
+                    current.authenticated === true ? "authenticated" : null,
+                    typeof current.total_models === "number" ? `${current.total_models} models available` : null,
+                    current.models_truncated ? "name list truncated" : null,
+                    "(gateway /api/model/options — read-only)",
+                  ]
+                    .filter(Boolean)
+                    .join(" — ")}
+                >
+                  {current.slug}
+                  <span className="text-dim/60"> · current</span>
+                </span>
+              )}
+              {current?.models?.slice(0, NAMES_INLINE).map((n) => (
+                <span key={`pn:${n}`} className="rounded-pill border border-border/60 px-1.5 py-0 text-[10px] text-dim/70" title={`model ${n} under ${current.slug} (switchable — read-only)`}>
+                  {n}
+                </span>
+              ))}
+              {current && (current.models?.length ?? 0) > NAMES_INLINE && (
+                <span className="text-[10px] text-dim" title={`${current.models?.length ?? 0} names survived the connector cap${current.models_truncated ? " of a longer gateway list" : ""}`}>
+                  +{(current.models?.length ?? 0) - NAMES_INLINE} more
+                </span>
+              )}
+              {others.length > 0 && (
+                <span
+                  className="text-[10px] text-dim"
+                  title={others.map((p) => `${p.slug}${typeof p.total_models === "number" ? ` (${p.total_models})` : ""}${p.models_truncated ? " †" : ""}`).join(", ")}
+                >
+                  +{others.length} switchable {others.length === 1 ? "provider" : "providers"}
+                </span>
+              )}
+            </div>
+          );
+        })}
+      </CardContent>
+    </Card>
   );
 }

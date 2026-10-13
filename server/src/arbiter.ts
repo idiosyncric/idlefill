@@ -72,7 +72,7 @@ import type {
   ThemeColors,
 } from './types.js';
 import type { StateStore } from './state.js';
-import type { ClientOverride, Lease, ProjectAllocation, ServerConfig, ServerConnection, ServerProvider, UtcDate, AgentRosterRow, HermesJobRow, HermesHostFactsSummary, HostFactStatus, HermesSkillRow, HermesToolsetRow } from './types.js';
+import type { ClientOverride, Lease, ProjectAllocation, ServerConfig, ServerConnection, ServerProvider, UtcDate, AgentRosterRow, HermesJobRow, HermesHostFactsSummary, HostFactStatus, HermesSkillRow, HermesToolsetRow, HermesModelRow, HermesModelProviderRow } from './types.js';
 import { PROVIDER_KINDS, THEME_DEFAULTS, THEME_HEX_RE, THEME_TOKEN_KEYS } from './types.js';
 
 /**
@@ -311,6 +311,90 @@ export function cleanHermesToolsets(raw: unknown): HermesToolsetRow[] | undefine
     }
     if (typeof o.enabled === 'boolean') row.enabled = o.enabled;
     if (typeof o.configured === 'boolean') row.configured = o.configured;
+    out.push(row);
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+/**
+ * #85 slice C: sanitize a reported HERMES MODELS block (what the gateway
+ * `GET /v1/models` SERVES — projected to id + optional root). Same edge
+ * posture as every client-published block: non-array / all-dropped →
+ * undefined (ABSENT — NEVER a clear); a member without a usable id (non-empty
+ * string ≤128) drops whole; `root` an optional string ≤128; `profile` ≤64;
+ * bounded hard at 64 rows. The OpenAI-compat decoration
+ * (created/owned_by/permission/parent) has NO landing place here.
+ */
+export function cleanHermesModels(raw: unknown): HermesModelRow[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out: HermesModelRow[] = [];
+  for (const r of raw as unknown[]) {
+    if (out.length >= 64) break;
+    if (!r || typeof r !== 'object' || Array.isArray(r)) continue;
+    const o = r as Record<string, unknown>;
+    const id = typeof o.id === 'string' ? o.id.trim() : '';
+    if (id === '' || id.length > 128) continue;
+    const row: HermesModelRow = { id };
+    if (typeof o.profile === 'string') {
+      const p = o.profile.trim();
+      if (p !== '' && p.length <= 64) row.profile = p;
+    }
+    if (typeof o.root === 'string') {
+      const rt = o.root.trim();
+      if (rt !== '' && rt.length <= 128) row.root = rt;
+    }
+    out.push(row);
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+/**
+ * #85 slice C: sanitize a reported HERMES MODEL-OPTIONS block (the gateway's
+ * `GET /api/model/options` provider catalog, projected to slug + the exact
+ * current/authenticated booleans + a bounded first slice of model NAMES).
+ * Slug required (non-empty ≤64 → drop whole otherwise); model names: an
+ * array of individually-checked non-empty strings ≤128, capped at 24 per
+ * provider (the OVER-cap posture: names past the cap are dropped, the row
+ * stands); `models_truncated` an exact boolean; `total_models` a sane
+ * integer ≤10000. ≤200 stored model names total per client. The pricing/
+ * endpoint/config members (`api_url`, `capabilities`, `aliases`, `free_tier`,
+ * `featured_models`, `unavailable_models`, `source`, …) and the display
+ * `name` have NO landing place. Bounded at 24 provider rows. Non-array /
+ * all-dropped → undefined (ABSENT — never a clear).
+ */
+export function cleanHermesModelOptions(raw: unknown): HermesModelProviderRow[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out: HermesModelProviderRow[] = [];
+  let nameBudget = 200;
+  for (const r of raw as unknown[]) {
+    if (out.length >= 24) break;
+    if (!r || typeof r !== 'object' || Array.isArray(r)) continue;
+    const o = r as Record<string, unknown>;
+    const slug = typeof o.slug === 'string' ? o.slug.trim() : '';
+    if (slug === '' || slug.length > 64) continue;
+    const row: HermesModelProviderRow = { slug };
+    if (typeof o.profile === 'string') {
+      const p = o.profile.trim();
+      if (p !== '' && p.length <= 64) row.profile = p;
+    }
+    if (typeof o.current === 'boolean') row.current = o.current;
+    if (typeof o.authenticated === 'boolean') row.authenticated = o.authenticated;
+    if (Array.isArray(o.models)) {
+      const names: string[] = [];
+      for (const m of o.models as unknown[]) {
+        if (names.length >= 24 || nameBudget <= 0) break;
+        if (typeof m !== 'string') continue;
+        const nm = m.trim();
+        if (nm === '' || nm.length > 128) continue;
+        names.push(nm);
+        nameBudget--;
+      }
+      if (names.length > 0) row.models = names;
+    }
+    if (typeof o.models_truncated === 'boolean') row.models_truncated = o.models_truncated;
+    if (typeof o.total_models === 'number' && Number.isInteger(o.total_models) && o.total_models >= 0 && o.total_models <= 10_000) {
+      row.total_models = o.total_models;
+    }
     out.push(row);
   }
   return out.length > 0 ? out : undefined;
@@ -830,7 +914,7 @@ export class Arbiter {
     observedIp: string,
     projects?: ProjectAllocation[],
     now?: number,
-    info?: { version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open'; proxy_port?: number; aggregate_port?: number; daemon_behind?: boolean; client_log?: string[]; agent_roster?: unknown; hermes_version?: unknown; gateway_reachable?: unknown; hermes_jobs?: unknown; hermes_host_facts?: unknown; hermes_skills?: unknown; hermes_toolsets?: unknown },
+    info?: { version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open'; proxy_port?: number; aggregate_port?: number; daemon_behind?: boolean; client_log?: string[]; agent_roster?: unknown; hermes_version?: unknown; gateway_reachable?: unknown; hermes_jobs?: unknown; hermes_host_facts?: unknown; hermes_skills?: unknown; hermes_toolsets?: unknown; hermes_models?: unknown; hermes_model_options?: unknown },
   ): { client_id: string; created: boolean } {
     const s = this.store.state;
     const seen = now ?? Date.now();
@@ -954,6 +1038,10 @@ export class Arbiter {
     // row; a non-array / all-dropped block is ABSENT (never a clear).
     const hermesSkills = cleanHermesSkills(info?.hermes_skills);
     const hermesToolsets = cleanHermesToolsets(info?.hermes_toolsets);
+    // #85 slice C: the per-profile model-access blocks (hermes_models /
+    // hermes_model_options — see cleanHermesModels/cleanHermesModelOptions).
+    const hermesModels = cleanHermesModels(info?.hermes_models);
+    const hermesModelOptions = cleanHermesModelOptions(info?.hermes_model_options);
     const existing = s.clients.find((c) => c.name === name);
     if (existing) {
       if (validIp(observedIp)) existing.ip = observedIp; // observed wins
@@ -1024,6 +1112,8 @@ export class Arbiter {
       // byte-for-byte unchanged).
       if (hermesSkills !== undefined) existing.hermes_skills = hermesSkills;
       if (hermesToolsets !== undefined) existing.hermes_toolsets = hermesToolsets;
+      if (hermesModels !== undefined) existing.hermes_models = hermesModels;
+      if (hermesModelOptions !== undefined) existing.hermes_model_options = hermesModelOptions;
       // #85 slice E: the richer host facts — same ADD-key rule as the
       // roster: a present, valid block replaces the stored one; an absent
       // (or wholly malformed) block NEVER clears it (the client only
@@ -1070,6 +1160,8 @@ export class Arbiter {
       // (same ADD-key store rule as the heartbeat path).
       ...(hermesSkills !== undefined ? { hermes_skills: hermesSkills } : {}),
       ...(hermesToolsets !== undefined ? { hermes_toolsets: hermesToolsets } : {}),
+      ...(hermesModels !== undefined ? { hermes_models: hermesModels } : {}),
+      ...(hermesModelOptions !== undefined ? { hermes_model_options: hermesModelOptions } : {}),
       // #85 slice E: the richer host facts land only when a valid block
       // was reported — the fresh row simply has no key otherwise.
       ...(hostFacts !== undefined ? { hermes_host_facts: hostFacts } : {}),

@@ -879,6 +879,148 @@ export function sanitizeHermesToolset(raw: unknown, profile: string): HermesTool
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// #85 slice C: MODEL ACCESS — what each Hermes profile can actually serve
+// (`GET /v1/models` + `GET /api/model/options?include_unconfigured=false`).
+// READ-ONLY, same round discipline as slice B: one bounded GET per surface per
+// keyed profile per connector round; zero requests while down/unkeyed; the
+// read plane NEVER touches any model set/switch verb.
+//
+// Live shapes (verified at build against the running gateway, default-profile
+// key read from the operator key file — the key value NEVER pasted):
+//   `GET /v1/models` → 200 `{object:'list', data:[{id,object,created,
+//     owned_by,permission,root,parent}]}` (OpenAI-compat list; the gateway
+//     serves its own agent model). The sanitizer projects ONLY id (+ `root`
+//     when a plain string — a null/absent root stays absent).
+//   `GET /api/model/options` → 200 `{model, provider, providers:[{slug,name,
+//     is_current,is_user_defined,models:[str…],total_models,source,api_url,
+//     native_catalog_empty,authenticated,free_tier,pricing_pending,
+//     unavailable_models,capabilities,featured_models,aliases}]}` (56
+//     providers unfiltered). The connector asks for `?include_unconfigured=
+//     false` (live: 7 providers / 104 model names — the gateway's own
+//     filter, a smaller honest payload) and projects ONLY slug + `current`
+//     (exact bool of `is_current`) + `authenticated` (exact bool) + the first
+//     ≤24 model NAMES (≤128 each, `models_truncated` when the provider
+//     listed more) + `total_models` (a sane bounded integer). `name` is slug
+//     decoration; `api_url`/`capabilities`/`aliases`/`free_tier`/
+//     `pricing_pending`/`featured_models`/`unavailable_models`/`source` are
+//     pricing/endpoint noise and config detail — NEVER published. A provider
+//     that definitively reports `authenticated: false` CANNOT serve and drops
+//     whole (belt beyond the query filter).
+//   Per-profile mirrors `/p/<profile>/…` exist for both routes (401 on a
+//   foreign key — the per-profile Bearer rule, verified live).
+//
+// WHY both surfaces: `/v1/models` is what the gateway SERVES (the agent
+// model it answers as); `/api/model/options` is what each profile could
+// switch TO (provider catalog). The Models tab cross-checks those names
+// against idlefill's own engine inventory — a profile that can reach a model
+// idlefill never wires is a visible gap, and it is honest about which side
+// of the join it came from.
+// ---------------------------------------------------------------------------
+
+/** Count caps (the model list is tiny; the provider catalog is the noisy
+ *  one — the query filter plus these caps bound a heartbeat). */
+export const MODELS_MAX_PER_PROFILE = 64;
+export const MODELS_MAX_TOTAL = 64;
+export const MODEL_OPTIONS_MAX_PER_PROFILE = 24; // providers per profile
+export const MODEL_OPTIONS_MAX_TOTAL = 48; // provider rows published total
+export const MODEL_NAMES_PER_PROVIDER = 24; // model names per provider row
+export const MODEL_NAMES_MAX_PER_PROFILE = 200; // model names per profile
+/** Per-member string caps (drop-don't-poison; the names-only discipline). */
+export const MODEL_ID_CAP = 128; // model id + root
+export const MODEL_NAME_CAP = 128; // a provider's model entry
+export const MODEL_SLUG_CAP = 64; // provider slug
+/** `total_models` only rides while it is a sane bounded integer. */
+export const MODEL_TOTAL_MODELS_MAX = 10_000;
+
+/** One sanitized `/v1/models` entry: the model id (required) + optional root
+ *  (the upstream a fine-tune derives from; a null/absent root stays absent). */
+export interface HermesModelRow {
+  profile?: string;
+  id: string;
+  root?: string;
+}
+
+/** One sanitized provider row from `/api/model/options` — the profile's
+ *  SWITCHABLE model catalog, names-only. `current` = the profile's active
+ *  provider; `authenticated` rides only as an exact boolean (and a provider
+ *  that reports `false` definitively never rides at all). */
+export interface HermesModelProviderRow {
+  profile?: string;
+  slug: string;
+  current?: boolean;
+  authenticated?: boolean;
+  models?: string[];
+  models_truncated?: boolean;
+  total_models?: number;
+}
+
+/** The URL paths (per-profile mirror rule — verified live for these routes). */
+export function modelsPath(profile: string): string {
+  return profile === 'default' ? '/v1/models' : `/p/${encodeURIComponent(profile)}/v1/models`;
+}
+export function modelOptionsPath(profile: string): string {
+  const q = '?include_unconfigured=false';
+  return profile === 'default' ? `/api/model/options${q}` : `/p/${encodeURIComponent(profile)}/api/model/options${q}`;
+}
+
+/**
+ * Sanitize ONE `/v1/models` entry. An entry without a usable id drops whole;
+ * `created`/`owned_by`/`permission`/`parent` are OpenAI-compat decoration and
+ * are NEVER projected.
+ */
+export function sanitizeHermesModel(raw: unknown, profile: string): HermesModelRow | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const m = raw as Record<string, unknown>;
+  const id = typeof m.id === 'string' ? m.id.trim().slice(0, MODEL_ID_CAP) : '';
+  if (id === '') return undefined;
+  const out: HermesModelRow = { id };
+  const prof = typeof profile === 'string' ? profile.trim().slice(0, 64) : '';
+  if (prof !== '') out.profile = prof;
+  if (typeof m.root === 'string' && m.root.trim() !== '') out.root = m.root.trim().slice(0, MODEL_ID_CAP);
+  return out;
+}
+
+/**
+ * Sanitize ONE `/api/model/options` provider record. Slug required (a record
+ * without one cannot be attributed → drop whole); a provider that definitively
+ * reports `authenticated: false` CANNOT serve and drops whole. Model names:
+ * individually checked strings (≤ `MODEL_NAMES_PER_PROVIDER`, each ≤128);
+ * `models_truncated: true` rides only when the provider listed more entries
+ * than survived the cap. The display `name` (slug decoration) and every
+ * pricing/endpoint/config member (`api_url`, `capabilities`, `aliases`,
+ * `free_tier`, `featured_models`, `unavailable_models`, `source`, …) are
+ * NEVER projected.
+ */
+export function sanitizeHermesModelProvider(raw: unknown, profile: string): HermesModelProviderRow | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const p = raw as Record<string, unknown>;
+  const slug = typeof p.slug === 'string' ? p.slug.trim().slice(0, MODEL_SLUG_CAP) : '';
+  if (slug === '') return undefined;
+  if (p.authenticated === false) return undefined; // definitively cannot serve
+  const out: HermesModelProviderRow = { slug };
+  const prof = typeof profile === 'string' ? profile.trim().slice(0, 64) : '';
+  if (prof !== '') out.profile = prof;
+  if (typeof p.is_current === 'boolean') out.current = p.is_current;
+  if (typeof p.authenticated === 'boolean') out.authenticated = p.authenticated;
+  if (Array.isArray(p.models)) {
+    const names: string[] = [];
+    let kept = 0;
+    for (const m of p.models) {
+      if (typeof m !== 'string' || m.trim() === '') continue; // bad entry drops alone
+      kept++;
+      if (names.length >= MODEL_NAMES_PER_PROVIDER) continue; // count the real list, emit the cap
+      names.push(m.trim().slice(0, MODEL_NAME_CAP));
+    }
+    if (names.length > 0) out.models = names;
+    if (kept > names.length) out.models_truncated = true;
+  }
+  if (typeof p.total_models === 'number' && Number.isInteger(p.total_models) && p.total_models >= 0 && p.total_models <= MODEL_TOTAL_MODELS_MAX) {
+    out.total_models = p.total_models;
+  }
+  return out;
+}
+
 /** The ledger join key's canonical shape (same rule `rowToMeta` applies to a
  *  row's id): trim, cap. A gate-captured header id is normalized the same way
  *  so a whitespace/padding difference never mis-joins. */
@@ -1055,12 +1197,18 @@ async function fetchRound(cfg: HermesGatewayConfig, fetchImpl: FetchImpl, nowMs:
    *  for the per-profile capability surfaces (`/v1/skills`, `/v1/toolsets`). */
   skills: Map<string, HermesSkillRow[]>;
   toolsets: Map<string, HermesToolsetRow[]>;
+  /** #85 slice C: the same discipline for the per-profile model-access
+   *  surfaces (`/v1/models`, `/api/model/options?include_unconfigured=false`). */
+  models: Map<string, HermesModelRow[]>;
+  modelOptions: Map<string, HermesModelProviderRow[]>;
   fetchedAt: number;
 }> {
   const rows = new Map<string, LedgerRowEntry>();
   const jobs = new Map<string, HermesJobRow[]>();
   const skills = new Map<string, HermesSkillRow[]>();
   const toolsets = new Map<string, HermesToolsetRow[]>();
+  const models = new Map<string, HermesModelRow[]>();
+  const modelOptions = new Map<string, HermesModelProviderRow[]>();
   let reachable = false;
   let version: string | undefined;
   let healthStatus: string | undefined;
@@ -1081,7 +1229,7 @@ async function fetchRound(cfg: HermesGatewayConfig, fetchImpl: FetchImpl, nowMs:
   } catch {
     /* unreachable — fail-quiet */
   }
-  if (!reachable) return { reachable, version, hostFacts, rows, jobs, skills, toolsets, fetchedAt: nowMs };
+  if (!reachable) return { reachable, version, hostFacts, rows, jobs, skills, toolsets, models, modelOptions, fetchedAt: nowMs };
 
   // #85 slice E: the richer host facts, ONE request per reachable round.
   // Requires an operator key (the route is authenticated) and a key is
@@ -1220,7 +1368,25 @@ async function fetchRound(cfg: HermesGatewayConfig, fetchImpl: FetchImpl, nowMs:
     const toolsetList = await fetchListSurface(cfg, fetchImpl, toolsetsPath(profile), key, (raw) => sanitizeHermesToolset(raw, profile), TOOLSETS_MAX_PER_PROFILE);
     if (toolsetList !== undefined) toolsets.set(profile, toolsetList);
   }
-  return { reachable, version, hostFacts, rows, jobs, skills, toolsets, fetchedAt: nowMs };
+
+  // #85 slice C: MODEL ACCESS — one bounded GET per surface per keyed profile
+  // per round (inside THIS round; zero requests while down — the unreachable
+  // round returned above). `/v1/models` answers through the same
+  // `{object:'list', data:[…]}` envelope as the slice-B surfaces (it REPLACES
+  // the profile's last-known list — the gateway list is unpaginated);
+  // `/api/model/options` carries a top-level `{providers:[…]}` envelope and
+  // replaces under the same rule. Any non-200 / malformed body leaves that
+  // surface's profile rows standing (last-known-wins across rounds). GET
+  // only: no model set/switch verb exists in the read plane.
+  for (const profile of cfg.profiles) {
+    const key = profile === 'default' ? cfg.key : cfg.profileKeys.get(profile);
+    if (!key) continue; // unkeyed profile ⇒ zero requests; its rows stay last-known
+    const modelList = await fetchListSurface(cfg, fetchImpl, modelsPath(profile), key, (raw) => sanitizeHermesModel(raw, profile), MODELS_MAX_PER_PROFILE);
+    if (modelList !== undefined) models.set(profile, modelList);
+    const providerList = await fetchModelOptionsSurface(cfg, fetchImpl, modelOptionsPath(profile), key, profile);
+    if (providerList !== undefined) modelOptions.set(profile, providerList);
+  }
+  return { reachable, version, hostFacts, rows, jobs, skills, toolsets, models, modelOptions, fetchedAt: nowMs };
 }
 
 /**
@@ -1267,6 +1433,62 @@ async function fetchListSurface<T>(
 }
 
 /**
+ * #85 slice C helper: one bounded `GET <path>` for the model-options surface
+ * (top-level `{providers:[…]}` envelope — NOT the slice-B list envelope).
+ * Same fail-quiet contract as `fetchListSurface`: the sanitized provider list
+ * on a 200 with a well-formed envelope (per-provider sanitize, provider cap,
+ * and a per-profile model-NAME budget so 56 providers of names cannot bloat
+ * a heartbeat), undefined on ANY failure. The fetch never throws.
+ */
+async function fetchModelOptionsSurface(
+  cfg: HermesGatewayConfig,
+  fetchImpl: FetchImpl,
+  path: string,
+  key: string,
+  profile: string,
+): Promise<HermesModelProviderRow[] | undefined> {
+  let res: Response;
+  try {
+    res = await fetchImpl(`${cfg.base_url}${path}`, {
+      headers: { authorization: `Bearer ${key}` },
+      signal: AbortSignal.timeout(cfg.timeout_ms),
+    });
+  } catch {
+    return undefined; // transport failure: this profile's provider rows stay last-known
+  }
+  if (res.status !== 200) return undefined; // 401/403/404/5xx: stay last-known
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    return undefined;
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return undefined;
+  const envProviders = (body as { providers?: unknown }).providers;
+  if (!Array.isArray(envProviders)) return undefined; // malformed envelope: stand as-is
+  const out: HermesModelProviderRow[] = [];
+  let nameBudget = MODEL_NAMES_MAX_PER_PROFILE;
+  for (const raw of envProviders) {
+    if (out.length >= MODEL_OPTIONS_MAX_PER_PROFILE) break;
+    const row = sanitizeHermesModelProvider(raw, profile);
+    if (!row) continue; // drop-don't-poison (and authenticated:false drops whole)
+    const n = row.models?.length ?? 0;
+    if (n > nameBudget) {
+      // Over the per-profile name budget: keep the row minus the overflow
+      // names (truncate honestly — the row's counts stay truthful).
+      row.models = row.models!.slice(0, nameBudget);
+      if (row.models.length === 0) delete row.models;
+      row.models_truncated = true;
+      nameBudget = 0;
+    } else {
+      nameBudget -= n;
+    }
+    out.push(row);
+  }
+  return out;
+}
+
+/**
  * The daemon-side connector: holds the last-known ledger (session id →
  * meta), polls on the daemon's tick cadence, and answers the two
  * questions the heartbeat asks: `metaFor(sessionId)` (the enrichment)
@@ -1286,6 +1508,10 @@ export class HermesGatewayConnector {
    *  replace-on-answer / stand-on-failure discipline — see `fetchRound`). */
   private skillsByProfile = new Map<string, HermesSkillRow[]>();
   private toolsetsByProfile = new Map<string, HermesToolsetRow[]>();
+  /** #85 slice C: the last-known model-access rows per profile (the same
+   *  replace-on-answer / stand-on-failure discipline — see `fetchRound`). */
+  private modelsByProfile = new Map<string, HermesModelRow[]>();
+  private modelOptionsByProfile = new Map<string, HermesModelProviderRow[]>();
   /** #82: session id → the (reachable) poll round that last reported it.
    *  Bookkeeping for the ledger evictions; a parallel structure so the
    *  published `HermesSessionMeta` shape never changes. */
@@ -1342,6 +1568,9 @@ export class HermesGatewayConnector {
       // #85 slice B: same merge discipline for the capability surfaces.
       for (const [profile, list] of round.skills) this.skillsByProfile.set(profile, list);
       for (const [profile, list] of round.toolsets) this.toolsetsByProfile.set(profile, list);
+      // #85 slice C: same merge discipline for the model-access surfaces.
+      for (const [profile, list] of round.models) this.modelsByProfile.set(profile, list);
+      for (const [profile, list] of round.modelOptions) this.modelOptionsByProfile.set(profile, list);
       // #82: only a REACHABLE round ages the ledger (an outage never evicts).
       if (round.reachable) this.pruneLedger(round.rows);
       // #83: a fresh REACHABLE round reopens the per-round lookup budget. An
@@ -1719,6 +1948,42 @@ export class HermesGatewayConnector {
       if (!list) continue;
       for (const row of list) {
         if (out.length >= TOOLSETS_MAX_TOTAL) return out;
+        out.push(row);
+      }
+    }
+    return out.length > 0 ? out : undefined;
+  }
+
+  /**
+   * #85 slice C: the model-access blocks for the client register heartbeat
+   * (ADD-keys `hermes_models` + `hermes_model_options`). undefined = publish
+   * NOTHING (the keys are omitted — the arbiter keeps its stored rows, and an
+   * old arbiter never saw these keys): connector disabled, no poll round run
+   * yet, or every profile answered empty/nothing. Rows iterate in config
+   * order and are capped at the *_MAX_TOTAL.
+   */
+  modelsSnapshot(): HermesModelRow[] | undefined {
+    if (!this.cfg.enabled || !this.polled) return undefined;
+    const out: HermesModelRow[] = [];
+    for (const profile of this.cfg.profiles) {
+      const list = this.modelsByProfile.get(profile);
+      if (!list) continue;
+      for (const row of list) {
+        if (out.length >= MODELS_MAX_TOTAL) return out;
+        out.push(row);
+      }
+    }
+    return out.length > 0 ? out : undefined;
+  }
+
+  modelOptionsSnapshot(): HermesModelProviderRow[] | undefined {
+    if (!this.cfg.enabled || !this.polled) return undefined;
+    const out: HermesModelProviderRow[] = [];
+    for (const profile of this.cfg.profiles) {
+      const list = this.modelOptionsByProfile.get(profile);
+      if (!list) continue;
+      for (const row of list) {
+        if (out.length >= MODEL_OPTIONS_MAX_TOTAL) return out;
         out.push(row);
       }
     }

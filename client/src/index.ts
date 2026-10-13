@@ -1266,29 +1266,43 @@ export class ClientDaemon {
    * version/status publishes NOTHING, so the body stays byte-for-byte
    * the slice-B shape. An old arbiter ignores the key.
    *
-   * #85 slice B adds the per-profile capability blocks, `hermes_skills` +
-   * `hermes_toolsets` (`GET /v1/skills` / `GET /v1/toolsets` harvested at
-   * most once per connector round, sanitized to names + the exact
-   * enabled/configured booleans client-side). They ride ONLY when a round
-   * answered non-empty rows: absent ⇒ the keys are OMITTED and the body
-   * stays byte-for-byte today's shape. READ-ONLY — the connector GETs and
-   * nothing here addresses an enable/disable verb.
-   */
-  private hermesGatewayHostFacts(): Record<string, unknown> {
-    const snap = this.hermesGateway?.snapshot();
-    if (!snap) return {};
-    const hermesJobs = this.hermesGateway?.jobsSnapshot();
-    const hermesSkills = this.hermesGateway?.skillsSnapshot();
-    const hermesToolsets = this.hermesGateway?.toolsetsSnapshot();
-    return {
-      ...(snap.version ? { hermes_version: snap.version } : {}),
-      gateway_reachable: snap.reachable,
-      ...(hermesJobs && hermesJobs.length > 0 ? { hermes_jobs: hermesJobs } : {}),
-      ...(hermesSkills && hermesSkills.length > 0 ? { hermes_skills: hermesSkills } : {}),
-      ...(hermesToolsets && hermesToolsets.length > 0 ? { hermes_toolsets: hermesToolsets } : {}),
-      ...(snap.hostFacts ? { hermes_host_facts: snap.hostFacts } : {}),
-    };
-  }
+    * #85 slice B adds the per-profile capability blocks, `hermes_skills` +
+    * `hermes_toolsets` (`GET /v1/skills` / `GET /v1/toolsets` harvested at
+    * most once per connector round, sanitized to names + the exact
+    * enabled/configured booleans client-side). They ride ONLY when a round
+    * answered non-empty rows: absent ⇒ the keys are OMITTED and the body
+    * stays byte-for-byte today's shape. READ-ONLY — the connector GETs and
+    * nothing here addresses an enable/disable verb.
+    *
+    * #85 slice C adds the per-profile model-access blocks, `hermes_models` +
+    * `hermes_model_options` (`GET /v1/models` + `GET /api/model/options?
+    * include_unconfigured=false` harvested at most once per connector round:
+    * served model ids, and the switchable provider catalog sanitized to slug
+    * + the exact current/authenticated booleans + a bounded first slice of
+    * model NAMES — pricing/endpoint/config detail NEVER published, a
+    * definitively unauthenticated provider NEVER published). Same gate:
+    * they ride ONLY when a round answered non-empty rows; absent ⇒ the keys
+    * are OMITTED. READ-ONLY — no model set/switch verb is ever addressed.
+    */
+   private hermesGatewayHostFacts(): Record<string, unknown> {
+     const snap = this.hermesGateway?.snapshot();
+     if (!snap) return {};
+     const hermesJobs = this.hermesGateway?.jobsSnapshot();
+     const hermesSkills = this.hermesGateway?.skillsSnapshot();
+     const hermesToolsets = this.hermesGateway?.toolsetsSnapshot();
+     const hermesModels = this.hermesGateway?.modelsSnapshot();
+     const hermesModelOptions = this.hermesGateway?.modelOptionsSnapshot();
+     return {
+       ...(snap.version ? { hermes_version: snap.version } : {}),
+       gateway_reachable: snap.reachable,
+       ...(hermesJobs && hermesJobs.length > 0 ? { hermes_jobs: hermesJobs } : {}),
+       ...(hermesSkills && hermesSkills.length > 0 ? { hermes_skills: hermesSkills } : {}),
+       ...(hermesToolsets && hermesToolsets.length > 0 ? { hermes_toolsets: hermesToolsets } : {}),
+       ...(hermesModels && hermesModels.length > 0 ? { hermes_models: hermesModels } : {}),
+       ...(hermesModelOptions && hermesModelOptions.length > 0 ? { hermes_model_options: hermesModelOptions } : {}),
+       ...(snap.hostFacts ? { hermes_host_facts: snap.hostFacts } : {}),
+     };
+   }
 
   /** #73: the gateway connector (tests / operators inspect it); null when
    *  the env switch is unset (the complement is not constructed). */

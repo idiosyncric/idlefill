@@ -590,6 +590,25 @@ export interface ClientRecord {
    */
   hermes_skills?: HermesSkillRow[];
   hermes_toolsets?: HermesToolsetRow[];
+  /**
+   * #85 slice C: the per-profile HERMES model access — the client connector
+   * harvested `GET /v1/models` (what the gateway SERVES) + `GET /api/model/
+   * options?include_unconfigured=false` (what each profile could switch TO)
+   * at most once per connector round and publishes the sanitized blocks as
+   * the ADD-keys `hermes_models` + `hermes_model_options`. Model rows carry
+   * ONLY id (+ optional root); provider rows carry slug + the exact
+   * current/authenticated booleans + a bounded first slice of model NAMES
+   * (the pricing/endpoint/config members — api_url/capabilities/aliases/
+   * free_tier/… — have NO member here by shape). A definitively
+   * unauthenticated provider never arrives (the client drops it). ADD-key:
+   * stored on a valid report (re-sanitized ≤64 model rows, ≤24 provider rows
+   * per client via cleanHermesModels/cleanHermesModelOptions); non-array /
+   * all-malformed ⇒ absent; absent NEVER clears the stored blocks. Read-only
+   * visibility (the Models-tab cross-check); NOTHING here addresses a model
+   * set/switch verb. Display only; never a gate.
+   */
+  hermes_models?: HermesModelRow[];
+  hermes_model_options?: HermesModelProviderRow[];
 }
 
 /**
@@ -683,6 +702,46 @@ export interface HermesToolsetRow {
   name: string;
   enabled?: boolean;
   configured?: boolean;
+}
+
+/**
+ * #85 slice C: one model the gateway SERVES (`GET /v1/models` entry,
+ * projected to id + optional root). The OpenAI-compat decoration
+ * (created/owned_by/permission/parent) has NO member here. The client
+ * connector sanitizes (id ≤128 required); the arbiter re-sanitizes on
+ * arrival (`cleanHermesModels`).
+ */
+export interface HermesModelRow {
+  /** Owning Hermes profile (the connector stamps it; display attribution). */
+  profile?: string;
+  id: string;
+  /** The upstream a derived model comes from (absent when null/not a string). */
+  root?: string;
+}
+
+/**
+ * #85 slice C: one SWITCHABLE provider row from the gateway's `GET /api/
+ * model/options` (the profile's model catalog, names-only). Slug required
+ * (≤64); `current` = the profile's active provider (exact boolean);
+ * `authenticated` rides only as an exact boolean — the CLIENT connector drops
+ * a provider that definitively reports false before it ever reaches here.
+ * `models` is a bounded first slice of the provider's model names (each
+ * ≤128; ≤24 per provider, ≤200 per profile); `models_truncated` marks a
+ * provider whose real list was longer; `total_models` the gateway's own
+ * count when sane. The display `name` (slug decoration) and every
+ * pricing/endpoint/config member (`api_url`, `capabilities`, `aliases`,
+ * `free_tier`, `featured_models`, `unavailable_models`, `source`, …) have NO
+ * member here — a poison attempt carrying them lands in the drop bucket.
+ */
+export interface HermesModelProviderRow {
+  /** Owning Hermes profile (the connector stamps it; display attribution). */
+  profile?: string;
+  slug: string;
+  current?: boolean;
+  authenticated?: boolean;
+  models?: string[];
+  models_truncated?: boolean;
+  total_models?: number;
 }
 
 /**

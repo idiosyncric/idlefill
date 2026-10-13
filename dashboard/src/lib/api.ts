@@ -180,6 +180,10 @@ export type ClientRow = {
   hermes_skills?: HermesSkillRow[];
   /** Per-profile HERMES toolsets (#85 slice B); absent on old clients / outages. */
   hermes_toolsets?: HermesToolsetRow[];
+  /** Per-profile HERMES served models (#85 slice C); absent on old clients / outages. */
+  hermes_models?: HermesModelRow[];
+  /** Per-profile HERMES switchable model catalog (#85 slice C); absent on old clients / outages. */
+  hermes_model_options?: HermesModelProviderRow[];
   projects: {
     name: string;
     model: string;
@@ -469,6 +473,41 @@ export type HermesToolsetRow = {
   name: string;
   enabled?: boolean;
   configured?: boolean;
+};
+
+// ---------------------------------------------------------------------------
+// Hermes model access (#85 slice C): what each Hermes profile can SERVE
+// (`GET /v1/models`, the gateway's own served list) and what it could SWITCH
+// TO (`GET /api/model/options?include_unconfigured=false`, the provider
+// catalog), harvested by the client's gateway connector at most once per
+// connector round and published as the ADD-keys `hermes_models` /
+// `hermes_model_options`. Names-only: served model ids; provider slug + the
+// exact current/authenticated booleans + a bounded first slice of model
+// NAMES (`models_truncated` marks a longer real list). The pricing/endpoint
+// detail (api_url, capabilities, aliases, free_tier, …) never arrives — a
+// definitively unauthenticated provider never does either. Read-only chrome:
+// NO model set/switch affordance anywhere; absent on old clients / outages
+// (the strip hides — never an empty list pretending to be truth).
+// ---------------------------------------------------------------------------
+export type HermesModelRow = {
+  profile?: string;
+  id: string;
+  /** The upstream a derived model comes from (absent when the gateway has none). */
+  root?: string;
+};
+
+export type HermesModelProviderRow = {
+  profile?: string;
+  slug: string;
+  /** The profile's ACTIVE provider (exact boolean). */
+  current?: boolean;
+  authenticated?: boolean;
+  /** A bounded first slice of the provider's model names. */
+  models?: string[];
+  /** TRUE when the provider listed more names than survived the cap. */
+  models_truncated?: boolean;
+  /** The gateway's own count for the provider, when sane. */
+  total_models?: number;
 };
 
 export type MeshPeerServer = {
