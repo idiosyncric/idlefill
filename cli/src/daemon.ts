@@ -120,6 +120,23 @@ function psRows(): string[] {
   return (out.stdout ?? '').split('\n').filter((l) => l.trim().length > 0);
 }
 
+/** The identity rule: node + THIS repo + the CLIENT entry. It must name the
+ *  client entry specifically — a bare 'src/index.ts' substring also matches the
+ *  ARBITER (server/src/index.ts), and on a native Linux install (the urza
+ *  cutover, container-ops.md D1) the arbiter runs from the SAME checkout, so
+ *  the loose form reported the arbiter's processes as client daemons. */
+export function isClientDaemonCmdline(cmd: string, repo: string, clientDir: string): boolean {
+  const argv0 = (cmd ?? '').split(/\s+/)[0] ?? '';
+  if (!argv0.endsWith('/node') && argv0 !== 'node') return false;
+  if (!cmd.includes(repo)) return false;
+  const entries = [
+    join(clientDir, 'src', 'index.ts'), // the tsx flavor every supervisor runs today
+    join(clientDir, 'dist', 'index.ts'), // the legacy matcher kept it legal
+    join(clientDir, 'dist', 'index.js'), // a built client entry, if one is ever emitted
+  ];
+  return entries.some((e) => cmd.includes(e));
+}
+
 /** Daemons of THIS repo: node + repo path + client entry in argv. */
 function daemonPids(): number[] {
   const pids: number[] = [];
@@ -127,10 +144,7 @@ function daemonPids(): number[] {
     const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
     if (!m) continue;
     const [, pid, , cmd] = m;
-    const argv0 = (cmd ?? '').split(/\s+/)[0] ?? '';
-    if (!argv0.endsWith('/node') && argv0 !== 'node') continue;
-    if (!(cmd ?? '').includes(P().repo)) continue;
-    if (!cmd?.includes('src/index.ts') && !cmd?.includes('dist/index.ts')) continue;
+    if (!isClientDaemonCmdline(cmd ?? '', P().repo, P().clientDir)) continue;
     pids.push(Number(pid));
   }
   return pids;

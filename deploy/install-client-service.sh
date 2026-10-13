@@ -63,10 +63,21 @@ NPATH="$(dirname "$NPX_BIN")"
 git -C "$REPO" rev-parse HEAD >/dev/null 2>&1 || fail "$REPO is not a git checkout — issue #49's boot revision needs git; clone the repo properly"
 
 # Refuse a running non-systemd client from THIS repo: two daemons under one
-# name fight over leases and flood registration heartbeats.
+# name fight over leases and flood registration heartbeats. The unit's OWN
+# processes match the same identity rule, so they are filtered out by cgroup —
+# otherwise this guard false-fires against the very unit it is about to
+# reinstall (and the arbiter's processes are no longer counted at all: the
+# pid matcher now names the client entry specifically).
 LIVE_PIDS="$(node "$REPO/scripts/idlefill-daemon.mjs" pids 2>/dev/null || true)"
-if [ -n "$LIVE_PIDS" ]; then
-  fail "a client daemon for this repo is already running outside systemd (pids: $(echo $LIVE_PIDS | tr '\n' ' ')). Stop it first: node scripts/idlefill-daemon.mjs stop"
+OUTSIDE=""
+for pid in $LIVE_PIDS; do
+  if [ -r "/proc/$pid/cgroup" ] && grep -q "/$UNIT.service" "/proc/$pid/cgroup" 2>/dev/null; then
+    continue # supervised by this unit already
+  fi
+  OUTSIDE="$OUTSIDE $pid"
+done
+if [ -n "$OUTSIDE" ]; then
+  fail "a client daemon for this repo is already running outside systemd (pids:$OUTSIDE). Stop it first: node scripts/idlefill-daemon.mjs stop"
 fi
 
 # ---- render + byte-verify (never edit the template) -----------------------
