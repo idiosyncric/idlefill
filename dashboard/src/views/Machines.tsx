@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
   Card,
@@ -22,6 +22,7 @@ import {
   type HostVia,
   type MachineSummary,
 } from "@/lib/hierarchy";
+import { machineKey } from "@/lib/hash-nav";
 import {
   apiToken,
   getRemoteMetrics,
@@ -93,6 +94,18 @@ const TONE: Record<string, string> = {
 // button — it updates by the operator's own command line; the intents asked
 // OF this machine render as chips on the local row (the coarse
 // update_intents block).
+//
+// Navigable hierarchy (2026-10-13, layout-only, zero wire change): each
+// row registers itself under its scheme key (machineKey = "machine/<name>",
+// the local row keyed by machineKey(LOCAL_MACHINE) — the SAME label the
+// hierarchy joins and the Servers-tab chip pass). A focusKey (App-owned,
+// prefix-gated to this scheme) that names a row scrolls it into view ONCE
+// and lights a transient hairline ring (~1.5 s, cleared on timeout AND on
+// unmount); every other case — a deleted machine, rows not in yet — just
+// opens the tab: no error chrome, no stale ring. Each hosted-engine row
+// (the "hosted here" block — the arbiter's own join, the one that knows
+// the row id) becomes a button deep-linking to that engine's card on the
+// Inference servers tab.
 // ---------------------------------------------------------------------------
 
 const REMOTE_WINDOW_MS = 7 * 86_400_000; // the 7-day default, local parity (D2)
@@ -104,7 +117,51 @@ const TILE_TITLES: string[] = [
   "watched engines idle across the mesh — only FRESH peer snapshots count",
 ];
 
-export function Machines({ st }: { st: StateSnapshot | null }) {
+export function Machines({
+  st,
+  focusKey,
+  onEnginePick,
+  onConsumeFocus,
+}: {
+  st: StateSnapshot | null;
+  /** App-owned deep-link focus, already prefix-gated to this view's scheme
+   *  ("machine/<name>") — null when the hash/focus names nothing here. */
+  focusKey?: string | null;
+  /** Cross-tab pick: open this engine's card on the Inference servers tab.
+   *  Absent = rows stay plain lines. */
+  onEnginePick?: (serverId: string) => void;
+  /** Tell App the focus was consumed (it clears the state and rewrites the
+   *  hash to the bare sub-tab so a refresh never re-flashes). */
+  onConsumeFocus?: () => void;
+}) {
+  // Deep-link plumbing (layout-only): every machine row registers itself
+  // under its scheme key; a focusKey that names a row scrolls it in ONCE
+  // and arms the transient ring. The ring timer is its own effect keyed on
+  // flashKey, so App clearing the focus (focusKey → null) cannot cut the
+  // highlight short, and unmounting clears the timer — no leaks, no stale
+  // ring. A focusKey that names no row (deleted machine, or the rows are
+  // not even in yet and never will be) just opens the tab.
+  const rowRefs = useRef(new Map<string, HTMLElement>());
+  const [flashKey, setFlashKey] = useState<string | null>(null);
+  const regRow = (key: string, el: HTMLElement | null) => {
+    if (el) rowRefs.current.set(key, el);
+    else rowRefs.current.delete(key);
+  };
+  const rowsIn = st !== null; // the skeleton render registers no rows
+  useEffect(() => {
+    if (!focusKey || !rowsIn) return;
+    const el = rowRefs.current.get(focusKey);
+    if (el) {
+      el.scrollIntoView({ block: "center" });
+      setFlashKey(focusKey);
+    }
+    onConsumeFocus?.(); // consumed exactly once, match or no match
+  }, [focusKey, rowsIn, onConsumeFocus]);
+  useEffect(() => {
+    if (flashKey === null) return;
+    const t = setTimeout(() => setFlashKey(null), 1500);
+    return () => clearTimeout(t); // timeout AND unmount both clear the highlight
+  }, [flashKey]);
   if (!st) {
     return (
       <section className="flex flex-col gap-3">
@@ -155,9 +212,24 @@ export function Machines({ st }: { st: StateSnapshot | null }) {
           stacks, each row splits identity/engines side by side when wide
           and stacks them when narrow — auto-fit, no media queries. */}
       <div className="flex flex-col gap-2.5">
-        <LocalRow st={st} hosted={hostedOn(LOCAL_MACHINE)} />
+        <LocalRow
+          st={st}
+          hosted={hostedOn(LOCAL_MACHINE)}
+          rowRef={(el) => regRow(machineKey(LOCAL_MACHINE), el)}
+          highlighted={flashKey === machineKey(LOCAL_MACHINE)}
+          onEnginePick={onEnginePick}
+        />
         {peers.map((p) => (
-          <PeerRow key={p.url} st={st} p={p} now={st.now} hosted={hostedOn(p.name)} />
+          <PeerRow
+            key={p.url}
+            st={st}
+            p={p}
+            now={st.now}
+            hosted={hostedOn(p.name)}
+            rowRef={(el) => regRow(machineKey(p.name), el)}
+            highlighted={flashKey === machineKey(p.name)}
+            onEnginePick={onEnginePick}
+          />
         ))}
       </div>
       {hosts.unhosted.length > 0 && (
@@ -199,14 +271,26 @@ function engineDot(row: ServerRow): string {
 // live node:os read (host-wide even inside a container); absent on an
 // arbiter that predates the key → no line, never a fake zero. Nothing here
 // dims: it is all this page's own live poll.
-function LocalRow({ st, hosted }: { st: StateSnapshot; hosted: { row: ServerRow; via: HostVia }[] }) {
+function LocalRow({
+  st,
+  hosted,
+  rowRef,
+  highlighted,
+  onEnginePick,
+}: {
+  st: StateSnapshot;
+  hosted: { row: ServerRow; via: HostVia }[];
+  rowRef: (el: HTMLElement | null) => void;
+  highlighted: boolean;
+  onEnginePick?: (serverId: string) => void;
+}) {
   const running = (st.active_leases ?? []).length > 0;
   const w: StateWord = liveWord(st.idle, running);
   const queued = (st.clients ?? []).flatMap((c) => c.projects ?? []).reduce((a, p) => a + (p.queue_depth || 0), 0);
   const h = st.host;
   const hline = hostLine(h);
   return (
-    <Card className="gap-0 py-0 shadow-none">
+    <Card ref={rowRef} className={`gap-0 py-0 shadow-none ${highlighted ? "ring-1 ring-ring" : ""}`}>
       <CardHeader className="flex-row items-center gap-2 px-3 py-2 pb-0">
         <span className="size-1.5 shrink-0 rounded-full bg-ok" title="this machine — the arbiter serving this page" />
         <CardTitle className="min-w-0 truncate text-[13px] font-semibold" title="the arbiter serving this page — local truth, not a pull">
@@ -274,8 +358,13 @@ function LocalRow({ st, hosted }: { st: StateSnapshot; hosted: { row: ServerRow;
                     row.signal ? { idle: row.signal.idle, degraded: row.signal.degraded } : null,
                     running || row.models.some((m) => m.running),
                   );
-                  return (
-                    <div key={row.id} className="flex items-center gap-2 text-[12px]">
+                  // the one line of the row: dot · name · right-aligned state
+                  // word (+ idle duration). With a wired pick it becomes a
+                  // button (keyboard-accessible, focus-visible ring, no
+                  // chevron — the affordance is the ring and the title, in
+                  // keeping with the flat-by-default posture).
+                  const line = (
+                    <>
                       <span
                         className={`size-1.5 shrink-0 rounded-full ${engineDot(row)}`}
                         title={`${row.name}: ${sw.label} — hosted here (${VIA_NOTE[via]})`}
@@ -285,6 +374,23 @@ function LocalRow({ st, hosted }: { st: StateSnapshot; hosted: { row: ServerRow;
                         {sw.label}
                         {row.signal?.idle && row.signal.idle_for_s != null ? ` · ${durFmt(row.signal.idle_for_s)}` : ""}
                       </span>
+                    </>
+                  );
+                  if (onEnginePick)
+                    return (
+                      <button
+                        key={row.id}
+                        type="button"
+                        onClick={() => onEnginePick(row.id)}
+                        title="open this engine's card on the Inference servers tab"
+                        className="flex items-center gap-2 rounded-sm text-left text-[12px] outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                      >
+                        {line}
+                      </button>
+                    );
+                  return (
+                    <div key={row.id} className="flex items-center gap-2 text-[12px]">
+                      {line}
                     </div>
                   );
                 })}
@@ -297,7 +403,23 @@ function LocalRow({ st, hosted }: { st: StateSnapshot; hosted: { row: ServerRow;
   );
 }
 
-function PeerRow({ st, p, now, hosted }: { st: StateSnapshot; p: MeshPeer; now: number; hosted: { row: ServerRow; via: HostVia }[] }) {
+function PeerRow({
+  st,
+  p,
+  now,
+  hosted,
+  rowRef,
+  highlighted,
+  onEnginePick,
+}: {
+  st: StateSnapshot;
+  p: MeshPeer;
+  now: number;
+  hosted: { row: ServerRow; via: HostVia }[];
+  rowRef: (el: HTMLElement | null) => void;
+  highlighted: boolean;
+  onEnginePick?: (serverId: string) => void;
+}) {
   const snap = p.snapshot;
   const w: StateWord = peerVerdict(snap);
   // Past the arbiter's 90 s pull window the snapshot is the LAST-KNOWN
@@ -307,7 +429,7 @@ function PeerRow({ st, p, now, hosted }: { st: StateSnapshot; p: MeshPeer; now: 
   const stale = !p.online;
   const staleDim = stale && snap ? "opacity-60" : "";
   return (
-    <Card className="gap-0 py-0 shadow-none">
+    <Card ref={rowRef} className={`gap-0 py-0 shadow-none ${highlighted ? "ring-1 ring-ring" : ""}`}>
       <CardHeader className="flex-row items-center gap-2 px-3 py-2 pb-0">
         <span
           className={`size-1.5 shrink-0 rounded-full ${p.online ? "bg-ok" : "bg-warn"}`}
@@ -375,8 +497,11 @@ function PeerRow({ st, p, now, hosted }: { st: StateSnapshot; p: MeshPeer; now: 
                     row.signal ? { idle: row.signal.idle, degraded: row.signal.degraded } : null,
                     !!row.engaged || row.models.some((m) => m.running),
                   );
-                  return (
-                    <div key={row.id} className="flex items-center gap-2 text-[12px]">
+                  // Same row shape as the local block — and the same pick
+                  // button (the block is this arbiter's own join, so it knows
+                  // the row id the Servers tab addresses the card by).
+                  const line = (
+                    <>
                       <span
                         className={`size-1.5 shrink-0 rounded-full ${engineDot(row)}`}
                         title={`${row.name} — ${VIA_NOTE[via]} · ${row.url}`}
@@ -386,6 +511,23 @@ function PeerRow({ st, p, now, hosted }: { st: StateSnapshot; p: MeshPeer; now: 
                         {sw.label}
                         {row.signal?.idle && row.signal.idle_for_s != null ? ` · ${durFmt(row.signal.idle_for_s)}` : ""}
                       </span>
+                    </>
+                  );
+                  if (onEnginePick)
+                    return (
+                      <button
+                        key={row.id}
+                        type="button"
+                        onClick={() => onEnginePick(row.id)}
+                        title="open this engine's card on the Inference servers tab"
+                        className="flex items-center gap-2 rounded-sm text-left text-[12px] outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                      >
+                        {line}
+                      </button>
+                    );
+                  return (
+                    <div key={row.id} className="flex items-center gap-2 text-[12px]">
+                      {line}
                     </div>
                   );
                 })}

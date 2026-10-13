@@ -42,6 +42,7 @@ import {
 } from "@/lib/api";
 import { ago, fmt, fmtCtx, liveWord, probeWord, PROVIDER_CHOICES } from "@/lib/format";
 import { LOCAL_MACHINE, VIA_NOTE, hostOfServer, serverBands, type HostVerdict } from "@/lib/hierarchy";
+import { SERVER_PREFIX } from "@/lib/hash-nav";
 import { engineGauges, engineTiles, gibfmt, ramAxis } from "@/lib/fleet-stats";
 import { MemBar } from "@/components/mem-bar";
 import { StatTiles, TilesSkeleton } from "@/components/stat-tiles";
@@ -65,12 +66,70 @@ const TONE: Record<string, string> = {
 // metrics as sparklines. Footer: the base URL + the last-seen line. Empty
 // states everywhere the data is missing. Flat by default: tonal panel +
 // hairline, zero shadow (the DESIGN.md posture, carried by the token map).
+//
+// Navigable hierarchy (2026-10-13, layout-only, zero wire change): the
+// footer's host chip ("on urza") becomes a button deep-linking to that
+// machine's row on the Machines tab (it passes the machine LABEL the
+// hierarchy joins mint, not the display words). A focusKey (App-owned,
+// prefix-gated to this view's "server/<id>" scheme) scrolls that card into
+// view ONCE and lights a transient hairline ring (~1.5 s, cleared on
+// timeout AND on unmount); a key naming no declared row just opens the tab
+// — no error chrome, no stale ring.
 // ---------------------------------------------------------------------------
 
-export function InferenceServers({ st }: { st: StateSnapshot | null }) {
+export function InferenceServers({
+  st,
+  focusKey,
+  onHostPick,
+  onConsumeFocus,
+}: {
+  st: StateSnapshot | null;
+  /** App-owned deep-link focus, already prefix-gated to this view's scheme
+   *  ("server/<id>") — null when the hash/focus names nothing here. */
+  focusKey?: string | null;
+  /** Cross-tab pick: open this machine's row on the Machines tab (the
+   *  machine LABEL from the join, never the display words). Absent = the
+   *  footer chip stays a plain span. */
+  onHostPick?: (machine: string) => void;
+  /** Tell App the focus was consumed (it clears the state and rewrites the
+   *  hash to the bare sub-tab so a refresh never re-flashes). */
+  onConsumeFocus?: () => void;
+}) {
   const [editId, setEditId] = React.useState<string | null>(null);
   const [adding, setAdding] = React.useState(false);
   const [metrics, setMetrics] = React.useState<Record<string, MetricPoint[]>>({});
+
+  // Deep-link plumbing (layout-only): every card registers itself by row id;
+  // a focus "server/<id>" that names a card scrolls it in ONCE and arms the
+  // transient ring. The ring timer is its own effect keyed on flashId, so
+  // App clearing the focus (focusKey → null) cannot cut the highlight short,
+  // and unmounting clears the timer — no leaks, no stale ring. A focus
+  // naming a deleted row just opens the tab: honest, no error chrome.
+  const cardRefs = React.useRef(new Map<string, HTMLElement>());
+  const [flashId, setFlashId] = React.useState<string | null>(null);
+  const regCard = (id: string, el: HTMLElement | null) => {
+    if (el) cardRefs.current.set(id, el);
+    else cardRefs.current.delete(id);
+  };
+  // The view owns its prefix: strip "server/" to the row id the cards key by.
+  const focusId = focusKey !== null && focusKey !== undefined && focusKey.startsWith(SERVER_PREFIX)
+    ? focusKey.slice(SERVER_PREFIX.length)
+    : null;
+  const rowsIn = st !== null; // the skeleton render registers no cards
+  React.useEffect(() => {
+    if (!focusId || !rowsIn) return;
+    const el = cardRefs.current.get(focusId);
+    if (el) {
+      el.scrollIntoView({ block: "center" });
+      setFlashId(focusId);
+    }
+    onConsumeFocus?.(); // consumed exactly once, match or no match
+  }, [focusId, rowsIn, onConsumeFocus]);
+  React.useEffect(() => {
+    if (flashId === null) return;
+    const t = setTimeout(() => setFlashId(null), 1500);
+    return () => clearTimeout(t); // timeout AND unmount both clear the highlight
+  }, [flashId]);
 
   const servers = st?.servers ?? [];
   const groups = st?.engine_groups ?? [];
@@ -173,6 +232,9 @@ export function InferenceServers({ st }: { st: StateSnapshot | null }) {
         if (requireToken()) setEditId(s.id);
       }}
       host={st ? hostOfServer(st, s) : null}
+      onHostPick={onHostPick}
+      cardRef={(el) => regCard(s.id, el)}
+      highlighted={flashId === s.id}
     />
   );
 
@@ -532,6 +594,9 @@ function ServerCard({
   onGroupPick,
   onEdit,
   host,
+  onHostPick,
+  cardRef,
+  highlighted,
 }: {
   s: ServerRow;
   now: number;
@@ -545,6 +610,9 @@ function ServerCard({
   onGroupPick: (gid: string | null) => void;
   onEdit: () => void;
   host: HostVerdict | null;
+  onHostPick?: (machine: string) => void;
+  cardRef: (el: HTMLElement | null) => void;
+  highlighted: boolean;
 }) {
   const word = s.watched
     ? liveWord({ idle: !!s.signal?.idle, degraded: !!s.signal?.degraded }, running || s.models.some((m) => m.running))
@@ -586,7 +654,7 @@ function ServerCard({
   };
 
   return (
-    <Card className="gap-0 py-0 shadow-none">
+    <Card ref={cardRef} className={`gap-0 py-0 shadow-none ${highlighted ? "ring-1 ring-ring" : ""}`}>
       <CardHeader className="flex-row items-center gap-2 px-3 py-2 pb-0">
         <CardTitle className="text-[13px] font-semibold">{s.name}</CardTitle>
         <span className={`text-[12px] font-semibold ${TONE[word.tone]}`} title={word.note}>
@@ -668,12 +736,25 @@ function ServerCard({
             {/* The hierarchy line (owner ask 2026-10-12): the card names the
                 machine it rides on — the EXACT join from lib/hierarchy (url
                 host = a peer's host, engine-group label = a machine's name,
-                or loopback). No machine named = no line, never a guess. */}
-            {host && (
-              <span className="text-[10px] text-dim" title={`${VIA_NOTE[host.via]} — the same join the Machines tab nests by`}>
-                on {host.machine === LOCAL_MACHINE ? "this machine" : host.machine}
-              </span>
-            )}
+                or loopback). No machine named = no line, never a guess.
+                With a wired pick the chip becomes a button (the machine
+                LABEL goes to App, which mints the "machine/<name>" focus
+                key — the display words never leave the footer). */}
+            {host &&
+              (onHostPick ? (
+                <button
+                  type="button"
+                  onClick={() => onHostPick(host.machine)}
+                  title="open this machine's row on the Machines tab"
+                  className="rounded-sm text-[10px] text-dim outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                >
+                  on {host.machine === LOCAL_MACHINE ? "this machine" : host.machine}
+                </button>
+              ) : (
+                <span className="text-[10px] text-dim" title={`${VIA_NOTE[host.via]} — the same join the Machines tab nests by`}>
+                  on {host.machine === LOCAL_MACHINE ? "this machine" : host.machine}
+                </span>
+              ))}
             {lastSeen(s, now)}
           </span>
         </div>

@@ -20,6 +20,7 @@ import {
 import { NavMain, type NavItem } from "@/components/nav-main";
 import { SiteHeader } from "@/components/site-header";
 import { NAV_IDS, RES_SUBTABS, type ResTab } from "@/nav";
+import { encodeTabFocus, machineKey, parseHash, serverKey, MACHINE_PREFIX, SERVER_PREFIX } from "@/lib/hash-nav";
 import { Input } from "@/components/ui/input";
 import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
@@ -60,16 +61,20 @@ const SUB_OPEN_KEY = "idlefill.navSubOpen";
 const VIEW_IDS: readonly string[] = NAV_IDS;
 
 function readView(): string {
-  const hash = location.hash.replace(/^#/, "");
+  const raw = location.hash.replace(/^#/, "");
   const stored = localStorage.getItem(VIEW_KEY);
   // Deep links to a Resources sub-tab: #projects/#models were top-level
   // tabs before the Resources rethink; every sub-tab id lands on
-  // Resources now (overview stays the top-level view — same id).
-  if (hash !== "overview" && RES_SUBTABS.some((t) => t.id === hash)) {
-    localStorage.setItem(RES_KEY, hash);
+  // Resources now (overview stays the top-level view — same id). A
+  // focus-carrying hash (#machines/focus/…) lands the same way: parseHash
+  // peels the focus segment (lib/hash-nav.ts) and the tab grammar below is
+  // byte-for-byte the old one for every bare id.
+  const { tab } = parseHash(raw);
+  if (tab !== null) {
+    localStorage.setItem(RES_KEY, tab);
     return "resources";
   }
-  if (VIEW_IDS.includes(hash)) return hash;
+  if (VIEW_IDS.includes(raw)) return raw;
   if (stored && VIEW_IDS.includes(stored)) return stored;
   return "overview";
 }
@@ -95,6 +100,16 @@ function readSubOpen(): Record<string, boolean> | null {
 export function App() {
   const [view, setView] = React.useState<string>(readView);
   const [resTab, setResTab] = React.useState<ResTab>(readResTab);
+  // A focus carried by the hash ("#machines/focus/machine/urza"): the key
+  // lives HERE — App-owned, single source — and only the sub-tab view whose
+  // scheme prefix matches ever receives it (gated at render below, so a
+  // servers focus can never move a Machines row and vice versa). The target
+  // view consumes it exactly once (consumeFocus); the hash is then rewritten
+  // to the bare sub-tab so a refresh opens the tab without re-flashing.
+  const [focus, setFocus] = React.useState<{ key: string } | null>(() => {
+    const p = parseHash(location.hash);
+    return p.tab !== null && p.focus !== null ? { key: p.focus } : null;
+  });
   const [openMap, setOpenMap] = React.useState<Record<string, boolean> | null>(readSubOpen);
   const [st, setSt] = React.useState<StateSnapshot | null>(null);
   const [stErr, setStErr] = React.useState<string | null>(null);
@@ -153,8 +168,72 @@ export function App() {
     });
   };
 
+  // The hash is a first-class input (deep links, and the focus rewrite
+  // below): every change routes through parseHash. A sub-tab id (bare or
+  // focus-carrying) lands exactly like the initial load does (readView); a
+  // bare view id routes to that view; empty/unknown hashes change nothing
+  // (the stored tabs stand — same as the boot fallback). pickView/pickResTab
+  // and the cross-tab picks write the hash themselves; the handler re-asserts
+  // the same state — idempotent, never a fight.
+  React.useEffect(() => {
+    const onHash = () => {
+      const raw = location.hash.replace(/^#/, "");
+      const p = parseHash(location.hash);
+      if (p.tab !== null) {
+        setView("resources");
+        setResTab(p.tab);
+        localStorage.setItem(RES_KEY, p.tab);
+        setFocus(p.focus !== null ? { key: p.focus } : null);
+      } else if (VIEW_IDS.includes(raw)) {
+        setView(raw);
+        localStorage.setItem(VIEW_KEY, raw);
+        setFocus(null);
+        // resTab is NOT reset here: only the explicit parent click (pickView)
+        // lands Resources on Overview; a bare #resources hash just names the
+        // section and the stored sub-tab stands — today's boot behavior.
+      }
+    };
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+
+  // A view consumed its focus: drop the App state (the highlight rings are
+  // the VIEWS' transient local state, self-clearing) and rewrite the hash to
+  // the bare sub-tab — via replaceState on purpose: no extra history entry,
+  // no hashchange echo, and a refresh of the rewritten URL opens the tab
+  // with no focus to re-flash.
+  const consumeFocus = React.useCallback(() => {
+    setFocus(null);
+    const p = parseHash(location.hash);
+    if (p.tab !== null && p.focus !== null) history.replaceState(null, "", `#${p.tab}`);
+  }, []);
+
+  // The two cross-tab deep links (hierarchy → hierarchy, layout-only): the
+  // focus key is minted by the ONE scheme (lib/hash-nav.ts), the hash rides
+  // the encodeTabFocus grammar, the tab switch writes the same localStorage
+  // pair a normal sidebar pick writes.
+  const gotoServerCard = (serverId: string) => {
+    const key = serverKey(serverId);
+    setView("resources");
+    localStorage.setItem(VIEW_KEY, "resources");
+    setResTab("servers");
+    localStorage.setItem(RES_KEY, "servers");
+    location.hash = encodeTabFocus("servers", key);
+    setFocus({ key });
+  };
+  const gotoMachineRow = (machine: string) => {
+    const key = machineKey(machine);
+    setView("resources");
+    localStorage.setItem(VIEW_KEY, "resources");
+    setResTab("machines");
+    localStorage.setItem(RES_KEY, "machines");
+    location.hash = encodeTabFocus("machines", key);
+    setFocus({ key });
+  };
+
   const pickView = (v: string) => {
     if (!VIEW_IDS.includes(v)) return;
+    setFocus(null); // a normal pick never carries a focus — no stale key lingers
     setView(v);
     localStorage.setItem(VIEW_KEY, v);
     location.hash = v;
@@ -168,12 +247,24 @@ export function App() {
   const pickResTab = (t: string) => {
     const next = t as ResTab;
     if (!RES_SUBTABS.some((x) => x.id === next)) return;
+    setFocus(null); // a normal pick never carries a focus (the hash stays bare)
     setView("resources");
     localStorage.setItem(VIEW_KEY, "resources");
     setResTab(next);
     localStorage.setItem(RES_KEY, next);
-    location.hash = "resources";
+    // The hash mirrors the sub-tab (no focus) — the deep-link grammar's
+    // resting form, so the bar holds a URL that reopens exactly this view.
+    // The sub-tab "overview" is the one id the grammar resolves to the TOP
+    // level (readView precedence), so it writes the section id instead.
+    location.hash = next === "overview" ? "resources" : next;
   };
+
+  // Prefix gating (the no-cross-tab-leakage fence): each view receives only
+  // its own scheme's key — a "server/…" focus never reaches the Machines
+  // view, a "machine/…" focus never reaches a server card. A key matching
+  // no prefix reaches NO view at all; normal picks clear the focus state.
+  const machineFocus = focus !== null && focus.key.startsWith(MACHINE_PREFIX) ? focus.key : null;
+  const serverFocus = focus !== null && focus.key.startsWith(SERVER_PREFIX) ? focus.key : null;
 
   const globalWord = st
     ? st.idle.degraded
@@ -245,11 +336,15 @@ export function App() {
           {view === "overview" && <Overview st={st} />}
           {view === "sessions" && <Sessions st={st} />}
           {view === "usage" && <Usage />}
-          {view === "resources" && resTab === "servers" && <InferenceServers st={st} />}
+          {view === "resources" && resTab === "servers" && (
+            <InferenceServers st={st} focusKey={serverFocus} onHostPick={gotoMachineRow} onConsumeFocus={consumeFocus} />
+          )}
           {view === "resources" && resTab === "overview" && (
             <ResourceOverview st={st} onPickTab={pickResTab} />
           )}
-          {view === "resources" && resTab === "machines" && <Machines st={st} />}
+          {view === "resources" && resTab === "machines" && (
+            <Machines st={st} focusKey={machineFocus} onEnginePick={gotoServerCard} onConsumeFocus={consumeFocus} />
+          )}
           {view === "resources" && resTab === "projects" && <Projects st={st} />}
           {view === "resources" && resTab === "models" && <Models st={st} />}
           {view === "resources" && resTab === "agents" && <Agents st={st} />}
