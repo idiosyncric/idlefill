@@ -181,7 +181,15 @@ grants, exactly as the ownership rule intends.
     `cli/dist/index.js`. Build-from-checkout is the product model
     (tauri-cutover D7), so the linked shim updates for free on every
     `./update.sh`; the installer is idempotent and refuses by name to
-    overwrite anything it did not render.
+    overwrite anything it did not render. The chain names itself end to
+    end (the urza lesson of #89, mac-update-helper pass): `update.sh`
+    turns a cli build failure into a named refusal (the shim must never
+    serve a stale dist), and after the install names what bare
+    `idlefill` resolves to on the shell's PATH; `idlefill update` runs
+    the same decision as a pure table (missing / foreign / broken /
+    wrong-checkout shim named before the exec; the honest
+    on-PATH posture and urza's documented absolute-path posture stay
+    silent).
 - MCP stays the scheduling plane (README "Scheduling work") — the CLI is the
   OPERATOR plane; they share the arbiter API, not each other's job.
 

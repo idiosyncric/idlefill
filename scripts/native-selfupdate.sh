@@ -34,7 +34,9 @@
 #   5. `npm install` ONLY when package.json/package-lock.json moved since the
 #      last install (the tsx runtime needs dev deps: NODE_ENV= cleared, the
 #      AGENTS.md trap).
-#   6. rebuild cli/ (the shim must never run a stale dist), then restart
+#   6. rebuild cli/ AND re-run scripts/install-cli.sh (the shim must never
+#      run a stale dist, nor stand uninstalled for a pulled template — the
+#      same fail-closed posture urza-selfupdate.sh carries), then restart
 #      idlefill-server and (when installed) idlefill-client.
 #   7. healthcheck GET /api/state; on failure roll the checkout back to the
 #      commit this run started from, restart, re-check, and report.
@@ -114,6 +116,12 @@ fi
 
 log "==> rebuilding the cli/ workspace (the PATH shim execs cli/dist when present)"
 NODE_ENV= npm run build --workspace cli
+# Re-run the shim installer right after the rebuild (the #89 posture, same
+# as urza-selfupdate.sh step 3): the fresh dist must never sit behind an
+# uninstalled shim or a template that moved. Idempotent: byte-identical is
+# a named no-op; a foreign/different-checkout target is a named refusal
+# that aborts here — before any unit is restarted.
+bash scripts/install-cli.sh
 
 # --- restart the units ------------------------------------------------------
 restart_units() {

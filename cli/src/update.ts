@@ -18,7 +18,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { accessSync, constants, existsSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -339,6 +339,124 @@ export function runWrapped(script: string, args: string[], spawn: SpawnLike = re
 }
 
 // ---------------------------------------------------------------------------
+// The shim chain (pure) — PATH honesty on the operator command. scripts/
+// install-cli.sh renders the shim (marker line + the IDLEFILL_CLI_REPO line)
+// that makes bare `idlefill` THE command, exec'ing THAT checkout's cli/dist.
+// The first live urza pass of #89 proved the failure mode: a PATH-resolved
+// command that does not serve the checkout you think you are running. This
+// is the decision half of the check (update.sh runs the same posture in
+// bash after the install); every mismatch is named, never swallowed (D3).
+// ---------------------------------------------------------------------------
+
+export const SHIM_MARKER = 'idlefill-cli-shim';
+
+// Mirrors install-cli.sh's default BINDIR ($HOME/.local/bin) as a RELATIVE
+// path — this checkout's shim always resolves against THIS machine's home,
+// and no new PATH dir is invented here.
+export const SHIM_DIR_SUBPATH = join('.local', 'bin');
+
+export type ShimProbe =
+  | { kind: 'shim'; repo: string }
+  | { kind: 'broken-shim' } // our marker line, no parseable IDLEFILL_CLI_REPO line
+  | { kind: 'not-a-shim' }; // not install-cli.sh's rendering at all
+
+export function probeShimText(text: string): ShimProbe {
+  if (!text.includes(SHIM_MARKER)) return { kind: 'not-a-shim' };
+  const m = /^IDLEFILL_CLI_REPO="(.+)"$/m.exec(text);
+  const repo = m?.[1];
+  return repo ? { kind: 'shim', repo } : { kind: 'broken-shim' };
+}
+
+/** The bash `command -v` shape: first executable hit in PATH order; an
+ *  empty PATH entry means the cwd, like bash treats it. */
+export function firstOnPath(name: string, pathValue: string, isExecutable: (p: string) => boolean): string | null {
+  for (const dir of pathValue.split(':')) {
+    const p = join(dir === '' ? '.' : dir, name);
+    if (isExecutable(p)) return p;
+  }
+  return null;
+}
+
+export interface ShimChainFacts {
+  pathShim: string | null; // what bare `idlefill` resolves to on $PATH (null: nothing)
+  pathShimProbe: ShimProbe | null; // content probe of that file (null: unreadable)
+  installedProbe: ShimProbe | null; // probe of the default install target (null: absent)
+  runningRepo: string; // the checkout THIS CLI code runs from
+  target: string; // the default install target for this home
+}
+
+export type ShimChainVerdict =
+  | { kind: 'ok'; shim: string }
+  | { kind: 'installed-off-path'; shim: string }
+  | { kind: 'not-installed'; target: string }
+  | { kind: 'foreign-path'; shim: string }
+  | { kind: 'broken-shim'; shim: string }
+  | { kind: 'wrong-checkout'; shim: string; shimRepo: string; runningRepo: string };
+
+export function decideShimChain(f: ShimChainFacts): ShimChainVerdict {
+  if (f.pathShim !== null) {
+    if (f.pathShimProbe === null || f.pathShimProbe.kind === 'not-a-shim') return { kind: 'foreign-path', shim: f.pathShim };
+    if (f.pathShimProbe.kind === 'broken-shim') return { kind: 'broken-shim', shim: f.pathShim };
+    if (f.pathShimProbe.repo === f.runningRepo) return { kind: 'ok', shim: f.pathShim };
+    return { kind: 'wrong-checkout', shim: f.pathShim, shimRepo: f.pathShimProbe.repo, runningRepo: f.runningRepo };
+  }
+  if (f.installedProbe?.kind === 'shim' && f.installedProbe.repo === f.runningRepo) {
+    return { kind: 'installed-off-path', shim: f.target };
+  }
+  return { kind: 'not-installed', target: f.target };
+}
+
+/** D3 voice: an exception-only note, or null when the chain is honest.
+ *  installed-off-path is silent ON PURPOSE — it is urza's documented
+ *  posture (its updater config carries the ABSOLUTE shim path precisely
+ *  because the rendered unit's PATH lacks the shim dir; #89 verified). */
+export function describeShimChain(v: ShimChainVerdict): string | null {
+  switch (v.kind) {
+    case 'ok':
+    case 'installed-off-path':
+      return null;
+    case 'not-installed':
+      return `no \`idlefill\` on this PATH and no shim for this checkout at ${v.target} — run \`bash scripts/install-cli.sh\` from this checkout to put the operator command on PATH (it names anything already there instead of overwriting it)`;
+    case 'foreign-path':
+      return `bare \`idlefill\` resolves to ${v.shim}, which is NOT a shim scripts/install-cli.sh rendered — that file could be anything. Named, not guessed: this run used the entry it was invoked from`;
+    case 'broken-shim':
+      return `bare \`idlefill\` resolves to ${v.shim}, which carries the shim marker but no IDLEFILL_CLI_REPO line — re-run \`bash scripts/install-cli.sh\` from the checkout that should own it`;
+    case 'wrong-checkout':
+      return `bare \`idlefill\` on this PATH serves ${v.shimRepo} (via ${v.shim}), but this invocation runs from ${v.runningRepo} — this run updates ${v.runningRepo}. Named, not guessed.`;
+  }
+}
+
+function isExecutableFile(p: string): boolean {
+  try {
+    if (!statSync(p).isFile()) return false;
+    accessSync(p, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readShimProbe(path: string): ShimProbe | null {
+  try {
+    return probeShimText(readFileSync(path, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+export function detectShimChainFacts(): ShimChainFacts {
+  const target = join(homedir(), SHIM_DIR_SUBPATH, 'idlefill');
+  const pathShim = firstOnPath('idlefill', process.env.PATH ?? '', isExecutableFile);
+  return {
+    pathShim,
+    pathShimProbe: pathShim ? readShimProbe(pathShim) : null,
+    installedProbe: existsSync(target) ? readShimProbe(target) : null,
+    runningRepo: repoRoot,
+    target,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // The live group
 // ---------------------------------------------------------------------------
 
@@ -422,6 +540,11 @@ export async function runUpdate(argv: string[], json: boolean): Promise<number> 
       console.error(`idlefill update: ${w.reason}`);
       return 1;
     }
+    // PATH honesty before the exec (the urza lesson of #89): name the shim
+    // chain this command actually rides, but only when it is NOT honest —
+    // an exception-only line (D3), never noise on the two clean postures.
+    const chainNote = describeShimChain(decideShimChain(detectShimChainFacts()));
+    if (chainNote) console.log(`idlefill update: ${chainNote}`);
     console.log(`idlefill update → ${w.what}`);
     return runWrapped(w.script, parsed.noPull ? ['--no-pull'] : []);
   } catch (err) {

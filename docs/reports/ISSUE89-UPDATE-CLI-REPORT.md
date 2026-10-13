@@ -89,6 +89,16 @@ owns it, and now it names `idlefill update`.
   the rewire is ready if the macOS helper plane is ever rendered — but
   the honest state is: **no macOS helper runs today; the CLI itself is
   the Mac update path.**
+  - **Correction (2026-10-13, mac-update-helper pass):** that "created
+    anyway" config does NOT exist on this machine — `ls ~/.idlefill`
+    names no `updater.json`. Whether it was never persisted or was
+    removed since, the claim could not be re-verified and the doc is
+    corrected against the live machine instead of trusted: the Mac has
+    **no helper config at all**, so "Mac config prepared" was
+    documentation-shaped, not state. The uninstalled-helper gap and the
+    "the CLI itself is the Mac update path" law stand, unchanged and
+    now honestly documented (see MAC-UPDATE-HELPER-REPORT.md for the
+    shim-side gap this same pass closed).
 
 ## Gates
 
@@ -146,7 +156,9 @@ owns it, and now it names `idlefill update`.
 - The feed-unreachable branch is pinned by tests only (no network
   simulation against the live host).
 - The Mac `updater.json` is a prepared config, not an executed one (no
-  macOS helper unit exists — the gap is named above).
+  macOS helper unit exists — the gap is named above) — and per the
+  correction above, the file is not even present on the machine, so
+  even "prepared" overstates it.
 
 ## Open gaps named for the owner
 

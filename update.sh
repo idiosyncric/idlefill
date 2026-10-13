@@ -11,7 +11,9 @@
 #   2. fast-forward main (--no-pull skips steps 1-2: rebuild at the current
 #      commit, e.g. after a manual checkout/pin)
 #   3. rebuild the cli/ workspace so a pulled cli/src change can never ship
-#      a stale dist under the PATH shim
+#      a stale dist under the PATH shim (a fresh checkout gets the cli
+#      workspace devDeps installed once first; a failed build is a NAMED
+#      refusal — the shim would otherwise keep serving the old dist)
 #   4. tauri/build.sh with IDLEFILL_BUILD_MARKER=<short sha> so
 #      `idlefill-app --version` reports the commit the bundle was built from
 #      (build.sh's own gate 4 byte-verifies the bundle's Info.plist)
@@ -19,6 +21,9 @@
 #      (~/.local/bin, linked to THIS checkout's cli/dist; owner ask
 #      2026-10-12, cli.md D8 amendment). Runs BEFORE the app is touched:
 #      a shim refusal aborts while /Applications is still untouched.
+#      Afterwards PATH honesty (the urza lesson of #89): update.sh names
+#      what bare `idlefill` actually resolves to on this shell's PATH —
+#      a shim shadowed off the name is named, never assumed.
 #   6. rsync the bundle to /Applications/Idlefill.app so the app shows in
 #      Launchpad/Spotlight/Finder like a normal Mac app
 #   7. tauri/install.sh --reinstall with IDLEFILL_APP_PROG pointed at the
@@ -49,8 +54,18 @@ fi
 # Rebuild the cli/ workspace right after the pull: the PATH shim (step 5)
 # execs THIS checkout's cli/dist, so a pulled cli/src change must never run
 # against a stale dist. NODE_ENV= clears the production trap (AGENTS.md).
+# The posture urza-selfupdate.sh learned in #89: a fresh checkout has no
+# tsc yet — install the cli workspace devDeps once first — and a failed
+# build is a NAMED refusal, not a silent set -e death, because the installed
+# shim would otherwise keep serving the previous dist with no explanation.
 echo "==> rebuilding the cli/ workspace"
-NODE_ENV= npm run build --workspace cli
+if [ ! -x node_modules/.bin/tsc ]; then
+  echo "    no tsc yet — installing the cli workspace devDeps (one-time on a fresh checkout)"
+  NODE_ENV= npm install --workspace cli >/dev/null \
+    || { echo "refused: the cli workspace devDeps would not install — the idlefill PATH shim needs a built cli/dist; nothing in /Applications was touched" >&2; exit 1; }
+fi
+NODE_ENV= npm run build --workspace cli \
+  || { echo "refused: the cli/ build failed — the idlefill PATH shim must never serve a stale dist, so the update stops here; nothing in /Applications was touched" >&2; exit 1; }
 
 MARKER="$(git rev-parse --short HEAD)"
 echo "==> building Idlefill.app at $MARKER"
@@ -58,9 +73,26 @@ IDLEFILL_BUILD_MARKER="$MARKER" bash tauri/build.sh
 
 # The operator CLI ships with the app install (owner ask 2026-10-12): the
 # linked shim goes onto PATH BEFORE anything in /Applications is touched —
-# a refusal there aborts fail-closed with the app still untouched.
+# a refusal there aborts fail-closed with the app still untouched (the
+# installer itself names every state: write | byte-identical no-op |
+# different-checkout refusal | foreign-file refusal; never a dangling
+# target — the render is atomic + marker-verified by re-reading).
 echo "==> installing the idlefill CLI shim on PATH"
-bash scripts/install-cli.sh
+bash scripts/install-cli.sh \
+  || { echo "refused: the idlefill shim install refused the PATH target (its reason is named above) — nothing in /Applications was touched" >&2; exit 1; }
+
+# PATH honesty — the urza lesson of #89 ported to the Mac side. The install
+# landed; but what does the BARE NAME resolve to in this shell? If
+# `idlefill` lands somewhere else (a file shadowing the name, or an
+# IDLEFILL_CLI_BIN_DIR off $PATH), the NEXT `idlefill update` may not ride
+# the shim this run just wrote. Named exactly, like urza's check against
+# the rendered unit's PATH — a note, not a failure: this update landed.
+SHIM_TARGET="${IDLEFILL_CLI_BIN_DIR:-$HOME/.local/bin}/idlefill"
+RESOLVED_SHIM="$(command -v idlefill || true)"
+if [ "$RESOLVED_SHIM" != "$SHIM_TARGET" ]; then
+  echo "note: 'idlefill' resolves to ${RESOLVED_SHIM:-nothing on \$PATH} — NOT the shim installed here ($SHIM_TARGET)." >&2
+  echo "      fix your PATH (or invoke $SHIM_TARGET by absolute path) before trusting bare \`idlefill update\`." >&2
+fi
 
 # Stage the bundle in /Applications so the app sits in the Applications
 # folder like a normal Mac app (Launchpad/Spotlight/Finder). The swap is a

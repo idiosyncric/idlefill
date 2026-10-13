@@ -592,14 +592,19 @@ The manual path is `./update.sh` — one command, fail-closed at every step:
    current commit — e.g. a pinned checkout);
 3. rebuild the `cli/` workspace (`npm run build --workspace cli`) so a
    pulled `cli/src` change can never run against a stale dist under the
-   PATH shim;
+   PATH shim — a fresh checkout installs the cli workspace devDeps once
+   first, and a failed build is a named refusal that stops the update
+   before anything else is touched;
 4. `tauri/build.sh` with `IDLEFILL_BUILD_MARKER=<short sha>` so the
    bundle proves its own origin;
 5. `scripts/install-cli.sh` puts the `idlefill` operator CLI on PATH —
    a linked shim at `~/.local/bin/idlefill` exec'ing THIS checkout's
    `cli/dist` (owner ask 2026-10-12; the CLI stays out of the bundle,
    cli.md D8 + amendment). It runs BEFORE the app: a refusal aborts
-   with `/Applications` still untouched;
+   with `/Applications` still untouched; afterwards `update.sh` names
+   what bare `idlefill` resolves to on this shell's PATH — a shim
+   shadowed off the name is named, never assumed (the urza PATH-honesty
+   lesson of #89);
 6. stage the bundle into `/Applications/Idlefill.app` (a rename swap —
    an rsync/cp over a running app's binary fails with ETXTBSY, a rename
    never does; the staged copy must pass `--version` before it lands);

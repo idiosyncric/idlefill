@@ -3,8 +3,11 @@
  * argv table, the release-feed shape sanitizer (malformed feed = a named
  * outcome, never a fake zero), the marker-compare decision table
  * (up-to-date / ahead / behind / unmatched / no-app / bad-marker), the
- * --json posture, and the wrapper decision table (macOS vs Linux container
- * host vs no documented path; --no-pull plumbing; exit-code passthrough).
+ * --json posture, the wrapper decision table (macOS vs Linux container
+ * host vs no documented path; --no-pull plumbing; exit-code passthrough),
+ * and the shim-chain PATH-honesty table (the urza lesson of #89: a bare
+ * `idlefill` that does not serve the running checkout is named, never
+ * trusted; the documented absolute-path posture stays silent).
  * A real-fs test stubs the wrapped script in a scratch dir.
  */
 
@@ -21,16 +24,23 @@ import {
   APP_BINARY,
   checkPayload,
   decideMarker,
+  decideShimChain,
   describeCheck,
+  describeShimChain,
+  firstOnPath,
   parseBuildMarker,
   parseUpdateArgs,
   nativeUnitInstalled,
+  probeShimText,
   RELEASE_FEED_URL,
   resolveUpdateCommand,
   runWrapped,
   sanitizeReleaseFeed,
+  SHIM_DIR_SUBPATH,
+  SHIM_MARKER,
   type MachineEnv,
   type ReleaseRef,
+  type ShimChainFacts,
 } from '../src/update.js';
 import { parseArgv } from '../src/argv.js';
 
@@ -369,4 +379,100 @@ test('a spawn failure is a named failure with exit 1, not a passthrough', () => 
 test('a wrapped command answering 0 but with a null status is not read as success', () => {
   assert.equal(runWrapped('whatever', [], () => ({ status: null })), 1);
   assert.equal(runWrapped('whatever', [], () => ({ status: 7 })), 7);
+});
+
+// ---------------------------------------------------------------------------
+// The shim chain — PATH honesty (the urza lesson of #89, Mac side)
+// ---------------------------------------------------------------------------
+
+const renderedShim = (repo: string): string => [
+  '#!/bin/sh',
+  `# ${SHIM_MARKER} v1 — rendered by scripts/install-cli.sh; do not edit.`,
+  `IDLEFILL_CLI_REPO="${repo}"`,
+  'DIST="$IDLEFILL_CLI_REPO/cli/dist/index.js"',
+  'exec node "$DIST" "$@"',
+  '',
+].join('\n');
+
+test('a rendered shim is probed for its checkout; anything else is named', () => {
+  assert.deepEqual(probeShimText(renderedShim('/repo/a')), { kind: 'shim', repo: '/repo/a' });
+  assert.deepEqual(probeShimText('#!/bin/sh\necho not idlefill\n'), { kind: 'not-a-shim' });
+  assert.deepEqual(probeShimText(`# ${SHIM_MARKER} v1 but the repo line was edited away`), { kind: 'broken-shim' });
+  assert.deepEqual(probeShimText(`# ${SHIM_MARKER}\nIDLEFILL_CLI_REPO=""`), { kind: 'broken-shim' }, 'an empty repo line is broken, not a shim serving ""');
+});
+
+test('firstOnPath walks PATH in order and skips non-executables', () => {
+  const tried: string[] = [];
+  const hit = firstOnPath('idlefill', `/a:/b:/c`, (p) => {
+    tried.push(p);
+    return p === join('/b', 'idlefill');
+  });
+  assert.equal(hit, join('/b', 'idlefill'));
+  assert.deepEqual(tried, [join('/a', 'idlefill'), join('/b', 'idlefill')], 'first hit wins — /c is never probed');
+  assert.equal(firstOnPath('idlefill', '', (p) => {
+    tried.push(p);
+    return false;
+  }), null);
+  assert.equal(tried[tried.length - 1], join('.', 'idlefill'), 'an empty PATH entry means the cwd, like bash');
+});
+
+const facts = (over: Partial<ShimChainFacts> = {}): ShimChainFacts => ({
+  pathShim: '/home/op/.local/bin/idlefill',
+  pathShimProbe: probeShimText(renderedShim('/repo/a')),
+  installedProbe: probeShimText(renderedShim('/repo/a')),
+  runningRepo: '/repo/a',
+  target: '/home/op/.local/bin/idlefill',
+  ...over,
+});
+
+test('the honest chain: bare `idlefill` serves THIS checkout — ok, and silent', () => {
+  const v = decideShimChain(facts());
+  assert.equal(v.kind, 'ok');
+  assert.equal(describeShimChain(v), null);
+});
+
+test('a PATH shim serving a DIFFERENT checkout is named (the stale/shadow chain class)', () => {
+  const v = decideShimChain(facts({ runningRepo: '/repo/b' }));
+  assert.equal(v.kind, 'wrong-checkout');
+  assert.ok(v.kind === 'wrong-checkout' && v.shimRepo === '/repo/a' && v.runningRepo === '/repo/b');
+  const line = describeShimChain(v) ?? '';
+  assert.ok(line.includes('/repo/a') && line.includes('/repo/b') && line.includes('Named, not guessed.'));
+});
+
+test('a PATH hit that is not install-cli.sh rendering is named, never trusted', () => {
+  const foreign = decideShimChain(facts({ pathShimProbe: probeShimText('#!/bin/sh\nrm -rf /\n') }));
+  assert.equal(foreign.kind, 'foreign-path');
+  assert.ok((describeShimChain(foreign) ?? '').includes('NOT a shim scripts/install-cli.sh rendered'));
+  const unreadable = decideShimChain(facts({ pathShimProbe: null }));
+  assert.equal(unreadable.kind, 'foreign-path', 'a PATH hit whose contents cannot be read is NOT assumed honest');
+  const broken = decideShimChain(facts({ pathShimProbe: probeShimText(`# ${SHIM_MARKER} with no repo line`) }));
+  assert.equal(broken.kind, 'broken-shim');
+  assert.ok((describeShimChain(broken) ?? '').includes('install-cli.sh'));
+});
+
+test('no PATH hit but the target shim serves this checkout: installed-off-path — the urza posture, silent', () => {
+  // urza's updater config carries the ABSOLUTE shim path precisely because
+  // the rendered unit's PATH lacks the shim dir (#89 verified) — an honest
+  // invocation must not be treated as a failure.
+  const v = decideShimChain(facts({ pathShim: null, pathShimProbe: null }));
+  assert.equal(v.kind, 'installed-off-path');
+  assert.equal(describeShimChain(v), null);
+});
+
+test('no PATH hit and no shim for this checkout at the target: named, with the installer named', () => {
+  const absent = decideShimChain(facts({ pathShim: null, pathShimProbe: null, installedProbe: null }));
+  assert.equal(absent.kind, 'not-installed');
+  assert.ok((describeShimChain(absent) ?? '').includes('scripts/install-cli.sh'));
+  const otherRepoAtTarget = decideShimChain(facts({
+    pathShim: null,
+    pathShimProbe: null,
+    installedProbe: probeShimText(renderedShim('/repo/a')),
+    runningRepo: '/repo/b',
+  }));
+  assert.equal(otherRepoAtTarget.kind, 'not-installed', "a target shim for ANOTHER checkout is not THIS checkout's chain");
+});
+
+test('the shim install dir is this home-relative (no absolute path is baked into the repo)', () => {
+  assert.equal(SHIM_DIR_SUBPATH, join('.local', 'bin'), 'mirrors install-cli.sh default BINDIR — not a new PATH dir');
+  assert.ok(!SHIM_DIR_SUBPATH.startsWith('/'));
 });
