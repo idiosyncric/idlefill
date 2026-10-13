@@ -17,7 +17,7 @@ operational record of the flip plus the mechanism it required.
 | client daemon | `idlefill-client.service` from the stale checkout, node 18, `server_url` = urza's own tailnet IP | same unit re-rendered from the canonical checkout at main, node 22, `server_url` = `http://127.0.0.1:8787` (the fused loopback shape, mesh.md D5) |
 | updater helper | `idlefill-updater.service` pointing at `/home/sam/idlefill/src`, config `command = idlefill update` (a shim for the other checkout, not on the unit's PATH) | re-rendered from the canonical checkout, node 22; config `command = bash /home/sam/Software/idlefill/scripts/native-selfupdate.sh` (absolute — PATH-independent, and D2's "no command rides the wire" posture untouched) |
 | `idlefill` CLI shim | `~/.local/bin/idlefill → /home/sam/idlefill/src` | re-installed → `/home/sam/Software/idlefill` |
-| container | running | `docker stop idlefill`, **not removed** — `docker start idlefill` is the one-line rollback |
+| container | running (surveyed as image `idlefill-server:ea4ca03`, env `IDLEFILL_REVISION=2d469b0`) | `docker stop idlefill`, **not removed** — `docker start idlefill` is the one-line rollback. The kept container now reads image `idlefill-server:2d469b0` (created 00:18 UTC): a container-era deploy landed mid-session from a concurrent worker — main also gained `2d469b0`/`05778fe` while this cutover was in flight, so the rollback image is one commit-set behind the flipped arbiter, not the surveyed one |
 
 ## Mechanism landed in the repo (this was not doable without it)
 
