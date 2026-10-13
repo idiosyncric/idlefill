@@ -13,7 +13,15 @@ import { StatTiles, TilesSkeleton } from "@/components/stat-tiles";
 import { ago, durFmt, fmt, liveWord, type StateWord } from "@/lib/format";
 import { buildGapLine, hostLine, intentWord, meshTiles, peerVerdict, relayOutcome } from "@/lib/mesh-stats";
 import { buildRemoteRows, type RemoteRow } from "@/lib/remote-metrics";
-import { LOCAL_MACHINE, VIA_NOTE, hostedServers, hostOfServer, type HostVia } from "@/lib/hierarchy";
+import {
+  LOCAL_MACHINE,
+  VIA_NOTE,
+  hostedServers,
+  hostOfServer,
+  machineSummary,
+  type HostVia,
+  type MachineSummary,
+} from "@/lib/hierarchy";
 import {
   apiToken,
   getRemoteMetrics,
@@ -37,24 +45,40 @@ const TONE: Record<string, string> = {
 // mesh · Engines idle — lib/mesh-stats.ts, the same discipline as the
 // fleet tiles: FRESH snapshots only in the sums, coverage named, absent =
 // em-dash with the reason, never a fake zero) and one read-only glance
-// card per configured peer (the EngineCard shape: name + activity verdict
-// word + presence dot + version, the peer's engines as rows, its queue/
-// session/lease counts as gauges). An offline peer dims to the last-known
+// ROW per configured machine (the EngineRow shape: name + activity verdict
+// word + presence dot + version, its engines as rows, its queue/session/
+// lease counts as gauges). An offline peer dims to the last-known
 // truth (labelled), exactly like a stale engine card. Coarse by
 // construction: presence, per-engine idle state, queue DEPTHS, and
 // session/lease counts — never job ids, titles, URLs, or payloads. The
 // write plane is the paired control of #39, not this surface.
 //
+// The resources wave re-layout (2026-10-13): the small grid cards became
+// FULL-WIDTH machine ROWS with a master-detail split — the left column is
+// the machine's identity (instance, coarse counts · host · build lines, the
+// update flow with its toasts, the peer-metrics expand), the right column
+// its engines with the two SOURCES side by side: "hosted here — declared on
+// this arbiter" (live local truth, NEVER dims) and "reported by that
+// machine" (the peer's own snapshot list, dims stale with its snapshot).
+// Narrow screens stack the columns (auto-fit grid, no media queries, the
+// design law). Under each name one SUMMARY line of published-only counts
+// (engines here · agents · sessions), derived by the exact joins in
+// lib/hierarchy.ts (machineSummary) — counts whose population is COMPLETE
+// for that machine, so unlike the tiles a 0 there is the truth, never a
+// fake. Nothing about what the data says moved — only where it sits.
+//
 // "This Machine" (owner call, 2026-10-11) sits FIRST in the list — the
 // earlier rule ("the local machine is the rest of this page, never a row
 // here") is retired: the operator reading a machines list expects to see
-// the machine they are on. Its card is the local truth (this page's own
+// the machine they are on. Its row is the local truth (this page's own
 // poll, not a pull): the same counts a peer would publish about us, plus
 // the coarse host block (load averages · memory · uptime — the
 // htop-equivalent ADD key off the arbiter's own node:os read; the GPU
-// truth already rides the engine load axis elsewhere).
+// truth already rides the engine load axis elsewhere). Its engine column
+// carries the ONE source there can be: the loopback/local-only join of the
+// declared rows.
 //
-// #79/#86: each card gains ONE read-only expand — the remote range read. It
+// #79/#86: each row gains ONE read-only expand — the remote range read. It
 // pulls that peer's engine + session series THROUGH this arbiter (never to
 // a peer origin, D3), on demand (no background pull), and renders the
 // #52/#57 Usage sparkline vocabulary. ADD-only: a failed pull is a render
@@ -67,7 +91,7 @@ const TONE: Record<string, string> = {
 // button creates an INTENT on the target, never a command: its host updater
 // helper runs the machine's own documented update. This Machine has no
 // button — it updates by the operator's own command line; the intents asked
-// OF this machine render as chips on the local card (the coarse
+// OF this machine render as chips on the local row (the coarse
 // update_intents block).
 // ---------------------------------------------------------------------------
 
@@ -92,10 +116,10 @@ export function Machines({ st }: { st: StateSnapshot | null }) {
   const peers = st.mesh?.peers ?? [];
   // The hierarchy pass (owner ask 2026-10-12): every declared engine row
   // joins to exactly one machine by its own named facts (url host / group
-  // label / loopback), and renders inside THAT machine's card — urza's
-  // card carries strata-urza AND llama-swap-urza, not just what urza's
+  // label / loopback), and renders inside THAT machine's row — urza's row
+  // carries strata-urza AND llama-swap-urza, not just what urza's
   // own arbiter happens to report. A row no machine names stays out of
-  // every card and is NAMED below the grid; it never disappears.
+  // every row and is NAMED below the list; it never disappears.
   const hosts = hostedServers(st);
   const hostedOn = (machine: string): { row: ServerRow; via: HostVia }[] =>
     (hosts.byMachine.get(machine) ?? []).map((row) => ({ row, via: hostOfServer(st, row)?.via ?? "local-only" }));
@@ -127,10 +151,13 @@ export function Machines({ st }: { st: StateSnapshot | null }) {
           </CardContent>
         </Card>
       ) : null}
-      <div className="grid gap-2.5 [grid-template-columns:repeat(auto-fit,minmax(300px,1fr))]">
-        <LocalCard st={st} hosted={hostedOn(LOCAL_MACHINE)} />
+      {/* Full-width rows, one per machine (the resources wave): the list
+          stacks, each row splits identity/engines side by side when wide
+          and stacks them when narrow — auto-fit, no media queries. */}
+      <div className="flex flex-col gap-2.5">
+        <LocalRow st={st} hosted={hostedOn(LOCAL_MACHINE)} />
         {peers.map((p) => (
-          <PeerCard key={p.url} p={p} now={st.now} hosted={hostedOn(p.name)} />
+          <PeerRow key={p.url} st={st} p={p} now={st.now} hosted={hostedOn(p.name)} />
         ))}
       </div>
       {hosts.unhosted.length > 0 && (
@@ -142,12 +169,37 @@ export function Machines({ st }: { st: StateSnapshot | null }) {
   );
 }
 
-// This Machine — the local card (first in the list, owner call 2026-10-11):
+// The per-machine summary line under the name (resources wave): published
+// counts only, every join EXACT (lib/hierarchy.ts machineSummary). The
+// tooltip names each join in one sentence; a 0 renders honestly because the
+// join is COMPLETE for this machine's population — the counts are not the
+// tiles, where absent coverage earns an em-dash instead.
+function SummaryLine({ s }: { s: MachineSummary }) {
+  const n = (v: number) => <span className="text-foreground">{fmt(v)}</span>;
+  return (
+    <div
+      className="text-[11px] text-dim"
+      title="published-only counts, every join EXACT — engines here = this arbiter's declared rows whose url host or engine-group label names this machine · agents = the profiles on this machine's clients' published rosters (rosters are what clients report — a client that publishes none contributes 0) · sessions = session rows whose client_id is one of this machine's client daemons"
+    >
+      {n(s.engines)} engines here · {n(s.agents)} agents · {n(s.sessions)} sessions
+    </div>
+  );
+}
+
+// The engine state word for one hosted row + its dot class — the shared
+// shape of the row line in both source columns (identity of the row:
+// dot, name, right-aligned state word, idle duration when idle).
+function engineDot(row: ServerRow): string {
+  return row.signal?.degraded ? "bg-err" : row.signal?.idle ? "bg-border" : "bg-accent";
+}
+
+// This Machine — the local row (first in the list, owner call 2026-10-11):
 // the same coarse counts a peer would publish about this instance, read as
 // local truth from this page's own poll. The host line is the arbiter's
 // live node:os read (host-wide even inside a container); absent on an
-// arbiter that predates the key → no line, never a fake zero.
-function LocalCard({ st, hosted }: { st: StateSnapshot; hosted: { row: ServerRow; via: HostVia }[] }) {
+// arbiter that predates the key → no line, never a fake zero. Nothing here
+// dims: it is all this page's own live poll.
+function LocalRow({ st, hosted }: { st: StateSnapshot; hosted: { row: ServerRow; via: HostVia }[] }) {
   const running = (st.active_leases ?? []).length > 0;
   const w: StateWord = liveWord(st.idle, running);
   const queued = (st.clients ?? []).flatMap((c) => c.projects ?? []).reduce((a, p) => a + (p.queue_depth || 0), 0);
@@ -162,79 +214,96 @@ function LocalCard({ st, hosted }: { st: StateSnapshot; hosted: { row: ServerRow
         </CardTitle>
         <span className={`shrink-0 text-[11px] font-semibold ${TONE[w.tone]}`} title={w.note}>{w.label}</span>
         <CardAction>
-          <span className="shrink-0 text-[11px] text-dim" title="this card rides the page's own 5 s state poll — not a peer pull">
+          <span className="shrink-0 text-[11px] text-dim" title="this row rides the page's own 5 s state poll — not a peer pull">
             local
           </span>
         </CardAction>
       </CardHeader>
 
-      <CardContent className="flex flex-col gap-2 px-3 py-2">
-        <div className="flex items-center gap-2 text-[11px] text-dim">
-          <span title="instance id — the identity (tailnet IPs move, the id does not)">instance</span>{" "}
-          <code className="min-w-0 truncate text-foreground/80">{st.mesh?.instance_id ?? "no mesh identity"}</code>
-        </div>
-        <div className="flex flex-col gap-0.5">
-          {(st.servers ?? []).length === 0 && <div className="text-[11px] text-dim">no engines declared</div>}
-          {(st.servers ?? []).length > 0 && hosted.length === 0 && (
-            <div className="text-[11px] text-dim" title="every declared row names another machine (url host or engine-group label) — this machine hosts none">
-              no engines hosted on this machine
+      <CardContent className="flex flex-col gap-1.5 px-3 py-2">
+        <SummaryLine s={machineSummary(st, LOCAL_MACHINE)} />
+        <div className="grid gap-x-4 gap-y-2 [grid-template-columns:repeat(auto-fit,minmax(300px,1fr))]">
+          {/* identity column — instance, coarse counts, host, update intents */}
+          <div className="flex flex-col gap-1.5">
+            <div className="flex items-center gap-2 text-[11px] text-dim">
+              <span title="instance id — the identity (tailnet IPs move, the id does not)">instance</span>{" "}
+              <code className="min-w-0 truncate text-foreground/80">{st.mesh?.instance_id ?? "no mesh identity"}</code>
             </div>
-          )}
-          {hosted.map(({ row, via }) => {
-            const sw: StateWord = liveWord(
-              row.signal ? { idle: row.signal.idle, degraded: row.signal.degraded } : null,
-              running || row.models.some((m) => m.running),
-            );
-            return (
-              <div key={row.id} className="flex items-center gap-2 text-[12px]">
-                <span
-                  className={`size-1.5 shrink-0 rounded-full ${row.signal?.degraded ? "bg-err" : row.signal?.idle ? "bg-border" : "bg-accent"}`}
-                  title={`${row.name}: ${sw.label} — hosted here (${VIA_NOTE[via]})`}
-                />
-                <span className="min-w-0 truncate">{row.name}</span>
-                <span className={`ml-auto whitespace-nowrap text-[11px] font-semibold ${TONE[sw.tone]}`} title={sw.note}>
-                  {sw.label}
-                  {row.signal?.idle && row.signal.idle_for_s != null ? ` · ${durFmt(row.signal.idle_for_s)}` : ""}
-                </span>
+            <div className="flex flex-col gap-1">
+              <div className="flex items-center gap-3 text-[11px] text-dim" title="the same coarse counts a peer would pull about this machine">
+                <span className="whitespace-nowrap" title="jobs waiting across this machine's clients"><span className="text-[13px] font-semibold text-foreground">{fmt(queued)}</span> queued</span>
+                <span className="whitespace-nowrap" title="interactive sessions registered here"><span className="text-[13px] font-semibold text-foreground">{fmt((st.sessions ?? []).length)}</span> sessions</span>
+                <span className="whitespace-nowrap" title="leases running here"><span className="text-[13px] font-semibold text-foreground">{fmt((st.active_leases ?? []).length)}</span> running</span>
               </div>
-            );
-          })}
-        </div>
-        <div className="flex flex-col gap-1">
-          <div className="flex items-center gap-3 text-[11px] text-dim" title="the same coarse counts a peer would pull about this machine">
-            <span className="whitespace-nowrap" title="jobs waiting across this machine's clients"><span className="text-[13px] font-semibold text-foreground">{fmt(queued)}</span> queued</span>
-            <span className="whitespace-nowrap" title="interactive sessions registered here"><span className="text-[13px] font-semibold text-foreground">{fmt((st.sessions ?? []).length)}</span> sessions</span>
-            <span className="whitespace-nowrap" title="leases running here"><span className="text-[13px] font-semibold text-foreground">{fmt((st.active_leases ?? []).length)}</span> running</span>
-          </div>
-          {hline && (
-            <div className="text-[10px] text-dim" title={`coarse host counters — what the arbiter's process sees of its own host (host-wide even inside its container)${h?.cpus ? ` · ${h.cpus} cpus` : ""}${h?.load15 !== undefined ? ` · 15m load ${h.load15}` : ""} · GPU truth rides the engine load axis`}>
-              {hline}
+              {hline && (
+                <div className="text-[10px] text-dim" title={`coarse host counters — what the arbiter's process sees of its own host (host-wide even inside its container)${h?.cpus ? ` · ${h.cpus} cpus` : ""}${h?.load15 !== undefined ? ` · 15m load ${h.load15}` : ""} · GPU truth rides the engine load axis`}>
+                  {hline}
+                </div>
+              )}
             </div>
-          )}
-        </div>
-        {(st.update_intents?.length ?? 0) > 0 && (
-          <div className="flex flex-wrap items-center gap-1.5" title="machine-update intents asked of THIS machine by a paired controller (mesh-update.md) — this machine updates by the operator's own command line, there is no local button">
-            <span className="text-[10px] uppercase tracking-wide text-dim">updates</span>
-            {[...(st.update_intents ?? [])].reverse().map((it) => {
-              const iw = intentWord(it, st.now);
-              return (
-                <span key={it.id} className={`rounded border border-border px-1.5 py-0.5 text-[10px] font-semibold ${TONE[iw.tone]}`} title={`${iw.note} · intent ${it.id} · requested by ${it.source_instance_id}`}>
-                  {iw.label}
-                </span>
-              );
-            })}
+            {(st.update_intents?.length ?? 0) > 0 && (
+              <div className="flex flex-wrap items-center gap-1.5" title="machine-update intents asked of THIS machine by a paired controller (mesh-update.md) — this machine updates by the operator's own command line, there is no local button">
+                <span className="text-[10px] uppercase tracking-wide text-dim">updates</span>
+                {[...(st.update_intents ?? [])].reverse().map((it) => {
+                  const iw = intentWord(it, st.now);
+                  return (
+                    <span key={it.id} className={`rounded border border-border px-1.5 py-0.5 text-[10px] font-semibold ${TONE[iw.tone]}`} title={`${iw.note} · intent ${it.id} · requested by ${it.source_instance_id}`}>
+                      {iw.label}
+                    </span>
+                  );
+                })}
+              </div>
+            )}
           </div>
-        )}
+          {/* engines column — the ONE source there can be for the local
+              machine: the loopback/local-only join of the declared rows
+              (live local truth, never dims). Exception-only lines when the
+              join names nothing. */}
+          <div className="flex flex-col gap-0.5">
+            {(st.servers ?? []).length === 0 && <div className="text-[11px] text-dim">no engines declared</div>}
+            {(st.servers ?? []).length > 0 && hosted.length === 0 && (
+              <div className="text-[11px] text-dim" title="every declared row names another machine (url host or engine-group label) — this machine hosts none">
+                no engines hosted on this machine
+              </div>
+            )}
+            {hosted.length > 0 && (
+              <>
+                <span className="text-[10px] uppercase tracking-wide text-dim">hosted here — declared on this arbiter</span>
+                {hosted.map(({ row, via }) => {
+                  const sw: StateWord = liveWord(
+                    row.signal ? { idle: row.signal.idle, degraded: row.signal.degraded } : null,
+                    running || row.models.some((m) => m.running),
+                  );
+                  return (
+                    <div key={row.id} className="flex items-center gap-2 text-[12px]">
+                      <span
+                        className={`size-1.5 shrink-0 rounded-full ${engineDot(row)}`}
+                        title={`${row.name}: ${sw.label} — hosted here (${VIA_NOTE[via]})`}
+                      />
+                      <span className="min-w-0 truncate">{row.name}</span>
+                      <span className={`ml-auto whitespace-nowrap text-[11px] font-semibold ${TONE[sw.tone]}`} title={sw.note}>
+                        {sw.label}
+                        {row.signal?.idle && row.signal.idle_for_s != null ? ` · ${durFmt(row.signal.idle_for_s)}` : ""}
+                      </span>
+                    </div>
+                  );
+                })}
+              </>
+            )}
+          </div>
+        </div>
       </CardContent>
     </Card>
   );
 }
 
-function PeerCard({ p, now, hosted }: { p: MeshPeer; now: number; hosted: { row: ServerRow; via: HostVia }[] }) {
+function PeerRow({ st, p, now, hosted }: { st: StateSnapshot; p: MeshPeer; now: number; hosted: { row: ServerRow; via: HostVia }[] }) {
   const snap = p.snapshot;
   const w: StateWord = peerVerdict(snap);
   // Past the arbiter's 90 s pull window the snapshot is the LAST-KNOWN
-  // truth: shown dimmed and labelled, never rewritten, never zeroed.
+  // truth: shown dimmed and labelled, never rewritten, never zeroed. Only
+  // the snapshot-sourced column dims — the hosted block and the identity
+  // lines are this arbiter's own live readings and never dim.
   const stale = !p.online;
   const staleDim = stale && snap ? "opacity-60" : "";
   return (
@@ -261,104 +330,118 @@ function PeerCard({ p, now, hosted }: { p: MeshPeer; now: number; hosted: { row:
         </CardAction>
       </CardHeader>
 
-      <CardContent className="flex flex-col gap-2 px-3 py-2">
-        <div className="flex items-center gap-2 text-[11px] text-dim">
-          <span title="instance id — the identity (tailnet IPs move, the id does not)">instance</span>{" "}
-          <code className="min-w-0 truncate text-foreground/80">{p.instance_id || "unknown"}</code>
-          {snap?.version && (
-            <span className="ml-auto shrink-0 text-[10px] text-dim" title="the peer's arbiter version">{snap.version}</span>
-          )}
-        </div>
-        {p.error && (
-          <div className="text-[11px] text-err" title="the last pull failed — exception-only, cleared on the next success">
-            last error: {p.error}
-          </div>
-        )}
-        {!snap && !p.error && (
-          <div className="text-[11px] text-dim">no snapshot yet — the first pull fills this card</div>
-        )}
-        {snap && (
-          <div className={`flex flex-col gap-2 ${staleDim}`} title={stale ? "the peer is offline — showing the last-known snapshot" : undefined}>
-            <div className="flex flex-col gap-0.5">
-              {snap.servers.length === 0 && <div className="text-[11px] text-dim">no engines reported</div>}
-              {snap.servers.map((s, i) => {
-                const sw: StateWord = liveWord({ idle: s.idle, degraded: s.degraded }, false);
-                return (
-                  <div key={i} className="flex items-center gap-2 text-[12px]">
-                    <span
-                      className={`size-1.5 shrink-0 rounded-full ${s.degraded ? "bg-err" : s.idle ? "bg-border" : "bg-accent"}`}
-                      title={`${s.name}: ${sw.label}`}
-                    />
-                    <span className="min-w-0 truncate">{s.name}</span>
-                    <span className={`ml-auto whitespace-nowrap text-[11px] font-semibold ${TONE[sw.tone]}`} title={sw.note}>
-                      {sw.label}
-                      {s.idle && s.idle_for_s != null ? ` · ${durFmt(s.idle_for_s)}` : ""}
-                    </span>
-                  </div>
-                );
-              })}
+      <CardContent className="flex flex-col gap-1.5 px-3 py-2">
+        <SummaryLine s={machineSummary(st, p.name)} />
+        <div className="grid gap-x-4 gap-y-2 [grid-template-columns:repeat(auto-fit,minmax(300px,1fr))]">
+          {/* identity column — instance, exceptions, the url, the one write
+              (the update flow), and the peer-metrics expand. All of it is
+              this arbiter's live reading: never dims. */}
+          <div className="flex flex-col gap-1.5">
+            <div className="flex items-center gap-2 text-[11px] text-dim">
+              <span title="instance id — the identity (tailnet IPs move, the id does not)">instance</span>{" "}
+              <code className="min-w-0 truncate text-foreground/80">{p.instance_id || "unknown"}</code>
+              {snap?.version && (
+                <span className="ml-auto shrink-0 text-[10px] text-dim" title="the peer's arbiter version">{snap.version}</span>
+              )}
             </div>
-            <div className="flex flex-col gap-1">
-              <div className="flex items-center gap-3 text-[11px] text-dim" title="queue depths, session and lease counts — coarse by construction (the peer publishes numbers, never rows)">
-                <span className="whitespace-nowrap" title="jobs waiting on that machine"><span className="text-[13px] font-semibold text-foreground">{fmt(snap.queue_depth)}</span> queued</span>
-                <span className="whitespace-nowrap" title="interactive sessions registered there"><span className="text-[13px] font-semibold text-foreground">{fmt(snap.sessions)}</span> sessions</span>
-                <span className="whitespace-nowrap" title="leases running there"><span className="text-[13px] font-semibold text-foreground">{fmt(snap.active_leases)}</span> running</span>
-                <span className="ml-auto whitespace-nowrap text-[10px]" title="when that machine took the snapshot (its own clock)">
-                  snap {ago(now - snap.ts)}
-                </span>
-                {stale && <span className="text-[10px] text-warn" title="the last successful pull lapsed past the 90 s window — these values may be out of date">stale</span>}
+            {p.error && (
+              <div className="text-[11px] text-err" title="the last pull failed — exception-only, cleared on the next success">
+                last error: {p.error}
               </div>
-              {hostLine(snap.host) && (
-                <div className="text-[10px] text-dim" title="coarse host counters as THAT machine's arbiter reported them (load/memory/uptime — absent on a peer that predates the key)">
-                  {hostLine(snap.host)}
-                </div>
-              )}
-              {buildGapLine(p) && (
-                <div className={`text-[10px] ${TONE[buildGapLine(p)!.tone]}`} title="the git commit that machine's arbiter booted from, and how far its build sits from this machine's (counted with git rev-list on this checkout — 'behind' is why the update button exists; 'differ' = the two shas cannot be ordered from here; absent = that machine does not report a build)">
-                  {buildGapLine(p)!.text}
-                </div>
-              )}
+            )}
+            {!snap && !p.error && (
+              <div className="text-[11px] text-dim">no snapshot yet — the first pull fills this row</div>
+            )}
+            <div className="flex items-center gap-2 border-t border-border pt-1.5 text-[11px] text-dim">
+              <code className="min-w-0 truncate" title="the peer's mesh url">{p.url}</code>
+              {p.i_control && <UpdateButton p={p} />}
             </div>
+            <RemoteExpand p={p} />
           </div>
-        )}
-        {/* The hierarchy block (owner ask 2026-10-12): the engine rows THIS
-            arbiter declares that host on THAT machine — exact joins (url
-            hostname = the peer's, or engine-group label = the machine's
-            name). urza's card carries strata-urza AND llama-swap-urza even
-            though urza's own snapshot names only one of them. Reads live
-            from this page's poll — never dims with a stale snapshot. */}
-        {hosted.length > 0 && (
-          <div className="flex flex-col gap-0.5 border-t border-border pt-1.5">
-            <span className="text-[10px] uppercase tracking-wide text-dim">hosted here — declared on this arbiter</span>
-            {hosted.map(({ row, via }) => {
-              const sw: StateWord = liveWord(
-                row.signal ? { idle: row.signal.idle, degraded: row.signal.degraded } : null,
-                !!row.engaged || row.models.some((m) => m.running),
-              );
-              return (
-                <div key={row.id} className="flex items-center gap-2 text-[12px]">
-                  <span
-                    className={`size-1.5 shrink-0 rounded-full ${row.signal?.degraded ? "bg-err" : row.signal?.idle ? "bg-border" : "bg-accent"}`}
-                    title={`${row.name} — ${VIA_NOTE[via]} · ${row.url}`}
-                  />
-                  <span className="min-w-0 truncate" title={`${row.url} · ${row.models.length} models seen`}>{row.name}</span>
-                  <span className={`ml-auto whitespace-nowrap text-[11px] font-semibold ${TONE[sw.tone]}`} title={sw.note}>
-                    {sw.label}
-                    {row.signal?.idle && row.signal.idle_for_s != null ? ` · ${durFmt(row.signal.idle_for_s)}` : ""}
-                  </span>
+          {/* engines column — the two SOURCES, side by side when wide,
+              stacked when narrow, never merged. */}
+          <div className="grid gap-x-4 gap-y-2 [grid-template-columns:repeat(auto-fit,minmax(200px,1fr))]">
+            {/* The hierarchy block (owner ask 2026-10-12): the engine rows THIS
+                arbiter declares that host on THAT machine — exact joins (url
+                hostname = the peer's, or engine-group label = the machine's
+                name). urza's row carries strata-urza AND llama-swap-urza even
+                though urza's own snapshot names only one of them. Reads live
+                from this page's poll — never dims with a stale snapshot. */}
+            {hosted.length > 0 && (
+              <div className="flex flex-col gap-0.5">
+                <span className="text-[10px] uppercase tracking-wide text-dim">hosted here — declared on this arbiter</span>
+                {hosted.map(({ row, via }) => {
+                  const sw: StateWord = liveWord(
+                    row.signal ? { idle: row.signal.idle, degraded: row.signal.degraded } : null,
+                    !!row.engaged || row.models.some((m) => m.running),
+                  );
+                  return (
+                    <div key={row.id} className="flex items-center gap-2 text-[12px]">
+                      <span
+                        className={`size-1.5 shrink-0 rounded-full ${engineDot(row)}`}
+                        title={`${row.name} — ${VIA_NOTE[via]} · ${row.url}`}
+                      />
+                      <span className="min-w-0 truncate" title={`${row.url} · ${row.models.length} models seen`}>{row.name}</span>
+                      <span className={`ml-auto whitespace-nowrap text-[11px] font-semibold ${TONE[sw.tone]}`} title={sw.note}>
+                        {sw.label}
+                        {row.signal?.idle && row.signal.idle_for_s != null ? ` · ${durFmt(row.signal.idle_for_s)}` : ""}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            {/* The peer's own column: everything here is THAT machine's
+                snapshot — its engines and its coarse counts — one block,
+                one dim when the pull goes stale. */}
+            {snap && (
+              <div className={`flex flex-col gap-2 ${staleDim}`} title={stale ? "the peer is offline — showing the last-known snapshot" : undefined}>
+                <div className="flex flex-col gap-0.5">
+                  <span className="text-[10px] uppercase tracking-wide text-dim" title="the peer's own snapshot: the engines it reports and its coarse counts — the last-known truth while the peer is offline">reported by that machine</span>
+                  {snap.servers.length === 0 && <div className="text-[11px] text-dim">no engines reported</div>}
+                  {snap.servers.map((s, i) => {
+                    const sw: StateWord = liveWord({ idle: s.idle, degraded: s.degraded }, false);
+                    return (
+                      <div key={i} className="flex items-center gap-2 text-[12px]">
+                        <span
+                          className={`size-1.5 shrink-0 rounded-full ${s.degraded ? "bg-err" : s.idle ? "bg-border" : "bg-accent"}`}
+                          title={`${s.name}: ${sw.label}`}
+                        />
+                        <span className="min-w-0 truncate">{s.name}</span>
+                        <span className={`ml-auto whitespace-nowrap text-[11px] font-semibold ${TONE[sw.tone]}`} title={sw.note}>
+                          {sw.label}
+                          {s.idle && s.idle_for_s != null ? ` · ${durFmt(s.idle_for_s)}` : ""}
+                        </span>
+                      </div>
+                    );
+                  })}
                 </div>
-              );
-            })}
+                <div className="flex flex-col gap-1">
+                  <div className="flex items-center gap-3 text-[11px] text-dim" title="queue depths, session and lease counts — coarse by construction (the peer publishes numbers, never rows)">
+                    <span className="whitespace-nowrap" title="jobs waiting on that machine"><span className="text-[13px] font-semibold text-foreground">{fmt(snap.queue_depth)}</span> queued</span>
+                    <span className="whitespace-nowrap" title="interactive sessions registered there"><span className="text-[13px] font-semibold text-foreground">{fmt(snap.sessions)}</span> sessions</span>
+                    <span className="whitespace-nowrap" title="leases running there"><span className="text-[13px] font-semibold text-foreground">{fmt(snap.active_leases)}</span> running</span>
+                    <span className="ml-auto whitespace-nowrap text-[10px]" title="when that machine took the snapshot (its own clock)">
+                      snap {ago(now - snap.ts)}
+                    </span>
+                    {stale && <span className="text-[10px] text-warn" title="the last successful pull lapsed past the 90 s window — these values may be out of date">stale</span>}
+                  </div>
+                  {hostLine(snap.host) && (
+                    <div className="text-[10px] text-dim" title="coarse host counters as THAT machine's arbiter reported them (load/memory/uptime — absent on a peer that predates the key)">
+                      {hostLine(snap.host)}
+                    </div>
+                  )}
+                  {buildGapLine(p) && (
+                    <div className={`text-[10px] ${TONE[buildGapLine(p)!.tone]}`} title="the git commit that machine's arbiter booted from, and how far its build sits from this machine's (counted with git rev-list on this checkout — 'behind' is why the update button exists; 'differ' = the two shas cannot be ordered from here; absent = that machine does not report a build)">
+                      {buildGapLine(p)!.text}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
-        )}
+        </div>
       </CardContent>
-
-      <RemoteExpand p={p} />
-
-      <div className="flex items-center gap-2 border-t border-border px-3 py-1.5 text-[11px] text-dim">
-        <code className="min-w-0 truncate" title="the peer's mesh url">{p.url}</code>
-        {p.i_control && <UpdateButton p={p} />}
-      </div>
     </Card>
   );
 }
@@ -431,12 +514,14 @@ function UpdateButton({ p }: { p: MeshPeer }) {
 }
 
 /**
- * The one expand per peer card (#79 D6, ADD-only). Collapsed = the page
+ * The one expand per peer row (#79 D6, ADD-only). Collapsed = the page
  * renders exactly as before. On open it range-reads the peer's engine +
  * session series THROUGH this arbiter (D3) and renders the Usage
  * sparkline vocabulary. Never on the poll tick — this fetch happens only
- * when the operator opens the card. A failed pull is a named gap; an
- * in-TTL cache hit rides the `stale` label.
+ * when the operator opens the row. A failed pull is a named gap; an
+ * in-TTL cache hit rides the `stale` label. It sits in the row's identity
+ * column (the series pull belongs to the machine, not to either engine
+ * source).
  */
 function RemoteExpand({ p }: { p: MeshPeer }) {
   const [open, setOpen] = useState(false);
@@ -473,19 +558,19 @@ function RemoteExpand({ p }: { p: MeshPeer }) {
   };
 
   return (
-    <div className="border-t border-border">
+    <div className="border-t border-border pt-1.5">
       <button
         type="button"
         onClick={toggle}
         disabled={!p.instance_id}
         title={p.instance_id ? "pull this peer's series through the local arbiter (on demand)" : "no instance id yet — the first snapshot pull is needed"}
-        className="w-full px-3 py-1.5 text-left text-[11px] text-dim hover:text-foreground disabled:opacity-50"
+        className="w-full py-0.5 text-left text-[11px] text-dim hover:text-foreground disabled:opacity-50"
       >
         {open ? "▾ hide peer metrics" : "▸ peer metrics"}
         <span className="ml-2 normal-case text-[10px] opacity-70">req/hr · tokens/hr · sessions (7 d)</span>
       </button>
       {open && (
-        <div className="flex flex-col gap-1 px-3 pb-2">
+        <div className="flex flex-col gap-1 pb-1">
           {loading && <div className="text-[11px] text-dim">pulling…</div>}
           {err && (
             <div className="text-[11px] text-err" title="the fetch failed: the row renders offline under the 90 s stale rule — no fake zeros">

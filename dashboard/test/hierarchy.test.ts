@@ -6,6 +6,11 @@
 // character); nothing fuzzy ever hosts or nests; an unnamed host renders
 // nowhere in the Machines buckets (never guessed onto a card); with no
 // peers declared every row rides This Machine (the single-arbiter truth).
+// The row-summary pass (2026-10-13) adds the per-machine summary joins
+// (machineClients / machineSummary): published counts only, the population
+// complete for that machine — a 0 there is the honest truth (unlike the
+// tiles), a client that names no host contributes to NO machine, and a
+// client that publishes no roster contributes 0 agents, never a guess.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -17,6 +22,8 @@ import {
   hostOfClient,
   hostedServers,
   localClientIds,
+  machineClients,
+  machineSummary,
   sessionsByProfile,
 } from "../src/lib/hierarchy.js";
 import type { StateSnapshot } from "../src/lib/api.js";
@@ -125,4 +132,57 @@ test("sessionsByProfile: nests ONLY on the provenance profile + the machine's cl
   assert.deepEqual([...byProfile.keys()].sort(), ["web-dev", "web-dev-orca"], "exact profile names — web-dev never nests web-dev-orca");
   assert.deepEqual(byProfile.get("web-dev")?.map((x) => x.token), ["t1"], "the remote client's and the client-less rows never nest here");
   assert.ok(!byProfile.has("no profile stamp"));
+});
+
+// The row-summary shape: the same urza mesh + the client/session plane. Two
+// daemons on urza (ONE publishes a roster, one never reports the key), a
+// local daemon with a roster, and a daemon no machine names (its roster
+// belongs to no summary). Sessions attribute by exact client_id.
+const urzaCounted = st({
+  mesh: urzaMesh.mesh,
+  engine_groups: urzaMesh.engine_groups,
+  servers: urzaMesh.servers,
+  clients: [
+    { client_id: "c-urza", name: "urza-box", ip: "100.105.225.1", last_seen: 0, agent_roster: [{ profile: "web-dev", posture: "adopted" }] },
+    { client_id: "c-urza2", name: "no-roster", ip: "100.105.225.1", last_seen: 0 },
+    { client_id: "c-local", name: "mac", ip: "127.0.0.1", last_seen: 0, agent_roster: [{ profile: "pr-agent", posture: "adopted" }] },
+    { client_id: "c-none", name: "elsewhere", ip: "10.20.30.40", last_seen: 0, agent_roster: [{ profile: "ghost", posture: "unset" }] },
+  ],
+  sessions: [
+    { token: "t1", client_id: "c-urza" },
+    { token: "t2", client_id: "c-urza2" },
+    { token: "t3", client_id: "c-local" },
+    { token: "t4", client_id: "c-none" },
+  ] as never,
+});
+
+test("machineClients: the exact hostOfClient join per machine — an unnamed client belongs to NO machine", () => {
+  assert.deepEqual(machineClients(urzaCounted, "urza").map((c) => c.client_id), ["c-urza", "c-urza2"]);
+  assert.deepEqual(machineClients(urzaCounted, LOCAL_MACHINE).map((c) => c.client_id), ["c-local"]);
+  assert.deepEqual(machineClients(urzaCounted, "scanbot"), []);
+  for (const m of ["urza", "scanbot", LOCAL_MACHINE]) {
+    assert.ok(!machineClients(urzaCounted, m).some((c) => c.client_id === "c-none"), "10.20.30.40 names no machine — it never rides a summary");
+  }
+});
+
+test("machineSummary on the urza shape: 2 hosted engines, the roster-less client contributes an honest 0 agents, sessions by exact client_id", () => {
+  assert.deepEqual(machineSummary(urzaCounted, "urza"), { engines: 2, agents: 1, sessions: 2 });
+  assert.equal(
+    machineSummary(urzaCounted, "urza").agents,
+    urzaCounted.clients!.filter((c) => c.client_id.startsWith("c-urza")).reduce((a, c) => a + (c.agent_roster?.length ?? 0), 0),
+    "rosters are what clients report — no roster is 0, never a guess",
+  );
+});
+
+test("machineSummary for the local machine: the loopback engine + the local client's roster + the local client's sessions", () => {
+  assert.deepEqual(machineSummary(urzaCounted, LOCAL_MACHINE), { engines: 1, agents: 1, sessions: 1 });
+});
+
+test("machineSummary for machines without clients: hosted engines still counted, agents/sessions honest zeros; a machine with neither is all zeros", () => {
+  assert.deepEqual(machineSummary(urzaCounted, "scanbot"), { engines: 1, agents: 0, sessions: 0 }, "srv-c rides scanbot's host; no client names it — two honest zeros, never hidden");
+  const lonely = st({
+    mesh: { instance_id: "i", peers: [{ url: "http://10.0.0.7:8787", name: "box2", instance_id: "b2", online: true, fetch_age_s: 1, snapshot: null }] },
+    servers: [srv("srv-omlx", "http://127.0.0.1:8000")],
+  });
+  assert.deepEqual(machineSummary(lonely, "box2"), { engines: 0, agents: 0, sessions: 0 }, "nothing declared on box2 and no client on it — three honest zeros");
 });

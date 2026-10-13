@@ -138,6 +138,13 @@ export function localClientIds(st: HierarchyState): string[] {
     .map((c) => c.client_id);
 }
 
+/** The daemons running on ONE machine (LOCAL_MACHINE or a peer name) — the
+ *  hostOfClient exact join, collected. A client whose ip/observed_ip names no
+ *  machine belongs to NONE of them (never distributed by guess). */
+export function machineClients(st: HierarchyState, machine: string): ClientRow[] {
+  return (st.clients ?? []).filter((c) => hostOfClient(st, c)?.machine === machine);
+}
+
 /**
  * Sessions grouped by their owning agent profile, EXACTLY:
  *   - the session row carries the connector's provenance stamp
@@ -157,4 +164,23 @@ export function sessionsByProfile(st: HierarchyState, clientIds: string[]): Map<
     out.set(profile, list);
   }
   return out;
+}
+
+/** The Machines row's summary line — published counts only, every join EXACT.
+ *  Unlike the tiles' "— with the reason" posture, a 0 HERE is the truth: the
+ *  population is complete for this machine (declared rows bucketed by
+ *  hostOfServer; THIS machine's clients' published rosters — rosters are what
+ *  clients report, a client that publishes none contributes 0; session rows
+ *  by client_id). Never a peer snapshot number — that is the peer's own
+ *  report, rendered beside these in the view, never merged with them. */
+export type MachineSummary = { engines: number; agents: number; sessions: number };
+
+export function machineSummary(st: HierarchyState, machine: string): MachineSummary {
+  const clients = machineClients(st, machine);
+  const ids = new Set(clients.map((c) => c.client_id));
+  return {
+    engines: (hostedServers(st).byMachine.get(machine) ?? []).length,
+    agents: clients.reduce((a, c) => a + (c.agent_roster?.length ?? 0), 0),
+    sessions: (st.sessions ?? []).filter((s) => s.client_id !== undefined && ids.has(s.client_id)).length,
+  };
 }
