@@ -1,4 +1,5 @@
 import * as React from "react";
+import { ChevronRight } from "lucide-react";
 import { toast } from "sonner";
 import {
   Card,
@@ -38,6 +39,7 @@ import {
 } from "@/lib/api";
 import { ago, sessStateWord, sessStale } from "@/lib/format";
 import { localClientIds, sessionsByProfile } from "@/lib/hierarchy";
+import { disclosureOpen, toggleDisclosure } from "@/lib/roster-disclosure";
 import { agentTiles } from "@/lib/agent-stats";
 import { StatTiles, TilesSkeleton } from "@/components/stat-tiles";
 
@@ -290,12 +292,29 @@ function RosterCard({
   // Exact label match only — the label is the one human-chosen fact of a minted
   // row; the #72 hand-off intends it to carry the profile name. Never fuzzy.
   const mintedLabels = new Set(keys.map((k) => k.label));
+  // Disclosure state (interaction only — zero wire, zero join change):
+  // the default is the live "owns sessions" verdict (children visible from
+  // first observation on, no toggle to wait for); `overrides` holds the
+  // user's toggles — the only stickiness: collapsed stays collapsed across
+  // session-count changes; expanded stays open even once the children vanish
+  // (the honest empty line renders there). State in the component survives
+  // the 5s re-renders (RosterCard itself is never remounted by the polls).
+  const [overrides, setOverrides] = React.useState<Map<string, boolean>>(new Map());
+  // Exception-only header hint: it appears only while nesting is real.
+  const anyNesting = roster.some((r) => (byProfile.get(r.profile) ?? []).length > 0);
   return (
     <Card className="mb-4 py-0 shadow-none">
       <CardContent className="flex flex-col">
-        <div className="flex items-center gap-2 border-b border-border px-3 py-2 text-[11px] text-dim">
-          <span className="font-semibold uppercase tracking-wide">profiles on this machine</span>
-          <span className="ml-auto">{adopted} of {roster.length} profiles adopted</span>
+        <div className="flex flex-col gap-0.5 border-b border-border px-3 py-2 text-[11px] text-dim">
+          <div className="flex items-center gap-2">
+            <span className="font-semibold uppercase tracking-wide">profiles on this machine</span>
+            <span className="ml-auto">{adopted} of {roster.length} profiles adopted</span>
+          </div>
+          {anyNesting && (
+            <span>
+              sessions nest under the profile whose gateway ledger named them — click a profile with sessions to fold/unfold
+            </span>
+          )}
         </div>
         {/* The hierarchy (owner ask 2026-10-12): a session nests under the
             profile it belongs to ONLY on exact provenance — the connector
@@ -303,16 +322,36 @@ function RosterCard({
             from (`hermes_meta.profile`), and the row's client must be one
             of this machine's daemons. No stamp, no nesting — never a guess
             from the model, the token, or a similar name. */}
-        <div className="flex flex-col gap-1 px-3 py-2">
+        <div className="flex flex-col gap-0.5 px-3 py-2">
           {roster.map((r) => {
             const minted = mintedLabels.has(r.profile);
             const owned = byProfile.get(r.profile) ?? [];
+            const open = disclosureOpen(overrides, r.profile, owned.length > 0);
+            // The name is a disclosure button only while there ARE children,
+            // or while its disclosure sits open with the children gone (so the
+            // honest empty line stays foldable). A childless profile that is
+            // not open is never a button and shows no chevron (exception-only)
+            // — its single row is exactly what it was before the disclosure.
+            const disclosure = owned.length > 0 || open;
             return (
               <React.Fragment key={r.profile}>
                 <div className="flex items-center gap-2 text-[12px]">
-                <span className="min-w-0 truncate font-semibold" title={r.base_url ?? r.profile}>
-                  {r.profile}
-                </span>
+                {disclosure ? (
+                  <button
+                    type="button"
+                    className="flex min-w-0 items-center gap-1 rounded-sm font-semibold outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                    aria-expanded={open}
+                    onClick={() => setOverrides((m) => toggleDisclosure(m, r.profile, owned.length > 0))}
+                    title={`${r.base_url ?? r.profile} — ${open ? "fold" : "unfold"} the sessions nested under this profile`}
+                  >
+                    <ChevronRight className={`size-3 shrink-0 text-dim ${open ? "rotate-90" : ""}`} />
+                    <span className="min-w-0 truncate">{r.profile}</span>
+                  </button>
+                ) : (
+                  <span className="min-w-0 truncate font-semibold" title={r.base_url ?? r.profile}>
+                    {r.profile}
+                  </span>
+                )}
                 {r.posture === "adopted" && (
                   <Badge variant="outline" className="h-4 rounded-pill px-1.5 py-0 text-[10px] font-normal text-accent">
                     routes through idlefill
@@ -353,9 +392,15 @@ function RosterCard({
                   </Button>
                 )}
                 </div>
-                {owned.map((s) => (
-                  <SessionSubRow key={s.token} s={s} now={now} />
-                ))}
+                {open &&
+                  owned.map((s) => (
+                    <SessionSubRow key={s.token} s={s} now={now} />
+                  ))}
+                {open && owned.length === 0 && (
+                  <div className="ml-4 text-[11px] italic text-dim">
+                    no sessions nest here — nesting needs the gateway-ledger provenance stamp (exact profile match)
+                  </div>
+                )}
               </React.Fragment>
             );
           })}
