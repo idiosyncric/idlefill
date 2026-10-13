@@ -72,7 +72,7 @@ import type {
   ThemeColors,
 } from './types.js';
 import type { StateStore } from './state.js';
-import type { ClientOverride, Lease, ProjectAllocation, ServerConfig, ServerConnection, ServerProvider, UtcDate, AgentRosterRow, HermesJobRow, HermesHostFactsSummary, HostFactStatus } from './types.js';
+import type { ClientOverride, Lease, ProjectAllocation, ServerConfig, ServerConnection, ServerProvider, UtcDate, AgentRosterRow, HermesJobRow, HermesHostFactsSummary, HostFactStatus, HermesSkillRow, HermesToolsetRow } from './types.js';
 import { PROVIDER_KINDS, THEME_DEFAULTS, THEME_HEX_RE, THEME_TOKEN_KEYS } from './types.js';
 
 /**
@@ -237,6 +237,80 @@ export function cleanHermesJobs(raw: unknown): HermesJobRow[] | undefined {
       const v = o[k];
       if (typeof v === 'number' && Number.isFinite(v) && v > 0 && v < 1e15) row[k] = Math.round(v);
     }
+    out.push(row);
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+/**
+ * #85 slice B: sanitize a reported HERMES SKILLS block (the gateway's
+ * `GET /v1/skills` entries — `{name, description, category}`) for storage on
+ * the client row. Same edge posture as `cleanHermesJobs` (the client is
+ * untrusted input):
+ *   - a non-array / missing report → undefined → ABSENT (absent NEVER clears
+ *     the stored block — a gateway outage or an old client leaves the row
+ *     byte-for-byte as-is);
+ *   - each member checked INDIVIDUALLY, malformed member dropped, rest kept:
+ *     `name` a non-empty string ≤128 (an entry without one cannot be
+ *     attributed — dropped whole), `description` optional string ≤256 (the
+ *     issue's cap), `category` optional string ≤64, `profile` ≤64;
+ *   - bounded hard at 200 rows.
+ * There is deliberately NO enabled/configured member for skills — the
+ * gateway's row does not carry those bits (toolsets-only); fabricating them
+ * would be a guess, so hostile members offering them have nowhere to land.
+ * Returns undefined for a non-array or an all-dropped array.
+ */
+export function cleanHermesSkills(raw: unknown): HermesSkillRow[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out: HermesSkillRow[] = [];
+  for (const r of raw as unknown[]) {
+    if (out.length >= 200) break;
+    if (!r || typeof r !== 'object' || Array.isArray(r)) continue;
+    const o = r as Record<string, unknown>;
+    const name = typeof o.name === 'string' ? o.name.trim() : '';
+    if (name === '' || name.length > 128) continue;
+    const row: HermesSkillRow = { name };
+    if (typeof o.profile === 'string') {
+      const p = o.profile.trim();
+      if (p !== '' && p.length <= 64) row.profile = p;
+    }
+    if (typeof o.description === 'string') {
+      const d = o.description.trim();
+      if (d !== '' && d.length <= 256) row.description = d;
+    }
+    if (typeof o.category === 'string') {
+      const c = o.category.trim();
+      if (c !== '' && c.length <= 64) row.category = c;
+    }
+    out.push(row);
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+/**
+ * #85 slice B: sanitize a reported HERMES TOOLSETS block (the gateway's
+ * `GET /v1/toolsets` entries, projected to name + the exact
+ * enabled/configured booleans — the issue's capability-row contract). The
+ * gateway's label/description/tools members have NO landing place here:
+ * a poison attempt carrying them drops, never enters the state file.
+ * Non-array / all-dropped → undefined (ABSENT — never a clear).
+ */
+export function cleanHermesToolsets(raw: unknown): HermesToolsetRow[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out: HermesToolsetRow[] = [];
+  for (const r of raw as unknown[]) {
+    if (out.length >= 200) break;
+    if (!r || typeof r !== 'object' || Array.isArray(r)) continue;
+    const o = r as Record<string, unknown>;
+    const name = typeof o.name === 'string' ? o.name.trim() : '';
+    if (name === '' || name.length > 64) continue;
+    const row: HermesToolsetRow = { name };
+    if (typeof o.profile === 'string') {
+      const p = o.profile.trim();
+      if (p !== '' && p.length <= 64) row.profile = p;
+    }
+    if (typeof o.enabled === 'boolean') row.enabled = o.enabled;
+    if (typeof o.configured === 'boolean') row.configured = o.configured;
     out.push(row);
   }
   return out.length > 0 ? out : undefined;
@@ -756,7 +830,7 @@ export class Arbiter {
     observedIp: string,
     projects?: ProjectAllocation[],
     now?: number,
-    info?: { version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open'; proxy_port?: number; aggregate_port?: number; daemon_behind?: boolean; client_log?: string[]; agent_roster?: unknown; hermes_version?: unknown; gateway_reachable?: unknown; hermes_jobs?: unknown; hermes_host_facts?: unknown },
+    info?: { version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open'; proxy_port?: number; aggregate_port?: number; daemon_behind?: boolean; client_log?: string[]; agent_roster?: unknown; hermes_version?: unknown; gateway_reachable?: unknown; hermes_jobs?: unknown; hermes_host_facts?: unknown; hermes_skills?: unknown; hermes_toolsets?: unknown },
   ): { client_id: string; created: boolean } {
     const s = this.store.state;
     const seen = now ?? Date.now();
@@ -874,6 +948,12 @@ export class Arbiter {
     // client (or a connector that never answered /api/jobs) leaves the row
     // exactly as it was — byte-for-byte unchanged.
     const hermesJobs = cleanHermesJobs(info?.hermes_jobs);
+    // #85 slice B: the per-profile capability blocks (hermes_skills /
+    // hermes_toolsets — see cleanHermesSkills/cleanHermesToolsets). Same
+    // ADD-key edge as the roster/jobs: a present, valid block updates the
+    // row; a non-array / all-dropped block is ABSENT (never a clear).
+    const hermesSkills = cleanHermesSkills(info?.hermes_skills);
+    const hermesToolsets = cleanHermesToolsets(info?.hermes_toolsets);
     const existing = s.clients.find((c) => c.name === name);
     if (existing) {
       if (validIp(observedIp)) existing.ip = observedIp; // observed wins
@@ -938,6 +1018,12 @@ export class Arbiter {
       // present, valid block replaces the stored list; absent (old client /
       // gateway outage / all-malformed report) NEVER clears it.
       if (hermesJobs !== undefined) existing.hermes_jobs = hermesJobs;
+      // #85 slice B (capabilities): same ADD-key rule — a present, valid
+      // block replaces the stored list; absent NEVER clears it (an old
+      // client, a gateway outage or an all-malformed report leaves the row
+      // byte-for-byte unchanged).
+      if (hermesSkills !== undefined) existing.hermes_skills = hermesSkills;
+      if (hermesToolsets !== undefined) existing.hermes_toolsets = hermesToolsets;
       // #85 slice E: the richer host facts — same ADD-key rule as the
       // roster: a present, valid block replaces the stored one; an absent
       // (or wholly malformed) block NEVER clears it (the client only
@@ -980,6 +1066,10 @@ export class Arbiter {
       // #85 slice D (Hermes jobs): lands only on a present, valid block
       // (same ADD-key store rule as the heartbeat path).
       ...(hermesJobs !== undefined ? { hermes_jobs: hermesJobs } : {}),
+      // #85 slice B (capabilities): land only on a present, valid block
+      // (same ADD-key store rule as the heartbeat path).
+      ...(hermesSkills !== undefined ? { hermes_skills: hermesSkills } : {}),
+      ...(hermesToolsets !== undefined ? { hermes_toolsets: hermesToolsets } : {}),
       // #85 slice E: the richer host facts land only when a valid block
       // was reported — the fresh row simply has no key otherwise.
       ...(hostFacts !== undefined ? { hermes_host_facts: hostFacts } : {}),
@@ -3057,8 +3147,12 @@ export class Arbiter {
    * a different box's profiles. Returns undefined when no loopback client
    * is online or that client reported no roster (the read route then says
    * so rather than showing an empty list).
+   * #85 slice B ADD-keys the same client's capability blocks (`skills` /
+   * `toolsets`) onto the result when that row carries them — the Agents tab
+   * renders per-profile capability rows from this ONE read (same local
+   * honesty: capabilities live behind that daemon's loopback gateway).
    */
-  localAgentRoster(now?: number): { client: string; roster: AgentRosterRow[] } | undefined {
+  localAgentRoster(now?: number): { client: string; roster: AgentRosterRow[]; skills?: HermesSkillRow[]; toolsets?: HermesToolsetRow[] } | undefined {
     const n = now ?? Date.now();
     // Pick the online loopback client with the newest last_seen (the live local
     // daemon); a tie falls to the later row (deterministic). In practice there
@@ -3071,7 +3165,12 @@ export class Arbiter {
       if (!best || c.last_seen >= best.last_seen) best = c;
     }
     if (!best) return undefined;
-    return { client: best.name, roster: best.agent_roster! };
+    return {
+      client: best.name,
+      roster: best.agent_roster!,
+      ...(best.hermes_skills && best.hermes_skills.length > 0 ? { skills: best.hermes_skills } : {}),
+      ...(best.hermes_toolsets && best.hermes_toolsets.length > 0 ? { toolsets: best.hermes_toolsets } : {}),
+    };
   }
 
   /** The digests the machine's own router enforces (loopback route only). */

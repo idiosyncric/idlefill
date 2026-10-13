@@ -1265,15 +1265,27 @@ export class ClientDaemon {
    * route that 401s/times out, or a body that adds nothing beyond
    * version/status publishes NOTHING, so the body stays byte-for-byte
    * the slice-B shape. An old arbiter ignores the key.
+   *
+   * #85 slice B adds the per-profile capability blocks, `hermes_skills` +
+   * `hermes_toolsets` (`GET /v1/skills` / `GET /v1/toolsets` harvested at
+   * most once per connector round, sanitized to names + the exact
+   * enabled/configured booleans client-side). They ride ONLY when a round
+   * answered non-empty rows: absent ⇒ the keys are OMITTED and the body
+   * stays byte-for-byte today's shape. READ-ONLY — the connector GETs and
+   * nothing here addresses an enable/disable verb.
    */
   private hermesGatewayHostFacts(): Record<string, unknown> {
     const snap = this.hermesGateway?.snapshot();
     if (!snap) return {};
     const hermesJobs = this.hermesGateway?.jobsSnapshot();
+    const hermesSkills = this.hermesGateway?.skillsSnapshot();
+    const hermesToolsets = this.hermesGateway?.toolsetsSnapshot();
     return {
       ...(snap.version ? { hermes_version: snap.version } : {}),
       gateway_reachable: snap.reachable,
       ...(hermesJobs && hermesJobs.length > 0 ? { hermes_jobs: hermesJobs } : {}),
+      ...(hermesSkills && hermesSkills.length > 0 ? { hermes_skills: hermesSkills } : {}),
+      ...(hermesToolsets && hermesToolsets.length > 0 ? { hermes_toolsets: hermesToolsets } : {}),
       ...(snap.hostFacts ? { hermes_host_facts: snap.hostFacts } : {}),
     };
   }

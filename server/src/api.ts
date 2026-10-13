@@ -430,7 +430,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   // ------------------------------------------------------------------
 
   app.post('/api/clients/register', async (req, reply) => {
-    const body = (req.body ?? {}) as { name?: string; ip?: string; projects?: ProjectAllocation[]; version?: unknown; protocol?: unknown; revision?: unknown; gate_posture?: unknown; proxy_port?: unknown; aggregate_port?: unknown; daemon_behind?: unknown; client_log?: unknown; agent_roster?: unknown; hermes_version?: unknown; gateway_reachable?: unknown; hermes_jobs?: unknown; hermes_host_facts?: unknown };
+    const body = (req.body ?? {}) as { name?: string; ip?: string; projects?: ProjectAllocation[]; version?: unknown; protocol?: unknown; revision?: unknown; gate_posture?: unknown; proxy_port?: unknown; aggregate_port?: unknown; daemon_behind?: unknown; client_log?: unknown; agent_roster?: unknown; hermes_version?: unknown; gateway_reachable?: unknown; hermes_jobs?: unknown; hermes_host_facts?: unknown; hermes_skills?: unknown; hermes_toolsets?: unknown };
     const name = typeof body.name === 'string' ? body.name.trim() : '';
     if (!name) return reply.code(400).send({ error: 'name required' });
     const remote = (req.ip ?? '').split(':').pop() ?? 'unknown';
@@ -596,14 +596,24 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     // daemons whose detailed round earned nothing: absent NEVER clears a
     // stored block.
     const hermes_host_facts = body.hermes_host_facts;
+    // #85 slice B: the per-profile capability blocks (`hermes_skills` +
+    // `hermes_toolsets` — the gateway's /v1/skills + /v1/toolsets inventories,
+    // sanitized client-side to names + the exact enabled/configured bits).
+    // Plain array pass-throughs here — sanitized (bounded rows, malformed
+    // members dropped individually, non-array/all-dropped → absent) in
+    // registerClient via cleanHermesSkills/cleanHermesToolsets. Absent on old
+    // clients and on daemons whose connector never answered these routes:
+    // absent NEVER clears a stored block.
+    const hermes_skills = Array.isArray(body.hermes_skills) ? (body.hermes_skills as unknown) : undefined;
+    const hermes_toolsets = Array.isArray(body.hermes_toolsets) ? (body.hermes_toolsets as unknown) : undefined;
     const res = arbiter.registerClient(
       name,
       typeof body.ip === 'string' && body.ip.trim() ? body.ip.trim() : undefined,
       remote,
       projects,
       undefined,
-      version !== undefined || protocol !== undefined || revision !== undefined || gate_posture !== undefined || proxy_port !== undefined || aggregate_port !== undefined || daemon_behind !== undefined || client_log !== undefined || agent_roster !== undefined || hermes_version !== undefined || gateway_reachable !== undefined || hermes_jobs !== undefined || hermes_host_facts !== undefined
-        ? { version, protocol, revision, gate_posture, proxy_port, aggregate_port, daemon_behind, client_log, agent_roster, hermes_version, gateway_reachable, hermes_jobs, hermes_host_facts }
+      version !== undefined || protocol !== undefined || revision !== undefined || gate_posture !== undefined || proxy_port !== undefined || aggregate_port !== undefined || daemon_behind !== undefined || client_log !== undefined || agent_roster !== undefined || hermes_version !== undefined || gateway_reachable !== undefined || hermes_jobs !== undefined || hermes_host_facts !== undefined || hermes_skills !== undefined || hermes_toolsets !== undefined
+        ? { version, protocol, revision, gate_posture, proxy_port, aggregate_port, daemon_behind, client_log, agent_roster, hermes_version, gateway_reachable, hermes_jobs, hermes_host_facts, hermes_skills, hermes_toolsets }
         : undefined,
     );
     return reply.code(200).send({ client_id: res.client_id, created: res.created });
@@ -968,10 +978,16 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
    * client is online or it reported no roster, the body carries no `roster`
    * key — the dashboard then hides the roster card (it does not show an
    * empty list). Token-gated like the other authoring reads.
+   * #85 slice B ADD-keys: when that same local client row carries the
+   * capability blocks (the `hermes_skills` / `hermes_toolsets` register
+   * blocks), they ride the response as `skills` / `toolsets` — the Agents
+   * tab renders them as per-profile capability rows (read-only). An old
+   * dashboard ignores the extra keys; a client that never reported them
+   * simply omits them (no empty arrays).
    */
   app.get('/api/agent-roster', async () => {
     const local = arbiter.localAgentRoster();
-    return local ? { client: local.client, roster: local.roster } : {};
+    return local ? { client: local.client, roster: local.roster, ...(local.skills ? { skills: local.skills } : {}), ...(local.toolsets ? { toolsets: local.toolsets } : {}) } : {};
   });
 
   /**

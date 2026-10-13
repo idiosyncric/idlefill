@@ -176,6 +176,10 @@ export type ClientRow = {
   /** HERMES' OWN scheduled jobs (#85 slice D) — Hermes cron on this client's
    *  machine; see the WorkerRow note for the naming rule + absence posture. */
   hermes_jobs?: HermesJobRow[];
+  /** Per-profile HERMES skills (#85 slice B); absent on old clients / outages. */
+  hermes_skills?: HermesSkillRow[];
+  /** Per-profile HERMES toolsets (#85 slice B); absent on old clients / outages. */
+  hermes_toolsets?: HermesToolsetRow[];
   projects: {
     name: string;
     model: string;
@@ -438,6 +442,33 @@ export type HermesJobRow = {
   /** epoch-ms (the client converts the gateway's ISO-8601). */
   last_run?: number;
   next_run?: number;
+};
+
+// ---------------------------------------------------------------------------
+// Hermes capabilities (#85 slice B): the per-profile HERMES skill + toolset
+// inventories, harvested by the client's gateway connector (`GET /v1/skills`
+// + `GET /v1/toolsets` on the machine's Hermes gateway, at most once per
+// connector round, sanitized client-side) and published as the ADD-keys
+// `hermes_skills` / `hermes_toolsets` on the register heartbeat. Toolsets
+// render the issue's capability-row contract (name + the enabled/configured
+// bits); skills carry name/description/category (the description capped
+// ≤256 — the one text member the issue's cap governs). Read-only chrome:
+// there is NO enable/disable affordance anywhere. Rows arrive stamped with
+// their owning profile; absent on old clients / gateway outages (the rows
+// hide — never an empty list pretending to be truth).
+// ---------------------------------------------------------------------------
+export type HermesSkillRow = {
+  profile?: string;
+  name: string;
+  description?: string;
+  category?: string;
+};
+
+export type HermesToolsetRow = {
+  profile?: string;
+  name: string;
+  enabled?: boolean;
+  configured?: boolean;
 };
 
 export type MeshPeerServer = {
@@ -741,12 +772,25 @@ export async function getAgentEndpoints(): Promise<AgentEndpoint[]> {
 // other authoring reads; the route omits `roster` when no loopback client is
 // online or it reported none — the view hides the roster card then (it never
 // shows an empty list).
-export async function getAgentRoster(): Promise<{ client?: string; roster: AgentRosterRow[] }> {
+export async function getAgentRoster(): Promise<{
+  client?: string;
+  roster: AgentRosterRow[];
+  skills?: HermesSkillRow[];
+  toolsets?: HermesToolsetRow[];
+}> {
   try {
-    const body = await json<{ client?: string; roster?: AgentRosterRow[] }>(
-      await fetch(`/api/agent-roster${qsToken()}`, { cache: "no-store" }),
-    );
-    return { client: body.client, roster: body.roster ?? [] };
+    const body = await json<{
+      client?: string;
+      roster?: AgentRosterRow[];
+      skills?: HermesSkillRow[];
+      toolsets?: HermesToolsetRow[];
+    }>(await fetch(`/api/agent-roster${qsToken()}`, { cache: "no-store" }));
+    return {
+      client: body.client,
+      roster: body.roster ?? [],
+      ...(body.skills ? { skills: body.skills } : {}),
+      ...(body.toolsets ? { toolsets: body.toolsets } : {}),
+    };
   } catch {
     return { roster: [] };
   }

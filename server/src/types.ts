@@ -571,6 +571,25 @@ export interface ClientRecord {
    * only; never a gate.
    */
   hermes_host_facts?: HermesHostFactsSummary;
+  /**
+   * #85 slice B: the per-profile HERMES capability inventory — the client's
+   * gateway connector harvested `GET /v1/skills` + `GET /v1/toolsets` at
+   * most once per connector round and publishes the sanitized blocks as the
+   * ADD-keys `hermes_skills` + `hermes_toolsets` on the register heartbeat.
+   * Skills carry ONLY name/description/category (the gateway's own row — the
+   * description capped ≤256); toolsets carry name + the exact
+   * enabled/configured booleans (the label/description/tools members are
+   * decoration/duplication and are NEVER published). ADD-key: stored on a
+   * valid report (sanitized arrays — malformed rows dropped individually,
+   * ≤200 rows each via cleanHermesSkills/cleanHermesToolsets); an
+   * all-malformed / non-array report is treated as absent; absent NEVER
+   * clears the stored blocks — a gateway outage or an old client leaves the
+   * row byte-for-byte as-is. Read-only visibility; the arbiter and dashboard
+   * render, NOTHING here addresses an enable/disable verb. Display only;
+   * never a gate.
+   */
+  hermes_skills?: HermesSkillRow[];
+  hermes_toolsets?: HermesToolsetRow[];
 }
 
 /**
@@ -632,6 +651,38 @@ export interface HermesJobRow {
   state?: string;
   last_run?: number;
   next_run?: number;
+}
+
+/**
+ * #85 slice B: one HERMES skill row (the gateway's `GET /v1/skills` entry —
+ * the source-pinned members are `{name, description, category}`). The client
+ * connector sanitizes (name ≤128 required, description ≤256, category ≤64);
+ * the arbiter re-sanitizes on arrival (`cleanHermesSkills`). There is
+ * deliberately NO member here the gateway's row does not carry — no
+ * enabled/configured fabrication for skills (those bits exist only on
+ * toolsets).
+ */
+export interface HermesSkillRow {
+  /** Owning Hermes profile (the connector stamps it; display attribution). */
+  profile?: string;
+  name: string;
+  description?: string;
+  category?: string;
+}
+
+/**
+ * #85 slice B: one HERMES toolset row (the gateway's `GET /v1/toolsets`
+ * entry, projected to the issue's capability-row contract: name + the exact
+ * enabled/configured booleans). The gateway's label (emoji decoration),
+ * description/tools (the tool-name list) have NO member here — a poison
+ * attempt carrying them lands in the drop bucket, not the state file.
+ */
+export interface HermesToolsetRow {
+  /** Owning Hermes profile (the connector stamps it; display attribution). */
+  profile?: string;
+  name: string;
+  enabled?: boolean;
+  configured?: boolean;
 }
 
 /**

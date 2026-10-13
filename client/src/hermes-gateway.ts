@@ -770,6 +770,115 @@ export function sanitizeHermesJob(raw: unknown, profile: string): HermesJobRow |
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// #85 slice B: SKILLS + TOOLSETS inventory — the per-profile capability rows
+// (`GET /v1/skills` + `GET /v1/toolsets`). READ-ONLY: the connector only ever
+// GETs; one bounded GET per surface per keyed profile per connector round
+// (inside the existing poll round — at most the connector's cadence, never
+// per page render, never bulk-polled; zero requests while down/unkeyed).
+//
+// Live shape (verified at build against the running gateway, default-profile
+// key read from the operator key file — the key value NEVER pasted):
+//   `GET /v1/toolsets` → 200 `{object:'list', platform:'api_server',
+//     data:[{name,label,description,enabled,configured,tools:[str…]}]}` (28
+//     rows on the live box). The sanitizer projects ONLY name + the two
+//     exact booleans (the issue's row contract: name/enabled/configured);
+//     `label` is emoji decoration and `description`/`tools` are the tool-name
+//     list — decoration and duplication are NOT published.
+//   `GET /v1/skills` → route EXISTS and is authenticated (401 unkeyed,
+//     verified live), but enumeration FAILED on this box at build (500
+//     "Failed to enumerate skills" — the connector fails-quiet: last-known
+//     stands, NOTHING guessed). The success row is pinned from the gateway
+//     SOURCE (`tools/skills_tool.py:239`): `{name, description, category}` —
+//     no enabled/configured member exists on skills (the toolset-only bits
+//     are not fabricated). Description is the one text member the issue's
+//     256-char cap governs: ≤256, name ≤128, category ≤64.
+//   Per-profile mirrors `/p/<profile>/v1/…` exist; a FOREIGN (default-home)
+//   key on a named mirror answers 401 — the #73 per-profile Bearer rule
+//   holds for these routes exactly as for the ledger/jobs routes.
+// ---------------------------------------------------------------------------
+
+/** Count caps (the issue's N≤200 per profile; the published totals bounded
+ *  the same way the jobs strip caps its publish — a hostile/buggy list
+ *  cannot bloat a heartbeat or the state file). */
+export const SKILLS_MAX_PER_PROFILE = 200;
+export const SKILLS_MAX_TOTAL = 200;
+export const TOOLSETS_MAX_PER_PROFILE = 200;
+export const TOOLSETS_MAX_TOTAL = 200;
+/** Per-member string caps (drop-don't-poison; the 256 governs the only text
+ *  member worth publishing — the skill description). */
+export const SKILL_NAME_CAP = 128;
+export const SKILL_DESC_CAP = 256;
+export const SKILL_CATEGORY_CAP = 64;
+export const TOOLSET_NAME_CAP = 64; // the live toolset names are short slugs
+
+/** One sanitized skill row — ONLY the source-pinned members (name required;
+ *  an entry without one cannot be attributed and drops whole). */
+export interface HermesSkillRow {
+  profile?: string;
+  name: string;
+  description?: string;
+  category?: string;
+}
+
+/** One sanitized toolset row — the issue's capability row contract: name +
+ *  the enabled/configured bits (EXACT booleans, never coerced). */
+export interface HermesToolsetRow {
+  profile?: string;
+  name: string;
+  enabled?: boolean;
+  configured?: boolean;
+}
+
+/** The URL paths (per-profile mirror rule — verified live: the mirrors exist
+ *  and enforce the per-profile key). */
+export function skillsPath(profile: string): string {
+  return profile === 'default' ? '/v1/skills' : `/p/${encodeURIComponent(profile)}/v1/skills`;
+}
+export function toolsetsPath(profile: string): string {
+  return profile === 'default' ? '/v1/toolsets' : `/p/${encodeURIComponent(profile)}/v1/toolsets`;
+}
+
+/**
+ * Sanitize ONE `/v1/skills` entry (`{name, description, category}` from
+ * skills_tool.py — the only members that exist). Bad members drop
+ * individually; an entry without a usable name drops whole.
+ */
+export function sanitizeHermesSkill(raw: unknown, profile: string): HermesSkillRow | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const s = raw as Record<string, unknown>;
+  const name = typeof s.name === 'string' ? s.name.trim().slice(0, SKILL_NAME_CAP) : '';
+  if (name === '') return undefined;
+  const out: HermesSkillRow = { name };
+  const prof = typeof profile === 'string' ? profile.trim().slice(0, 64) : '';
+  if (prof !== '') out.profile = prof;
+  if (typeof s.description === 'string' && s.description.trim() !== '') {
+    out.description = s.description.trim().slice(0, SKILL_DESC_CAP);
+  }
+  if (typeof s.category === 'string' && s.category.trim() !== '') {
+    out.category = s.category.trim().slice(0, SKILL_CATEGORY_CAP);
+  }
+  return out;
+}
+
+/**
+ * Sanitize ONE `/v1/toolsets` entry. ONLY name + the two exact booleans land:
+ * `label` (emoji decoration), `description`/`tools` (the tool-name list the
+ * name already implies) are NEVER projected — the names-only discipline.
+ */
+export function sanitizeHermesToolset(raw: unknown, profile: string): HermesToolsetRow | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const t = raw as Record<string, unknown>;
+  const name = typeof t.name === 'string' ? t.name.trim().slice(0, TOOLSET_NAME_CAP) : '';
+  if (name === '') return undefined;
+  const out: HermesToolsetRow = { name };
+  const prof = typeof profile === 'string' ? profile.trim().slice(0, 64) : '';
+  if (prof !== '') out.profile = prof;
+  if (typeof t.enabled === 'boolean') out.enabled = t.enabled;
+  if (typeof t.configured === 'boolean') out.configured = t.configured;
+  return out;
+}
+
 /** The ledger join key's canonical shape (same rule `rowToMeta` applies to a
  *  row's id): trim, cap. A gate-captured header id is normalized the same way
  *  so a whitespace/padding difference never mis-joins. */
@@ -942,10 +1051,16 @@ async function fetchRound(cfg: HermesGatewayConfig, fetchImpl: FetchImpl, nowMs:
    *  failed/401/malformed profile round adds NOTHING, the connector keeps
    *  that profile's last-known list). */
   jobs: Map<string, HermesJobRow[]>;
+  /** #85 slice B: the same replace-on-answer / stand-on-failure discipline
+   *  for the per-profile capability surfaces (`/v1/skills`, `/v1/toolsets`). */
+  skills: Map<string, HermesSkillRow[]>;
+  toolsets: Map<string, HermesToolsetRow[]>;
   fetchedAt: number;
 }> {
   const rows = new Map<string, LedgerRowEntry>();
   const jobs = new Map<string, HermesJobRow[]>();
+  const skills = new Map<string, HermesSkillRow[]>();
+  const toolsets = new Map<string, HermesToolsetRow[]>();
   let reachable = false;
   let version: string | undefined;
   let healthStatus: string | undefined;
@@ -966,7 +1081,7 @@ async function fetchRound(cfg: HermesGatewayConfig, fetchImpl: FetchImpl, nowMs:
   } catch {
     /* unreachable — fail-quiet */
   }
-  if (!reachable) return { reachable, version, hostFacts, rows, jobs, fetchedAt: nowMs };
+  if (!reachable) return { reachable, version, hostFacts, rows, jobs, skills, toolsets, fetchedAt: nowMs };
 
   // #85 slice E: the richer host facts, ONE request per reachable round.
   // Requires an operator key (the route is authenticated) and a key is
@@ -1084,7 +1199,71 @@ async function fetchRound(cfg: HermesGatewayConfig, fetchImpl: FetchImpl, nowMs:
     // (last-known-wins across rounds, merge-on-arrival per profile).
     jobs.set(profile, list);
   }
-  return { reachable, version, hostFacts, rows, jobs, fetchedAt: nowMs };
+
+  // #85 slice B: SKILLS + TOOLSETS — one bounded GET per surface per keyed
+  // profile per round (inside THIS round: at most once per connector cadence,
+  // never per page render, never bulk-polled; zero requests while down — the
+  // unreachable round returned above). GET only: this is a capability strip,
+  // there is no install/enable/disable verb in scope. A 200 with a
+  // well-formed `{object:'list', data:[…]}` envelope is the COMPLETE truth
+  // for THIS profile (both routes are unpaginated — verified in
+  // api_server.py `_handle_skills`/`_handle_toolsets`), so it REPLACES that
+  // profile's last-known list; any non-200 / malformed body leaves the
+  // profile's list standing (last-known-wins across rounds). A keyed profile
+  // whose skills route 500s (the live gateway's failed enumeration — see the
+  // slice-B section) simply stands last-known, publishing NOTHING new.
+  for (const profile of cfg.profiles) {
+    const key = profile === 'default' ? cfg.key : cfg.profileKeys.get(profile);
+    if (!key) continue; // unkeyed profile ⇒ zero requests; its rows stay last-known
+    const skillList = await fetchListSurface(cfg, fetchImpl, skillsPath(profile), key, (raw) => sanitizeHermesSkill(raw, profile), SKILLS_MAX_PER_PROFILE);
+    if (skillList !== undefined) skills.set(profile, skillList);
+    const toolsetList = await fetchListSurface(cfg, fetchImpl, toolsetsPath(profile), key, (raw) => sanitizeHermesToolset(raw, profile), TOOLSETS_MAX_PER_PROFILE);
+    if (toolsetList !== undefined) toolsets.set(profile, toolsetList);
+  }
+  return { reachable, version, hostFacts, rows, jobs, skills, toolsets, fetchedAt: nowMs };
+}
+
+/**
+ * #85 slice B helper: one bounded `GET <path>` for a `{object:'list',
+ * data:[…]}` capability surface. Returns the sanitized list on a 200 with a
+ * well-formed envelope (per-member sanitize, hard count cap), and undefined
+ * on ANY failure (transport / non-200 / malformed body) — the caller then
+ * leaves the profile's last-known list standing (fail-quiet). The fetch never
+ * throws.
+ */
+async function fetchListSurface<T>(
+  cfg: HermesGatewayConfig,
+  fetchImpl: FetchImpl,
+  path: string,
+  key: string,
+  sanitize: (raw: unknown) => T | undefined,
+  max: number,
+): Promise<T[] | undefined> {
+  let res: Response;
+  try {
+    res = await fetchImpl(`${cfg.base_url}${path}`, {
+      headers: { authorization: `Bearer ${key}` },
+      signal: AbortSignal.timeout(cfg.timeout_ms),
+    });
+  } catch {
+    return undefined; // transport failure: this profile's rows stay last-known
+  }
+  if (res.status !== 200) return undefined; // 401/403/404/5xx: stay last-known
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    return undefined;
+  }
+  const env = body as { data?: unknown };
+  if (!Array.isArray(env.data)) return undefined; // malformed envelope: stand as-is
+  const out: T[] = [];
+  for (const raw of env.data) {
+    if (out.length >= max) break;
+    const row = sanitize(raw);
+    if (row) out.push(row); // drop-don't-poison: one bad record never poisons the list
+  }
+  return out;
 }
 
 /**
@@ -1103,6 +1282,10 @@ export class HermesGatewayConnector {
    *  slice-D section + `fetchRound` for the replace-on-answer /
    *  stand-on-failure discipline). */
   private jobsByProfile = new Map<string, HermesJobRow[]>();
+  /** #85 slice B: the last-known capability rows per profile (the same
+   *  replace-on-answer / stand-on-failure discipline — see `fetchRound`). */
+  private skillsByProfile = new Map<string, HermesSkillRow[]>();
+  private toolsetsByProfile = new Map<string, HermesToolsetRow[]>();
   /** #82: session id → the (reachable) poll round that last reported it.
    *  Bookkeeping for the ledger evictions; a parallel structure so the
    *  published `HermesSessionMeta` shape never changes. */
@@ -1156,6 +1339,9 @@ export class HermesGatewayConnector {
       // that answered are in the map — see `fetchRound`; a profile that
       // failed/401'd/malformed this round keeps its last-known list).
       for (const [profile, list] of round.jobs) this.jobsByProfile.set(profile, list);
+      // #85 slice B: same merge discipline for the capability surfaces.
+      for (const [profile, list] of round.skills) this.skillsByProfile.set(profile, list);
+      for (const [profile, list] of round.toolsets) this.toolsetsByProfile.set(profile, list);
       // #82: only a REACHABLE round ages the ledger (an outage never evicts).
       if (round.reachable) this.pruneLedger(round.rows);
       // #83: a fresh REACHABLE round reopens the per-round lookup budget. An
@@ -1497,6 +1683,42 @@ export class HermesGatewayConnector {
       if (!list) continue;
       for (const row of list) {
         if (out.length >= JOBS_MAX_TOTAL) return out;
+        out.push(row);
+      }
+    }
+    return out.length > 0 ? out : undefined;
+  }
+
+  /**
+   * #85 slice B: the capability rows for the client register heartbeat
+   * (ADD-keys `hermes_skills` + `hermes_toolsets`). undefined = publish
+   * NOTHING (the keys are omitted — the arbiter keeps its stored rows, and an
+   * old arbiter never saw these keys): connector disabled, no poll round run
+   * yet, or every profile answered empty/nothing. Rows iterate in config
+   * order (stable profile attribution) and are capped at the *_MAX_TOTAL.
+   */
+  skillsSnapshot(): HermesSkillRow[] | undefined {
+    if (!this.cfg.enabled || !this.polled) return undefined;
+    const out: HermesSkillRow[] = [];
+    for (const profile of this.cfg.profiles) {
+      const list = this.skillsByProfile.get(profile);
+      if (!list) continue;
+      for (const row of list) {
+        if (out.length >= SKILLS_MAX_TOTAL) return out;
+        out.push(row);
+      }
+    }
+    return out.length > 0 ? out : undefined;
+  }
+
+  toolsetsSnapshot(): HermesToolsetRow[] | undefined {
+    if (!this.cfg.enabled || !this.polled) return undefined;
+    const out: HermesToolsetRow[] = [];
+    for (const profile of this.cfg.profiles) {
+      const list = this.toolsetsByProfile.get(profile);
+      if (!list) continue;
+      for (const row of list) {
+        if (out.length >= TOOLSETS_MAX_TOTAL) return out;
         out.push(row);
       }
     }

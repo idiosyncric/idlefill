@@ -34,12 +34,20 @@ import {
   type AgentEndpoint,
   type AgentKeyRow,
   type AgentRosterRow,
+  type HermesSkillRow,
+  type HermesToolsetRow,
   type SessionRow,
   type StateSnapshot,
 } from "@/lib/api";
 import { ago, sessStateWord, sessStale } from "@/lib/format";
 import { localClientIds, sessionsByProfile } from "@/lib/hierarchy";
 import { disclosureOpen, toggleDisclosure } from "@/lib/roster-disclosure";
+import {
+  HERMES_CAPABILITIES_LABEL,
+  groupCapabilitiesByProfile,
+  hasCapabilities,
+  type ProfileCapabilities,
+} from "@/lib/hermes-capabilities";
 import { agentTiles } from "@/lib/agent-stats";
 import { StatTiles, TilesSkeleton } from "@/components/stat-tiles";
 
@@ -115,6 +123,11 @@ export function Agents({ st }: { st: StateSnapshotLike | null }) {
   // (no online loopback client, or a daemon without a Hermes home) → the
   // card is hidden too (never an empty list); a non-empty array renders.
   const [roster, setRoster] = React.useState<AgentRosterRow[] | null>(null);
+  // #85 slice B: the local client's capability blocks (the roster route's
+  // ADD-keys). undefined = never reported (old client / gateway never
+  // answered) — then every roster row is byte-for-byte its pre-slice shape.
+  const [skills, setSkills] = React.useState<HermesSkillRow[] | undefined>(undefined);
+  const [toolsets, setToolsets] = React.useState<HermesToolsetRow[] | undefined>(undefined);
   const [modal, setModal] = React.useState(false);
   // Label pre-fill for the EXISTING mint dialog (#72): set when an unadopted
   // roster row's "mint key" is clicked; the dialog seeds its label field.
@@ -144,6 +157,10 @@ export function Agents({ st }: { st: StateSnapshotLike | null }) {
     try {
       const r = await getAgentRoster();
       setRoster(r.roster);
+      // #85 slice B ADD-keys: undefined stays undefined (absent = never
+      // reported, never an empty list pretending to be truth).
+      setSkills(r.skills);
+      setToolsets(r.toolsets);
     } catch {
       /* the roster keeps its last good rows */
     }
@@ -214,6 +231,7 @@ export function Agents({ st }: { st: StateSnapshotLike | null }) {
           roster={roster}
           keys={keys}
           byProfile={st ? sessionsByProfile(st, localClientIds(st)) : new Map<string, SessionRow[]>()}
+          capsByProfile={groupCapabilitiesByProfile(skills, toolsets)}
           now={now}
           onMint={(name) => { setPrefillLabel(name); setModal(true); }}
         />
@@ -278,6 +296,7 @@ function RosterCard({
   roster,
   keys,
   byProfile,
+  capsByProfile,
   now,
   onMint,
 }: {
@@ -285,6 +304,8 @@ function RosterCard({
   keys: AgentKeyRow[];
   /** Sessions nested by EXACT provenance profile (lib/hierarchy). */
   byProfile: Map<string, SessionRow[]>;
+  /** #85 slice B: profile → gateway capability rows (may be empty/absent). */
+  capsByProfile: Map<string, ProfileCapabilities>;
   now: number;
   onMint: (profile: string) => void;
 }) {
@@ -302,6 +323,10 @@ function RosterCard({
   const [overrides, setOverrides] = React.useState<Map<string, boolean>>(new Map());
   // Exception-only header hint: it appears only while nesting is real.
   const anyNesting = roster.some((r) => (byProfile.get(r.profile) ?? []).length > 0);
+  // #85 slice B: the capability hint + per-profile chips appear ONLY while
+  // the local gateway actually reported rows (exception-only — an old client
+  // or an unanswered surface leaves every row exactly as it was).
+  const anyCaps = hasCapabilities(capsByProfile);
   return (
     <Card className="mb-4 py-0 shadow-none">
       <CardContent className="flex flex-col">
@@ -313,6 +338,11 @@ function RosterCard({
           {anyNesting && (
             <span>
               sessions nest under the profile whose gateway ledger named them — click a profile with sessions to fold/unfold
+            </span>
+          )}
+          {anyCaps && (
+            <span>
+              {HERMES_CAPABILITIES_LABEL} ride each profile from this machine's gateway (/v1/skills + /v1/toolsets) — read-only
             </span>
           )}
         </div>
@@ -333,6 +363,7 @@ function RosterCard({
             // not open is never a button and shows no chevron (exception-only)
             // — its single row is exactly what it was before the disclosure.
             const disclosure = owned.length > 0 || open;
+            const caps = capsByProfile.get(r.profile);
             return (
               <React.Fragment key={r.profile}>
                 <div className="flex items-center gap-2 text-[12px]">
@@ -392,6 +423,17 @@ function RosterCard({
                   </Button>
                 )}
                 </div>
+                {/* #85 slice B: the per-profile capability chips. Exception-
+                    only: a profile with neither skills nor toolsets renders
+                    NOTHING here — its row is exactly what it was. Toolsets
+                    carry the gateway's enabled/configured verdicts (dim +
+                    strike = not enabled, dashed border = not configured);
+                    skills are the gateway's name/category rows (description
+                    in the tooltip). READ-ONLY chips: no enable/disable
+                    affordance exists in this plane. */}
+                {caps && (caps.skills.length > 0 || caps.toolsets.length > 0) && (
+                  <CapabilityChips caps={caps} />
+                )}
                 {open &&
                   owned.map((s) => (
                     <SessionSubRow key={s.token} s={s} now={now} />
@@ -407,6 +449,45 @@ function RosterCard({
         </div>
       </CardContent>
     </Card>
+  );
+}
+
+// #85 slice B: the read-only capability chips for one profile. Toolsets render
+// the issue's capability-row contract (name + the gateway's enabled/configured
+// verdicts — the gateway owns those bits, we only show them: dim + line-through
+// = NOT enabled, dashed border = NOT configured). Skills are the gateway's
+// name rows (category + ≤256-char description in the tooltip). There is NO
+// button/onClick here: the enable/disable verbs are not in idlefill's surface
+// at all.
+function CapabilityChips({ caps }: { caps: ProfileCapabilities }) {
+  return (
+    <div className="ml-4 flex flex-wrap items-center gap-1 pb-1 pt-0.5">
+      {caps.toolsets.map((t) => {
+        const on = t.enabled !== false;
+        const classes = `rounded-pill border px-1.5 py-0 text-[10px] font-normal ${on ? "text-dim" : "text-dim/60 line-through"} ${t.configured === false ? "border-dashed border-border" : "border-border"}`;
+        const title = `toolset ${t.name} — enabled: ${on ? "yes" : "no"}, configured: ${t.configured === false ? "no" : "yes"} (gateway /v1/toolsets — read-only)`;
+        return (
+          <span key={`ts:${t.name}`} className={classes} title={title}>
+            {t.name}
+          </span>
+        );
+      })}
+      {caps.skills.map((s) => {
+        const title = [
+          `skill ${s.name}`,
+          s.category ? `category: ${s.category}` : null,
+          s.description ? s.description : null,
+          "(gateway /v1/skills — read-only)",
+        ]
+          .filter(Boolean)
+          .join(" — ");
+        return (
+          <span key={`sk:${s.name}`} className="rounded-pill border border-border bg-background/40 px-1.5 py-0 text-[10px] text-dim" title={title}>
+            {s.name}
+          </span>
+        );
+      })}
+    </div>
   );
 }
 
