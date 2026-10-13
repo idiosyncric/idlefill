@@ -10,7 +10,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 import { tmpdir } from 'node:os';
@@ -24,6 +24,7 @@ import {
   describeCheck,
   parseBuildMarker,
   parseUpdateArgs,
+  nativeUnitInstalled,
   RELEASE_FEED_URL,
   resolveUpdateCommand,
   runWrapped,
@@ -224,8 +225,12 @@ const env = (over: Partial<MachineEnv> = {}): MachineEnv => ({
   docker: false,
   updateScript: '/repo/update.sh',
   urzaScript: '/repo/scripts/urza-selfupdate.sh',
+  nativeScript: '/repo/scripts/native-selfupdate.sh',
+  nativeUnit: false,
   ...over,
 });
+
+const NATIVE = join(REPO_ROOT, 'scripts', 'native-selfupdate.sh');
 
 test('macOS: update.sh is the documented command when it exists', () => {
   const w = resolveUpdateCommand({ ...env(), updateScript: join(REPO_ROOT, 'update.sh') }, false);
@@ -246,6 +251,53 @@ test('Linux container host: docker + urza-selfupdate.sh selects the host helper'
   assert.ok(w.ok);
   assert.equal(w.script, join(REPO_ROOT, 'scripts', 'urza-selfupdate.sh'));
   assert.ok(w.what.includes('urza-selfupdate.sh'));
+});
+
+test('a NATIVE Linux install wins over docker even with docker installed', () => {
+  // The cutover hazard: the container helper would build an image and start a
+  // container that fights the running unit for the arbiter port.
+  const w = resolveUpdateCommand(
+    {
+      ...env(),
+      platform: 'linux',
+      docker: true,
+      urzaScript: join(REPO_ROOT, 'scripts', 'urza-selfupdate.sh'),
+      nativeScript: NATIVE,
+      nativeUnit: true,
+    },
+    false,
+  );
+  assert.ok(w.ok);
+  assert.equal(w.script, NATIVE);
+  assert.ok(w.what.includes('native-selfupdate.sh'));
+  assert.ok(w.what.includes('units'));
+});
+
+test('native unit but no native-selfupdate.sh here: named refusal, nothing runs', () => {
+  const w = resolveUpdateCommand({ ...env(), platform: 'linux', docker: true, nativeUnit: true, nativeScript: '/nonexistent/native-selfupdate.sh' }, false);
+  assert.equal(w.ok, false);
+  assert.match(w.reason, /native-selfupdate\.sh is absent/);
+  assert.ok(w.reason.includes('nothing was run'));
+});
+
+test('--no-pull is legal on the native path — it rebuilds THIS checkout', () => {
+  const w = resolveUpdateCommand({ ...env(), platform: 'linux', docker: true, nativeUnit: true, nativeScript: NATIVE }, true);
+  assert.ok(w.ok);
+  assert.equal(w.script, NATIVE);
+});
+
+test('the native unit is detected in the user flavor and the system flavor', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'idlefill-native-unit-'));
+  try {
+    assert.equal(nativeUnitInstalled(dir), false, 'no unit files = not native');
+    const userDir = join(dir, '.config', 'systemd', 'user');
+    mkdirSync(userDir, { recursive: true });
+    writeFileSync(join(userDir, 'idlefill-server.service'), '# rendered\n');
+    assert.equal(nativeUnitInstalled(dir), true, 'the rendered user unit says this box is native');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  assert.equal(nativeUnitInstalled('/nonexistent-home'), false);
 });
 
 test('Linux without docker: named refusal — this box has no documented update command', () => {

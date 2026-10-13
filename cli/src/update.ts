@@ -2,9 +2,11 @@
  * The `idlefill update` group (cli.md D4, issue #89 S2) — a read-only
  * release-feed check and a WRAPPER around this machine's documented update
  * command. The CLI re-implements NOTHING (D4 LOCKED): `update` execs
- * ./update.sh on macOS or scripts/urza-selfupdate.sh on the Linux container
- * host; `--check` reads the signed release feed published by
- * scripts/release.sh and compares it against the installed build marker.
+ * ./update.sh on macOS, scripts/native-selfupdate.sh on a Linux box with the
+ * native arbiter unit installed (container-ops.md D1), or
+ * scripts/urza-selfupdate.sh on the Linux container host; `--check` reads the
+ * signed release feed published by scripts/release.sh and compares it against
+ * the installed build marker.
  * Plane discipline: the LOCAL checkout/app plane only — updating ANOTHER
  * machine is the mesh intent plane (mesh-update.md, the dashboard button);
  * there is no `idlefill update <peer>`.
@@ -17,6 +19,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 import { repoRoot } from './engine.js';
@@ -222,9 +225,10 @@ export function checkPayload(d: CheckDecision): Record<string, unknown> {
 
 // ---------------------------------------------------------------------------
 // The wrapper decision table (pure) — which script is THIS machine's
-// documented one: platform first, docker presence second, named refusal when
-// neither path is real. (D4: the wrapper runs the machine's own command; it
-// re-implements nothing.)
+// documented one: platform first, then on Linux whether the NATIVE arbiter
+// unit is installed (the container→native flip, container-ops.md D1), docker
+// presence next, named refusal when no path is real. (D4: the wrapper runs
+// the machine's own command; it re-implements nothing.)
 // ---------------------------------------------------------------------------
 
 export interface MachineEnv {
@@ -232,6 +236,19 @@ export interface MachineEnv {
   docker: boolean;
   updateScript: string;
   urzaScript: string;
+  nativeScript: string;
+  /** True when the native Linux arbiter unit exists on this box. */
+  nativeUnit: boolean;
+}
+
+// The unit name deploy/install-server-service.sh renders, in both the user
+// and the system flavor. Its presence — not docker's — says this box runs the
+// arbiter natively.
+export const NATIVE_UNIT_USER_PATH = '.config/systemd/user/idlefill-server.service';
+export const NATIVE_UNIT_SYSTEM_PATH = '/etc/systemd/system/idlefill-server.service';
+
+export function nativeUnitInstalled(home: string = homedir()): boolean {
+  return existsSync(join(home, NATIVE_UNIT_USER_PATH)) || existsSync(NATIVE_UNIT_SYSTEM_PATH);
 }
 
 export function detectMachineEnv(root: string = repoRoot): MachineEnv {
@@ -241,6 +258,8 @@ export function detectMachineEnv(root: string = repoRoot): MachineEnv {
     docker,
     updateScript: join(root, 'update.sh'),
     urzaScript: join(root, 'scripts', 'urza-selfupdate.sh'),
+    nativeScript: join(root, 'scripts', 'native-selfupdate.sh'),
+    nativeUnit: nativeUnitInstalled(),
   };
 }
 
@@ -256,11 +275,29 @@ export function resolveUpdateCommand(env: MachineEnv, noPull: boolean): WrapperD
     return { ok: true, script: env.updateScript, what: './update.sh — the locked five-step fail-closed sequence (README "Updating")' };
   }
   if (env.platform === 'linux') {
+    if (env.nativeUnit) {
+      // The native install owns this box's arbiter (the container era is
+      // over here): picking the container helper would BUILD an image and
+      // start a container that fights the running unit for the port.
+      if (!existsSync(env.nativeScript)) {
+        return {
+          ok: false,
+          reason:
+            `this Linux machine runs the native arbiter unit, but scripts/native-selfupdate.sh is absent at ${env.nativeScript} — the native update path is missing in this checkout. ` +
+            'Named refusal: nothing was run.',
+        };
+      }
+      return {
+        ok: true,
+        script: env.nativeScript,
+        what: 'scripts/native-selfupdate.sh — fast-forward main in this checkout, install only when the lockfile moved, restart the arbiter + client units, healthcheck, roll the checkout back to the previous commit on failure',
+      };
+    }
     if (!env.docker) {
       return {
         ok: false,
         reason:
-          'this Linux machine has no docker on PATH — the documented Linux update command is the container-host helper scripts/urza-selfupdate.sh, and there is no container host here. ' +
+          'this Linux machine has no docker on PATH and no native arbiter unit installed — the documented Linux update commands are the container-host helper scripts/urza-selfupdate.sh or the native install (deploy/install-server-service.sh + scripts/native-selfupdate.sh), and neither is present here. ' +
           'Named refusal: this box has no documented update command; nothing was run.',
       };
     }
@@ -272,7 +309,7 @@ export function resolveUpdateCommand(env: MachineEnv, noPull: boolean): WrapperD
         ok: false,
         reason:
           '--no-pull names update.sh semantics (rebuild THIS checkout at its current commit). ' +
-          'The host helper always hard-resolves the checkout to origin/main — there is no rebuild-in-place mode there. Nothing was run.',
+          'The container host helper always hard-resolves its disposable checkout to origin/main — there is no rebuild-in-place mode there. Nothing was run.',
       };
     }
     return {
@@ -283,7 +320,7 @@ export function resolveUpdateCommand(env: MachineEnv, noPull: boolean): WrapperD
   }
   return {
     ok: false,
-    reason: `idlefill update has no documented command for platform "${env.platform}" — the wave covers macOS (update.sh) and the Linux container host (urza-selfupdate.sh) only. Nothing was run.`,
+    reason: `idlefill update has no documented command for platform "${env.platform}" — the wave covers macOS (update.sh), the native Linux install (native-selfupdate.sh) and the Linux container host (urza-selfupdate.sh) only. Nothing was run.`,
   };
 }
 

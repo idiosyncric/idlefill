@@ -75,6 +75,7 @@ test('the update group help (live, S2 #89) names the check, the wrapper, and the
     'never a fake',
     'update.sh',
     'urza-selfupdate.sh',
+    'native-selfupdate.sh',
     'there is no\n`idlefill update <peer>`',
   ]) {
     assert.ok(UPDATE_USAGE.includes(needle), needle);

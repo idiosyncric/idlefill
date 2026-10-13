@@ -77,8 +77,11 @@ Touches nothing; an unreachable feed is a named outcome, never a fake
 zero. --json prints the machine-readable verdict.
 update — a WRAPPER, not a re-implementation (D4): it execs THIS machine's
 documented update command — macOS: ./update.sh (the locked five-step
-fail-closed sequence); Linux container host: scripts/urza-selfupdate.sh.
---no-pull rebuilds this checkout at its current commit (macOS path).
+fail-closed sequence); Linux with the native arbiter unit:
+scripts/native-selfupdate.sh; Linux container host:
+scripts/urza-selfupdate.sh.
+--no-pull rebuilds this checkout at its current commit (the macOS and native
+Linux paths).
 Exit codes pass through from the wrapped script. Plane discipline: this
 is the local checkout/app plane — updating ANOTHER machine is the mesh
 intent plane (the dashboard button, mesh-update.md); there is no
