@@ -11,6 +11,10 @@
 // complete for that machine — a 0 there is the honest truth (unlike the
 // tiles), a client that names no host contributes to NO machine, and a
 // client that publishes no roster contributes 0 agents, never a guess.
+// The Servers-tab band projection (2026-10-13, fleet-hierarchy D3) adds
+// serverBands: a pure partition of the declared rows (This Machine first,
+// peers by name, unhosted LAST) — never-hide: every row lands in exactly
+// one band; a single band is what the view uses to render its flat grid.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -24,6 +28,7 @@ import {
   localClientIds,
   machineClients,
   machineSummary,
+  serverBands,
   sessionsByProfile,
 } from "../src/lib/hierarchy.js";
 import type { StateSnapshot } from "../src/lib/api.js";
@@ -185,4 +190,43 @@ test("machineSummary for machines without clients: hosted engines still counted,
     servers: [srv("srv-omlx", "http://127.0.0.1:8000")],
   });
   assert.deepEqual(machineSummary(lonely, "box2"), { engines: 0, agents: 0, sessions: 0 }, "nothing declared on box2 and no client on it — three honest zeros");
+});
+
+// The band projection (fleet-hierarchy D3): the Servers tab renders the
+// declared rows BANNDED by machine — This Machine first, then peers by name,
+// unhosted trailing. The partition law is the point: every row lands in
+// exactly one band, and a single band (the flat case) is what tells the view
+// to keep today's header-free grid.
+test("serverBands on the urza fixture: [This Machine, scanbot, urza] — order fixed, urza carries BOTH srv-a and srv-b", () => {
+  const bands = serverBands(urzaMesh);
+  assert.deepEqual(bands.map((b) => b.machine), [LOCAL_MACHINE, "scanbot", "urza"], "local first, then peers by name (scanbot < urza)");
+  assert.deepEqual(bands.map((b) => b.label), ["on this machine", "on scanbot", "on urza"]);
+  assert.deepEqual(bands.map((b) => b.servers.map((s) => s.id)), [["srv-omlx"], ["srv-c"], ["srv-a", "srv-b"]], "the group-label row AND the url-host row ride urza");
+});
+
+test("serverBands with no peers: exactly ONE band (local, all rows) — the view's flat-render signal", () => {
+  const s = st({ servers: [srv("a", "http://127.0.0.1:8000"), srv("b", "http://192.168.1.9:11434")] });
+  const bands = serverBands(s);
+  assert.equal(bands.length, 1, "one band = the single-machine case: the view keeps the flat grid, no header");
+  assert.equal(bands[0].machine, LOCAL_MACHINE);
+  assert.deepEqual(bands[0].servers.map((x) => x.id), ["a", "b"]);
+});
+
+test("serverBands: an unnamed-host row lands ONLY in the trailing unhosted band (machine null) — in no other band (never-hide partition)", () => {
+  const s = st({
+    mesh: { instance_id: "i", peers: [{ url: "http://100.105.225.1:8787", name: "urza", instance_id: "u", online: true, fetch_age_s: 1, snapshot: null }] },
+    servers: [srv("home", "http://127.0.0.1:8000"), srv("hosted", "http://100.105.225.1:11434"), srv("near", "http://100.105.225.10:11434")],
+  });
+  const bands = serverBands(s);
+  assert.deepEqual(bands.map((b) => b.machine), [LOCAL_MACHINE, "urza", null], "the unhosted band trails every machine band");
+  const un = bands[2];
+  assert.equal(un.label, "");
+  assert.deepEqual(un.servers.map((x) => x.id), ["near"], "100.105.225.10 names no machine — it rides no host band, and it is never dropped");
+  const seen = bands.flatMap((b) => b.servers.map((x) => x.id));
+  assert.deepEqual(seen.slice().sort(), ["home", "hosted", "near"], "the bands PARTITION st.servers — each row in exactly one band");
+});
+
+test("serverBands on empty st.servers: []", () => {
+  assert.deepEqual(serverBands(st({})), []);
+  assert.deepEqual(serverBands(st({ servers: [] })), []);
 });

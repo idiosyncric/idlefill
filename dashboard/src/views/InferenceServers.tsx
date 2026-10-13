@@ -41,7 +41,7 @@ import {
   type EngineGroup,
 } from "@/lib/api";
 import { ago, fmt, fmtCtx, liveWord, probeWord, PROVIDER_CHOICES } from "@/lib/format";
-import { LOCAL_MACHINE, VIA_NOTE, hostOfServer, type HostVerdict } from "@/lib/hierarchy";
+import { LOCAL_MACHINE, VIA_NOTE, hostOfServer, serverBands, type HostVerdict } from "@/lib/hierarchy";
 import { engineGauges, engineTiles, gibfmt, ramAxis } from "@/lib/fleet-stats";
 import { MemBar } from "@/components/mem-bar";
 import { StatTiles, TilesSkeleton } from "@/components/stat-tiles";
@@ -154,6 +154,39 @@ export function InferenceServers({ st }: { st: StateSnapshot | null }) {
     }
   };
 
+  // The card body is identical in every rendering below (flat or banded) —
+  // hoisted so the two branches can never drift apart.
+  const card = (s: ServerRow) => (
+    <ServerCard
+      key={s.id}
+      s={s}
+      now={st?.now ?? Date.now()}
+      running={runningAnywhere.has(s.id)}
+      points={metrics[s.id] ?? []}
+      staleS={st?.metrics_load_stale_s ?? LOAD_FRESHNESS_DEFAULT_S}
+      group={groupOfRow(s)}
+      groups={groups}
+      srvName={srvName}
+      requireToken={requireToken}
+      onGroupPick={(gid) => void changeRowGroup(s, gid)}
+      onEdit={() => {
+        if (requireToken()) setEditId(s.id);
+      }}
+      host={st ? hostOfServer(st, s) : null}
+    />
+  );
+
+  // The band projection (fleet-hierarchy.md D3 — read-side only, zero new
+  // wire keys): serverBands PARTITIONS the declared rows — This Machine band
+  // first, peer bands by name, an unhosted band LAST holding every row whose
+  // url host and engine-group name no machine. NEVER-HIDE LAW: each row lands
+  // in exactly one band, so no join can lose a row. FLAT-FALLBACK LAW: one
+  // band (the common single-machine case — everything resolves to this
+  // machine, nothing unhosted) renders today's flat grid with NO header line.
+  // Bands group the grid only; the host chip inside every card footer stays
+  // exactly where it is — a band never replaces the card's own verdict.
+  const bands = st ? serverBands(st) : [];
+
   return (
     <section>
       <div className="flex items-center gap-3 mb-3">
@@ -200,26 +233,31 @@ export function InferenceServers({ st }: { st: StateSnapshot | null }) {
         <div className="border border-border bg-card px-4 py-8 text-center text-[12px] text-dim">
           no servers declared — add one
         </div>
-      ) : (
+      ) : bands.length === 1 ? (
+        // The flat fallback: one band means every row resolves to one machine
+        // and nothing is unhosted — exactly today's grid, header-free.
         <div className="grid gap-2.5 [grid-template-columns:repeat(auto-fit,minmax(280px,1fr))]">
-          {servers.map((s) => (
-            <ServerCard
-              key={s.id}
-              s={s}
-              now={st?.now ?? Date.now()}
-              running={runningAnywhere.has(s.id)}
-              points={metrics[s.id] ?? []}
-              staleS={st?.metrics_load_stale_s ?? LOAD_FRESHNESS_DEFAULT_S}
-              group={groupOfRow(s)}
-              groups={groups}
-              srvName={srvName}
-              requireToken={requireToken}
-              onGroupPick={(gid) => void changeRowGroup(s, gid)}
-              onEdit={() => {
-                if (requireToken()) setEditId(s.id);
-              }}
-              host={st ? hostOfServer(st, s) : null}
-            />
+          {servers.map(card)}
+        </div>
+      ) : (
+        <div className="flex flex-col gap-3">
+          {bands.map((b) => (
+            <section key={b.machine ?? "unhosted"}>
+              <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-dim">
+                <span
+                  title={
+                    b.machine === null
+                      ? "these rows' url hostnames match no machine and their engine-group names no machine — never guessed onto a machine band; the whole set stays visible here"
+                      : undefined
+                  }
+                >
+                  {b.machine === null ? "host not named" : b.label}
+                </span>
+              </div>
+              <div className="grid gap-2.5 [grid-template-columns:repeat(auto-fit,minmax(280px,1fr))]">
+                {b.servers.map(card)}
+              </div>
+            </section>
           ))}
         </div>
       )}

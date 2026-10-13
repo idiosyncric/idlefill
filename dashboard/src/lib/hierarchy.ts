@@ -113,6 +113,39 @@ export function hostedServers(st: HierarchyState): { byMachine: Map<string, Serv
   return { byMachine, unhosted };
 }
 
+/** The Servers-tab band projection (fleet-hierarchy.md D3 — the hierarchy is a
+ *  read-side projection, zero new wire keys): the declared rows as RENDER
+ *  bands in a STABLE order — the LOCAL_MACHINE band first (when non-empty),
+ *  then the peer bands by machine name (localeCompare), and LAST an unhosted
+ *  band (machine null, label '') for the rows hostOfServer gives no verdict.
+ *  NEVER-HIDE LAW: the bands PARTITION st.servers — every declared row lands
+ *  in exactly one band; a row that names no machine rides the trailing band
+ *  and appears in no other. A band with zero rows never appears. The view
+ *  renders its flat grid when this returns a single band (the common
+ *  single-machine case). */
+export type ServerBand = {
+  /** The machine label, or null for the unhosted band. */
+  machine: string | null;
+  /** The rendered header line, lowercase ("on urza" / "on this machine"); '' for the unhosted band. */
+  label: string;
+  /** The band's rows, in declaration order. */
+  servers: ServerRow[];
+};
+
+export function serverBands(st: HierarchyState): ServerBand[] {
+  const { byMachine, unhosted } = hostedServers(st); // the same join, never re-derived here
+  const bands: ServerBand[] = [];
+  const local = byMachine.get(LOCAL_MACHINE);
+  if (local && local.length > 0)
+    bands.push({ machine: LOCAL_MACHINE, label: `on ${LOCAL_MACHINE.toLowerCase()}`, servers: local });
+  const peers = [...byMachine.entries()]
+    .filter(([m]) => m !== LOCAL_MACHINE)
+    .sort(([a], [b]) => a.localeCompare(b));
+  for (const [m, rows] of peers) bands.push({ machine: m, label: `on ${m}`, servers: rows });
+  if (unhosted.length > 0) bands.push({ machine: null, label: "", servers: unhosted });
+  return bands;
+}
+
 /** The machine a client daemon runs on (ip / observed_ip, EXACT host match). */
 export function hostOfClient(st: HierarchyState, c: ClientRow): HostVerdict | null {
   const peers = peersOf(st);
