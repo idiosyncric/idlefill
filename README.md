@@ -49,7 +49,7 @@ Architecture below.
 | 1 | Monorepo, server (Docker), client daemon, career-ops adapter, tests | **Done** — see `npm test`, Docker build |
 | 1.5 | Arbiter deployed to **urza** (2026-09-25) | **Done** — the live path is `scripts/deploy-server.sh` (gate, native amd64 build on urza, host-network container swap, tailnet healthcheck, auto-rollback). Image tag = the commit sha. State + config live under urza's `~/idlefill/` (0700/0600). Dashboard: `http://100.105.225.1:8787` |
 | 2 | urza hardening (compose + traefik route + IP/auth middleware), launchd client, NInfer log ro-mount | **Superseded (retired 2026-10-08)** — the compose + traefik plane never ran (urza is host-networked via the script above; `/mnt/docker/idlefill` never existed). The launchd client IS live (`tauri/install.sh` renders `tauri/IdlefillApp.plist`; the daemon/arbiter plists render from the Rust lifecycle plane) and the Linux client service is exercised (issue #54) |
-| 3 (operator CLI) | One `idlefill` command for update / mesh / engine / agent (+ daemon/control groups) | **S1 + S3 + S4 + S5 landed (2026-10-12)** — `cli/` workspace + the `idlefill` dispatcher + help tree; `daemon`/`control` live as passthrough groups (the `scripts/idlefill-*.mjs` CLIs are shims onto it); `idlefill engine` live (#90) — inventory list/add/set/remove over `/api/servers` + the `add --local` co-location pre-flight (mesh.md rule 1: probe `log_glob` against real files, refuse-with-the-rule-named and save nothing on a miss); `idlefill mesh` live (#91) — status/join/leave/pair, join is probe-then-write (the candidate must answer `GET /api/mesh` with the `peer_token` before any config write; atomic upsert of the `mesh_peers` row into `server/config.json` with timestamped backup — never `server_peers`), plus the wave's one new server surface: `POST /api/mesh/peers/reload`, the scoped re-read of `mesh_peers` + `peer_token` only — a live join needs no arbiter restart; `idlefill agent` live (#92) — list renders the published `agent_roster` fetch-honestly (no key = named absence, fetched-empty = true 0), connect/disconnect flip a Hermes profile's model base URL to the aggregate endpoint and back (the wave's only out-of-repo write: backup-before-write, never touches `.env`, never follows `key_env`, userinfo URL = refusal not redaction, unparseable = named refusal; routing only, never admission). Design: `docs/architecture/cli.md`; remaining slice #89 (S2) filed |
+| 3 (operator CLI) | One `idlefill` command for update / mesh / engine / agent (+ daemon/control groups) | **S1–S5 landed (2026-10-12)** — `cli/` workspace + the `idlefill` dispatcher + help tree; `daemon`/`control` live as passthrough groups (the `scripts/idlefill-*.mjs` CLIs are shims onto it); `idlefill engine` live (#90) — inventory list/add/set/remove over `/api/servers` + the `add --local` co-location pre-flight (mesh.md rule 1: probe `log_glob` against real files, refuse-with-the-rule-named and save nothing on a miss); `idlefill mesh` live (#91) — status/join/leave/pair, join is probe-then-write (the candidate must answer `GET /api/mesh` with the `peer_token` before any config write; atomic upsert of the `mesh_peers` row into `server/config.json` with timestamped backup — never `server_peers`), plus the wave's one new server surface: `POST /api/mesh/peers/reload`, the scoped re-read of `mesh_peers` + `peer_token` only — a live join needs no arbiter restart; `idlefill agent` live (#92) — list renders the published `agent_roster` fetch-honestly (no key = named absence, fetched-empty = true 0), connect/disconnect flip a Hermes profile's model base URL to the aggregate endpoint and back (the wave's only out-of-repo write: backup-before-write, never touches `.env`, never follows `key_env`, userinfo URL = refusal not redaction, unparseable = named refusal; routing only, never admission). Design: `docs/architecture/cli.md`; `idlefill update` live (#89) — `--check` anonymously probes the signed release feed and compares it against the installed build marker (`idlefill-app --version`); `update` WRAPS this machine's documented update command (macOS `./update.sh`, Linux container host `scripts/urza-selfupdate.sh`; anything else is a named refusal) — the mesh intent plane stays the dashboard's |
 
 ## Architecture
 
@@ -247,7 +247,7 @@ cli/        the `idlefill` operator CLI (#88–#92) — one dispatcher over
             groups (docs/architecture/cli.md). Live: S1 (`npx idlefill`,
             daemon/control byte-identical to the old scripts, --json on
             reads) + S3 engine (#90) + S4 mesh (#91) + S5 agent (#92);
-            S2 (update, #89) refuses by name until it lands
+            S2 update live (#89)
 deploy/     launchd templates (com.sam.idlefill.client.plist,
             com.sam.idlefill.server.plist) + systemd/ + install-client-service.sh
             = the Linux client service (issue #54 — exercised, see below).
@@ -609,9 +609,10 @@ The manual path is `./update.sh` — one command, fail-closed at every step:
 ./update.sh --no-pull    # rebuild THIS checkout, reinstall
 ```
 
-(Planned, #89: `idlefill update` / `idlefill update --check` wraps this exact
+(Shipped, #89: `idlefill update` / `idlefill update --check` wraps this exact
 sequence and adds a release-feed compare against the installed build marker —
-`docs/architecture/cli.md` D4. update.sh stays the locked implementation.)
+`docs/architecture/cli.md` D4. update.sh stays the locked implementation; the
+CLI is only the wrapper.)
 
 **Build identity.** The marker contract survives the pipeline's death:
 `idlefill-app --version` prints `idlefill <marker>` — the commit's short
@@ -871,8 +872,8 @@ fail-closed for grants — display + routing metadata, honestly.
  ## The operator CLI (`idlefill`) — dispatcher live (S1), engine live (S3), mesh live (S4), agent live (S5)
 
 Design authority: `docs/architecture/cli.md` (accepted 2026-10-12); waves
-filed as issues #88–#92 — S1 (#88), S3 (#90), S4 (#91) and S5 (#92) have
-landed (S2, `update` #89, remains). One dispatcher over the planes that
+filed as issues #88–#92 — all five slices (#88–#92)
+landed, `update` (#89) last. One dispatcher over the planes that
 today live in `update.sh` and the `scripts/` control CLIs — a front-end,
 not a new backend: every command calls an existing endpoint, runs an
 existing script, or is named as the wave that adds the one missing piece
