@@ -47,9 +47,9 @@ Architecture below.
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | Monorepo, server (Docker), client daemon, career-ops adapter, tests | **Done** — see `npm test`, Docker build |
-| 1.5 | Arbiter deployed to **urza** (2026-09-25) | **Done** — the live path is `scripts/deploy-server.sh` (gate, native amd64 build on urza, host-network container swap, tailnet healthcheck, auto-rollback). Image tag = the commit sha. State + config live under urza's `~/idlefill/` (0700/0600). Dashboard: `http://100.105.225.1:8787` |
+| 1.5 | Arbiter deployed to **urza** (2026-09-25) | **Done — and NATIVE since 2026-10-13**: the arbiter is the `idlefill-server` systemd USER unit running from `~/Software/idlefill` on urza (deploy/systemd/idlefill-server.service.template + deploy/install-server-service.sh); its state file was carried across (`~/idlefill/data/state.json`, pinned by the unit — instance id, pairing edges and history survived), its config is now the checkout's `server/config.json` (0600). The container it used to run in is stopped-but-kept as the rollback. The container-era path (`scripts/deploy-server.sh` + `scripts/urza-selfupdate.sh`: gate, native amd64 image build, host-network swap, tailnet healthcheck, auto-rollback) stays in the tree for Linux boxes deployed that way. Dashboard: `http://100.105.225.1:8787` |
 | 2 | urza hardening (compose + traefik route + IP/auth middleware), launchd client, NInfer log ro-mount | **Superseded (retired 2026-10-08)** — the compose + traefik plane never ran (urza is host-networked via the script above; `/mnt/docker/idlefill` never existed). The launchd client IS live (`tauri/install.sh` renders `tauri/IdlefillApp.plist`; the daemon/arbiter plists render from the Rust lifecycle plane) and the Linux client service is exercised (issue #54) |
-| 3 (operator CLI) | One `idlefill` command for update / mesh / engine / agent (+ daemon/control groups) | **S1–S5 landed (2026-10-12)** — `cli/` workspace + the `idlefill` dispatcher + help tree; `daemon`/`control` live as passthrough groups (the `scripts/idlefill-*.mjs` CLIs are shims onto it); `idlefill engine` live (#90) — inventory list/add/set/remove over `/api/servers` + the `add --local` co-location pre-flight (mesh.md rule 1: probe `log_glob` against real files, refuse-with-the-rule-named and save nothing on a miss); `idlefill mesh` live (#91) — status/join/leave/pair, join is probe-then-write (the candidate must answer `GET /api/mesh` with the `peer_token` before any config write; atomic upsert of the `mesh_peers` row into `server/config.json` with timestamped backup — never `server_peers`), plus the wave's one new server surface: `POST /api/mesh/peers/reload`, the scoped re-read of `mesh_peers` + `peer_token` only — a live join needs no arbiter restart; `idlefill agent` live (#92) — list renders the published `agent_roster` fetch-honestly (no key = named absence, fetched-empty = true 0), connect/disconnect flip a Hermes profile's model base URL to the aggregate endpoint and back (the wave's only out-of-repo write: backup-before-write, never touches `.env`, never follows `key_env`, userinfo URL = refusal not redaction, unparseable = named refusal; routing only, never admission). Design: `docs/architecture/cli.md`; `idlefill update` live (#89) — `--check` anonymously probes the signed release feed and compares it against the installed build marker (`idlefill-app --version`); `update` WRAPS this machine's documented update command (macOS `./update.sh`, Linux container host `scripts/urza-selfupdate.sh`; anything else is a named refusal) — the mesh intent plane stays the dashboard's |
+| 3 (operator CLI) | One `idlefill` command for update / mesh / engine / agent (+ daemon/control groups) | **S1–S5 landed (2026-10-12)** — `cli/` workspace + the `idlefill` dispatcher + help tree; `daemon`/`control` live as passthrough groups (the `scripts/idlefill-*.mjs` CLIs are shims onto it); `idlefill engine` live (#90) — inventory list/add/set/remove over `/api/servers` + the `add --local` co-location pre-flight (mesh.md rule 1: probe `log_glob` against real files, refuse-with-the-rule-named and save nothing on a miss); `idlefill mesh` live (#91) — status/join/leave/pair, join is probe-then-write (the candidate must answer `GET /api/mesh` with the `peer_token` before any config write; atomic upsert of the `mesh_peers` row into `server/config.json` with timestamped backup — never `server_peers`), plus the wave's one new server surface: `POST /api/mesh/peers/reload`, the scoped re-read of `mesh_peers` + `peer_token` only — a live join needs no arbiter restart; `idlefill agent` live (#92) — list renders the published `agent_roster` fetch-honestly (no key = named absence, fetched-empty = true 0), connect/disconnect flip a Hermes profile's model base URL to the aggregate endpoint and back (the wave's only out-of-repo write: backup-before-write, never touches `.env`, never follows `key_env`, userinfo URL = refusal not redaction, unparseable = named refusal; routing only, never admission). Design: `docs/architecture/cli.md`; `idlefill update` live (#89) — `--check` anonymously probes the signed release feed and compares it against the installed build marker (`idlefill-app --version`); `update` WRAPS this machine's documented update command (macOS `./update.sh`, Linux with the native arbiter unit `scripts/native-selfupdate.sh`, Linux container host `scripts/urza-selfupdate.sh`; anything else is a named refusal) — the mesh intent plane stays the dashboard's |
 
 ## Architecture
 
@@ -159,7 +159,7 @@ no chains.
 
 ```
                          ┌────────────────────────────────────────────┐
-                         │ urza (Docker)                              │
+                          │ urza: native arbiter + Docker workloads    │
                         │                                            │
   interactive users ──▶ │  llama-swap :8080 (OpenAI-compat /v1)      │
                         │   ├── activity feed /api/metrics/activity  │
@@ -211,8 +211,10 @@ docker run --rm --name idlefill-dev \
   -e IDLEFILL_CONFIG="$(cat config.json)" \
   -e IDLEFILL_STATE=./state.json \
   -p 8787:8787 idlefill-server:dev
-# (dev: -p is for convenience; the urza container is host-networked and
-#  publishes nothing — scripts/deploy-server.sh is the live deploy path)
+# (dev: -p is for convenience; the container-era urza deploy was host-networked
+#  and published nothing — scripts/deploy-server.sh. urza itself is NATIVE since
+#  2026-10-13: deploy/install-server-service.sh renders the arbiter's systemd
+#  user unit from the checkout, no image involved)
 
 # 1b. Or run the server directly on the Mac (no Docker):
 #   cd server && npx tsx src/index.ts   (reads ./config.json)
@@ -250,7 +252,10 @@ cli/        the `idlefill` operator CLI (#88–#92) — one dispatcher over
             S2 update live (#89)
 deploy/     launchd templates (com.sam.idlefill.client.plist,
             com.sam.idlefill.server.plist) + systemd/ + install-client-service.sh
-            = the Linux client service (issue #54 — exercised, see below).
+            = the Linux client service (issue #54 — exercised, see below), and
+            install-server-service.sh + systemd/idlefill-server.service.template
+            = the Linux ARBITER as a systemd user unit (the native install;
+            live on urza since 2026-10-13).
             The compose + traefik hardening plane is RETIRED (2026-10-08):
             urza is host-networked and the live deploy is scripts/deploy-server.sh.
 docs/       reports/ — per-issue build reports (historical record; see
@@ -613,6 +618,19 @@ The manual path is `./update.sh` — one command, fail-closed at every step:
 sequence and adds a release-feed compare against the installed build marker —
 `docs/architecture/cli.md` D4. update.sh stays the locked implementation; the
 CLI is only the wrapper.)
+
+**Linux (the native install — urza since 2026-10-13)** has no app bundle and no
+image: the arbiter and the client daemon are systemd USER units running tsx
+from the checkout (`idlefill-server`, `idlefill-client`, plus the
+`idlefill-updater` helper), so the update is `scripts/native-selfupdate.sh` —
+fast-forward `main` (a dirty checkout is refused, never reset away),
+`npm install` only when `package.json`/`package-lock.json` moved, rebuild `cli/`
+(the PATH shim execs `cli/dist` when it exists), restart the units, healthcheck
+`/api/state`, and roll the checkout back to the commit the run started from if
+the healthcheck fails. `idlefill update` picks it automatically when the
+`idlefill-server` unit is installed; the container-era
+`scripts/urza-selfupdate.sh` is what it picks on a Linux box still deployed as
+an image.
 
 **Build identity.** The marker contract survives the pipeline's death:
 `idlefill-app --version` prints `idlefill <marker>` — the commit's short

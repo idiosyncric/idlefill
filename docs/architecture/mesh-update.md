@@ -67,12 +67,18 @@ direction, with zero new credentials:
   intent (`POST /api/update-intents/:id/claim` — the arbiter's
   single-flight makes claim atomic); run the machine's documented
   update command; report (`POST /api/update-intents/:id/result`).
-- Commands, by machine: urza = `scripts/urza-selfupdate.sh` (fetch
-  main, build the image from the COMMITTED tree exactly as
+- Commands, by machine: urza = `scripts/native-selfupdate.sh` since the
+  native cutover (2026-10-13: fast-forward main in the checkout the units
+  run from, `npm install` only when the lockfile moved, rebuild `cli/`,
+  restart the arbiter + client units, healthcheck, roll the checkout back
+  to the previous commit on failure). Before the flip urza ran
+  `scripts/urza-selfupdate.sh` — that script stays as the CONTAINER path
+  (fetch main, build the image from the committed tree exactly as
   scripts/deploy-server.sh builds it, swap the container, tailnet
-  healthcheck, roll back to the previous image on failure); macOS =
-  `./update.sh`. The helper refuses to run if its command is unset — an
-  unconfigured helper never executes anything.
+  healthcheck, roll back to the previous image on failure) for any Linux
+  box still deployed that way; macOS = `./update.sh`. The helper refuses
+  to run if its command is unset — an unconfigured helper never executes
+  anything.
 - The helper talks to its OWN loopback arbiter only; the token never
   crosses the wire.
 

@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 # idlefill — deploy the arbiter to urza. One command, safe to re-run.
 #
+# CONTAINER-ERA PATH (urza flipped to a NATIVE install 2026-10-13 —
+# deploy/install-server-service.sh renders the arbiter's systemd user unit from
+# the checkout; docs/reports/URZA-NATIVE-CUTOVER-REPORT.md). This script stays
+# for (a) rolling a containerized box back and (b) any other Linux box still
+# deployed as a host-networked image. Against a native urza it cannot work:
+# the unit owns :8787, so the swapped container dies on EADDRINUSE and the
+# healthcheck rolls it back; the native update command there is
+# scripts/native-selfupdate.sh.
+#
 #   1. Gate: npm ci + full test suite + tsc (server & client). Fail ⇒ no deploy.
 #   2. Ship the COMMITTED server/ tree (git archive HEAD) — a dirty worktree
 #      never silently ships; the image tag is the real commit sha.

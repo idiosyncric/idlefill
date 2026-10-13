@@ -2,13 +2,21 @@
 
 Status: **PROPOSED** — D1..D6 await the owner. Filed by
 `docs/architecture/fleet-hierarchy.md` D5 ("deliberately NOT designed
-here — filed for a future grilling"); this doc is that grilling.
+here"); this doc is that grilling.
 The owner settled the vantage question during the grill (2026-10-12,
 D1): **urza flips to a NATIVE install** — the fused idlefill process runs
 on the host, once the CLI wave (`docs/architecture/cli.md`, #88–#92) is
 complete — so the machine's own daemon carries the Docker vantage. No
 container-specific host helper is built, and the earlier D5 sketch
 (client daemon reports coarse rows) stands as written.
+**D1's flip LANDED 2026-10-13** (`docs/reports/URZA-NATIVE-CUTOVER-
+REPORT.md`): urza's arbiter is the `idlefill-server` systemd user unit
+(deploy/systemd/idlefill-server.service.template +
+deploy/install-server-service.sh) running from the same checkout as its
+client daemon, its state file carried across so the instance id, the
+pairing edge and the lease history survived. The container stays on the
+box, stopped, as the rollback. This doc's D2..D6 (the visibility plane)
+still await the owner.
 
 Verified against HEAD `aa2ddb8`. No container code exists anywhere yet
 (no `ContainerRow`, no `containers` key in `server/src`) — the plane is
@@ -46,14 +54,16 @@ Consequences held:
 - **The update plane is untouched.** `host-updater.mjs` (mesh-update D3)
   answers a different question — swapping the very arbiter running it —
   and stays exactly as locked; native urza just points its `command` at
-  the macOS-style `./update.sh` shape instead of the image-swap script.
-- **The transition posture is honest absence.** While urza is still
-  containerized it reports no `containers` key — the card hides, the
-  routes name their refusal (`helper_absent`-style absence, the existing
-  old-build tolerance), and NO bridge is built for the gap. When urza
-  flips native and the operator turns the gate ON, the plane opens.
-  The flip itself is an operational step gated on the CLI wave's
-  completion — not a container-ops code slice.
+  the native counterpart of that shape (`scripts/native-selfupdate.sh`,
+  landed with the flip: restart the units instead of swapping an image).
+- **The transition posture was honest absence.** While urza was still
+  containerized it reported no `containers` key — the card hid, the
+  routes named their refusal (`helper_absent`-style absence, the existing
+  old-build tolerance), and NO bridge was built for the gap. The flip
+  landed 2026-10-13, so from here the posture is the normal one: when the
+  operator turns the D2 gate ON, the daemon's `docker ps` rows ride the
+  heartbeat. The flip itself was an operational step gated on the CLI
+  wave's completion — not a container-ops code slice.
 
 ## D1 — The Docker vantage is the machine's own fused daemon; rows ride the register heartbeat — PROPOSED
 

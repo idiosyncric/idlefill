@@ -209,7 +209,10 @@ here: filed as **issue #87**; the grilling ran (2026-10-12) as
 the vantage gap the same day: urza flips to a **native install** once the
 CLI wave (#88–#92) completes, so the fused daemon carries the Docker
 vantage on every machine; no container host-helper bridge is built for
-the gap (urza honestly shows nothing until the flip).
+the gap. The flip LANDED 2026-10-13 (`docs/reports/URZA-NATIVE-CUTOVER-
+REPORT.md`): urza's arbiter is now the `idlefill-server` systemd user unit
+running from the checkout, so the "urza honestly shows nothing until the
+flip" posture is the pre-flip record, not today's state.
 
 ### D6 — System Resources: keep the existing split — PROPOSED
 
