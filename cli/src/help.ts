@@ -64,12 +64,25 @@ Auth: the arbiter token is read AT RUNTIME from the gitignored config —
 it never appears on a command line.
 `;
 
-export const UPDATE_USAGE = `idlefill update — update this checkout/app to the latest release.
+export const UPDATE_USAGE = `idlefill update — update THIS machine's idlefill install (cli.md D4).
 
-  idlefill update [--check] [--no-pull]
+  idlefill update [--check] [--no-pull] [--json]
 
-Planned — S2 (issue #89). Not implemented yet; ./update.sh stays the
-manual path (the locked five-step fail-closed sequence).
+--check — read-only: an anonymous GET of the signed release feed (the
+\`latest\` pseudo-tag's latest.json, published by scripts/release.sh),
+compared against the installed build marker (the /Applications bundle's
+\`idlefill-app --version\` → \`idlefill <short sha>\`). A named answer
+either way — "up to date at <sha>" / "Release #N available (<sha>)".
+Touches nothing; an unreachable feed is a named outcome, never a fake
+zero. --json prints the machine-readable verdict.
+update — a WRAPPER, not a re-implementation (D4): it execs THIS machine's
+documented update command — macOS: ./update.sh (the locked five-step
+fail-closed sequence); Linux container host: scripts/urza-selfupdate.sh.
+--no-pull rebuilds this checkout at its current commit (macOS path).
+Exit codes pass through from the wrapped script. Plane discipline: this
+is the local checkout/app plane — updating ANOTHER machine is the mesh
+intent plane (the dashboard button, mesh-update.md); there is no
+\`idlefill update <peer>\`.
 `;
 
 export const MESH_USAGE = `idlefill mesh — join / leave / inspect the mesh.

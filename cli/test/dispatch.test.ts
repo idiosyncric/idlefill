@@ -38,18 +38,16 @@ test('agent routes as a live group (S5, #92)', () => {
   assert.equal(GROUPS.agent.issue, 92);
 });
 
-test('update is registered but refuses by name until S2', () => {
-  const planned: Array<[string, string, number]> = [
-    ['update', 'S2', 89],
-  ];
-  for (const [id, slice, issue] of planned) {
-    const spec = GROUPS[id as keyof typeof GROUPS];
-    assert.equal(spec.implemented, false, id);
-    assert.equal(spec.slice, slice, id);
-    assert.equal(spec.issue, issue, id);
-    const note = notImplementedNote(spec);
-    assert.match(note, new RegExp(`^idlefill ${id}: not implemented yet — lands in ${slice} \\(issue #${issue}\\)$`));
-  }
+test('update routes as a live group (S2, #89)', () => {
+  assert.deepEqual(dispatch(parse(['update', '--check'])), { kind: 'group', group: 'update' });
+  assert.equal(GROUPS.update.implemented, true);
+  assert.equal(GROUPS.update.slice, 'S2');
+  assert.equal(GROUPS.update.issue, 89);
+});
+
+test('notImplementedNote still names the slice and issue for any not-live group', () => {
+  const note = notImplementedNote({ id: 'update', summary: 'x', implemented: false, slice: 'S2', issue: 89 });
+  assert.match(note, /^idlefill update: not implemented yet — lands in S2 \(issue #89\)$/);
 });
 
 test('no argv → no-group (usage)', () => {

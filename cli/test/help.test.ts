@@ -54,21 +54,31 @@ test('the control group help names every wrapped subcommand', () => {
   assert.ok(CONTROL_USAGE.includes('never appears on a command line'));
 });
 
-test('top help lists all six groups with their status', () => {
+test('top help lists all six groups, all live', () => {
   const help = topHelp();
   assert.ok(help.includes('idlefill <group> [command] [flags]'));
   for (const id of GROUP_ORDER) assert.ok(help.includes(id), id);
   assert.ok(help.includes('live'));
-  assert.ok(help.includes('#89'), 'update (S2, #89) is still planned');
-  for (const issue of ['#90', '#91', '#92']) {
+  for (const issue of ['#89', '#90', '#91', '#92']) {
     assert.ok(!help.includes(issue), `${issue} landed — no longer listed as planned`);
   }
   assert.ok(help.includes('--json'));
   assert.ok(help.includes('docs/architecture/cli.md'));
 });
 
-test('the planned update group names its slice, issue, and today\'s path', () => {
-  assert.ok(UPDATE_USAGE.includes('S2 (issue #89)') && UPDATE_USAGE.includes('./update.sh'));
+test('the update group help (live, S2 #89) names the check, the wrapper, and the plane rule', () => {
+  for (const needle of [
+    'idlefill update [--check] [--no-pull] [--json]',
+    'release feed',
+    'up to date at <sha>',
+    'Release #N available',
+    'never a fake',
+    'update.sh',
+    'urza-selfupdate.sh',
+    'there is no\n`idlefill update <peer>`',
+  ]) {
+    assert.ok(UPDATE_USAGE.includes(needle), needle);
+  }
   assert.equal(groupHelp('update'), UPDATE_USAGE);
   assert.equal(groupHelp('mesh'), MESH_USAGE);
   assert.equal(groupHelp('engine'), ENGINE_USAGE);

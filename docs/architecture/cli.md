@@ -190,7 +190,7 @@ grants, exactly as the ownership rule intends.
 | Slice | Issue | Lands |
 |---|---|---|
 | S1 | **#88** | `cli/` workspace + dispatcher + help tree; `daemon`/`control` passthrough groups; shims keep old paths working. Zero new behavior. |
-| S2 | **#89** | `idlefill update` / `--check` — release-feed probe + build-marker compare + update.sh wrapper. |
+| S2 | **#89** | `idlefill update` / `--check` — release-feed probe + build-marker compare + update.sh wrapper. **Shipped** (the wrapper resolves this machine's documented command: macOS → `./update.sh`; Linux container host → `scripts/urza-selfupdate.sh`; anything else is a named refusal). |
 | S3 | **#90** | `idlefill engine` — inventory CRUD + `--local` co-location pre-flight. Pure API client. |
 | S4 | **#91** | `idlefill mesh status/join/leave/pair` + the ONE new server surface (scoped mesh config re-read). |
 | S5 | **#92** | `idlefill agent list/connect/disconnect` — roster rendering + the guarded Hermes write-back. |

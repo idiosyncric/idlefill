@@ -12,16 +12,20 @@
 #      origin); hard-reset to origin/main — the tree shipped is COMMITTED
 #      main, never a dirty worktree.
 #   2. no-op when the running container already carries idlefill-server:<sha>.
-#   3. git archive HEAD server dashboard/dist (the dashboard build output is
+#   3. rebuild the cli/ workspace and re-run scripts/install-cli.sh (issue
+#      #89): the `idlefill` PATH shim execs this checkout's cli/dist, so the
+#      shim must never serve a stale dist after a host update. Aborts before
+#      the container is touched on any failure.
+#   4. git archive HEAD server dashboard/dist (the dashboard build output is
 #      committed — urza needs no npm step), stage the dashboard INSIDE the
 #      server/ docker context (the mv-not-mkdir rule deploy 39ab986 fixed),
 #      docker build idlefill-server:<sha> natively.
-#   4. swap the container with the exact deploy-server.sh run flags (host
+#   5. swap the container with the exact deploy-server.sh run flags (host
 #      network, ~/idlefill/data, config.json ro, the host uid).
-#   5. healthcheck GET /api/state (loopback by default; IDLEFILL_HEALTH_URL
+#   6. healthcheck GET /api/state (loopback by default; IDLEFILL_HEALTH_URL
 #      overrides with the tailnet URL — the arbiter listens on the host
 #      network, so urza answering its own URL is the same shape).
-#   6. fail health ⇒ re-run the PREVIOUS image (config injected from the
+#   7. fail health ⇒ re-run the PREVIOUS image (config injected from the
 #      on-host file, base64 — the rollback works against any generation).
 set -euo pipefail
 
@@ -62,6 +66,21 @@ if [ "$CUR_IMG" = "$TAG" ]; then
   echo "already at $TAG — nothing to do"
   exit 0
 fi
+
+# --- rebuild the cli/ workspace BEFORE the container swap ---------------------
+# Same posture as update.sh step 3 (issue #89, owner ask): the `idlefill`
+# PATH shim execs THIS checkout's cli/dist, so a pulled cli/src change must
+# never run against a stale dist after a host update. Fail-closed: a cli
+# build or shim-install error aborts here — the container is still untouched.
+# NODE_ENV= clears the production trap (AGENTS.md; the systemd unit's own env
+# sets NODE_ENV=production, which would make npm skip devDependencies).
+echo "==> rebuilding the cli/ workspace for the idlefill PATH shim"
+if [ ! -x node_modules/.bin/tsc ]; then
+  echo "    no node_modules yet — installing the cli workspace dev deps (one-time on urza)"
+  NODE_ENV= npm install --workspace cli >/dev/null
+fi
+NODE_ENV= npm run build --workspace cli
+bash scripts/install-cli.sh
 
 # --- build exactly as deploy-server.sh does ---------------------------------
 echo "==> building $TAG from the committed tree"
