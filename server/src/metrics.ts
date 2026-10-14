@@ -158,13 +158,16 @@ export interface LeaseOutcomeLine {
   score: number | null;
 }
 
-/** Session line shape (#45's heartbeat block will feed this; #51 defines it). */
+/** Session line shape (#45's heartbeat block feeds this; #51 defines it).
+ * `reqs_per_min` is the newest minute the heartbeat's ring reported — a copy
+ * of a reported value, never a derived rate. `model` is optional: the block
+ * carries one only when the router sniffed it, and absence is not a zero. */
 export interface SessionSampleLine {
   ts: number;
   kind: 'session';
   token: string;
   reqs_per_min: number;
-  model: string;
+  model?: string;
 }
 
 export interface EngineHourLine {
@@ -452,13 +455,37 @@ export class MetricsStore {
   }
 
   /**
-   * Session append — the call #45's register-heartbeat block will use
-   * ("the arbiter appends what the heartbeat carries", D2/D3). Nothing
-   * calls it until #45 lands; the shape is defined here so #45's block is
-   * a copy, not a transform.
+   * Session append — the call #45's register-heartbeat block uses (metrics
+   * wave S4, grill D9): "the arbiter appends what the heartbeat carries".
+   * A copy, not a transform — nothing here is derived from the gateway, the
+   * router's counters, or the lease plane.
    */
   appendSessionSample(line: SessionSampleLine): void {
     this.appendLine(line);
+  }
+
+  /**
+   * Metrics wave S4 (grill D9): wire the producer. One line per register
+   * heartbeat that carries a `history` block; a heartbeat with no block
+   * appends NOTHING (byte-identity for old clients). Caps mirror
+   * cleanReportedHistory: the newest reported minute only, integers 0..1e6,
+   * the model only if the block names one. Nothing valid → no line.
+   */
+  recordSessionHeartbeat(session: { token: string; last_seen: number; history?: { rpm?: unknown; model?: unknown } } | null): void {
+    if (!session || typeof session.token !== 'string' || session.token === '') return;
+    if (!Number.isFinite(session.last_seen)) return;
+    const h = session.history;
+    if (!h || !Array.isArray(h.rpm) || h.rpm.length === 0) return;
+    const rpm = h.rpm[h.rpm.length - 1];
+    if (typeof rpm !== 'number' || !Number.isInteger(rpm) || rpm < 0 || rpm > 1_000_000) return;
+    const model = typeof h.model === 'string' ? h.model.trim().slice(0, 128) : '';
+    this.appendSessionSample({
+      ts: session.last_seen,
+      kind: 'session',
+      token: session.token.slice(0, 128),
+      reqs_per_min: rpm,
+      ...(model !== '' ? { model } : {}),
+    });
   }
 
   private appendLine(line: MetricsLine): void {
@@ -728,6 +755,16 @@ export class MetricsStore {
 export function instrumentArbiterForMetrics(arbiter: Arbiter, metrics: MetricsStore): Arbiter {
   return new Proxy(arbiter, {
     get(target, prop, receiver) {
+      if (prop === 'registerSession') {
+        return (token: string, opts: Parameters<Arbiter['registerSession']>[1]) => {
+          const res = target.registerSession(token, opts);
+          // S4: the session producer. A heartbeat that carries a sanitized
+          // history block copies one line; one that carries none writes
+          // nothing at all.
+          if (res.ok && res.session) metrics.recordSessionHeartbeat(res.session);
+          return res;
+        };
+      }
       if (prop === 'requestLease') {
         return (params: Parameters<Arbiter['requestLease']>[0]) => {
           const res = target.requestLease(params);

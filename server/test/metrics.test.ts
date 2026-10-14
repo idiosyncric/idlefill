@@ -33,6 +33,7 @@ import {
   HOUR_MS,
   loadAggregate,
   metricsUtcDay,
+  instrumentArbiterForMetrics,
   type EngineSampleLine,
 } from '../src/metrics.js';
 import type { ServerConfig } from '../src/types.js';
@@ -490,4 +491,79 @@ test('S1 byte budget: the aggregates add bounded bytes per hour line, never a se
   assert.ok(delta < 200, `the worst-case aggregate is bounded (${delta} bytes, expected < 200)`);
   assert.ok(delta > 0);
   assert.ok(!grown.includes('mean'), 'no means anywhere in the shape');
+});
+
+// --- S4: the session producer, wired (grill D9) ---------------------------
+
+test('S4: a real register heartbeat carrying a history block appends exactly one session line', () => {
+  const { dir, store } = mkStore();
+  try {
+    const { arbiter } = (() => {
+      const cfg: ServerConfig = {
+        listen: 0, api_tokens: [ADMIN], llama_swap_url: 'http://fake', activity_path: '/api/metrics/activity',
+        server_name: 'llama-swap', server_models: [], server_peers: [], log_glob: '', idle_seconds: 300,
+        poll_ms: 60_000, lease_ttl_seconds: 1800, lease_ttl_safety_factor: 2, lease_ttl_floor_seconds: 60,
+        max_concurrent_leases: 1, job_fail_threshold: 5, job_cooldown_seconds: 300, projects: [],
+        state_file: join(dir, 'state.json'),
+      } as unknown as ServerConfig;
+      const det = new IdleDetector({ fetchActivity: async () => [], logMtime: () => null, llama_swap_url: cfg.llama_swap_url, activity_path: cfg.activity_path, log_glob: '', idle_seconds: cfg.idle_seconds });
+      return { arbiter: instrumentArbiterForMetrics(new Arbiter(new StateStore(cfg.state_file), cfg, det), store) };
+    })();
+    // A heartbeat timestamped inside the hour the rollup is about to close.
+    const now = Date.now();
+    const hourStart = Math.floor(now / HOUR_MS) * HOUR_MS - HOUR_MS;
+    const hbTs = hourStart + 60_000;
+    const res = arbiter.registerSession('s-abc', { now: hbTs, client_name: 'm1max', history: { rpm: [1, 3, 12], model: 'qwen3.8-flash-next-q2_0' } });
+    assert.ok(res.ok);
+    const lines = store.readRange({ series: 'session', from: hbTs - 1000, to: hbTs + 1000, bucket: 'raw' });
+    assert.equal(lines.length, 1, 'one line per heartbeat, not one per minute in the ring');
+    assert.equal(JSON.stringify(lines[0]), JSON.stringify({ ts: hbTs, kind: 'session', token: 's-abc', reqs_per_min: 12, model: 'qwen3.8-flash-next-q2_0' }));
+    // the hour rollup reads it like any other raw line
+    store.rollupHour(hourStart, now);
+    const hour = store.readRange({ series: 'session', from: hourStart, to: hourStart + HOUR_MS - 1, bucket: 'hour' });
+    assert.equal(hour.length, 1);
+    assert.equal((hour[0] as unknown as { reqs_per_min_max: number }).reqs_per_min_max, 12);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('S4: a heartbeat with no history block writes nothing — the file is byte-identical', () => {
+  const { dir, store } = mkStore();
+  try {
+    const cfg: ServerConfig = {
+      listen: 0, api_tokens: [ADMIN], llama_swap_url: 'http://fake', activity_path: '/api/metrics/activity',
+      server_name: 'llama-swap', server_models: [], server_peers: [], log_glob: '', idle_seconds: 300,
+      poll_ms: 60_000, lease_ttl_seconds: 1800, lease_ttl_safety_factor: 2, lease_ttl_floor_seconds: 60,
+      max_concurrent_leases: 1, job_fail_threshold: 5, job_cooldown_seconds: 300, projects: [],
+      state_file: join(dir, 'state.json'),
+    } as unknown as ServerConfig;
+    const det = new IdleDetector({ fetchActivity: async () => [], logMtime: () => null, llama_swap_url: cfg.llama_swap_url, activity_path: cfg.activity_path, log_glob: '', idle_seconds: cfg.idle_seconds });
+    const arbiter = instrumentArbiterForMetrics(new Arbiter(new StateStore(cfg.state_file), cfg, det), store);
+    const before = existsSync(join(dir, `metrics-raw-${metricsUtcDay(Date.now())}.jsonl`)) ? readFileSync(join(dir, `metrics-raw-${metricsUtcDay(Date.now())}.jsonl`), 'utf-8') : '';
+    arbiter.registerSession('s-quiet', { now: Date.now(), client_name: 'old-router' });
+    arbiter.registerSession('s-quiet', { now: Date.now(), history: { rpm: [], model: 'x'.repeat(200) } }); // nothing valid survived
+    arbiter.registerSession('s-quiet', { now: Date.now(), history: { rpm: ['nope', null] } });
+    const after = existsSync(join(dir, `metrics-raw-${metricsUtcDay(Date.now())}.jsonl`)) ? readFileSync(join(dir, `metrics-raw-${metricsUtcDay(Date.now())}.jsonl`), 'utf-8') : '';
+    assert.equal(after, before, 'no block, no line — old clients change nothing');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('S4: the caps are the store\u2019s, not the client\u2019s', () => {
+  const { dir, store } = mkStore();
+  try {
+    const now = Date.now();
+    store.recordSessionHeartbeat({ token: 's-' + 'z'.repeat(200), last_seen: now, history: { rpm: [5, 7], model: 'm'.repeat(200) } });
+    const line = store.readRange({ series: 'session', from: now - 1000, to: now + 1000, bucket: 'raw' })[0] as unknown as Record<string, unknown>;
+    assert.equal(line.token.length, 128);
+    assert.equal(line.model.length, 128);
+    assert.equal(line.reqs_per_min, 7);
+    store.recordSessionHeartbeat({ token: 's-bad', last_seen: now, history: { rpm: [1_000_001] } });
+    store.recordSessionHeartbeat({ token: 's-bad', last_seen: now, history: { rpm: [-1] } });
+    assert.equal(store.readRange({ series: 'session', key: 's-bad', from: now - 1000, to: now + 1000, bucket: 'raw' }).length, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
