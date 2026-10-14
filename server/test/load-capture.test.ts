@@ -30,6 +30,7 @@ import {
   parseOmlxStatus,
   parsePrometheusGauges,
   parseStrataHardware,
+  parseStrataConversationAxis,
   newestFeedTps,
   modelQuantFromName,
 } from '../src/load.js';
@@ -446,6 +447,19 @@ test('omlx: the credential rides the Authorization header (same family as the fe
   await c.read(T0, null);
   assert.equal(calls[0]?.url, 'http://127.0.0.1:8000/api/status');
   assert.equal(calls[0]?.headers?.authorization, 'Bearer sekret', 'oMLX verify_api_key accepts the Bearer header (installed 0.7.0 source) — the row key qualifies');
+});
+
+test('strata kind: a full read carries the conversation axis alongside the D4 state', async () => {
+  const { transport } = fakeTransport((url) =>
+    url === 'http://10.10.10.6:8080/metrics' ? { ok: true, status: 200, text: JSON.stringify(STRATA_CONVERSATION_FIXTURE) } : { ok: false, status: 404 },
+  );
+  const c = new LoadCollector({ url: 'http://10.10.10.6:8080', provider: 'strata', auth_token: 'k', transport });
+  await c.read(T0, null);
+  const view = c.current(T0)!;
+  assert.equal(view.conv_cache_parked, 4, 'the parked-conversation count rides the signal for the flow view');
+  assert.equal(view.queue_depth, 2, 'live.queued fills the queue axis for this kind');
+  assert.equal(view.avg_generation_tps, 35.0);
+  assert.equal(view.in_flight, 1, 'the D4 live slot is untouched by the new axis');
 });
 
 test('strata kind: the /metrics collector reads live.state; a payload with no live object is UNKNOWN (no reading)', async () => {
@@ -902,6 +916,57 @@ test('parseStrataHardware: tolerant per key — garbage drops the KEY, never a f
     parseStrataHardware({ live: { state: 'generating', tok_s: 'fast' }, hardware: { gpu_util: 'x', gpu_mem_used: 3.4e10, gpu_power: -5, tok_s: NaN } }),
     { gpu_mem_used_bytes: 3.4e10 },
     'garbage/negative/NaN values drop their own key only',
+  );
+});
+
+// The conversation axis (strata 0.1.43): the parked-conversation caches the
+// flow view's "Outside idlefill" detection reads. Key: same tolerance law as
+// every other load key — garbage drops the KEY, never a fake zero.
+const STRATA_CONVERSATION_FIXTURE = {
+  time: 1792002677.678,
+  engine: { model: 'qwen3.8-flash-next-q2_0', conversation_cache_slots: 4 },
+  live: { state: 'generating', queued: 2, tok_s: 44.4, tok_s_mean: 35.0, prefill_tok_s_mean: 99.1 },
+  requests: [],
+  conversation_cache: {
+    enabled: true, budget_mib: 12288, slots: 4, parked: 4, bytes: 7755316872,
+    evictions: 69, parks: 748, restores: 513,
+    last_event: 'restored', last_tokens: 159028, last_at: 1792002312.706,
+  },
+  totals: { since: 1791838436, requests: 1963, prompt_tokens: 223182176, reused: 219759068, output_tokens: 1181494 },
+};
+
+test('parseStrataConversationAxis: the parked-conversation axis rides verbatim; the totals ratio is the KV hit', () => {
+  assert.deepEqual(parseStrataConversationAxis(STRATA_CONVERSATION_FIXTURE), {
+    conv_cache_parked: 4,
+    conv_cache_slots: 4,
+    conv_cache_bytes: 7755316872,
+    conv_cache_evictions: 69,
+    conv_cache_parks: 748,
+    conv_cache_restores: 513,
+    conv_cache_last_at: 1792002312.706,
+    queue_depth: 2,
+    avg_generation_tps: 35.0,
+    avg_prefill_tps: 99.1,
+    cache_efficiency: 219759068 / 223182176,
+  });
+});
+
+test('parseStrataConversationAxis: tolerant — no conversation_cache block yields only what the payload names', () => {
+  assert.deepEqual(parseStrataConversationAxis({}), {}, 'nothing named → nothing rides');
+  assert.deepEqual(
+    parseStrataConversationAxis({ live: { state: 'idle', parked: 'x' }, conversation_cache: { parked: -1, slots: 'four' } }),
+    {},
+    'garbage/negative values drop their own key only',
+  );
+  assert.deepEqual(
+    parseStrataConversationAxis({ totals: { prompt_tokens: 0, reused: 0 } }),
+    {},
+    'a zero-prompt denominator names no ratio — absent, never a fake 0%',
+  );
+  assert.deepEqual(
+    parseStrataConversationAxis({ totals: { prompt_tokens: 100, reused: 130 } }),
+    {},
+    'a ratio above 1 is not the axis (reused > prompt is a counting oddity, not a 130% hit)',
   );
 });
 

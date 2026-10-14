@@ -7,14 +7,21 @@
 // envelope) or ABSENT — never inferred, never a fake zero. The session→engine
 // edge itself still lives in lib/session-edge.ts; this lib only decorates it.
 //
-// The "outside idlefill" rule: an engine row that NAMES an in-flight count
-// (oMLX `active_requests`, strata's single live slot) can prove traffic the
-// router never registered — conversations aimed straight at the engine
-// instead of through a /s/<token> session. foreign = in_flight − the
-// idlefill sessions the gate says are holding a slot on that engine RIGHT
-// NOW. A parked (queued) request is NOT in-flight at the engine, so it never
-// counts as a slot. Kinds with no in-flight axis (llama-swap, HTTP-only)
-// simply never produce a row — no count, no claim.
+// The "outside idlefill" rule, two-tier:
+//  1. CONVERSATION evidence (strata): the engine NAMES the conversation KV
+//     caches it parks between requests (`conversation_cache.parked`). Each
+//     parked cache is a conversation the engine served; the live slot adds
+//     the one conversation currently generating. Registered sessions account
+//     for at most one conversation each (the captured hermes session id) —
+//     the remainder is conversations the router never registered. An honest
+//     CEILING on what's accounted for: a session whose cache was evicted is
+//     invisible to the engine's count, so the remainder may under-claim.
+//  2. REQUEST evidence (fallback, oMLX `active_requests`, strata's live
+//     slot): foreign = in_flight − the idlefill sessions the gate says are
+//     holding a slot RIGHT NOW. A parked (queued) request is NOT in-flight
+//     at the engine, so it never counts as a slot. Kinds with neither axis
+//     (llama-swap, HTTP-only) simply never produce a row — no count, no
+//     claim.
 import type { ServerRow, ServerSignal, SessionRow, StateSnapshot } from "./api";
 
 // The same "active now" window the state word uses (lib/format.ts): a row
@@ -62,31 +69,53 @@ export function sessionCardFacts(
 
 export type ForeignRow = {
   engineId: string;
-  /** The engine's own in-flight count, verbatim. */
-  inFlight: number;
-  /** Idlefill sessions the gate says hold a slot on this engine right now. */
-  idlefillSlots: number;
-  /** inFlight − idlefillSlots — traffic the router never registered. */
+  /** Which of the engine's own counts produced this row. */
+  evidence: "conversation_cache" | "in_flight";
+  /** Conversation caches the engine says are PARKED (null = no such axis). */
+  parkedConversations: number | null;
+  /** The engine's own in-flight count, verbatim (null = no such axis). */
+  inFlight: number | null;
+  /** Conversation caches this view can attribute to registered sessions. */
+  attributed: number;
+  /** The remainder — conversations/traffic the router never registered. */
   foreign: number;
 };
 
-/** Engines whose own status names MORE in-flight work than idlefill holds. */
+/** Sessions whose conversations live on this engine: registered AND actually
+ *  used (a token that never sent a request has no conversation anywhere). */
+function sessionsOn(st: StateSnapshot, engineId: string): SessionRow[] {
+  return (st.sessions ?? []).filter(
+    (s) =>
+      (s.engine_pin?.server_id ?? s.server_id ?? "") === engineId &&
+      ((s.history?.rpm ?? []).some((v) => v > 0) || s.last_activity != null || s.gate?.state === "queued"),
+  );
+}
+
+/** Engines whose own conversation/request counts exceed what idlefill can
+ *  account for. Conversation evidence wins when the engine names parked
+ *  caches (strata); in-flight counts are the fallback (oMLX). */
 export function foreignActivity(st: StateSnapshot, engines: ServerRow[]): ForeignRow[] {
   const out: ForeignRow[] = [];
   for (const e of engines) {
+    const parked = num(e.signal?.conv_cache_parked);
     const inFlight = num(e.signal?.in_flight);
-    if (inFlight === null) continue; // the kind names no in-flight axis: no row, no claim
-    const target = (s: SessionRow) => s.engine_pin?.server_id ?? s.server_id ?? "";
-    let slots = 0;
-    for (const s of st.sessions ?? []) {
-      if (target(s) !== e.id) continue;
-      if (s.gate?.state === "queued") continue; // parked at the client, not at the engine
-      const active =
-        s.gate?.state === "active" ||
-        (s.gate == null && s.last_activity != null && st.now - s.last_activity < ACTIVE_WINDOW_MS);
-      if (active) slots += 1;
+    if (parked === null && inFlight === null) continue; // no axis, no claim
+    const mine = sessionsOn(st, e.id).length;
+    if (parked !== null) {
+      const foreign = parked - mine;
+      if (foreign > 0) out.push({ engineId: e.id, evidence: "conversation_cache", parkedConversations: parked, inFlight, attributed: mine, foreign });
+    } else if (inFlight !== null) {
+      let slots = 0;
+      for (const s of st.sessions ?? []) {
+        if ((s.engine_pin?.server_id ?? s.server_id ?? "") !== e.id) continue;
+        if (s.gate?.state === "queued") continue; // parked at the client, not at the engine
+        const active =
+          s.gate?.state === "active" ||
+          (s.gate == null && s.last_activity != null && st.now - s.last_activity < ACTIVE_WINDOW_MS);
+        if (active) slots += 1;
+      }
+      if (inFlight > slots) out.push({ engineId: e.id, evidence: "in_flight", parkedConversations: null, inFlight, attributed: slots, foreign: inFlight - slots });
     }
-    if (inFlight > slots) out.push({ engineId: e.id, inFlight, idlefillSlots: slots, foreign: inFlight - slots });
   }
   return out;
 }

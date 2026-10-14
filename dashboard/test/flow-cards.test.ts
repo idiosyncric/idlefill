@@ -61,39 +61,77 @@ test("sessionCardFacts: no meta, no engine axis → all nulls (never a fake zero
   assert.equal(bad.cachePct, null, "a ratio outside [0,1] never rides");
 });
 
-test("foreignActivity: only kinds that NAME an in-flight count can produce a row", () => {
+test("foreignActivity: parked conversation caches are the PRIMARY evidence (strata)", () => {
+  const engines: ServerRow[] = [
+    { id: "e-strata", name: "strata", url: "http://x", signal: sig({ idle: false, in_flight: 1, conv_cache_parked: 4, conv_cache_slots: 4 }), model_source: "probed", probed_at: null, models: [] },
+  ];
+  const st = {
+    now: NOW,
+    servers: engines,
+    sessions: [sess({ server_id: "e-strata", gate: { state: "active", waiting: 0 } })],
+  } as StateSnapshot;
+  assert.deepEqual(
+    foreignActivity(st, engines),
+    [{ engineId: "e-strata", evidence: "conversation_cache", parkedConversations: 4, inFlight: 1, attributed: 1, foreign: 3 }],
+    "the engine names 4 parked conversation caches; only one session is registered — three conversations are someone else's",
+  );
+  // Every parked cache attributable → no remainder, no card.
+  const allMine = {
+    ...st,
+    sessions: [
+      sess({ token: "tok-aaaa0001", server_id: "e-strata", gate: { state: "active", waiting: 0 } }),
+      sess({ token: "tok-aaaa0002", server_id: "e-strata", last_activity: NOW - 10_000 }),
+      sess({ token: "tok-aaaa0003", engine_pin: { server_id: "e-strata", url: "http://x", set_at: NOW }, last_activity: NOW - 400_000 }),
+      sess({ token: "tok-aaaa0004", server_id: "e-strata", gate: { state: "queued", waiting: 1 } }),
+    ],
+  } as StateSnapshot;
+  assert.deepEqual(foreignActivity(allMine, engines), [], "parked − sessions-on-engine = 0 → honest nothing");
+});
+
+test("foreignActivity: a never-used token has no conversation to subtract", () => {
+  const engines: ServerRow[] = [
+    { id: "e-1", name: "strata", url: "http://x", signal: sig({ idle: false, conv_cache_parked: 2 }), model_source: "probed", probed_at: null, models: [] },
+  ];
+  const st = {
+    now: NOW,
+    servers: engines,
+    sessions: [{ token: "fresh-mint", registered_at: NOW, last_seen: NOW, last_activity: null, server_id: "e-1" } as SessionRow],
+  } as StateSnapshot;
+  assert.deepEqual(
+    foreignActivity(st, engines),
+    [{ engineId: "e-1", evidence: "conversation_cache", parkedConversations: 2, inFlight: null, attributed: 0, foreign: 2 }],
+    "the minted-but-never-requested token carries no conversation on the engine — the parked caches are not its",
+  );
+  const noSignal: ServerRow[] = [{ id: "e-1", name: "x", url: "u", signal: null, model_source: "declared", probed_at: null, models: [] }];
+  assert.deepEqual(foreignActivity({ now: NOW, sessions: [], servers: noSignal } as StateSnapshot, noSignal), [], "no axis, no claim");
+});
+
+test("foreignActivity: in-flight counts are the FALLBACK (oMLX), and held slots subtract", () => {
   const engines: ServerRow[] = [
     { id: "e-omlx", name: "oMLX", url: "http://x", signal: sig({ idle: false, in_flight: 2 }), model_source: "probed", probed_at: null, models: [] },
     { id: "e-lswap", name: "llama-swap", url: "http://y", signal: sig({ idle: false }), model_source: "probed", probed_at: null, models: [] },
   ];
   const st = { now: NOW, sessions: [], servers: engines } as StateSnapshot;
-  assert.deepEqual(foreignActivity(st, engines), [{ engineId: "e-omlx", inFlight: 2, idlefillSlots: 0, foreign: 2 }], "the strata/oMLX in-flight axis speaks; llama-swap (HTTP, no count) never does");
-});
-
-test("foreignActivity: held slots subtract; the remainder is the only row", () => {
-  const engines: ServerRow[] = [
-    { id: "e-1", name: "engine-1", url: "http://x", signal: sig({ idle: false, in_flight: 3 }), model_source: "probed", probed_at: null, models: [] },
-  ];
-  const st = {
+  assert.deepEqual(
+    foreignActivity(st, engines),
+    [{ engineId: "e-omlx", evidence: "in_flight", parkedConversations: null, inFlight: 2, attributed: 0, foreign: 2 }],
+    "the in-flight axis speaks; llama-swap (HTTP, no count) never does",
+  );
+  const held: ServerRow[] = [{ id: "e-omlx", name: "oMLX", url: "http://x", signal: sig({ idle: false, in_flight: 3 }), model_source: "probed", probed_at: null, models: [] }];
+  const st2 = {
     now: NOW,
-    servers: engines,
+    servers: held,
     sessions: [
-      sess({ token: "a", server_id: "e-1", gate: { state: "active", waiting: 0 } }),
-      sess({ token: "b", server_id: "e-1", gate: { state: "queued", waiting: 2 } }), // parked at the client: not a slot
-      sess({ token: "c", engine_pin: { server_id: "e-1", url: "http://x", set_at: NOW }, last_activity: NOW - 10_000 }), // gate-less but active within the window
+      sess({ token: "tok-bbbb1111", server_id: "e-omlx", gate: { state: "active", waiting: 0 } }),
+      sess({ token: "tok-bbbb2222", server_id: "e-omlx", gate: { state: "queued", waiting: 2 } }), // parked at the client: not a slot
+      sess({ token: "tok-bbbb3333", engine_pin: { server_id: "e-omlx", url: "http://x", set_at: NOW }, last_activity: NOW - 10_000 }), // gate-less but active within the window
     ],
   } as StateSnapshot;
-  assert.deepEqual(foreignActivity(st, engines), [{ engineId: "e-1", inFlight: 3, idlefillSlots: 2, foreign: 1 }]);
-  const balanced: ServerRow[] = [{ ...engines[0], signal: sig({ idle: false, in_flight: 2 }) }];
-  assert.deepEqual(foreignActivity({ ...st, servers: balanced } as StateSnapshot, balanced), [], "no remainder → no card: everything the engine counts belongs to idlefill");
-  const noSignal: ServerRow[] = [{ ...engines[0], signal: null }];
-  assert.deepEqual(foreignActivity({ ...st, servers: noSignal } as StateSnapshot, noSignal), [], "no axis, no claim");
-});
-
-test("foreignActivity: an old gate-less row is not a held slot", () => {
-  const engines: ServerRow[] = [
-    { id: "e-1", name: "engine-1", url: "http://x", signal: sig({ idle: false, in_flight: 1 }), model_source: "probed", probed_at: null, models: [] },
-  ];
-  const st = { now: NOW, servers: engines, sessions: [sess({ server_id: "e-1", last_activity: NOW - 60_000 })] } as StateSnapshot;
-  assert.deepEqual(foreignActivity(st, engines), [{ engineId: "e-1", inFlight: 1, idlefillSlots: 0, foreign: 1 }], "a row whose last request is 60s old holds no live slot — the engine's live count is someone else's conversation");
+  assert.deepEqual(foreignActivity(st2, held), [{ engineId: "e-omlx", evidence: "in_flight", parkedConversations: null, inFlight: 3, attributed: 2, foreign: 1 }]);
+  const oldRow = { ...st2, sessions: [...st2.sessions, sess({ token: "tok-bbbb4444", server_id: "e-omlx", last_activity: NOW - 60_000 })] } as StateSnapshot;
+  assert.deepEqual(
+    foreignActivity(oldRow, held),
+    [{ engineId: "e-omlx", evidence: "in_flight", parkedConversations: null, inFlight: 3, attributed: 2, foreign: 1 }],
+    "an old gate-less row holds no live slot — the engine's count still names someone else's conversation",
+  );
 });

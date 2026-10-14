@@ -46,18 +46,27 @@ export type ServerSignal = {
   host_mem_total_bytes?: number;
   model_mem_used_bytes?: number;
   model_mem_max_bytes?: number;
-  // The scheduler queue count (oMLX `waiting_requests` today; llama-swap /
-  // strata name none). ADD key — rides the load reading's spread into the
+  // The scheduler queue count (oMLX `waiting_requests`, strata `live.queued`;
+  // llama-swap names none). ADD key — rides the load reading's spread into the
   // signal block (serverView), so its freshness stamp is `load_age_s`. The
   // session→engine edge (alias-stability D4) reads it; absent = the row's
   // kind names no queue, never a fake zero.
   queue_depth?: number;
-  // The oMLX KV/rate axis: the engine's own since-boot `cache_efficiency`
-  // ratio (0..1) and `avg_prefill_tps` / `avg_generation_tps`. ADD keys —
-  // display only; absent = the read named no such axis.
+  // The engine KV/rate axis: oMLX since-boot `cache_efficiency` ratio (0..1)
+  // and `avg_prefill_tps` / `avg_generation_tps`; strata `live.queued`,
+  // `live.tok_s_mean` / `live.prefill_tok_s_mean` and the conversation cache.
+  // ADD keys — display only; absent = the read named no such axis.
   cache_efficiency?: number;
   avg_prefill_tps?: number;
   avg_generation_tps?: number;
+  // The strata conversation axis: parked conversation KV caches. ADD keys.
+  conv_cache_parked?: number;
+  conv_cache_slots?: number;
+  conv_cache_bytes?: number;
+  conv_cache_evictions?: number;
+  conv_cache_parks?: number;
+  conv_cache_restores?: number;
+  conv_cache_last_at?: number;
 };
 
 export type ServerRow = {

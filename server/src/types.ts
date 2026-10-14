@@ -1112,8 +1112,9 @@ export interface IdleSignal {
   /**
    * The scheduler queue depth. oMLX 0.7.0 `/api/status` `waiting_requests`
    * — the first queue count in the fleet (the D8 amendment, #52 slice 5;
-   * the D5 "named, not filled" key, now filled for this kind). Absent on
-   * llama-swap and strata (the probes found no queue count there). ADD key.
+   * the D5 "named, not filled" key, now filled for this kind); strata
+   * `live.queued` (the conversation axis slice). Absent on llama-swap
+   * (HTTP has no queue view). ADD key.
    */
   queue_depth?: number;
   /**
@@ -1144,15 +1145,31 @@ export interface IdleSignal {
   model_mem_used_bytes?: number;
   model_mem_max_bytes?: number;
   /**
-   * The oMLX KV/rate axis (the flow view's cache + t/s cards): the engine's
-   * own since-boot `cache_efficiency` ratio (0..1) and `avg_prefill_tps` /
-   * `avg_generation_tps` rates, verbatim from `/api/status`. Display only —
-   * never a verdict input, never a granted-token figure. Absent = the read
-   * named no such axis. ADD keys.
+   * The engine KV/rate axis (the flow view's cache + t/s cards): oMLX
+   * since-boot `cache_efficiency` ratio (0..1) and `avg_prefill_tps` /
+   * `avg_generation_tps` from `/api/status`; strata `live.tok_s_mean` /
+   * `live.prefill_tok_s_mean` and the totals ratio. Display only — never a
+   * verdict input, never a granted-token figure. Absent = the read named no
+   * such axis. ADD keys.
    */
   cache_efficiency?: number;
   avg_prefill_tps?: number;
   avg_generation_tps?: number;
+  /**
+   * The strata conversation axis (strata 0.1.43 `conversation_cache` block,
+   * verified live 2026-10-14): how many conversation KV caches the engine
+   * PARKS between requests (`parked` of `slots`), their bytes, and the
+   * park/restore/eviction counters. The flow view's "Outside idlefill"
+   * detection reads the parked count. Display only. Absent = the kind names
+   * no conversation cache. ADD keys.
+   */
+  conv_cache_parked?: number;
+  conv_cache_slots?: number;
+  conv_cache_bytes?: number;
+  conv_cache_evictions?: number;
+  conv_cache_parks?: number;
+  conv_cache_restores?: number;
+  conv_cache_last_at?: number;
 }
 
 export type EventKind =

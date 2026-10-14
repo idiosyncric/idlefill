@@ -78,8 +78,22 @@ export interface LoadReading {
   cache_efficiency?: number;
   /** oMLX `/api/status` `avg_prefill_tps` — engine-reported prompt-eval rate (tokens/s, since-boot average). Display only. ADD key. */
   avg_prefill_tps?: number;
-  /** oMLX `/api/status` `avg_generation_tps` — engine-reported decode rate (tokens/s, since-boot average). Display only. ADD key. */
+  /** oMLX `/api/status` `avg_generation_tps` (strata `live.tok_s_mean`) — engine-reported decode rate (tokens/s, since-boot average). Display only. ADD key. */
   avg_generation_tps?: number;
+  /**
+   * The strata conversation-cache block: how many conversation KV caches the
+   * engine is PARKING right now (`parked`/`slots`), the bytes they occupy,
+   * the park/restore/eviction counters, and the last park instant (epoch-s).
+   * Display only — the flow view's "Outside idlefill" detection reads the
+   * parked count. Absent = the payload named no conversation axis. ADD keys.
+   */
+  conv_cache_parked?: number;
+  conv_cache_slots?: number;
+  conv_cache_bytes?: number;
+  conv_cache_evictions?: number;
+  conv_cache_parks?: number;
+  conv_cache_restores?: number;
+  conv_cache_last_at?: number;
   /**
    * The oMLX status envelope's since-boot counters (`total_requests`,
    * `total_prompt_tokens`, `total_completion_tokens`,
@@ -127,8 +141,8 @@ export interface LoadSignalView {
   in_flight?: number;
   /**
    * The scheduler queue (oMLX 0.7.0 `/api/status` `waiting_requests`, D8
-   * slice 5 — the first queue count in the fleet). Absent on llama-swap
-   * and strata (the probes found no queue count there). ADD key.
+   * slice 5; strata `live.queued`, the conversation axis slice). Absent on
+   * llama-swap (HTTP has no queue view). ADD key.
    */
   queue_depth?: number;
   model_loaded?: string;
@@ -152,11 +166,19 @@ export interface LoadSignalView {
    */
   model_mem_used_bytes?: number;
   model_mem_max_bytes?: number;
-  /** oMLX-reported KV-cache hit ratio (0..1, since-boot). Display only — the flow view's cache axis. ADD key. */
+  /** Engine-reported KV-cache hit ratio (0..1, since-boot; oMLX `cache_efficiency`, strata totals ratio). Display only — the flow view's cache axis. ADD key. */
   cache_efficiency?: number;
-  /** oMLX-reported prompt-eval / decode rates (tokens/s, since-boot averages). Display only. ADD keys. */
+  /** Engine-reported prompt-eval / decode rates (tokens/s, since-boot averages). Display only. ADD keys. */
   avg_prefill_tps?: number;
   avg_generation_tps?: number;
+  /** The strata conversation axis: parked KV caches and their footprint. Display only; absent = the kind names no conversation cache. ADD keys. */
+  conv_cache_parked?: number;
+  conv_cache_slots?: number;
+  conv_cache_bytes?: number;
+  conv_cache_evictions?: number;
+  conv_cache_parks?: number;
+  conv_cache_restores?: number;
+  conv_cache_last_at?: number;
 }
 
 /** Minimal response shape the collectors need (a real fetch Response fits). */
@@ -400,6 +422,61 @@ export function parseStrataLoadState(body: unknown): string | null {
   if (!live || typeof live !== 'object') return null;
   const state = String(live.state ?? '').trim().toLowerCase();
   return state === '' ? null : state;
+}
+
+/**
+ * The strata CONVERSATION axis (strata 0.1.43, verified live 2026-10-14
+ * on the scanbot row's /metrics): the engine parks conversation KV state
+ * between requests. `conversation_cache` names what is parked (parked /
+ * slots / bytes / evictions / parks / restores / last_at), `live.queued`
+ * names the scheduler queue, `live.tok_s_mean` / `live.prefill_tok_s_mean`
+ * name the engine's own rates, and the since-boot totals give the KV hit
+ * ratio. Display only — never a verdict input — exactly like the oMLX KV
+ * axis: the flow view's "Outside idlefill" cards read the parked count.
+ * Tolerant per KEY (garbage drops the KEY, never a fake zero); a payload
+ * naming no axis yields {}. ADD keys.
+ */
+export function parseStrataConversationAxis(body: unknown): Pick<
+  LoadReading,
+  | 'conv_cache_parked' | 'conv_cache_slots' | 'conv_cache_bytes' | 'conv_cache_evictions'
+  | 'conv_cache_parks' | 'conv_cache_restores' | 'conv_cache_last_at'
+  | 'queue_depth' | 'avg_generation_tps' | 'avg_prefill_tps' | 'cache_efficiency'
+> {
+  const j = (body ?? {}) as Record<string, unknown>;
+  const num = (v: unknown): number | undefined =>
+    typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : undefined;
+  const out: ReturnType<typeof parseStrataConversationAxis> = {};
+  const cc = (j.conversation_cache && typeof j.conversation_cache === 'object')
+    ? (j.conversation_cache as Record<string, unknown>)
+    : {};
+  const parked = num(cc.parked);
+  if (parked !== undefined) out.conv_cache_parked = parked;
+  const slots = num(cc.slots);
+  if (slots !== undefined) out.conv_cache_slots = slots;
+  const bytes = num(cc.bytes);
+  if (bytes !== undefined) out.conv_cache_bytes = bytes;
+  const evictions = num(cc.evictions);
+  if (evictions !== undefined) out.conv_cache_evictions = evictions;
+  const parks = num(cc.parks);
+  if (parks !== undefined) out.conv_cache_parks = parks;
+  const restores = num(cc.restores);
+  if (restores !== undefined) out.conv_cache_restores = restores;
+  const lastAt = num(cc.last_at);
+  if (lastAt !== undefined) out.conv_cache_last_at = lastAt;
+  const live = (j.live && typeof j.live === 'object') ? (j.live as Record<string, unknown>) : {};
+  const queued = num(live.queued);
+  if (queued !== undefined) out.queue_depth = queued;
+  const gen = num(live.tok_s_mean);
+  if (gen !== undefined) out.avg_generation_tps = gen;
+  const prefill = num(live.prefill_tok_s_mean);
+  if (prefill !== undefined) out.avg_prefill_tps = prefill;
+  const totals = (j.totals && typeof j.totals === 'object') ? (j.totals as Record<string, unknown>) : {};
+  const reused = num(totals.reused);
+  const prompt = num(totals.prompt_tokens);
+  if (reused !== undefined && prompt !== undefined && prompt > 0 && reused <= prompt) {
+    out.cache_efficiency = reused / prompt;
+  }
+  return out;
 }
 
 /**
@@ -711,6 +788,8 @@ export class LoadCollector {
       // The single live slot (D5): 1 while generating, 0 otherwise.
       in_flight: state === 'idle' || state === 'stopped' || state === 'none' ? 0 : 1,
       ...parseStrataHardware(body),
+      // The conversation axis: parked KV caches, queue, rates, hit ratio.
+      ...parseStrataConversationAxis(body),
       load_source: source,
       read_at: now,
     };

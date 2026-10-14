@@ -1208,7 +1208,10 @@ function FlowView({ st }: { st: StateSnapshot }) {
         token: `foreign:${f.engineId}`,
         d: flowPipePath(x1, y1, x2, y2, 10),
         cls: pipeClass({ phase: "base", dashed: false, animated: false, muted: true, reason: "outside idlefill" }),
-        title: `engine ${serverName(st, f.engineId)} carries ${f.foreign} request${f.foreign === 1 ? "" : "s"} the router never registered — the engine names ${f.inFlight} in-flight, ${f.idlefillSlots} belong to idlefill sessions`,
+        title:
+          f.evidence === "conversation_cache"
+            ? `engine ${serverName(st, f.engineId)} is PARKING ${f.parkedConversations} conversation caches; ${f.attributed} belong to registered sessions — ${f.foreign} conversation${f.foreign === 1 ? "" : "s"} the router never registered`
+            : `engine ${serverName(st, f.engineId)} carries ${f.foreign} request${f.foreign === 1 ? "" : "s"} the router never registered — the engine names ${f.inFlight} in-flight, ${f.attributed} belong to idlefill sessions`,
         ex: x2,
         ey: y2,
       });
@@ -1321,12 +1324,21 @@ function FlowView({ st }: { st: StateSnapshot }) {
                   className="flex max-w-[360px] flex-col gap-0.5 rounded-md border border-dashed border-border bg-panel px-2 py-1.5"
                 >
                   <div className="flex items-center gap-1.5 text-[11px]">
-                    <span className="size-1.5 shrink-0 rounded-full bg-warn" title="the engine's own status names live traffic the router never registered" />
-                    <span>{f.foreign} request{f.foreign === 1 ? "" : "s"} outside the router</span>
+                    <span className="size-1.5 shrink-0 rounded-full bg-warn" title={f.evidence === "conversation_cache" ? "the engine's conversation cache names parked conversations the router never registered" : "the engine's own status names live traffic the router never registered"} />
+                    <span>{f.foreign} conversation{f.foreign === 1 ? "" : "s"} outside the router</span>
                     <span className="ml-auto text-[10px] text-dim">→ {serverName(st, f.engineId)}</span>
                   </div>
-                  <div className="text-[10px] text-dim" title="the engine's status reports more in-flight requests than idlefill sessions hold — the remainder is direct traffic aimed at the engine, never seen by any /s/<token> session">
-                    engine names {fmt(f.inFlight)} in-flight · {fmt(f.idlefillSlots)} idlefill
+                  <div
+                    className="text-[10px] text-dim"
+                    title={
+                      f.evidence === "conversation_cache"
+                        ? `the engine parks ${fmt(f.parkedConversations!)} conversation KV caches; ${fmt(f.attributed)} of them belong to sessions this view sees — the rest are conversations aimed straight at the engine, never through a /s/<token> session. ceiling honesty: a session whose cache was evicted is invisible to the engine's count`
+                        : `the engine's status reports more in-flight requests than idlefill sessions hold — the remainder is direct traffic aimed at the engine, never seen by any /s/<token> session`
+                    }
+                  >
+                    {f.evidence === "conversation_cache"
+                      ? `${fmt(f.parkedConversations!)} parked caches · ${fmt(f.attributed)} attributable to sessions${f.inFlight != null && f.inFlight > 0 ? ` · ${fmt(f.inFlight)} generating` : ""}`
+                      : `engine names ${fmt(f.inFlight!)} in-flight · ${fmt(f.attributed)} idlefill`}
                   </div>
                 </div>
               ))}
@@ -1359,8 +1371,13 @@ function FlowView({ st }: { st: StateSnapshot }) {
                     {sig?.idle && sig.idle_for_s != null ? ` · ${durFmt(sig.idle_for_s)}` : ""}
                   </span>
                 </div>
-                {(sig?.cache_efficiency != null || sig?.avg_generation_tps != null || sig?.avg_prefill_tps != null) && (
+                {(sig?.cache_efficiency != null || sig?.avg_generation_tps != null || sig?.avg_prefill_tps != null || sig?.conv_cache_parked != null) && (
                   <div className="flex flex-wrap gap-x-1.5 text-[10px] text-dim">
+                    {typeof sig?.conv_cache_parked === "number" && (
+                      <span title={`the engine parks conversation KV caches between requests: ${fmt(sig.conv_cache_parked)} parked of ${sig.conv_cache_slots != null ? fmt(sig.conv_cache_slots) : "?"} slots (${fmt(sig.conv_cache_parks ?? 0)} parks, ${fmt(sig.conv_cache_restores ?? 0)} restores, ${fmt(sig.conv_cache_evictions ?? 0)} evictions)`}>
+                        conversations: {fmt(sig.conv_cache_parked)} parked{sig.conv_cache_slots != null ? ` / ${fmt(sig.conv_cache_slots)}` : ""}
+                      </span>
+                    )}
                     {typeof sig?.cache_efficiency === "number" && sig.cache_efficiency <= 1 && (
                       <span title="KV-cache hit ratio, the engine's own reported number (since boot)">KV cache: {Math.round(sig.cache_efficiency * 100)}% hit</span>
                     )}
@@ -1390,7 +1407,7 @@ function FlowView({ st }: { st: StateSnapshot }) {
         </svg>
       </CardContent>
       <div className="border-t border-border px-4 py-1.5 text-[11px] text-dim">
-        the connectors draw the session→engine edge the rows already name — the pin select on a row (rows mode) re-routes it; the agent never learns the engine changed. the “outside idlefill” cards appear only when an engine&apos;s own status names more in-flight requests than the router holds — the engine&apos;s count, never a guess
+        the connectors draw the session→engine edge the rows already name — the pin select on a row (rows mode) re-routes it; the agent never learns the engine changed. the “outside idlefill” cards appear only when an engine&apos;s own status names more conversations than the router can attribute — parked conversation caches (strata) first, in-flight counts as the fallback; the engine&apos;s count, never a guess
       </div>
     </Card>
   );
