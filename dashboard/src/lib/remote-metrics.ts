@@ -5,6 +5,14 @@
 // merge (the #79 conflict rule): no cross-peer sums, no renaming here.
 // A feed-delta engine with no counter-backed token truth gets NO token
 // row — a gap, never a fake zero (the #62 honesty rule).
+//
+// Metrics wave S3: the peer rows carry the SAME exception-only utilization
+// rows as the local Usage tab, built by the same pure builder, with the
+// peer attribution and the pull's stale/truncated state in the label. A
+// peer on an older build (no `load_reads` key in its hour lines) renders
+// the named absence and nothing else — old-build tolerance, not an error.
+
+import { utilizationRowsFor } from "./utilization-stats";
 
 export type RemoteSeries = { key: string; points: Record<string, unknown>[] }[];
 
@@ -22,8 +30,14 @@ function num(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : null;
 }
 
-export function buildRemoteRows(engine: RemoteSeries, session: RemoteSeries): RemoteRow[] {
+export type RemotePullMeta = { stale?: boolean; truncated?: boolean };
+
+export function buildRemoteRows(engine: RemoteSeries, session: RemoteSeries, meta: RemotePullMeta = {}): { rows: RemoteRow[]; absences: string[] } {
+  const attribution = meta.stale || meta.truncated
+    ? ` · ${meta.stale ? "cached (stale)" : ""}${meta.stale && meta.truncated ? " + " : ""}${meta.truncated ? "truncated by the 2,000-point cap" : ""}`
+    : "";
   const rows: RemoteRow[] = [];
+  const absences: string[] = [];
   for (const s of engine.slice(0, 20)) {
     const reqs = s.points.map((p) => num(p.req_total) ?? 0);
     rows.push({
@@ -47,8 +61,20 @@ export function buildRemoteRows(engine: RemoteSeries, session: RemoteSeries): Re
         title: "engine-reported output tokens per hour bucket (null = no counter-backed sample — a gap, not a zero)",
       });
     }
+    const util = utilizationRowsFor(s.key, s.points as never);
+    for (const r of util.rows) {
+      rows.push({
+        key: s.key,
+        series: "engine",
+        label: r.label,
+        values: r.values,
+        stroke: r.stroke,
+        valueText: r.valueText,
+        title: `${r.title} · the peer's own rollup, attributed to this peer (never merged across peers)${attribution}`,
+      });
+    }
+    if (util.absence) absences.push(`${util.absence}${attribution}`);
   }
-  // Session rows: the series key is the peer's derived session token —
   // often a model name (the owner allowed this field to cross, #79 Q5/Q6).
   for (const s of session.slice(0, 20)) {
     const rpm = s.points.map((p) => num(p.reqs_per_min_max) ?? 0);
@@ -62,5 +88,5 @@ export function buildRemoteRows(engine: RemoteSeries, session: RemoteSeries): Re
       title: "peak requests/min per hour bucket, the peer's session series (key = its derived token)",
     });
   }
-  return rows;
+  return { rows, absences };
 }

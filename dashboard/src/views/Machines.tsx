@@ -668,7 +668,7 @@ function UpdateButton({ p }: { p: MeshPeer }) {
 function RemoteExpand({ p }: { p: MeshPeer }) {
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [rows, setRows] = useState<RemoteRow[] | null>(null);
+  const [built, setBuilt] = useState<{ rows: RemoteRow[]; absences: string[] } | null>(null);
   const [meta, setMeta] = useState<{ stale: boolean; pulledAt: number; truncated: boolean } | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
@@ -682,10 +682,10 @@ function RemoteExpand({ p }: { p: MeshPeer }) {
         getRemoteMetrics(id, "engine", from, now),
         getRemoteMetrics(id, "session", from, now),
       ]);
-      setRows(buildRemoteRows(eng.series, ses.series));
+      setBuilt(buildRemoteRows(eng.series, ses.series, { stale: eng.stale, truncated: eng.truncated }));
       setMeta({ stale: eng.stale || ses.stale, pulledAt: Math.max(eng.pulled_at, ses.pulled_at), truncated: eng.truncated || ses.truncated });
     } catch (e) {
-      setRows(null);
+      setBuilt(null);
       setMeta(null);
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
@@ -696,7 +696,7 @@ function RemoteExpand({ p }: { p: MeshPeer }) {
   const toggle = () => {
     const next = !open;
     setOpen(next);
-    if (next && p.instance_id && rows === null && !loading && err === null) void pull(p.instance_id);
+    if (next && p.instance_id && built === null && !loading && err === null) void pull(p.instance_id);
   };
 
   return (
@@ -719,7 +719,7 @@ function RemoteExpand({ p }: { p: MeshPeer }) {
               pull failed: {err}
             </div>
           )}
-          {!loading && !err && rows && rows.length === 0 && (
+          {!loading && !err && built && built.rows.length === 0 && built.absences.length === 0 && (
             <div className="text-[11px] text-dim">no series lines in the window — the peer's store is empty here</div>
           )}
           {!loading && meta && (
@@ -728,7 +728,10 @@ function RemoteExpand({ p }: { p: MeshPeer }) {
               {meta.truncated && <span title="the 2,000-point cap trimmed the oldest"> · truncated</span>}
             </div>
           )}
-          {!loading && rows && rows.map((r, i) => (
+          {!loading && built && built.absences.map((a) => (
+            <div key={a} className="text-[11px] text-dim italic" title="the peer's own store carries no load axis for this engine — named, never zeroed">{a}</div>
+          ))}
+          {!loading && built && built.rows.map((r, i) => (
             <div key={`${r.label}-${i}`} className="flex items-center gap-2 text-[11px]">
               <span className="w-36 min-w-0 truncate" title={r.title}>{r.label}</span>
               <Sparkline values={r.values} stroke={r.stroke} title={r.title} />
