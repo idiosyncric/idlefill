@@ -160,18 +160,30 @@ async function fetchRawJson(url: string, auth?: string): Promise<unknown> {
 }
 
 /**
+ * Metrics wave S0: an observer for the RAW payload a strata poll just fetched.
+ * The strata feed body is ALSO the load surface (`/metrics` is both the feed
+ * and the gauge payload — #62 B), so the tick does not need a second GET of
+ * the same URL. The load collector takes the body when the URL matches; nothing
+ * else changes.
+ */
+export type RawBodyObserver = (url: string, body: unknown) => void;
+
+/**
  * The 'strata' fetcher: strata has no activity feed — its /metrics JSON is
  * adapted into feed entries by parseStrataMetrics. The SAME payload also
  * carries the engine's own `totals` counters: when a `counters` observer
  * is passed, it sees them on every successful poll (no extra HTTP call).
+ * When an `onBody` observer is passed it sees the raw payload too (S0: the
+ * load read rides this same fetch).
  */
-export function makeStrataActivityFetcher(counters?: (c: EngineCounters) => void): ActivityFetcher {
+export function makeStrataActivityFetcher(counters?: (c: EngineCounters) => void, onBody?: RawBodyObserver): ActivityFetcher {
   return async (url, auth) => {
     const body = await fetchRawJson(url, auth);
     if (counters) {
       const c = readStrataCounters(body);
       if (c) counters(c);
     }
+    if (onBody) onBody(url, body);
     return parseStrataMetrics(body);
   };
 }
@@ -187,8 +199,12 @@ export function makeStrataActivityFetcher(counters?: (c: EngineCounters) => void
  * the 'omlx' kind is the operator mis-setting the row; honest failure
  * beats a silent llama-swap guess).
  */
-export function makeActivityFetcherFor(provider?: ServerProvider, counters?: (c: EngineCounters) => void): ActivityFetcher {
-  if (provider === 'strata') return makeStrataActivityFetcher(counters);
+export function makeActivityFetcherFor(
+  provider?: ServerProvider,
+  counters?: (c: EngineCounters) => void,
+  onBody?: RawBodyObserver,
+): ActivityFetcher {
+  if (provider === 'strata') return makeStrataActivityFetcher(counters, onBody);
   return makeRealActivityFetcher();
 }
 

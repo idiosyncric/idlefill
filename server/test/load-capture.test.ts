@@ -23,7 +23,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { IdleDetector } from '../src/idle.js';
+import { IdleDetector, makeActivityFetcherFor } from '../src/idle.js';
 import {
   LoadCollector,
   parseLlamaSwapMetrics,
@@ -1012,5 +1012,94 @@ test('omlx failed load reads (unreachable, 401) leave the VERDICT byte-identical
       JSON.stringify(verdictOnly(baseline)),
       `${c.name}: the mtime-only verdict is byte-identical with a failed oMLX load read`,
     );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Metrics wave S0: the strata double-fetch is folded. The grill measured TWO
+// GETs of the same /metrics URL per strata row per tick (the feed adapter and
+// the load collector). S0 hands the collector the body the feed fetch already
+// returned — pure subtraction: same parse, same keys, one HTTP call.
+// ---------------------------------------------------------------------------
+
+test('S0: a shared body from the tick\'s own feed fetch yields the IDENTICAL reading with ZERO transport calls', async () => {
+  const { transport, calls } = fakeTransport(() => ({ ok: true, status: 200, text: STRATA_HARDWARE }));
+  const unfused = new LoadCollector({ url: 'http://10.10.10.6:8080', provider: 'strata', auth_token: 'k', stale_window_ms: 45_000, transport });
+  const fused = new LoadCollector({ url: 'http://10.10.10.6:8080', provider: 'strata', auth_token: 'k', stale_window_ms: 45_000, transport });
+  const baseline = await unfused.read(T0, null);
+  const shared = await fused.read(T0, null, { url: 'http://10.10.10.6:8080/metrics', body: JSON.parse(STRATA_HARDWARE) });
+  assert.ok(baseline && shared, 'both paths resolve a reading');
+  assert.equal(calls.length, 1, 'the shared path made NO HTTP call — only the unfused control fetched');
+  // read_at is a clock, not a wire key: compare the published signal block.
+  assert.deepEqual(fused.current(T0), unfused.current(T0), 'the signal block is byte-identical folded vs unfused');
+  assert.equal(shared.gpu_util_percent, 100, 'the hardware gauges ride the shared body exactly as a fetched one would');
+  assert.equal(shared.in_flight, 1);
+});
+
+test('S0: a shared body is honoured only when the URL matches the collector\'s own surface', async () => {
+  const { transport, calls } = fakeTransport((url) =>
+    url === 'http://10.10.10.6:8080/metrics' ? { ok: true, status: 200, text: STRATA_HARDWARE } : { ok: false, status: 404 },
+  );
+  const c = new LoadCollector({ url: 'http://10.10.10.6:8080', provider: 'strata', stale_window_ms: 45_000, transport });
+  // A body captured for a DIFFERENT url (another row, a mis-set activity_path)
+  // is not this row's load surface: the collector reads its own, as before.
+  const reading = await c.read(T0, null, { url: 'http://10.10.10.6:8080/metrics?other=1', body: JSON.parse(STRATA_HARDWARE) });
+  assert.ok(reading, 'the collector still fetched its own surface');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]!.url, 'http://10.10.10.6:8080/metrics');
+});
+
+test('S0: a FAILED feed fetch shares nothing — the auth-gap reason naming is unchanged', async () => {
+  const { transport, calls } = fakeTransport(() => ({ ok: false, status: 401 }));
+  const c = new LoadCollector({ url: 'http://10.10.10.6:8080', provider: 'strata', stale_window_ms: 45_000, transport });
+  const reading = await c.read(T0, null, undefined); // no body captured: the feed fetch failed
+  assert.equal(reading, null);
+  assert.ok(c.lastFailReason, 'the D4 auth gap is still named, exactly as before the fold');
+  assert.equal(c.current(T0)?.load_fail_reason, c.lastFailReason);
+  assert.equal(calls.length, 1, 'the collector still probes its own surface when the feed never answered');
+});
+
+test('S0 end-to-end over real sockets: one strata row, one tick, ONE GET of /metrics', async () => {
+  const { createServer } = await import('node:http');
+  const hits: string[] = [];
+  const srv = createServer((req, res) => {
+    hits.push(req.url ?? '');
+    if (req.url === '/metrics') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.write(STRATA_HARDWARE);
+    } else {
+      res.writeHead(404);
+    }
+    res.end();
+  });
+  await new Promise<void>((resolve) => srv.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${(srv.address() as { port: number }).port}`;
+  try {
+    const captured = new Map<string, unknown>();
+    // Exactly the composition index.ts builds: the kind fetcher with the body
+    // observer, and the row's load collector.
+    const fetcher = makeActivityFetcherFor('strata', undefined, (url, body) => captured.set(url, body));
+    const detector = new IdleDetector({
+      fetchActivity: fetcher,
+      logMtime: () => null,
+      llama_swap_url: origin,
+      activity_path: '/metrics',
+      log_glob: '',
+      idle_seconds: 60,
+    });
+    const fused = new LoadCollector({ url: origin, provider: 'strata', stale_window_ms: 45_000 });
+    const control = new LoadCollector({ url: origin, provider: 'strata', stale_window_ms: 45_000 });
+    const sig = await detector.poll(T0, new Set());
+    assert.equal(sig.signal_degraded, false, 'the feed answered');
+    const url = `${origin}/metrics`;
+    const body = captured.get(url);
+    assert.ok(body, 'the tick captured the payload it already fetched');
+    assert.ok(await fused.read(T0, null, { url, body }), 'the folded load read resolves');
+    assert.equal(hits.filter((u) => u === '/metrics').length, 1, 'ONE GET for the tick — the second GET is gone');
+    await control.read(T0, null); // the unfused control: the same row's load read costs its own GET
+    assert.equal(hits.filter((u) => u === '/metrics').length, 2, 'the unfused path really did make the second GET the fold removes');
+    assert.deepEqual(fused.current(T0), control.current(T0), 'the signal block is byte-identical to the unfused read');
+  } finally {
+    srv.close();
   }
 });

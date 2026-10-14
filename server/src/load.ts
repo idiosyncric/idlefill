@@ -540,6 +540,17 @@ export class LoadCollector {
    * reading — it must not disturb the tick, the verdict, or the
    * feed-degraded plane.
    *
+   * `shared` (metrics wave S0): the strata row's `/metrics` body the FEED
+   * adapter already fetched on THIS tick, with the exact URL it came from.
+   * When it is present and the URL matches the collector's own surface, the
+   * parse runs on that body and NO HTTP call is made — a strata row costs
+   * one GET per tick, not two. The parse is the same code path, so the
+   * reading and the published signal block are identical to the unfused
+   * read. A shared body is only ever passed for the strata kind, and only
+   * when the feed fetch succeeded (a failed feed fetch names nothing here;
+   * the collector still does its own read, so the D4 auth-gap reason keeps
+   * being reported exactly as before).
+   *
    * On a FAILED read the collector records an operator-readable
    * `lastFailReason` (#52 slice 4 — the D4 strata auth gap): a strata row
    * with NO row credential whose `/metrics` answers 401 names exactly
@@ -554,11 +565,24 @@ export class LoadCollector {
    * fetch (the tick already made that HTTP call; riding it keeps the
    * llama-swap rate from costing a second fetch, D5).
    */
-  async read(now: number, feedTps: number | null = null): Promise<LoadReading | null> {
+  async read(
+    now: number,
+    feedTps: number | null = null,
+    shared?: { url: string; body: unknown },
+  ): Promise<LoadReading | null> {
     const spec = LoadCollector.specFor(this.o.provider);
     if (!spec) return null; // no collector for this kind in this slice
     const url = `${String(this.o.url ?? '').replace(/\/$/, '')}${spec.path}`;
     if (!/^https?:\/\//.test(url)) return null; // a non-HTTP row cannot be probed
+    if (this.o.provider === 'strata' && shared && shared.url === url) {
+      // S0: the payload the feed fetch already returned. The endpoint
+      // ANSWERED, so any prior auth rejection is stale (same rule as the
+      // fetched path).
+      this.failReason = null;
+      const sharedReading = this.strataReading(shared.body, now, spec.source);
+      if (sharedReading) this.reading = sharedReading;
+      return sharedReading;
+    }
     const headers: Record<string, string> = {};
     if (this.o.auth_token) headers.authorization = 'Bearer ' + this.o.auth_token;
     const timeout = this.o.fetch_timeout_ms ?? 10_000;
@@ -615,18 +639,7 @@ export class LoadCollector {
         // (util/VRAM/power/decode rate — verified live 2026-10-11) rides
         // the SAME reading under the llama-swap key names, per-key
         // tolerant; a payload without it reads byte-for-byte as before.
-        const body = JSON.parse(text) as unknown;
-        const state = parseStrataLoadState(body);
-        if (state !== null) {
-          reading = {
-            strata_live_state: state,
-            // The single live slot (D5): 1 while generating, 0 otherwise.
-            in_flight: state === 'idle' || state === 'stopped' || state === 'none' ? 0 : 1,
-            ...parseStrataHardware(body),
-            load_source: spec.source,
-            read_at: now,
-          };
-        }
+        reading = this.strataReading(JSON.parse(text), now, spec.source);
       } else {
         const parsed = parseLlamaSwapMetrics(text);
         if (parsed) {
@@ -650,6 +663,25 @@ export class LoadCollector {
       this.reading = reading;
     }
     return reading;
+  }
+
+  /**
+   * The strata /metrics payload → a reading. ONE parse, shared by the
+   * collector's own fetch and the S0 shared-body path, so the reading is
+   * identical whichever way the body arrived (the whole point of folding
+   * the double-fetch: pure subtraction, zero wire change).
+   */
+  private strataReading(body: unknown, now: number, source: string): LoadReading | null {
+    const state = parseStrataLoadState(body);
+    if (state === null) return null;
+    return {
+      strata_live_state: state,
+      // The single live slot (D5): 1 while generating, 0 otherwise.
+      in_flight: state === 'idle' || state === 'stopped' || state === 'none' ? 0 : 1,
+      ...parseStrataHardware(body),
+      load_source: source,
+      read_at: now,
+    };
   }
 
   /**

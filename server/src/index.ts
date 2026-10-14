@@ -84,9 +84,24 @@ async function main(): Promise<void> {
   // the credential header, and the delta observers are shared.
   /** The feed rates captured this tick (cleared at the top of each tick). */
   const feedTpsThisTick = new Map<string, number | null>();
+  /**
+   * Metrics wave S0: the RAW strata /metrics payload the feed adapter already
+   * fetched this tick, keyed by the exact URL it came from. A strata row's
+   * feed surface IS its load surface — the grill measured two GETs of the
+   * same URL per strata row per tick. The load collector takes the body when
+   * the URL matches its own spec; when it does not (a feed-off row, a failed
+   * feed fetch, a row whose activity_path is not /metrics), the collector
+   * reads its own surface exactly as before. Cleared at the top of each tick.
+   */
+  const sharedLoadBody = new Map<string, unknown>();
   const fetchByKind = (row: ServerConnection): ActivityFetcher => {
     const counters = (c: EngineCounters) => counterDelta.observe(row.id, c);
-    const base = makeActivityFetcherFor(row.provider, row.provider === 'strata' ? counters : undefined);
+    const base = makeActivityFetcherFor(
+      row.provider,
+      row.provider === 'strata' ? counters : undefined,
+      // S0: only the kind whose feed body IS the load payload is captured.
+      row.provider === 'strata' ? (url, body) => sharedLoadBody.set(url, body) : undefined,
+    );
     return async (url: string, auth?: string): Promise<ActivityEntry[]> => {
       const entries = await base(url, auth);
       feedDelta.observe(url, entries);
@@ -151,7 +166,17 @@ async function main(): Promise<void> {
       const c = loadCollectorFor(row);
       if (!c) continue;
       try {
-        await c.read(now, feedTpsThisTick.get(row.id) ?? null);
+        // S0: hand the collector the body the feed fetch already returned for
+        // THIS tick, keyed by the exact URL the collector would have asked
+        // for. No match → its own read, byte-for-byte the pre-wave behavior.
+        const spec = LoadCollector.specFor(row.provider ?? 'llama-swap');
+        const url = spec ? `${String(row.url ?? '').replace(/\/$/, '')}${spec.path}` : '';
+        const body = row.provider === 'strata' && url ? sharedLoadBody.get(url) : undefined;
+        await c.read(
+          now,
+          feedTpsThisTick.get(row.id) ?? null,
+          body !== undefined ? { url, body } : undefined,
+        );
       } catch {
         /* load reads never throw; a failure is an absent reading */
       }
@@ -444,6 +469,7 @@ async function main(): Promise<void> {
       // A load read's failure is an absent reading — it never throws
       // here and must not disturb the verdict.
       feedTpsThisTick.clear();
+      sharedLoadBody.clear();
       const { revoked } = await arbiter.tick();
       await loadRead(Date.now());
       // Catalog probe (#64 D4): per-row credentialed GET /v1/models on
