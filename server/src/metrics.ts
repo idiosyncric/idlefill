@@ -192,6 +192,32 @@ export interface EngineHourLine {
    * contributed. ADD key.
    */
   engine_tokens_cached?: number | null;
+  /**
+   * Metrics wave S1 (grill D1/D2, LOCKED owner 2026-10-14): the bounded
+   * peak-and-count rollup of the hour's load reads. ADD keys, present ONLY
+   * when the hour saw ≥1 load read — an engine with no load axis writes the
+   * hour line byte-for-byte as before, and an OLD state file parses
+   * unchanged (absent is absent).
+   *
+   * Never a mean: a mean of a spiky gauge is a lie about the machine.
+   * `load_reads` counts every successful load read in the hour (a read whose
+   * verdict was degraded still counts — the load axis is its own plane);
+   * `busy_reads` counts only readings that published `load_busy: true`, so a
+   * STALE read (no `load_busy` key at all, D2 rule 2) is a read, never a
+   * busy. Every `peak_*` is a max over PRESENT values only — an absent gauge
+   * is simply not seen, and the peak of an empty set is undefined, not 0.
+   * `model_loaded_last` / `model_quant_last` are the identity the LAST load
+   * read of the hour carried, capped (≤2 ids, ≤128 chars each) before it
+   * rides an hour line.
+   */
+  load_reads?: number;
+  busy_reads?: number;
+  peak_in_flight?: number;
+  peak_queue_depth?: number;
+  gpu_util_max?: number;
+  gpu_power_max?: number;
+  model_loaded_last?: string;
+  model_quant_last?: string;
 }
 
 export interface LeaseHourLine {
@@ -239,6 +265,64 @@ export function seriesKeyOf(line: MetricsLine): string {
 /** UTC day key for an epoch-ms timestamp: "2026-10-04". */
 export function metricsUtcDay(ms: number): string {
   return new Date(ms).toISOString().slice(0, 10);
+}
+
+// ---------------------------------------------------------------------------
+// The load rollup (metrics wave S1, grill D1/D2). Peaks and counts, never
+// means — a mean of a spiky gauge is a lie about the machine. Pure, so the
+// byte budget and the honesty rules are testable without a filesystem.
+
+export type LoadAggregate = Pick<
+  EngineHourLine,
+  'load_reads' | 'busy_reads' | 'peak_in_flight' | 'peak_queue_depth' | 'gpu_util_max' | 'gpu_power_max' | 'model_loaded_last' | 'model_quant_last'
+>;
+
+/** `model_loaded` is a comma-joined engine payload: bounded before it rides an hour line (mesh privacy, grill risk list). */
+function cleanModelIds(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const ids = raw.split(',').map((s) => s.trim()).filter((s) => s !== '' && s.length <= 128).slice(0, 2);
+  return ids.length > 0 ? ids.join(',') : undefined;
+}
+
+/**
+ * The bounded aggregate of one hour's raw engine lines. Returns `{}` when the
+ * hour saw no load read at all — the caller then writes the hour line exactly
+ * as it always has. Drop-don't-poison per key: garbage in one gauge drops
+ * that key, never the hour. `busy_reads` is a true count (0 is a real zero
+ * when the axis was read and never fired), and every peak is a max over the
+ * values that were actually present.
+ */
+export function loadAggregate(lines: MetricsLine[]): LoadAggregate {
+  const out: LoadAggregate = {};
+  let identityTs = -1;
+  const bump = (key: 'peak_in_flight' | 'peak_queue_depth' | 'gpu_util_max' | 'gpu_power_max', v: unknown, cap: number): void => {
+    if (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > cap) return;
+    const cur = out[key];
+    out[key] = cur === undefined || v > cur ? v : cur;
+  };
+  for (const l of lines) {
+    if (l.kind !== 'engine') continue;
+    // A load read is a reading the collector actually captured (load_source
+    // rides only on a successful read). A failed read, or a kind with no
+    // collector, carries nothing here.
+    if (typeof l.load_source !== 'string' || l.load_source === '') continue;
+    out.load_reads = (out.load_reads ?? 0) + 1;
+    if (l.load_busy === true) out.busy_reads = (out.busy_reads ?? 0) + 1;
+    bump('peak_in_flight', l.in_flight, 1_000_000);
+    bump('peak_queue_depth', l.queue_depth, 1_000_000);
+    bump('gpu_util_max', l.gpu_util_percent, 1000);
+    bump('gpu_power_max', l.gpu_power_watts, 1_000_000);
+    const ids = cleanModelIds(l.model_loaded);
+    const quant = typeof l.model_quant === 'string' && l.model_quant.length <= 32 ? l.model_quant : undefined;
+    if ((ids !== undefined || quant !== undefined) && (l.ts ?? 0) >= identityTs) {
+      if (ids !== undefined) out.model_loaded_last = ids;
+      if (quant !== undefined) out.model_quant_last = quant;
+      identityTs = l.ts ?? 0;
+    }
+  }
+  if (!out.load_reads) return {};
+  if (out.busy_reads === undefined) out.busy_reads = 0;
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -434,8 +518,15 @@ export class MetricsStore {
 
     // engine_hour: per server_id, from engine lines + that hour's lease lines
     const engine = new Map<string, EngineHourLine>();
+    // S1: the raw lines per engine, kept so the load aggregate is computed
+    // from the store's own files (D5: the rollup reads raw, never an
+    // accumulator).
+    const engineLines = new Map<string, EngineSampleLine[]>();
     for (const l of inHour) {
       if (l.kind !== 'engine') continue;
+      const bucket = engineLines.get(l.server_id);
+      if (bucket) bucket.push(l);
+      else engineLines.set(l.server_id, [l]);
       const e = engine.get(l.server_id) ?? {
         ts: hourStart,
         kind: 'engine_hour' as const,
@@ -510,6 +601,15 @@ export class MetricsStore {
       e.samples += 1;
       if (l.reqs_per_min > e.reqs_per_min_max) e.reqs_per_min_max = l.reqs_per_min;
       session.set(l.token, e);
+    }
+
+    // S1: the bounded load aggregates ride the hour line ONLY for an engine
+    // whose hour carried at least one load read. An hour with no load axis is
+    // written exactly as before — old state files and load-free engines read
+    // byte-for-byte unchanged.
+    for (const [serverId, e] of engine) {
+      const agg = loadAggregate(engineLines.get(serverId) ?? []);
+      if (agg.load_reads) Object.assign(e, agg);
     }
 
     const buckets = [...engine.values(), ...lease.values(), ...session.values()];

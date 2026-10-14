@@ -31,6 +31,7 @@ import {
   MetricsStore,
   DAY_MS,
   HOUR_MS,
+  loadAggregate,
   metricsUtcDay,
   type EngineSampleLine,
 } from '../src/metrics.js';
@@ -356,4 +357,137 @@ test('raw bucket answers only inside the raw window (from is clamped); hour is t
   // so the default read is also empty (no raw leak through the default).
   const def = await (await fetch(`${base}/api/metrics?series=engine&from=${old - 10 * HOUR_MS}&to=${old + 10 * HOUR_MS}`)).json() as { series: { points: unknown[] }[] };
   assert.equal(def.series.reduce((n, s) => n + s.points.length, 0), 0);
+});
+
+// ---------------------------------------------------------------------------
+// Metrics wave S1 (grill D1/D2, owner LOCKED 2026-10-14): the hour line may
+// carry bounded load AGGREGATES — peaks and counts, never means. The keys are
+// ADD-only and appear ONLY when the hour saw a load read.
+
+function mkLoadLine(ts: number, over: Record<string, unknown>): EngineSampleLine {
+  return { ...mkEngine(ts), ...over } as EngineSampleLine;
+}
+
+test('S1 byte-identity: an hour with no load axis writes the hour line exactly as it always has', () => {
+  const { dir, store } = mkStore();
+  try {
+    const now = Date.now();
+    const hourStart = Math.floor(now / HOUR_MS) * HOUR_MS - HOUR_MS;
+    store.appendEngineSample(mkEngine(hourStart + 1_000));
+    store.appendEngineSample(mkEngine(hourStart + 2_000, { server_id: 'srv-b' }));
+    store.rollupHour(hourStart, now);
+    const line = readFileSync(join(dir, `metrics-hour-${metricsUtcDay(hourStart)}.jsonl`), 'utf-8').trim().split('\n')[0]!;
+    const parsed = JSON.parse(line) as Record<string, unknown>;
+    const expectedKeys = ['ts', 'kind', 'server_id', 'samples', 'req_total', 'idle_samples', 'grants', 'revoked', 'tokens_out', 'tokens_in', 'engine_tokens_in', 'engine_tokens_out', 'engine_tokens_cached'];
+    assert.deepEqual(Object.keys(parsed).sort(), [...expectedKeys].sort(), 'no load keys ride a load-free hour');
+    assert.equal('load_reads' in parsed, false);
+    assert.equal('peak_in_flight' in parsed, false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('S1 rollup: peaks and counts over the verbatim #52-shaped readings (strata busy, oMLX queue, llama-swap gauges)', () => {
+  const { dir, store } = mkStore();
+  try {
+    const now = Date.now();
+    const hourStart = Math.floor(now / HOUR_MS) * HOUR_MS - HOUR_MS;
+    // strata: a fresh busy read (in_flight 1, gpu 99%, 90 W) then a fresh idle read.
+    store.appendEngineSample(mkLoadLine(hourStart + 1_000, { server_id: 'srv-strata', load_source: 'strata-metrics', load_busy: true, load_age_s: 9, in_flight: 1, gpu_util_percent: 99, gpu_power_watts: 90, host_mem_used_bytes: 55100000000, model_loaded: 'qwen3.8-flash-next-q2_0', model_quant: 'q2_0' }));
+    store.appendEngineSample(mkLoadLine(hourStart + 2_000, { server_id: 'srv-strata', load_source: 'strata-metrics', load_busy: false, load_age_s: 14, in_flight: 0, gpu_util_percent: 12, gpu_power_watts: 21.5, model_loaded: 'qwen3.8-flash-next-q2_0', model_quant: 'q2_0' }));
+    // A STALE read: it is a read, never a busy (D2 rule 2 — no load_busy key).
+    store.appendEngineSample(mkLoadLine(hourStart + 3_000, { server_id: 'srv-strata', load_source: 'strata-metrics', load_age_s: 60, gpu_util_percent: 100 }));
+    // oMLX: the only queue depth in the fleet.
+    store.appendEngineSample(mkLoadLine(hourStart + 1_500, { server_id: 'srv-omlx', load_source: 'omlx-status', load_busy: true, in_flight: 3, queue_depth: 2, model_loaded: 'a-model-4bit,b-model-4bit', model_quant: '4bit' }));
+    store.appendEngineSample(mkLoadLine(hourStart + 1_800, { server_id: 'srv-omlx', load_source: 'omlx-status', load_busy: false, in_flight: 0, queue_depth: 5, model_loaded: 'a-model-4bit', model_quant: '4bit' }));
+    // llama-swap: gauges, no predicate (the owner's threshold is UNSET).
+    store.appendEngineSample(mkLoadLine(hourStart + 1_000, { server_id: 'srv-swap', load_source: 'llamaswap-metrics', gpu_util_percent: 91, gpu_power_watts: 3.2656850944e1 }));
+    store.rollupHour(hourStart, now);
+
+    const read = (key: string) => store.readRange({ series: 'engine', key, from: hourStart, to: hourStart + HOUR_MS - 1, bucket: 'hour' }) as unknown as Record<string, number | string>[];
+    const strata = read('srv-strata')[0]!;
+    assert.equal(strata.samples, 3);
+    assert.equal(strata.load_reads, 3, 'every successful load read counts, stale included');
+    assert.equal(strata.busy_reads, 1, 'only the fresh busy read counts as busy');
+    assert.equal(strata.peak_in_flight, 1);
+    assert.equal(strata.gpu_util_max, 100, 'the max over present values, never a mean');
+    assert.equal(strata.gpu_power_max, 90);
+    assert.equal(strata.model_loaded_last, 'qwen3.8-flash-next-q2_0');
+    assert.equal(strata.model_quant_last, 'q2_0');
+    const omlx = read('srv-omlx')[0]!;
+    assert.equal(omlx.load_reads, 2);
+    assert.equal(omlx.busy_reads, 1);
+    assert.equal(omlx.peak_in_flight, 3);
+    assert.equal(omlx.peak_queue_depth, 5);
+    assert.equal('gpu_util_max' in omlx, false, 'an absent gauge is not seen, never zero');
+    const swap = read('srv-swap')[0]!;
+    assert.equal(swap.load_reads, 1);
+    assert.equal(swap.busy_reads, 0, 'a kind with no predicate is a real zero busy, not a fake one');
+    assert.equal('peak_in_flight' in swap, false, 'llama-swap publishes no in-flight count — absent stays absent');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('S1 hostile input drops per key and never poisons the hour', () => {
+  const { dir, store } = mkStore();
+  try {
+    const now = Date.now();
+    const hourStart = Math.floor(now / HOUR_MS) * HOUR_MS - HOUR_MS;
+    store.appendEngineSample(mkLoadLine(hourStart + 1_000, { load_source: 'strata-metrics', in_flight: -5, gpu_util_percent: 'ninety-nine', gpu_power_watts: Number.NaN, model_loaded: 'x'.repeat(200), model_quant: 'q9'.repeat(20) }));
+    store.appendEngineSample(mkLoadLine(hourStart + 2_000, { load_source: 'strata-metrics', in_flight: 2, queue_depth: 1, gpu_util_percent: 40 }));
+    store.appendEngineSample(mkLoadLine(hourStart + 3_000, { load_source: 'llamaswap-metrics', gpu_util_percent: 1e9 }));
+    store.rollupHour(hourStart, now);
+    const line = store.readRange({ series: 'engine', from: hourStart, to: hourStart + HOUR_MS - 1, bucket: 'hour' })[0] as unknown as Record<string, unknown>;
+    assert.equal(line.load_reads, 3);
+    assert.equal(line.busy_reads, 0);
+    assert.equal(line.peak_in_flight, 2, 'the negative reading dropped; the valid one stands');
+    assert.equal(line.gpu_util_max, 40, 'the string and the absurd value dropped');
+    assert.equal('model_loaded_last' in line, false, 'the over-cap id never rides');
+    assert.equal('model_quant_last' in line, false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('S1 privacy cap: model_loaded_last is bounded to 2 ids of <=128 chars', () => {
+  const { dir, store } = mkStore();
+  try {
+    const now = Date.now();
+    const hourStart = Math.floor(now / HOUR_MS) * HOUR_MS - HOUR_MS;
+    store.appendEngineSample(mkLoadLine(hourStart + 1_000, { load_source: 'omlx-status', model_loaded: 'one-4bit,two-4bit,three-4bit,' + 'z'.repeat(200) }));
+    store.rollupHour(hourStart, now);
+    const line = store.readRange({ series: 'engine', from: hourStart, to: hourStart + HOUR_MS - 1, bucket: 'hour' })[0] as unknown as Record<string, string>;
+    assert.equal(line.model_loaded_last, 'one-4bit,two-4bit');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('S1 old state files read unchanged: a pre-wave hour line round-trips byte-for-byte', () => {
+  const { dir, store } = mkStore();
+  try {
+    const now = Date.now();
+    const hourStart = Math.floor(now / HOUR_MS) * HOUR_MS - HOUR_MS;
+    const preWave = '{"ts":' + hourStart + ',"kind":"engine_hour","server_id":"srv-old","samples":240,"req_total":57,"idle_samples":180,"grants":6,"revoked":2,"tokens_out":120000,"tokens_in":30000,"requests_source":"feed-delta","engine_tokens_in":null,"engine_tokens_out":null,"engine_tokens_cached":null}';
+    writeFileSync(join(dir, `metrics-hour-${metricsUtcDay(hourStart)}.jsonl`), preWave + '\n');
+    const lines = store.readRange({ series: 'engine', from: hourStart, to: hourStart + HOUR_MS - 1, bucket: 'hour' });
+    assert.equal(lines.length, 1);
+    assert.equal(JSON.stringify(lines[0]), preWave, 'the reader invents no keys on an old line');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('S1 byte budget: the aggregates add bounded bytes per hour line, never a series', () => {
+  const loadFree = JSON.stringify({ ts: 1, kind: 'engine_hour', server_id: 'srv-a', samples: 240, req_total: 0, idle_samples: 180, grants: 0, revoked: 0, tokens_out: 0, tokens_in: 0, requests_source: 'metrics-counter', engine_tokens_in: 0, engine_tokens_out: 0, engine_tokens_cached: 0 });
+  const agg = loadAggregate([
+    mkLoadLine(2, { load_source: 'strata-metrics', load_busy: true, in_flight: 1, gpu_util_percent: 99.7, gpu_power_watts: 90.123, model_loaded: 'qwen3.8-flash-next-q2_0', model_quant: 'q2_0' }),
+    mkLoadLine(3, { load_source: 'strata-metrics', load_busy: false, in_flight: 0, queue_depth: 4 }),
+  ]);
+  const grown = JSON.stringify({ ...JSON.parse(loadFree), ...agg });
+  const delta = grown.length - loadFree.length;
+  assert.ok(delta < 200, `the worst-case aggregate is bounded (${delta} bytes, expected < 200)`);
+  assert.ok(delta > 0);
+  assert.ok(!grown.includes('mean'), 'no means anywhere in the shape');
 });
