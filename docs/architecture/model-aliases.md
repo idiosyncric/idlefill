@@ -8,7 +8,13 @@ the Sessions-connector drag consumes: a re-pin is a write to this plane,
 never a per-request hack. Companion: `docs/architecture/aggregate-endpoint.md`
 (LOCKED — this doc amends, never restates, and `docs/architecture/mesh.md`
 (locked topology). Decisions are LOCKED where the trade-off is clear-cut
-for the single operator. The rest are PROPOSED. Nothing here is built.
+for the single operator. The rest are PROPOSED.
+**Status (ratified 2026-10-14): this plane is LIVE.** The alias plane shipped
+(#66 close-out), the capability probe shipped (docs/architecture/model-capabilities.md),
+and the stability decisions D1–D4 of `docs/architecture/alias-stability-and-slow-engines.md`
+shipped whole (reports: ISSUE-ALIAS-PUBLISH, ISSUE-8800-FENCE, ISSUE-ALIAS-STABILITY-SLOW,
+ISSUE-ALIAS-STABILITY-DASH, live runbook ISSUE-ALIAS-STABILITY-LIVE). Items still
+marked PROPOSED remain genuinely unbuilt.
 
 ## The gap, re-verified against the code and the live fleet
 

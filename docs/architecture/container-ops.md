@@ -1,6 +1,9 @@
 # container-ops — settings-gated Docker visibility: logs, exec, deploy (issue #87 grilling, 2026-10-12)
 
-Status: **PROPOSED** — D1..D6 await the owner. Filed by
+Status: **D1 EXECUTED; D2..D6 PARKED (owner decision 2026-10-14)** — with
+urza native and no fleet machine currently hosting container workloads worth
+operating, the visibility plane stays unbuilt; issue #87 is the parked record.
+Filed by
 `docs/architecture/fleet-hierarchy.md` D5 ("deliberately NOT designed
 here"); this doc is that grilling.
 The owner settled the vantage question during the grill (2026-10-12,
@@ -16,7 +19,7 @@ deploy/install-server-service.sh) running from the same checkout as its
 client daemon, its state file carried across so the instance id, the
 pairing edge and the lease history survived. The container stays on the
 box, stopped, as the rollback. This doc's D2..D6 (the visibility plane)
-still await the owner.
+are parked (owner, 2026-10-14).
 
 Verified against HEAD `aa2ddb8`. No container code exists anywhere yet
 (no `ContainerRow`, no `containers` key in `server/src`) — the plane is

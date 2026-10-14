@@ -1,6 +1,12 @@
 # Fleet hierarchy — the target resource tree (proposal, 2026-10-12)
 
-Status: **PROPOSED** — D1..D6 await the owner. Written from the owner's
+Status: **RATIFIED (2026-10-14, owner)** — the read-side core has shipped: D1,
+D3 and D6 are live; D2 shipped except the "planned" facet; D4's agent half is
+live, its projects half is not. D5's reporting mechanism remains unbuilt and
+its ops plane (#87) is **PARKED** by the owner decision of 2026-10-14 — the
+grilled proposals await a machine that actually hosts container workloads. D7
+stays deferred (blocked on fleet-service D7). The per-decision tags below name
+the exact state. Originally written as a proposal from the owner's
 sketched tree (2026-10-12) with two owner decisions already in force for
 this round:
 
@@ -132,7 +138,7 @@ The sketch is closer to the shipped model than it looks:
 
 ## Decisions
 
-### D1 — The fleet root is a VIEW, not a store — PROPOSED
+### D1 — The fleet root is a VIEW, not a store — LOCKED (shipped)
 
 The tree is composed at the dashboard from `StateSnapshot` keys that
 already exist: `clients`, `servers`, `model_aliases`, `projects`,
@@ -145,7 +151,7 @@ Rejected: promoting the fleet service into a machine/engine/agent registry
 — it is identity-only by locked design, and mesh-aggregation was the
 owner's call (2026-10-12).
 
-### D2 — Machine node identity and facets — PROPOSED
+### D2 — Machine node identity and facets — identity LIVE, planned facet unbuilt
 
 A machine node keys on `instance_id` (identity; addresses move). Three
 facets render from existing data:
@@ -157,7 +163,7 @@ facets render from existing data:
   DGX-Spark_Tyler). NOT built this round; the tree shape must tolerate a
   machine with no snapshot (already true for stale peers).
 
-### D3 — Children are joined in the view, no FK re-shape — PROPOSED
+### D3 — Children are joined in the view, no FK re-shape — LOCKED (shipped twice: resources-hierarchy + layout waves 1–4)
 
 Do not restructure `state.json` into nested machine objects. The
 existing flat collections already carry the parent keys:
@@ -171,7 +177,7 @@ existing flat collections already carry the parent keys:
 ADD-key discipline holds: the tree is a read-side projection, so no
 migration, no renames, old state files untouched.
 
-### D4 — Peer agents AND peer projects ride the mesh snapshot (ADD keys) — PROPOSED
+### D4 — Peer agents AND peer projects ride the mesh snapshot (ADD keys) — agent half LIVE, projects half unbuilt
 
 Add `agent_roster` to `MeshSnapshot` — coarse: `{ profile, posture,
 provider }` only; no base_url, no key material. Add `projects` — coarse:
@@ -186,7 +192,7 @@ operator who does not want roster/project sharing) is an opt-out config
 key, default OFF (share), matching the existing snapshot tolerance style:
 absent key = older build, never a fake empty.
 
-### D5 — Containers/services: settings-gated reporting now; ops plane is issue #87 — PROPOSED
+### D5 — Containers/services: settings-gated reporting; ops plane is issue #87 — PARKED (owner 2026-10-14; see container-ops.md status)
 
 New `ClientRecord.containers?: ContainerRow[]` — the client daemon (same
 process that already scans Hermes jobs/profiles) reports coarse rows:
@@ -214,7 +220,7 @@ REPORT.md`): urza's arbiter is now the `idlefill-server` systemd user unit
 running from the checkout, so the "urza honestly shows nothing until the
 flip" posture is the pre-flip record, not today's state.
 
-### D6 — System Resources: keep the existing split — PROPOSED
+### D6 — System Resources: keep the existing split — LOCKED (status quo honored)
 
 Machine node shows CPU (load vs cpu count), RAM (total/free MemBar — the
 `ramAxis` rule already exists in `lib/fleet-stats.ts`), and uptime, from

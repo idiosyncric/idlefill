@@ -8,7 +8,12 @@ the `/s/<token>` retirement lives there, not here) · #60 (the per-server
 topology this doc sits on). Companion: `docs/architecture/mesh.md`
 (locked). This document is the GRILL, not the build. Decisions are
 LOCKED where the trade-off is clear-cut for the single-operator fleet.
-The rest are PROPOSED for the owner. Nothing here is built.
+The rest are PROPOSED for the owner.
+**Status (ratified 2026-10-14): the LOCKED plane is LIVE** — :8800 has served
+every keyed Hermes profile since the #63 build wave, with the alias surface,
+the :8800 default-target fence and the slow-engine policy added on top
+(docs/architecture/alias-stability-and-slow-engines.md). Items still marked
+PROPOSED await the owner.
 
 ## The gap, re-verified against the code
 
