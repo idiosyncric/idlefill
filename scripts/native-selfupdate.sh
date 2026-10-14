@@ -26,8 +26,12 @@
 #   1. the native install must exist: the idlefill-server user unit installed
 #      and active, and the arbiter answering. No unit = a named refusal that
 #      names the installer, never a silent container swap.
-#   2. no-op when HEAD already equals the last successful native update and
-#      the unit is active.
+#   2. fast-forward main, then no-op ONLY when the pull moved nothing — i.e.
+#      HEAD already equals origin/main — and the unit is active. The
+#      last-known-good marker is a ROLLBACK ANCHOR, never an up-to-date
+#      signal: HEAD equaling it says nothing about how far main has moved
+#      since (the live urza lesson, 2026-10-14: HEAD == marker at 5308ca9
+#      while origin/main was 20+ commits ahead — "nothing to do" was wrong).
 #   3. refuse a dirty checkout; fast-forward main (--no-pull = rebuild THIS
 #      checkout at its current commit).
 #   4. lease preflight — the arbiter's own posture: a live lease is not cut.
@@ -85,12 +89,6 @@ if [ "${ACTIVE:-0}" -gt 0 ]; then
 fi
 
 cd "$REPO"
-HEAD_SHA="$(git rev-parse --short HEAD)"
-if [ -f "$GOODFILE" ] && [ "$(cat "$GOODFILE" 2>/dev/null || true)" = "$HEAD_SHA" ]; then
-  log "already at $HEAD_SHA (last successful native update) and $UNIT is active — nothing to do"
-  exit 0
-fi
-
 git diff --quiet && git diff --cached --quiet || fail "uncommitted tracked changes in $REPO — commit or stash first (this checkout is yours; this script never resets it away)"
 PREV="$(git rev-parse HEAD)"
 log "at ${PREV:0:7} ($(git log -1 --format=%s | cut -c1-72))"
@@ -100,6 +98,10 @@ if [ "$NO_PULL" = 0 ]; then
   git pull --ff-only
 fi
 SHA="$(git rev-parse --short HEAD)"
+if [ "$NO_PULL" = 0 ] && [ "$SHA" = "${PREV:0:7}" ]; then
+  log "already at $SHA — origin/main has nothing newer, and $UNIT is active — nothing to do"
+  exit 0
+fi
 log "target $SHA"
 
 # --- deps: only when the manifest moved -------------------------------------
