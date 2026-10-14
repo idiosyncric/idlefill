@@ -60,6 +60,7 @@ import {
 import { ago, durFmt, isOnline, liveWord, sessGateLabelText, sessStateWord, sessStale } from "@/lib/format";
 import { engineEdge, type EngineEdge } from "@/lib/session-edge";
 import { sessionTiles } from "@/lib/session-stats";
+import { flowPipePath, pipeClass, pipeEdge, pipeTitle, type PipeEdge } from "@/lib/pipe-phases";
 import { StatTiles, TilesSkeleton } from "@/components/stat-tiles";
 
 const TONE: Record<string, string> = {
@@ -1075,13 +1076,22 @@ function RerouteChooser({ st, s, onClose }: { st: StateSnapshot; s: SessionRow; 
 }
 
 // ---------------------------------------------------------------------------
-// The #67 flow view: the same published payload drawn as a live surface.
-// Left: sessions grouped by the model name they ask for. Right: the engine
-// rows with their load (counts read from the session rows — arbiter truth).
-// A connector line ties each session to the engine it routes to; the pin
-// select on each session row is the re-route (drag is the legacy affordance
-// — the select carries the same write, POST /api/sessions/:token/pin).
+// The #67 flow view, #74-ported: the same published payload drawn as a live
+// surface. Left: sessions grouped by the model name they ask for. Right: the
+// engine rows with their load (counts read from the session rows — arbiter
+// truth). The GRID stays the functional surface — the D4 edge labels and
+// exception annotations render exactly as before, and the pin select on the
+// rows-mode row is the re-route (the same write, POST /api/sessions/:token/pin).
+// NEW: orthogonal SVG connectors (session→engine, #67-style) paint on top,
+// phase-colored by the pure mapping in lib/pipe-phases.ts. The SVG is
+// aria-hidden decoration carrying the SAME tooltip text as the grid edge; the
+// row semantics already carry everything a screen reader needs. Geometry is
+// measured from the rendered DOM on each poll — zero new network calls.
 // ---------------------------------------------------------------------------
+
+const cssSafe = (s: string) => String(s).replace(/[^a-zA-Z0-9_-]/g, "_");
+
+type PipePath = { token: string; d: string; cls: string; title: string; ex: number; ey: number };
 
 function FlowView({ st }: { st: StateSnapshot }) {
   const rows = st.sessions ?? [];
@@ -1095,6 +1105,8 @@ function FlowView({ st }: { st: StateSnapshot }) {
     group: string;
     target: string;
     edge: EngineEdge;
+    pipe: PipeEdge;
+    engineName: string;
   };
   const nodes: SessNode[] = [];
   const groups = new Map<string, SessNode[]>();
@@ -1103,6 +1115,7 @@ function FlowView({ st }: { st: StateSnapshot }) {
     const target = s.engine_pin?.server_id ?? s.server_id ?? engines[0]?.id ?? "";
     const edgeSignal =
       (st.servers ?? []).find((r) => r.id === (s.engine_pin?.server_id ?? s.server_id ?? ""))?.signal ?? null;
+    const edge = engineEdge(s, edgeSignal);
     const node: SessNode = {
       token: s.token,
       short: String(s.token ?? "").slice(0, 8),
@@ -1110,7 +1123,9 @@ function FlowView({ st }: { st: StateSnapshot }) {
       stale: sessStale(s, st.now),
       group: g,
       target,
-      edge: engineEdge(s, edgeSignal),
+      edge,
+      pipe: pipeEdge(s, edge, st.now),
+      engineName: engines.find((e) => e.id === edge.target)?.name ?? edge.target ?? "",
     };
     nodes.push(node);
     const list = groups.get(g) ?? [];
@@ -1129,9 +1144,46 @@ function FlowView({ st }: { st: StateSnapshot }) {
     else if (s.gate?.state === "active" || (s.last_activity != null && st.now - s.last_activity < 30_000)) l.active += 1;
   }
 
+  // The connector geometry: measure the rendered nodes, draw the pipes. Runs
+  // after each render of this view (the 5s poll re-runs it); no fetch, no
+  // timers — pure DOM arithmetic on the state already in hand.
+  const boxRef = React.useRef<HTMLDivElement | null>(null);
+  const [paths, setPaths] = React.useState<PipePath[]>([]);
+  React.useEffect(() => {
+    const box = boxRef.current;
+    if (!box) return;
+    const b = box.getBoundingClientRect();
+    if (b.width === 0 || b.height === 0) return;
+    const out: PipePath[] = [];
+    for (const n of nodes) {
+      if (!n.edge.target || !engines.some((e) => e.id === n.edge.target)) continue; // fail-quiet: no edge row, no pipe
+      const sEl = box.querySelector(`[data-flow-node="sess:${cssSafe(n.token)}"]`);
+      const eEl = box.querySelector(`[data-flow-node="engine:${cssSafe(n.edge.target)}"]`);
+      if (!sEl || !eEl) continue; // engine row vanished mid-render: no pipe, no crash
+      const sr = sEl.getBoundingClientRect();
+      const er = eEl.getBoundingClientRect();
+      const x1 = sr.right - b.left + 2;
+      const y1 = (sr.top + sr.bottom) / 2 - b.top;
+      const x2 = er.left - b.left - 2;
+      const y2 = (er.top + er.bottom) / 2 - b.top;
+      out.push({
+        token: n.token,
+        d: flowPipePath(x1, y1, x2, y2, 10),
+        cls: pipeClass(n.pipe),
+        title: pipeTitle(n.short, n.engineName, n.edge, n.pipe),
+        ex: x2,
+        ey: y2,
+      });
+    }
+    setPaths(out);
+  }, [st]);
+
   return (
     <Card className="py-0 shadow-none">
-      <CardContent className="grid grid-cols-2 gap-4 px-4 py-3">
+      {/* The wide column gutter is the #67 connector lane — the grid columns
+          keep their content, only the space between them grows so the pipes
+          have a legible run (the legacy flow view used a 120px gutter). */}
+      <CardContent ref={boxRef} className="relative grid grid-cols-2 gap-14 px-4 py-3">
         <div className="flex flex-col gap-2">
           <div className="text-[11px] font-semibold uppercase tracking-wide text-dim">Sessions by model</div>
           {groupNames.map((g) => {
@@ -1146,23 +1198,24 @@ function FlowView({ st }: { st: StateSnapshot }) {
                 </div>
                 <div className="flex flex-col gap-0.5">
                   {members.map((s) => (
-                    <div key={s.token} className={`flex items-center gap-2 text-[12px] ${s.stale ? "opacity-60" : ""}`}>
+                    <div
+                      key={s.token}
+                      data-flow-node={`sess:${cssSafe(s.token)}`}
+                      className={`flex items-center gap-2 text-[12px] ${s.stale ? "opacity-60" : ""}`}
+                    >
                       <span className={`size-1.5 rounded-full ${s.stale ? "bg-border" : "bg-ok"}`} />
                       <span className="font-mono text-[11px]">{s.short}</span>
                       <span className="text-[11px] text-dim">@{s.host}</span>
                       {/* D4: the labelled session→engine edge (no graph
                           library — the engine column carries the posture
-                          word). Warn = the slow heuristic fired. */}
+                          word). Warn = the slow heuristic fired. The SVG
+                          pipe on this row carries the identical title. */}
                       {s.edge.target && (
                         <span
                           className={`text-[11px] ${s.edge.slow ? "text-warn" : "text-dim"}`}
-                          title={
-                            s.edge.slow
-                              ? `slow: ${s.edge.slowReasons.join("; ")} — re-route from the rows mode`
-                              : `routes to ${engines.find((e) => e.id === s.edge.target)?.name ?? s.edge.target}`
-                          }
+                          title={pipeTitle(s.short, s.engineName, s.edge, s.pipe)}
                         >
-                          → {engines.find((e) => e.id === s.edge.target)?.name ?? s.edge.target}
+                          → {s.engineName || s.edge.target}
                           {s.edge.annotation ? ` · ${s.edge.annotation}` : ""}
                         </span>
                       )}
@@ -1180,7 +1233,7 @@ function FlowView({ st }: { st: StateSnapshot }) {
             const sig = e.signal;
             const w = liveWord(sig ? { idle: sig.idle, degraded: sig.degraded } : null, l.active > 0);
             return (
-              <div key={e.id} className="flex items-center gap-2 text-[12px]">
+              <div key={e.id} data-flow-node={`engine:${cssSafe(e.id)}`} className="flex items-center gap-2 text-[12px]">
                 <span
                   className={`size-1.5 shrink-0 rounded-full ${sig?.degraded ? "bg-err" : sig ? (sig.idle ? "bg-border" : "bg-accent") : "bg-border"}`}
                   title={`${e.name}: ${w.label}`}
@@ -1198,9 +1251,20 @@ function FlowView({ st }: { st: StateSnapshot }) {
           })}
           {engines.length === 0 && <div className="text-[12px] text-dim">no engines declared</div>}
         </div>
+        {/* LAST child, as in #67: the pipes paint above the node chrome. */}
+        <svg className="flow-pipes" aria-hidden="true">
+          {paths.map((p) => (
+            <g key={p.token}>
+              <path className={p.cls} d={p.d}>
+                <title>{p.title}</title>
+              </path>
+              <circle className="pipe-end" cx={p.ex} cy={p.ey} r={3} />
+            </g>
+          ))}
+        </svg>
       </CardContent>
       <div className="border-t border-border px-4 py-1.5 text-[11px] text-dim">
-        the pin select on a row (rows mode) re-routes a session — the agent never learns the engine changed
+        the connectors draw the session→engine edge the rows already name — the pin select on a row (rows mode) re-routes it; the agent never learns the engine changed
       </div>
     </Card>
   );

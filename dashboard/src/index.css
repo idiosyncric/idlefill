@@ -19,6 +19,17 @@
   --err: #f85149;
   --accent: #58a6ff;
 
+  /* #74: the pipe phase tokens (#67), integrated as SEMANTIC derivations of
+     the #68 palette — not a hardcoded legacy set. A theme write to --ok,
+     --warn or --accent moves the pipes with it (var() resolves at use time,
+     so the <html> override cascades). The tools purple is derived from the
+     configured accent + error colors, never a fixed hex. */
+  --pipe-base: var(--border);
+  --pipe-queued: var(--warn);
+  --pipe-thinking: var(--ok);
+  --pipe-output: var(--accent);
+  --pipe-tools: color-mix(in oklab, var(--accent), var(--err));
+
   --radius-xs: 3px;
   --radius-sm: 4px;
   --radius-md: 6px;
@@ -116,5 +127,58 @@
     font-family: var(--font-mono);
     font-size: 13px;
     line-height: 1.5;
+  }
+}
+
+/* #74: the flow pipes — orthogonal SVG connectors over the Sessions flow
+   grid. Pure decoration (the svg is aria-hidden; the row text carries the
+   semantics), styled from the derived --pipe-* tokens above. Motion runs
+   engine→session on a live stream only, and stops when the operator asks
+   for reduced motion (the #67 rule, carried verbatim). */
+.flow-pipes {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  overflow: visible;
+}
+.pipe {
+  fill: none;
+  stroke: var(--pipe-base);
+  stroke-width: 1.6;
+}
+.pipe.queued {
+  stroke: var(--pipe-queued);
+  stroke-dasharray: 5 4;
+}
+.pipe.responding {
+  stroke-width: 2.2;
+}
+.pipe.thinking {
+  stroke: var(--pipe-thinking);
+}
+.pipe.output {
+  stroke: var(--pipe-output);
+}
+.pipe.tools {
+  stroke: var(--pipe-tools);
+}
+.pipe.muted {
+  stroke-dasharray: 2 3;
+  opacity: 0.5;
+}
+.pipe-end {
+  fill: var(--pipe-base);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .pipe.responding {
+    stroke-dasharray: 7 9;
+    animation: pipeflow 1.1s linear infinite;
+  }
+}
+@keyframes pipeflow {
+  to {
+    stroke-dashoffset: 160;
   }
 }
