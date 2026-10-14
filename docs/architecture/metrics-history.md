@@ -3,7 +3,14 @@
 Map: #50 (the mesh defines who publishes). Companion: `docs/architecture/mesh.md`
 (locked). This doc settles the retention-store decisions. Decisions are LOCKED
 where the trade-off is clear-cut for a single-operator personal fleet. The rest
-are marked PROPOSED for the owner. Nothing here is built.
+were marked PROPOSED for the owner.
+
+**Status (2026-10-14): every PROPOSED item in this doc is now LOCKED.** The
+wave that followed it — the metrics wave over #51 + #52 — was grilled in
+[../reports/METRICS-WAVE-GRILL-REPORT.md](../reports/METRICS-WAVE-GRILL-REPORT.md)
+and signed off by the owner on 2026-10-14, all ten recommendations verbatim.
+The amendments are recorded in "Metrics wave amendments" below; the build
+evidence is [../reports/METRICS-WAVE-REPORT.md](../reports/METRICS-WAVE-REPORT.md).
 
 ## The gap, verified against the code
 
@@ -70,9 +77,12 @@ Four series kinds. Three are in scope now. One is deferred.
    #45 lands, the store records only the active-session count inside the
    engine sample. Do not build a second session history.
 4. **Host metrics** — DEFERRED to #52. The boundary: #52 is the source (the
-   exporter module co-located with each engine, per mesh.md). #51 is the
-   sink and the query surface. #51 defines the append call the #52 module
-   will use. #51 does not build a collector.
+   exporter module co-located with each engine, per mesh.md). #51 is the sink
+   and the query surface. #51 defines the append call the #52 module will use.
+   #51 does not build a collector. *(Settled by the wave: the coarse host
+   counters `server/src/host.ts` already reads for the This-Machine card append
+   a `kind:"host"` line on the same tick — no new collector, no GPU, no daemon
+   exec; engine-host RAM and power continue to ride the engine rows.)*
 
 Token counts, stated honestly. The arbiter sees lease tokens: the client
 reports them at `POST /api/leases/:id/usage` (`server/src/api.ts:403-431`).
@@ -158,7 +168,9 @@ Shape:
 GET /api/metrics?series=engine&key=<server_id>&from=<epoch_ms>&to=<epoch_ms>&bucket=hour|raw
 ```
 
-- `series`: `engine` | `lease` | `session`.
+- `series`: `engine` | `lease` | `session`. (S5 adds `host` on the LOCAL route
+  — raw only; the peer serve/pull contract stays engine|lease|session, so no
+  new payload crosses the mesh.)
 - `key`: one `server_id` / session token / project. Optional filter.
 - `from` / `to`: epoch-ms. Default: the last 7 days.
 - `bucket`: `hour` (default) or `raw`. Raw answers only inside the raw
@@ -202,19 +214,80 @@ per-peer token field to the dashboard. The owner should weigh in. This wave
 ships local-machine charts only. Every arbiter serves the dashboard (mesh.md
 D3), so every machine charts itself today.
 
-## D8 — Dashboard chart surface (PROPOSED)
+## D8 — Dashboard chart surface (LOCKED)
 
-Minimal for a single operator: one new section ("Usage"), exception-only
-like the other views of `dashboard/src/`.
+One section ("Usage"), exception-only like the other views of `dashboard/src/`.
 
-- Per engine: requests per hour (last 7 days), idle hours per day, lease
+- Per engine: requests per hour (last 7 days), idle share per hour, lease
   tokens per day.
-- Inline SVG sparklines. No chart library. The dashboard is hand-written
-  single-file HTML with inline JS outside tsc.
-- The 30-day acceptance bar is about the store, not the default view. A
-  range control can come later.
+- Inline SVG sparklines. No chart library.
+- The 30-day acceptance bar is about the store, not the default view. A range
+  control can come later.
 
-The owner should pick the exact chart set before the build slice.
+The owner's chart set is settled by the wave below: utilization rides these
+rows, plus a raw-only 48 h drill on the per-engine card; no new nav surface.
+
+## Metrics wave amendments (owner sign-off, 2026-10-14) — LOCKED
+
+The wave over #51 + #52 was grilled in
+[METRICS-WAVE-GRILL-REPORT.md](../reports/METRICS-WAVE-GRILL-REPORT.md), which
+numbered its either/or decisions D1–D10; the owner approved all ten verbatim.
+The grill's numbers are carried here so the pointer resolves. Every one is an
+ADD: no key renamed, no shape changed, no verdict moved, the mesh snapshot and
+the #79 pull contract byte-for-byte.
+
+- **D1 — the hour bucket may carry load.** D5's "hour buckets stay load-free"
+  is amended: a bounded, aggregate-only set of load keys rides the engine hour
+  line (S1). The cost the grill priced — ~1 KB per engine-hour — is noise
+  against the ~10 MB per engine-day the raw window already writes.
+- **D2 — peaks and counts, never means.** `load_reads`, `busy_reads`,
+  `peak_in_flight`, `peak_queue_depth`, `gpu_util_max`, `gpu_power_max`,
+  `model_loaded_last`, `model_quant_last`. A mean of a spiky gauge is a lie
+  about the machine — the same reasoning that kept the llama-swap number out of
+  the verdict. The keys appear only when the hour had ≥1 load read; an engine
+  with no load axis writes the hour line exactly as before. A stale read counts
+  as a read, never as busy; a peak of an empty set is undefined, not 0.
+- **D3 — the raw window stays 48 h.** No widening. Raw is the drill-in, S1 is
+  the history; a 7-day window buys a second copy of data the rollup already
+  aggregated. The `metrics_raw_window_hours` knob exists and stays default.
+- **D4 — retention stays 400 days.** Open question 3, answered by arithmetic:
+  the whole 400-day hour series is ~1 MB per engine, ~5 MB with the new keys.
+  Unbounded means rotation has no horizon and every `readRange` walks more files
+  for no operator benefit; 90 days discards exactly the year-over-year view the
+  owner asked for.
+- **D5 — the standalone-sidecar hatch is PARKED.** Capture stays in-process on
+  the fused arbiter (`metrics-sidecar.md` D1). Every machine in the fleet runs
+  one; building the hatch adds a lifecycle, a port and a token plane for zero
+  value. The pure-function boundary that would make it possible is kept, and
+  recorded as unexercised.
+- **D6 — no new nav surface.** Utilization rides the existing Usage rows, plus
+  a raw-only 48 h sparkline on the per-engine card labelled `raw · last 48h`.
+  A Utilization tab is a new surface with no new information.
+- **D7 — cross-machine utilization is peer attribution.** Through the existing
+  `GET /api/metrics/remote` pull (#79/#86), never a fleet-merged series: a
+  peer's timestamps are its own clock, and "fleet peak GPU util" is a number
+  nobody can audit. Remote lines stay ephemeral on the puller.
+- **D8 — the llama-swap load threshold stays UNSET.** Display and sample only.
+  If the owner wants that kind vetied, the honest move is to re-declare a
+  llama-swap row and pick the number from a week of S1 samples.
+- **D9 — the session producer is wired.** One line per register heartbeat that
+  carries a `history` block, into the shape `metrics.ts` already defines — a
+  copy, not a transform. Bounded: one line per heartbeat per token, caps
+  mirroring `cleanReportedHistory`. Leaving the shape unwired made every peer
+  expand's session section a permanently empty, i.e. fake, absence.
+- **D10 — the load-read cadence stays every tick.** The strata row's double GET
+  of the same URL is folded into the fetch the tick already makes (S0); S1–S5
+  add no fetches. Revisit only if an engine objects to four reads a minute.
+- **Host series (S5) joins the query contract.** `series=host` on the local
+  route answers `bucket=raw` only — coarse counters (load averages, cpu count,
+  memory totals, uptime), never GPU: the engine rows own GPU truth
+  (`host.ts`). The peer serve/pull contract stays engine|lease|session, so no
+  new payload crosses the mesh. A host hour rollup is deferred behind the same
+  shape decision as S1; the day's peak load average is not stored.
+- **Range control (7/30/90): DEFERRED.** Without day buckets, a 30-day
+  three-engine query is 2,160 hour points against the 2,000 cap — the view
+  would render the oldest 160 points silently trimmed and still call itself 30
+  days. The honest version needs a day rollup, which this wave does not build.
 
 ## File family and line shapes
 
@@ -244,7 +317,30 @@ state vocabulary):
 
 {"ts":1759570110000,"kind":"session","token":"s-…","reqs_per_min":12,
  "model":"qwen3-27b"}
+
+{"ts":1759570000000,"kind":"host","load1":2.4,"load5":1.9,"cpus":8,
+ "mem_total_bytes":68719476736,"mem_free_bytes":21474836480,"uptime_s":864000}
 ```
+
+The wave's ADD keys on the hour line (S1), present only when that hour had at
+least one load read — otherwise the line is byte-for-byte the shape above:
+
+```
+{"ts":1759564800000,"kind":"engine_hour","server_id":"srv-f1c85327",
+ "samples":240,"req_total":57,"idle_samples":180,"grants":6,"revoked":2,
+ "tokens_out":120000,"tokens_in":30000,
+ "load_reads":231,"busy_reads":12,"peak_in_flight":1,"peak_queue_depth":3,
+ "gpu_util_max":99,"gpu_power_max":90.4,
+ "model_loaded_last":"qwen3.8-flash-next-q2_0","model_quant_last":"q2_0"}
+```
+
+The `model_loaded_last` value is capped before it rides a line (≤2 ids, ≤128
+chars each) — a comma-joined engine payload crossing into an hour bucket is a
+disclosure the mesh privacy rule bounds. `model` on the session line is
+optional: the heartbeat's block carries a model only when the router sniffed
+one, and absence is not a zero. The host line carries only what
+`collectHostStats()` can name (per-key tolerant, `host.ts`); a platform without
+load averages simply has no `load1` key.
 
 The reader keeps the LAST line per (hour, series key), so a re-run rollup is
 idempotent without rewriting any file.
@@ -299,10 +395,18 @@ Untouched:
 ## Open questions
 
 1. Does the llama-swap feed `id` restart at zero when llama-swap restarts?
-   Measure on urza before the `req_delta` logic ships.
+   Measure on urza before the `req_delta` logic ships. *(Unanswered, and no
+   longer blocking: `FeedDeltaTracker` already reads a backwards id as an
+   unknown delta, and urza declares no llama-swap row today.)*
 2. Interactive token counts: #52's exporter or #45's usage chunk? Pick one
-   owner before either builds it.
-3. Hour-bucket horizon: is 400 days the right default, or should retention
-   be unbounded for a personal fleet?
-4. Cross-machine charts: one shared `api_token` across instances, or
-   per-peer tokens in the dashboard?
+   owner before either builds it. *(Settled by what shipped: #45's heartbeat
+   carries the ring buffer, and the session producer copies exactly what the
+   heartbeat reports. The store records no token key it cannot see.)*
+3. ~~Hour-bucket horizon: is 400 days the right default, or should retention
+   be unbounded for a personal fleet?~~ RESOLVED (owner, 2026-10-14): 400
+   days, unchanged — see D4 above.
+4. ~~Cross-machine charts: one shared `api_token` across instances, or
+   per-peer tokens in the dashboard?~~ RESOLVED: neither. #79/#86 put the pull
+   inside the arbiter — the dashboard asks its own instance, which hops to the
+   peer with the fleet `peer_token` the dashboard never sees. No browser
+   fan-out, no shared token.

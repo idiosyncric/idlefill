@@ -14,7 +14,10 @@ Status: LOCKED (the grill closed it 2026-10-09, owner answers on every
 decision). D1/D2/D3/D6/D7 LOCKED as written — shipped and proven in
 slices 1–4. D4 LOCKED with the llama-swap threshold UNSET by the owner
 (the veto is live for strata — OBSERVED on the urza row — and inert for
-llama-swap by choice). D5 LOCKED, hour buckets stay load-free. D8
+llama-swap by choice). D5 LOCKED, hour buckets stay load-free — AMENDED
+2026-10-14 by the metrics wave (owner): bounded peak/count aggregates now ride
+the hour line; the raw sample line remains where the readings live. See
+`metrics-history.md`, "Metrics wave amendments". D8
 AMENDED by the grill and SHIPPED in slice 5: the installed oMLX 0.7.0
 exposes `/api/status` with `active_requests` / `waiting_requests` /
 `loaded_models`; the collector now reads it (`load_source`
@@ -104,11 +107,14 @@ arbiter). A new push direction. The mesh rule is pull
 (`docs/architecture/mesh.md` D1). The engine does not know the arbiter
 exists.
 
-Escape hatch (not built here): the collector is a pure function of
-(kind, row config) producing a `LoadReading`. If a future engine host
-cannot run the fused app, the same module runs standalone and appends to
-the local #51 store. The boundary is what makes that possible. No code
-for that case lands in this wave.
+Escape hatch (PARKED — owner call 2026-10-14, grill D5): the collector is a pure
+function of (kind, row config) producing a `LoadReading`. If a future engine host
+cannot run the fused app, the same module runs standalone and appends to the
+local #51 store. The boundary is what makes that possible, and it stays real.
+No host in this fleet needs the hatch — mac, urza's native systemd unit and
+scanbot all run a fused arbiter — and building it would add a lifecycle, a port
+and a token plane for zero value. Unexercised, on purpose; no code for that case
+lands in any wave.
 
 ## D2 — The verdict contract: the load axis is a monotonic busy veto
 
@@ -225,9 +231,11 @@ change; `queue_depth` was filled for oMLX in slice 5):
 
 The #51 engine sample line (`metrics-raw`, `EngineSampleLine`) carries
 the SAME key names. The sample is where the series lives. The hour line
-stays unchanged in this wave (the rollup reader keeps the last line per
-(hour, key)). LOCKED at the grill: hour buckets stay load-free — the
-load series live in the raw engine sample line only.
+stayed unchanged in this wave (the rollup reader keeps the last line per
+(hour, key)): hour buckets were load-free, the load series living in the raw
+engine sample line only. AMENDED 2026-10-14 by the metrics wave (owner): the
+hour line now carries a bounded aggregate view of those readings — counts and
+peaks, never means, keys absent when the hour saw no load read.
 
 NO KV-cache pressure key. No engine exposes occupancy. What the engines
 expose are proxies (per-request `cache_tokens`, `totals.reused`, host
@@ -374,9 +382,10 @@ Untouched (fenced):
    threshold **UNSET by owner choice**: the veto stays off for that
    kind until a number is set deliberately; no HTTP in-flight count
    exists upstream to wait for (WS-only).
-5. D5 — the wire key set. **LOCKED**; hour buckets stay load-free (raw
-   sample line only, owner call). The shipped key set also carries
-   `load_fail_reason` and `omlx_loaded_count`.
+5. D5 — the wire key set. **LOCKED**; hour buckets were load-free (raw
+   sample line only, owner call) — **amended 2026-10-14**: the hour line
+   carries bounded peaks and counts of those readings, never the series. The
+   shipped key set also carries `load_fail_reason` and `omlx_loaded_count`.
 6. D7 — mesh snapshot byte-for-byte. **LOCKED** (shipped).
 7. D8 — **AMENDED + LOCKED**: oMLX does NOT stay mtime-only. The
    follow-up slice wires `/api/status` (busy predicate, real model
