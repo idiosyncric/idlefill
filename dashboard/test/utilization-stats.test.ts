@@ -7,7 +7,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { utilizationRowsFor, rawLoadDrill } from '../src/lib/utilization-stats';
+import { utilizationRowsFor, rawLoadDrill, hostSparklines } from '../src/lib/utilization-stats';
 import type { MetricPoint, RawLoadLine } from '../src/lib/api';
 
 const HOUR = 3_600_000;
@@ -97,4 +97,28 @@ test('raw drill returns null when the window has no load axis at all', () => {
   ];
   assert.equal(rawLoadDrill(lines, 48 * HOUR, now), null);
   assert.equal(rawLoadDrill([], 48 * HOUR, now), null);
+});
+
+test("S5 host sparklines: exception-only, thinned to a render budget, coverage named", () => {
+  const now = 1_800_000_000_000;
+  const pts = Array.from({ length: 300 }, (_, i) => ({
+    ts: now - i * 15000,
+    kind: "host" as const,
+    load1: 1 + (i % 5) * 0.5,
+    cpus: 10,
+    mem_total_bytes: 68_719_476_736,
+    mem_free_bytes: 60_000_000_000,
+  }));
+  const built = hostSparklines(pts);
+  assert.ok(built);
+  assert.equal(built.rows.length, 2);
+  assert.equal(built.rows[0]!.values.length, 240, "the newest 240 samples, oldest dropped");
+  assert.equal(built.rows[0]!.valueText, "1", "the newest reading is the headline, oldest points dropped");
+  assert.ok(built.coverage.includes("240 host samples"));
+  const noLoad = hostSparklines([{ ts: now, kind: "host", mem_total_bytes: 1000, mem_free_bytes: 500 }]);
+  assert.ok(noLoad);
+  assert.equal(noLoad.rows.length, 1, "a platform with no loadavg names no load row, never a zero");
+  assert.ok(noLoad.rows[0]!.label === "mem used · raw");
+  assert.equal(hostSparklines([{ ts: now, kind: "host" }]), null, "nothing valid: no rows at all");
+  assert.equal(hostSparklines([]), null);
 });

@@ -13,6 +13,7 @@ import { StatTiles, TilesSkeleton } from "@/components/stat-tiles";
 import { ago, durFmt, fmt, liveWord, type StateWord } from "@/lib/format";
 import { buildGapLine, hostLine, intentWord, meshTiles, peerVerdict, relayOutcome } from "@/lib/mesh-stats";
 import { buildRemoteRows, type RemoteRow } from "@/lib/remote-metrics";
+import { hostSparklines } from "@/lib/utilization-stats";
 import {
   LOCAL_MACHINE,
   VIA_NOTE,
@@ -25,6 +26,7 @@ import {
 import { machineKey } from "@/lib/hash-nav";
 import {
   apiToken,
+  getHostSeries,
   getRemoteMetrics,
   requestPeerUpdate,
   type MeshPeer,
@@ -265,6 +267,60 @@ function engineDot(row: ServerRow): string {
   return row.signal?.degraded ? "bg-err" : row.signal?.idle ? "bg-border" : "bg-accent";
 }
 
+
+/** Metrics wave S5: this machine's own host series, raw only, on demand —
+ * never on the 5 s poll. Exception-only: a gauge the platform cannot name
+ * gets no row. */
+function HostSparklines() {
+  const [open, setOpen] = useState(false);
+  const [built, setBuilt] = useState<{ rows: { label: string; values: number[]; stroke: string; valueCls: string; valueText: string; title: string }[]; coverage: string } | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  const pull = async () => {
+    const now = Date.now();
+    try {
+      const { points, truncated } = await getHostSeries(now - 48 * 3600_000, now);
+      const b = hostSparklines(points);
+      setBuilt(b ? { rows: b.rows, coverage: b.coverage + (truncated ? " (the store's 2,000-point cap trimmed the oldest)" : "") } : null);
+      setErr(null);
+    } catch (e) {
+      setBuilt(null);
+      setErr(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-1">
+      <button
+        type="button"
+        onClick={() => {
+          const next = !open;
+          setOpen(next);
+          if (next && built === null && err === null) void pull();
+        }}
+        className="w-full py-0.5 text-left text-[11px] text-dim hover:text-foreground"
+        title="the host counters this arbiter reads from its own process, one line per poll tick (raw only — no hour bucket exists for a host)"
+      >
+        {open ? "▾ hide host history" : "▸ host history · raw 48h"}
+      </button>
+      {open && err && <div className="text-[11px] text-err" title="the read failed: no series, no fake zero">{err}</div>}
+      {open && built === null && !err && <div className="text-[11px] text-dim italic">no host lines in this window — this arbiter has not sampled its own host yet</div>}
+      {open && built && (
+        <>
+          {built.rows.map((r, i) => (
+            <div key={`${r.label}-${i}`} className="flex items-center gap-2 text-[11px]" title={r.title}>
+              <span className="min-w-[96px] shrink-0 text-dim">{r.label}</span>
+              <Sparkline values={r.values} stroke={r.stroke} />
+              <span className={`ml-auto whitespace-nowrap ${r.valueCls}`}>{r.valueText}</span>
+            </div>
+          ))}
+          <div className="text-[10px] text-dim">{built.coverage}</div>
+        </>
+      )}
+    </div>
+  );
+}
+
 // This Machine — the local row (first in the list, owner call 2026-10-11):
 // the same coarse counts a peer would publish about this instance, read as
 // local truth from this page's own poll. The host line is the arbiter's
@@ -324,6 +380,7 @@ function LocalRow({
                   {hline}
                 </div>
               )}
+              <HostSparklines />
             </div>
             {(st.update_intents?.length ?? 0) > 0 && (
               <div className="flex flex-wrap items-center gap-1.5" title="machine-update intents asked of THIS machine by a paired controller (mesh-update.md) — this machine updates by the operator's own command line, there is no local button">

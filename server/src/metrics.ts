@@ -32,12 +32,13 @@
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { WATCHED_SERVER_ID, type Arbiter } from './arbiter.js';
+import type { HostStats } from './host.js';
 import type { RequestsSource } from './types.js';
 
 export const HOUR_MS = 3_600_000;
 export const DAY_MS = 86_400_000;
 
-export type MetricsSeries = 'engine' | 'lease' | 'session';
+export type MetricsSeries = 'engine' | 'lease' | 'session' | 'host';
 export type MetricsBucket = 'hour' | 'raw';
 
 // ---------------------------------------------------------------------------
@@ -170,6 +171,25 @@ export interface SessionSampleLine {
   model?: string;
 }
 
+/**
+ * Host line (metrics wave S5, grill D10): this machine's coarse counters,
+ * one line per tick, copied from collectHostStats(). Raw-only — no host hour
+ * rollup is built in this wave. A key the platform cannot name is simply
+ * absent (never a zero), and nothing here ever crosses the mesh: the peer
+ * serve/pull contract stays engine|lease|session.
+ */
+export interface HostLine {
+  ts: number;
+  kind: 'host';
+  load1?: number;
+  load5?: number;
+  load15?: number;
+  cpus?: number;
+  mem_total_bytes?: number;
+  mem_free_bytes?: number;
+  uptime_s?: number;
+}
+
 export interface EngineHourLine {
   ts: number; // hour start (epoch-ms)
   kind: 'engine_hour';
@@ -246,11 +266,16 @@ export type MetricsLine =
   | EngineSampleLine
   | LeaseOutcomeLine
   | SessionSampleLine
+  | HostLine
   | EngineHourLine
   | LeaseHourLine
   | SessionHourLine;
 
 /** The series key dimension (D6: server_id / session token / project). */
+/** The one key a host line carries: this machine, always. It never leaves
+ * the local store (S5 is local-only; the mesh contract is untouched). */
+export const HOST_SERIES_KEY = 'local';
+
 export function seriesKeyOf(line: MetricsLine): string {
   switch (line.kind) {
     case 'engine':
@@ -262,6 +287,8 @@ export function seriesKeyOf(line: MetricsLine): string {
     case 'session':
     case 'session_hour':
       return line.token;
+    case 'host':
+      return HOST_SERIES_KEY;
   }
 }
 
@@ -403,6 +430,22 @@ export class MetricsStore {
   }
 
   appendLeaseOutcome(line: LeaseOutcomeLine): void {
+    this.appendLine(line);
+  }
+
+  /**
+   * Metrics wave S5 (grill D10): one host line per tick, copied from
+   * collectHostStats(). Per-key tolerant exactly as host.ts is: a key the
+   * platform cannot name is absent, and a line with nothing valid is not
+   * written at all. Raw only — there is no host hour rollup in this wave.
+   */
+  appendHostSample(ts: number, stats: HostStats): void {
+    const line: HostLine = { ts, kind: 'host' };
+    for (const k of ['load1', 'load5', 'load15', 'cpus', 'mem_total_bytes', 'mem_free_bytes', 'uptime_s'] as const) {
+      const v = stats[k];
+      if (typeof v === 'number' && Number.isFinite(v) && v >= 0) line[k] = v;
+    }
+    if (Object.keys(line).length <= 2) return; // ts + kind only: nothing to say
     this.appendLine(line);
   }
 

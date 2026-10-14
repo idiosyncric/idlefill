@@ -12,6 +12,7 @@ import { Arbiter, leaseServerId, WATCHED_SERVER_ID } from './arbiter.js';
 import { loadConfig } from './config.js';
 import { IdleDetector, makeActivityFetcherFor, makeRealActivityFetcher, makeRealLogMtimeSource } from './idle.js';
 import { LoadCollector, newestFeedTps } from './load.js';
+import { collectHostStats } from './host.js';
 import { makeRealModelsFetcher } from './catalog.js';
 import type { ActivityFetcher } from './idle.js';
 import type { LoadSignalView } from './load.js';
@@ -437,6 +438,11 @@ async function main(): Promise<void> {
         ...(load ? { ...load } : {}),
       });
     }
+    // Metrics wave S5 (grill D10): the host series rides this same tick — coarse
+    // counters from collectHostStats(), raw-only, never a second GPU probe, and
+    // never on the wire to a peer. A platform that cannot name a key writes no
+    // key; a line with nothing valid is not written at all.
+    metrics.appendHostSample(now, collectHostStats());
   };
 
   // One rollup when the clock crosses an hour boundary (#51 D5): the

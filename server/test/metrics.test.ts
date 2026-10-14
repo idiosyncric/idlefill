@@ -493,6 +493,39 @@ test('S1 byte budget: the aggregates add bounded bytes per hour line, never a se
   assert.ok(!grown.includes('mean'), 'no means anywhere in the shape');
 });
 
+// --- S5: the host series, local raw only (grill D10) ----------------------
+
+test('S5 append: a host line copies what the platform can name, and nothing else', () => {
+  const { dir, store } = mkStore();
+  try {
+    const now = Date.now();
+    store.appendHostSample(now, { load1: 2.4, cpus: 10, mem_total_bytes: 68719476736, mem_free_bytes: 1000, uptime_s: 86400 });
+    store.appendHostSample(now + 1, { load1: 1.1, cpus: NaN, mem_total_bytes: -5 });
+    store.appendHostSample(now + 2, {}); // nothing valid: no line at all
+    const lines = store.readRange({ series: 'host', from: now - 1000, to: now + 3000, bucket: 'raw' });
+    assert.equal(lines.length, 2);
+    assert.equal(JSON.stringify(lines[0]), JSON.stringify({ ts: now, kind: 'host', load1: 2.4, cpus: 10, mem_total_bytes: 68719476736, mem_free_bytes: 1000, uptime_s: 86400 }));
+    assert.equal(JSON.stringify(lines[1]), JSON.stringify({ ts: now + 1, kind: 'host', load1: 1.1 }));
+    assert.ok(!JSON.stringify(lines[1]).includes('cpus'), 'an unnameable key is absent, never zero');
+    assert.equal(store.readRange({ series: 'host', from: now - 1000, to: now + 3000, bucket: 'hour' }).length, 0, 'no host hour bucket exists in this wave');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('S5 contract: series=host is local + raw only; the peer contract keeps engine|lease|session', async () => {
+  const now = Date.now();
+  store.appendHostSample(now, { load1: 3.2, cpus: 8, mem_total_bytes: 100, mem_free_bytes: 40, uptime_s: 100 });
+  const ok = await (await fetch(`${base}/api/metrics?series=host&bucket=raw&from=${now - 1000}&to=${now + 1000}`)).json() as { series: { key: string; points: unknown[] }[] };
+  assert.equal(ok.series.length, 1);
+  assert.equal(ok.series[0]!.key, 'local');
+  const hour = await fetch(`${base}/api/metrics?series=host&bucket=hour`);
+  assert.equal(hour.status, 400);
+  assert.ok(((await hour.json()) as { error: string }).error.includes('raw-only'));
+  const remoteServe = await fetch(`${base}/api/metrics/remote?series=host&bucket=raw`, { headers: { authorization: `Bearer ${PEER}` } });
+  assert.equal(remoteServe.status, 400, 'host never crosses the mesh: the peer contract is engine|lease|session');
+});
+
 // --- S4: the session producer, wired (grill D9) ---------------------------
 
 test('S4: a real register heartbeat carrying a history block appends exactly one session line', () => {

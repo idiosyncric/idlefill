@@ -12,7 +12,7 @@
 // gauge the kind never reports is absent, so it is never seen, and its peak is
 // undefined, not 0. Sparkline gaps are rendered as 0 exactly as the existing
 // token rows do, and the row's `title` names the gap.
-import type { MetricPoint, RawLoadLine } from "./api";
+import type { MetricPoint, RawLoadLine, HostPoint } from "./api";
 
 export type UsageRow = {
   label: string;
@@ -119,4 +119,45 @@ export function rawLoadDrill(
 
 function row(label: string, values: number[], stroke: string, valueCls: string, valueText: string, title: string): UsageRow {
   return { label, values, stroke, valueCls, valueText, title };
+}
+
+/**
+ * Metrics wave S5 — the This-Machine card's host sparklines, pure. Raw host
+ * lines only (there is no host hour bucket in this wave). Exception-only: a
+ * key the platform never named gets no row. Values are thinned to a render
+ * budget (the newest points win) and the row's title says exactly how much
+ * history is actually on screen — the store's 2,000-point cap trims the oldest.
+ */
+const HOST_RENDER_BUDGET = 240;
+
+export function hostSparklines(points: HostPoint[]): { rows: UsageRow[]; coverage: string } | null {
+  const clean = points
+    .filter((p) => typeof p.ts === "number" && Number.isFinite(p.ts))
+    .sort((a, b) => a.ts - b.ts);
+  if (clean.length === 0) return null;
+  const newest = clean.slice(-HOST_RENDER_BUDGET);
+  const rows: UsageRow[] = [];
+  const gauge = (
+    getter: (p: HostPoint) => number | null,
+    label: string,
+    unit: string,
+    stroke: string,
+    cls: string,
+    note: string,
+  ) => {
+    const vals = newest.map(getter);
+    if (!vals.some((v) => v !== null)) return;
+    const shown = vals.map((v) => v ?? 0);
+    const last = shown[shown.length - 1];
+    rows.push(row(`${label}`, shown, stroke, cls, `${last}${unit}`, note));
+  };
+  gauge((p) => num(p.load1), "load 1m · raw", "", "var(--accent)", "text-accent", "1-minute load average, one point per arbiter tick — the oldest points are trimmed by the store's 2,000-point cap");
+  gauge((p) => {
+    const t = num(p.mem_total_bytes);
+    const f = num(p.mem_free_bytes);
+    return t !== null && f !== null && t > 0 ? Math.round(((t - f) / 1_073_741_824) * 10) / 10 : null;
+  }, "mem used · raw", " GiB", "var(--warn)", "text-warn", "physical memory in use, from the arbiter's own os.totalmem/os.freemem (host-wide, container included)");
+  if (rows.length === 0) return null;
+  const spanH = Math.max(1, Math.round((newest[newest.length - 1]!.ts - newest[0]!.ts) / 3_600_000));
+  return { rows, coverage: `${newest.length} host samples spanning ${spanH}h — per tick, raw only` };
 }

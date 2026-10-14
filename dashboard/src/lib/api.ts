@@ -784,6 +784,26 @@ export async function getEngineRawSeries(serverId: string, from: number, to: num
   return { points: points as unknown as RawLoadLine[], truncated: body.truncated === true };
 }
 
+/** Metrics wave S5: this machine's own host series — local, raw only. */
+export type HostPoint = {
+  ts: number;
+  kind: "host";
+  load1?: number;
+  load5?: number;
+  load15?: number;
+  cpus?: number;
+  mem_total_bytes?: number;
+  mem_free_bytes?: number;
+  uptime_s?: number;
+};
+
+export async function getHostSeries(from: number, to: number): Promise<{ points: HostPoint[]; truncated: boolean }> {
+  const url = `/api/metrics?series=host&bucket=raw&from=${from}&to=${to}`;
+  const body = await json<{ series: { key: string; points: Record<string, unknown>[] }[]; truncated: boolean }>(await fetch(url, { cache: "no-store" }));
+  const points = body.series.flatMap((s) => s.points as unknown as HostPoint[]);
+  return { points, truncated: body.truncated === true };
+}
+
 export async function getRawLines(from: number, to: number): Promise<{ engine: RawEngineLine[]; lease: RawLeaseLine[] }> {
   const [eng, lease] = await Promise.all([
     json<{ series: { key: string; points: Record<string, unknown>[] }[] }>(

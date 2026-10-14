@@ -1972,12 +1972,18 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
 
     const q = (typeof req.query === 'object' && req.query !== null ? req.query : {}) as Record<string, unknown>;
     const series = q.series;
-    if (series !== 'engine' && series !== 'lease' && series !== 'session') {
-      return reply.code(400).send({ error: 'series must be engine, lease, or session' });
+    // S5 widens the LOCAL contract with `host` — raw only, since the wave
+    // builds no host hour bucket. The peer serve/pull contract stays
+    // engine|lease|session, so no host payload ever crosses the mesh.
+    if (series !== 'engine' && series !== 'lease' && series !== 'session' && series !== 'host') {
+      return reply.code(400).send({ error: 'series must be engine, lease, session, or host' });
     }
     const bucket = q.bucket === undefined ? 'hour' : q.bucket;
     if (bucket !== 'hour' && bucket !== 'raw') {
       return reply.code(400).send({ error: 'bucket must be hour or raw' });
+    }
+    if (series === 'host' && bucket !== 'raw') {
+      return reply.code(400).send({ error: 'the host series is raw-only' });
     }
     const now = Date.now();
     const WEEK_MS = 7 * 86_400_000;
@@ -2051,7 +2057,8 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     const token = bearer(req);
     const peerId = typeof q.peer === 'string' ? q.peer.trim() : '';
 
-    // Param contract — the local route's, mirrored exactly (D2).
+    // Param contract — the local route's, mirrored EXCEPT for S5: the host
+    // series is local-only by design, so `host` is not a legal peer series.
     const series = q.series;
     if (series !== 'engine' && series !== 'lease' && series !== 'session') {
       return reply.code(400).send({ error: 'series must be engine, lease, or session' });
