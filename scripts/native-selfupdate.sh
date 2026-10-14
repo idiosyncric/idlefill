@@ -109,7 +109,11 @@ LOCK_STAMP="$REPO/node_modules/.idlefill-lock-sha"
 LOCK_NOW="$("$NODE_BIN" -e 'const{createHash}=require("crypto"),{readFileSync}=require("fs");const h=createHash("sha256");for(const f of ["package.json","package-lock.json"]){try{h.update(readFileSync(f))}catch{}}console.log(h.digest("hex"))')"
 if [ ! -d "$REPO/node_modules" ] || [ "$(cat "$LOCK_STAMP" 2>/dev/null || true)" != "$LOCK_NOW" ]; then
   log "==> installing dependencies (the lockfile moved)"
-  NODE_ENV= npm install --no-audit --no-fund
+  # --no-save: every npm version writes its own lockfile metadata (the libc
+  # fields, 2026-10-14) — the versions are already pinned by the committed
+  # lock; rewriting it on the host machine only makes the next run's dirty
+  # check refuse. Install respects the lock; it does not rewrite it.
+  NODE_ENV= npm install --no-audit --no-fund --no-save
   mkdir -p "$REPO/node_modules"
   printf '%s' "$LOCK_NOW" > "$LOCK_STAMP"
 else
