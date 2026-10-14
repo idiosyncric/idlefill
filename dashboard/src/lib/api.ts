@@ -647,6 +647,16 @@ export type MetricPoint = {
   idle_samples?: number;
   samples?: number;
   requests_source?: string;
+  // Metrics wave S1 ADD-keys on the hour line. ABSENT = the hour saw no load
+  // read at all: the renderer draws nothing, never a zero.
+  load_reads?: number;
+  busy_reads?: number;
+  peak_in_flight?: number;
+  peak_queue_depth?: number;
+  gpu_util_max?: number;
+  gpu_power_max?: number;
+  model_loaded_last?: string;
+  model_quant_last?: string;
 };
 
 export type MetricsSeries = { key: string; points: MetricPoint[] }[];
@@ -744,6 +754,35 @@ export type RawLeaseLine = {
   tokens_out: number;
   tokens_in: number;
 };
+
+/**
+ * A raw engine line carrying the load axis (#52 keys) — the shape the per-engine
+ * card's 48h drill reads (metrics wave S2). Everything optional: a row whose
+ * kind reports no load axis has none of these keys.
+ */
+export type RawLoadLine = {
+  ts: number;
+  kind: "engine";
+  server_id: string;
+  load_source?: string;
+  load_busy?: boolean;
+  in_flight?: number;
+  queue_depth?: number;
+  gpu_util_percent?: number;
+  gpu_power_watts?: number;
+};
+
+/**
+ * One engine's raw load lines inside the raw window (the card's drill). The
+ * store clamps `from` to its own window and trims the OLDEST points at the
+ * 2,000 cap — the caller labels that honestly, never pretends a full 48h.
+ */
+export async function getEngineRawSeries(serverId: string, from: number, to: number): Promise<{ points: RawLoadLine[]; truncated: boolean }> {
+  const url = `/api/metrics?series=engine&bucket=raw&key=${encodeURIComponent(serverId)}&from=${from}&to=${to}`;
+  const body = await json<{ series: { key: string; points: Record<string, unknown>[] }[]; truncated: boolean }>(await fetch(url, { cache: "no-store" }));
+  const points = body.series.find((s) => s.key === serverId)?.points ?? [];
+  return { points: points as unknown as RawLoadLine[], truncated: body.truncated === true };
+}
 
 export async function getRawLines(from: number, to: number): Promise<{ engine: RawEngineLine[]; lease: RawLeaseLine[] }> {
   const [eng, lease] = await Promise.all([

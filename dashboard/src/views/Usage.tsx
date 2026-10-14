@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Sparkline } from "@/components/Sparkline";
 import { StatTiles, TilesSkeleton } from "@/components/stat-tiles";
 import { usageTiles, type UsageTile } from "@/lib/usage-stats";
+import { utilizationRowsFor, type UsageRow as UtilRow } from "@/lib/utilization-stats";
 import {
   getMetrics,
   type MetricsSeries,
@@ -22,23 +23,24 @@ import {
 //                (only when some point carries a counter-backed sample)
 //            <key> tok in/hour (engine)  — engine-reported input tokens, warn
 //            <key> idle % — idle samples per hour bucket, ok (avg in the value)
+//   engine (metrics wave S2 — the utilization rows, exception-only, from the
+//          hour line's bounded aggregates):
+//            <key> busy %          — share of load reads that fired the veto
+//            <key> peak in-flight  — the max the kind reported, never a mean
+//            <key> peak queue      — oMLX only; other kinds publish no queue
+//            <key> gpu util max / gpu power max — only when the gauge exists
+//          An engine with no load axis gets NO row; the absence is named.
 //   lease:   <key> tokens/hour — lease output tokens, warn
 // ---------------------------------------------------------------------------
 
 const USAGE_MS = 7 * 86400000; // the default view: last 7 days (D8)
 const REFRESH_MS = 300_000; // 5 min — its own timer, not the state poll
 
-type UsageRow = {
-  label: string;
-  values: number[];
-  stroke: string;
-  valueCls: string;
-  valueText: string;
-  title: string;
-};
+type UsageRow = UtilRow;
 
-function buildRows(engKeys: MetricsSeries, leaseKeys: MetricsSeries): UsageRow[] {
+function buildRows(engKeys: MetricsSeries, leaseKeys: MetricsSeries): { rows: UsageRow[]; absences: string[] } {
   const rows: UsageRow[] = [];
+  const absences: string[] = [];
   for (const s of engKeys) {
     const pts = s.points;
     // requests per hour (the doc's chart 1)
@@ -95,6 +97,11 @@ function buildRows(engKeys: MetricsSeries, leaseKeys: MetricsSeries): UsageRow[]
         "idle samples per hour bucket, last 7 days",
       ),
     );
+    // The utilization rows (S2): exception-only, from the hour line's bounded
+    // aggregates. No load_reads key anywhere → no row, and the absence is named.
+    const util = utilizationRowsFor(s.key, pts);
+    rows.push(...util.rows);
+    if (util.absence) absences.push(util.absence);
   }
   for (const s of leaseKeys) {
     const pts = s.points;
@@ -110,7 +117,7 @@ function buildRows(engKeys: MetricsSeries, leaseKeys: MetricsSeries): UsageRow[]
       ),
     );
   }
-  return rows;
+  return { rows, absences };
 }
 
 function usageRow(
@@ -126,6 +133,7 @@ function usageRow(
 
 export function Usage() {
   const [rows, setRows] = React.useState<UsageRow[] | null>(null);
+  const [absences, setAbsences] = React.useState<string[]>([]);
   const [tiles, setTiles] = React.useState<UsageTile[] | null>(null);
   const [err, setErr] = React.useState<string | null>(null);
   const [loadedAt, setLoadedAt] = React.useState<number | null>(null);
@@ -139,13 +147,8 @@ export function Usage() {
       const [eng, lease] = await Promise.all([getMetrics("engine", from, now), getMetrics("lease", from, now)]);
       const built = buildRows(eng, lease);
       setTiles(usageTiles(eng, lease));
-      if (built.length === 0) {
-        setRows([]);
-        setErr(null);
-        setLoadedAt(now);
-        return;
-      }
-      setRows(built);
+      setRows(built.rows);
+      setAbsences(built.absences);
       setErr(null);
       setLoadedAt(now);
     } catch {
@@ -207,6 +210,13 @@ export function Usage() {
               </span>
               <Sparkline values={r.values} stroke={r.stroke} />
               <span className={`ml-auto flex-none ${r.valueCls}`}>{r.valueText}</span>
+            </div>
+          ))}
+          {/* Named absences: an engine with no load axis gets no row, and the
+              gap is stated — never a confident zero. */}
+          {absences.map((a, i) => (
+            <div key={`abs-${i}`} className="text-[11px] text-dim italic" title="the utilization rows are exception-only: no load read means nothing to report">
+              {a}
             </div>
           ))}
         </CardContent>

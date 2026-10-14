@@ -31,6 +31,7 @@ import { Sparkline } from "@/components/Sparkline";
 import {
   getState,
   getEngineMetrics,
+  getEngineRawSeries,
   postServer,
   removeServer,
   putEngineGroup,
@@ -44,11 +45,13 @@ import { ago, fmt, fmtCtx, liveWord, probeWord, PROVIDER_CHOICES } from "@/lib/f
 import { LOCAL_MACHINE, VIA_NOTE, hostOfServer, serverBands, type HostVerdict } from "@/lib/hierarchy";
 import { SERVER_PREFIX } from "@/lib/hash-nav";
 import { engineGauges, engineTiles, gibfmt, ramAxis } from "@/lib/fleet-stats";
+import { rawLoadDrill, type UsageRow } from "@/lib/utilization-stats";
 import { MemBar } from "@/components/mem-bar";
 import { StatTiles, TilesSkeleton } from "@/components/stat-tiles";
 import { loadRead, LOAD_FRESHNESS_DEFAULT_S } from "@/lib/load-read";
 
 const METRICS_24H = 24 * 3600_000; // the card's sparkline window
+const RAW_48H_MS = 48 * 3600_000; // the raw drill's window (the store clamps it)
 const TONE: Record<string, string> = {
   ok: "text-ok",
   warn: "text-warn",
@@ -726,7 +729,7 @@ function ServerCard({
           </div>
         )}
         <Separator />
-        <MetricRows points={points} />
+        <MetricRows points={points} server={s} />
       </CardContent>
 
       <CardFooter className="flex-col items-stretch gap-1.5 px-3 py-1.5 text-[11px] text-dim">
@@ -838,7 +841,7 @@ function ModelList({ s, now }: { s: ServerRow; now: number }) {
   );
 }
 
-function MetricRows({ points }: { points: MetricPoint[] }) {
+function MetricRows({ points, server }: { points: MetricPoint[]; server: ServerRow }) {
   if (points.length === 0) {
     return <div className="text-[11px] text-dim">no metrics yet — the store fills as the engine runs</div>;
   }
@@ -849,6 +852,73 @@ function MetricRows({ points }: { points: MetricPoint[] }) {
     <div className="flex flex-col gap-1">
       <MetricRow k="req / hr" values={reqs} value={fmt(last(reqs))} title="requests per hour, last 24h" />
       <MetricRow k="tokens / hr" values={tok} value={fmt(last(tok))} title="output tokens per hour, last 24h" />
+      {/* Metrics wave S2: the raw drill (grill D6 — the history belongs in
+          Usage, the measurement belongs beside the engine). On-demand only:
+          one click, one range read, no new poll. An engine with no load axis
+          gets no affordance at all — there is nothing raw to show. */}
+      {typeof server.signal?.load_source === "string" && server.signal.load_source !== "" && (
+        <RawDrill serverId={server.id} />
+      )}
+    </div>
+  );
+}
+
+/**
+ * The 48h raw drill on the per-engine card (S2). Peaks per hour from the raw
+ * sample lines — the store clamps the window and trims the OLDEST points at
+ * its 2,000 cap, and the coverage line says exactly what was served. No load
+ * lines = the gap named, never a row of zeros.
+ */
+function RawDrill({ serverId }: { serverId: string }) {
+  const [open, setOpen] = React.useState(false);
+  const [drill, setDrill] = React.useState<{ rows: UsageRow[]; coverage: string } | null>(null);
+  const [gap, setGap] = React.useState<string | null>(null);
+  const [busy, setBusy] = React.useState(false);
+
+  const load = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const now = Date.now();
+      const { points } = await getEngineRawSeries(serverId, now - RAW_48H_MS, now);
+      const built = rawLoadDrill(points, RAW_48H_MS, now);
+      if (built === null) {
+        setDrill(null);
+        setGap("no load read in the raw window — this engine has no load axis the store can see");
+      } else {
+        setDrill(built);
+        setGap(null);
+      }
+    } catch {
+      setGap("the raw window could not be read");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center gap-2">
+        <Button size="xs" variant="ghost" className="h-6 px-2 text-[11px]" onClick={() => { setOpen((o) => !o); if (!open) void load(); }} title="read the raw load samples inside the 48h retention window">
+          {open ? "hide raw · 48h" : "raw · 48h"}
+        </Button>
+        {busy && <span className="text-[10px] text-dim">reading…</span>}
+      </div>
+      {open && gap && (
+        <div className="text-[11px] text-dim italic" title="exception-only: nothing was measured, so nothing is drawn">{gap}</div>
+      )}
+      {open && drill && (
+        <>
+          {drill.rows.map((r, i) => (
+            <div key={i} className="flex items-center gap-2 text-[11px]" title={r.title}>
+              <span className="min-w-[96px] shrink-0 text-dim">{r.label}</span>
+              <Sparkline values={r.values} stroke={r.stroke} />
+              <span className={`ml-auto whitespace-nowrap ${r.valueCls}`}>{r.valueText}</span>
+            </div>
+          ))}
+          <div className="text-[10px] text-dim" title="the store serves the raw window it keeps; beyond the 2,000-point cap the oldest samples are trimmed">{drill.coverage}</div>
+        </>
+      )}
     </div>
   );
 }
