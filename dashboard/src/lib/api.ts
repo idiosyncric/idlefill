@@ -52,6 +52,12 @@ export type ServerSignal = {
   // session→engine edge (alias-stability D4) reads it; absent = the row's
   // kind names no queue, never a fake zero.
   queue_depth?: number;
+  // The oMLX KV/rate axis: the engine's own since-boot `cache_efficiency`
+  // ratio (0..1) and `avg_prefill_tps` / `avg_generation_tps`. ADD keys —
+  // display only; absent = the read named no such axis.
+  cache_efficiency?: number;
+  avg_prefill_tps?: number;
+  avg_generation_tps?: number;
 };
 
 export type ServerRow = {

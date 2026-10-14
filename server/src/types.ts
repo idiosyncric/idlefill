@@ -1143,6 +1143,16 @@ export interface IdleSignal {
    */
   model_mem_used_bytes?: number;
   model_mem_max_bytes?: number;
+  /**
+   * The oMLX KV/rate axis (the flow view's cache + t/s cards): the engine's
+   * own since-boot `cache_efficiency` ratio (0..1) and `avg_prefill_tps` /
+   * `avg_generation_tps` rates, verbatim from `/api/status`. Display only —
+   * never a verdict input, never a granted-token figure. Absent = the read
+   * named no such axis. ADD keys.
+   */
+  cache_efficiency?: number;
+  avg_prefill_tps?: number;
+  avg_generation_tps?: number;
 }
 
 export type EventKind =

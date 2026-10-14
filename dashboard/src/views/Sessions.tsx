@@ -57,10 +57,11 @@ import {
   type SessionTranscript,
   type StateSnapshot,
 } from "@/lib/api";
-import { ago, durFmt, isOnline, liveWord, sessGateLabelText, sessStateWord, sessStale } from "@/lib/format";
+import { ago, durFmt, fmt, isOnline, liveWord, sessGateLabelText, sessStateWord, sessStale } from "@/lib/format";
 import { engineEdge, type EngineEdge } from "@/lib/session-edge";
 import { sessionTiles } from "@/lib/session-stats";
 import { flowPipePath, pipeClass, pipeEdge, pipeTitle, type PipeEdge } from "@/lib/pipe-phases";
+import { foreignActivity, sessionCardFacts, type SessionCardFacts } from "@/lib/flow-cards";
 import { StatTiles, TilesSkeleton } from "@/components/stat-tiles";
 
 const TONE: Record<string, string> = {
@@ -1077,16 +1078,23 @@ function RerouteChooser({ st, s, onClose }: { st: StateSnapshot; s: SessionRow; 
 
 // ---------------------------------------------------------------------------
 // The #67 flow view, #74-ported: the same published payload drawn as a live
-// surface. Left: sessions grouped by the model name they ask for. Right: the
-// engine rows with their load (counts read from the session rows — arbiter
-// truth). The GRID stays the functional surface — the D4 edge labels and
-// exception annotations render exactly as before, and the pin select on the
-// rows-mode row is the re-route (the same write, POST /api/sessions/:token/pin).
-// NEW: orthogonal SVG connectors (session→engine, #67-style) paint on top,
-// phase-colored by the pure mapping in lib/pipe-phases.ts. The SVG is
-// aria-hidden decoration carrying the SAME tooltip text as the grid edge; the
-// row semantics already carry everything a screen reader needs. Geometry is
-// measured from the rendered DOM on each poll — zero new network calls.
+// surface. Left: sessions as compact cards (agent profile, session id, age,
+// model, engine-reported rates, ledger Ctx/Turns) grouped by the model name
+// they ask for. Right: the engine rows as cards with their load (counts read
+// from the session rows — arbiter truth). The GRID stays the functional
+// surface — the D4 edge labels and exception annotations render exactly as
+// before, and the pin select on the rows-mode row is the re-route (the same
+// write, POST /api/sessions/:token/pin). Orthogonal SVG connectors (session→
+// engine, #67-style) paint on top, phase-colored by the pure mapping in
+// lib/pipe-phases.ts, anchored to the CARD borders so every pipe visibly
+// meets the card it names — not the far corner of a column-wide text row.
+// NEW: the "Outside idlefill" cards — engines whose own status names more
+// in-flight requests than the router holds are carrying conversations that
+// never registered a session; detected by pure arithmetic in lib/flow-cards.ts.
+// The SVG is aria-hidden decoration carrying the SAME tooltip text as the grid
+// edge; the card text already carries everything a screen reader needs.
+// Geometry is measured from the rendered DOM on each poll — zero new network
+// calls.
 // ---------------------------------------------------------------------------
 
 const cssSafe = (s: string) => String(s).replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -1100,6 +1108,7 @@ function FlowView({ st }: { st: StateSnapshot }) {
   type SessNode = {
     token: string;
     short: string;
+    sid: string | null;
     host: string;
     stale: boolean;
     group: string;
@@ -1107,11 +1116,12 @@ function FlowView({ st }: { st: StateSnapshot }) {
     edge: EngineEdge;
     pipe: PipeEdge;
     engineName: string;
+    facts: SessionCardFacts;
   };
   const nodes: SessNode[] = [];
   const groups = new Map<string, SessNode[]>();
   for (const s of rows) {
-    const g = s.history?.model ?? "(unseen model)";
+    const g = s.history?.model ?? s.hermes_meta?.model ?? "(unseen model)";
     const target = s.engine_pin?.server_id ?? s.server_id ?? engines[0]?.id ?? "";
     const edgeSignal =
       (st.servers ?? []).find((r) => r.id === (s.engine_pin?.server_id ?? s.server_id ?? ""))?.signal ?? null;
@@ -1119,6 +1129,7 @@ function FlowView({ st }: { st: StateSnapshot }) {
     const node: SessNode = {
       token: s.token,
       short: String(s.token ?? "").slice(0, 8),
+      sid: s.session_id ?? null,
       host: s.client_name ?? "unknown host",
       stale: sessStale(s, st.now),
       group: g,
@@ -1126,6 +1137,7 @@ function FlowView({ st }: { st: StateSnapshot }) {
       edge,
       pipe: pipeEdge(s, edge, st.now),
       engineName: engines.find((e) => e.id === edge.target)?.name ?? edge.target ?? "",
+      facts: sessionCardFacts(s, edgeSignal, st.now),
     };
     nodes.push(node);
     const list = groups.get(g) ?? [];
@@ -1144,9 +1156,16 @@ function FlowView({ st }: { st: StateSnapshot }) {
     else if (s.gate?.state === "active" || (s.last_activity != null && st.now - s.last_activity < 30_000)) l.active += 1;
   }
 
-  // The connector geometry: measure the rendered nodes, draw the pipes. Runs
+  // "Outside idlefill": an engine whose OWN status names more in-flight work
+  // than the router holds is carrying conversations that never registered a
+  // /s/<token> session. Pure arithmetic on the payload already in hand — the
+  // kinds with no in-flight axis (llama-swap) never produce a row.
+  const foreign = foreignActivity(st, engines);
+
+  // The connector geometry: measure the rendered cards, draw the pipes. Runs
   // after each render of this view (the 5s poll re-runs it); no fetch, no
-  // timers — pure DOM arithmetic on the state already in hand.
+  // timers — pure DOM arithmetic on the state already in hand. The anchors
+  // are the CARD borders, so every pipe visibly meets the card it names.
   const boxRef = React.useRef<HTMLDivElement | null>(null);
   const [paths, setPaths] = React.useState<PipePath[]>([]);
   React.useEffect(() => {
@@ -1175,6 +1194,25 @@ function FlowView({ st }: { st: StateSnapshot }) {
         ey: y2,
       });
     }
+    for (const f of foreign) {
+      const sEl = box.querySelector(`[data-flow-node="foreign:${cssSafe(f.engineId)}"]`);
+      const eEl = box.querySelector(`[data-flow-node="engine:${cssSafe(f.engineId)}"]`);
+      if (!sEl || !eEl) continue;
+      const sr = sEl.getBoundingClientRect();
+      const er = eEl.getBoundingClientRect();
+      const x1 = sr.right - b.left + 2;
+      const y1 = (sr.top + sr.bottom) / 2 - b.top;
+      const x2 = er.left - b.left - 2;
+      const y2 = (er.top + er.bottom) / 2 - b.top;
+      out.push({
+        token: `foreign:${f.engineId}`,
+        d: flowPipePath(x1, y1, x2, y2, 10),
+        cls: pipeClass({ phase: "base", dashed: false, animated: false, muted: true, reason: "outside idlefill" }),
+        title: `engine ${serverName(st, f.engineId)} carries ${f.foreign} request${f.foreign === 1 ? "" : "s"} the router never registered — the engine names ${f.inFlight} in-flight, ${f.idlefillSlots} belong to idlefill sessions`,
+        ex: x2,
+        ey: y2,
+      });
+    }
     setPaths(out);
   }, [st]);
 
@@ -1196,23 +1234,71 @@ function FlowView({ st }: { st: StateSnapshot }) {
                 <div className="mb-0.5 text-[12px]">
                   <b>{g}</b> <span className="text-dim">— {counts}</span>
                 </div>
-                <div className="flex flex-col gap-0.5">
+                <div className="flex flex-col gap-1">
                   {members.map((s) => (
                     <div
                       key={s.token}
                       data-flow-node={`sess:${cssSafe(s.token)}`}
-                      className={`flex items-center gap-2 text-[12px] ${s.stale ? "opacity-60" : ""}`}
+                      className={`flex max-w-[360px] flex-col gap-0.5 rounded-md border border-border bg-panel px-2 py-1.5 ${s.stale ? "opacity-60" : ""}`}
                     >
-                      <span className={`size-1.5 rounded-full ${s.stale ? "bg-border" : "bg-ok"}`} />
-                      <span className="font-mono text-[11px]">{s.short}</span>
-                      <span className="text-[11px] text-dim">@{s.host}</span>
+                      {/* header: the session's identity — id, owning agent
+                          profile (exact provenance, never inferred), age. */}
+                      <div className="flex items-center gap-1.5 text-[11px]">
+                        <span
+                          className={`size-1.5 shrink-0 rounded-full ${s.stale ? "bg-border" : "bg-ok"}`}
+                          title={s.stale ? "stale (no heartbeat within 90s)" : "live (heartbeat within 90s)"}
+                        />
+                        <span
+                          className="font-mono font-semibold"
+                          title={`session ${s.token}${s.sid ? ` — hermes ${s.sid}` : ""}`}
+                        >
+                          {s.short}
+                        </span>
+                        <span
+                          className="text-[10px] text-dim"
+                          title={s.facts.profile ? "the agent profile that owns this session — provenance: the profile ledger the gateway row was read from (exact, never inferred)" : "the client this session registered from — no profile provenance reported"}
+                        >
+                          {s.facts.profile ? `agent ${s.facts.profile}` : `@${s.host}`}
+                        </span>
+                        <span className="ml-auto text-[10px] text-dim" title="session age at the arbiter — since its first registered request">
+                          {durFmt(s.facts.ageS)}
+                        </span>
+                      </div>
+                      {/* the model it asks for, plus the engine's OWN reported
+                          rates (since-boot averages — labelled as such). */}
+                      <div className="flex flex-wrap items-center gap-x-1.5 text-[11px]">
+                        <span>{s.group}</span>
+                        {s.facts.genTps != null && (
+                          <span className="text-[10px] text-dim" title="the engine's own reported average decode rate (since-boot average from its status read)">
+                            ≈{fmt(Math.round(s.facts.genTps))} t/s
+                          </span>
+                        )}
+                        {s.facts.prefillTps != null && (
+                          <span className="text-[10px] text-dim" title="the engine's own reported average prompt-eval (prefill) rate (since-boot)">
+                            ≈{fmt(Math.round(s.facts.prefillTps))} t/s prefill
+                          </span>
+                        )}
+                      </div>
+                      {(s.facts.ctx != null || s.facts.turns != null || s.facts.cachePct != null) && (
+                        <div className="flex flex-wrap gap-x-1.5 text-[10px] text-dim">
+                          {s.facts.ctx != null && (
+                            <span title="input tokens recorded for this session in the gateway ledger">Ctx: {fmt(s.facts.ctx)}</span>
+                          )}
+                          {s.facts.turns != null && (
+                            <span title="messages recorded for this session in the gateway ledger">Turns: {fmt(s.facts.turns)}</span>
+                          )}
+                          {s.facts.cachePct != null && (
+                            <span title="KV-cache hit ratio reported by the engine itself (since boot) — engine-level, not per-session">Cache: {s.facts.cachePct}% hit</span>
+                          )}
+                        </div>
+                      )}
                       {/* D4: the labelled session→engine edge (no graph
                           library — the engine column carries the posture
                           word). Warn = the slow heuristic fired. The SVG
-                          pipe on this row carries the identical title. */}
+                          pipe on this card carries the identical title. */}
                       {s.edge.target && (
                         <span
-                          className={`text-[11px] ${s.edge.slow ? "text-warn" : "text-dim"}`}
+                          className={`text-[10px] ${s.edge.slow ? "text-warn" : "text-dim"}`}
                           title={pipeTitle(s.short, s.engineName, s.edge, s.pipe)}
                         >
                           → {s.engineName || s.edge.target}
@@ -1225,6 +1311,27 @@ function FlowView({ st }: { st: StateSnapshot }) {
               </div>
             );
           })}
+          {foreign.length > 0 && (
+            <div className="flex flex-col gap-1">
+              <div className="text-[11px] font-semibold uppercase tracking-wide text-dim">Outside idlefill</div>
+              {foreign.map((f) => (
+                <div
+                  key={f.engineId}
+                  data-flow-node={`foreign:${cssSafe(f.engineId)}`}
+                  className="flex max-w-[360px] flex-col gap-0.5 rounded-md border border-dashed border-border bg-panel px-2 py-1.5"
+                >
+                  <div className="flex items-center gap-1.5 text-[11px]">
+                    <span className="size-1.5 shrink-0 rounded-full bg-warn" title="the engine's own status names live traffic the router never registered" />
+                    <span>{f.foreign} request{f.foreign === 1 ? "" : "s"} outside the router</span>
+                    <span className="ml-auto text-[10px] text-dim">→ {serverName(st, f.engineId)}</span>
+                  </div>
+                  <div className="text-[10px] text-dim" title="the engine's status reports more in-flight requests than idlefill sessions hold — the remainder is direct traffic aimed at the engine, never seen by any /s/<token> session">
+                    engine names {fmt(f.inFlight)} in-flight · {fmt(f.idlefillSlots)} idlefill
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
         <div className="flex flex-col gap-2">
           <div className="text-[11px] font-semibold uppercase tracking-wide text-dim">Inference engines</div>
@@ -1233,19 +1340,38 @@ function FlowView({ st }: { st: StateSnapshot }) {
             const sig = e.signal;
             const w = liveWord(sig ? { idle: sig.idle, degraded: sig.degraded } : null, l.active > 0);
             return (
-              <div key={e.id} data-flow-node={`engine:${cssSafe(e.id)}`} className="flex items-center gap-2 text-[12px]">
-                <span
-                  className={`size-1.5 shrink-0 rounded-full ${sig?.degraded ? "bg-err" : sig ? (sig.idle ? "bg-border" : "bg-accent") : "bg-border"}`}
-                  title={`${e.name}: ${w.label}`}
-                />
-                <span className="font-semibold">{e.name}</span>
-                <span className="ml-auto text-[11px] text-dim" title="sessions routing here: active / queued">
-                  {l.active} act · {l.queued} q
-                </span>
-                <span className={`whitespace-nowrap text-[11px] font-semibold ${TONE[w.tone]}`} title={w.note}>
-                  {w.label}
-                  {sig?.idle && sig.idle_for_s != null ? ` · ${durFmt(sig.idle_for_s)}` : ""}
-                </span>
+              <div
+                key={e.id}
+                data-flow-node={`engine:${cssSafe(e.id)}`}
+                className="flex flex-col gap-0.5 rounded-md border border-border bg-panel px-2 py-1.5"
+              >
+                <div className="flex items-center gap-1.5 text-[11px]">
+                  <span
+                    className={`size-1.5 shrink-0 rounded-full ${sig?.degraded ? "bg-err" : sig ? (sig.idle ? "bg-border" : "bg-accent") : "bg-border"}`}
+                    title={`${e.name}: ${w.label}`}
+                  />
+                  <span className="font-semibold">{e.name}</span>
+                  <span className="ml-auto text-[10px] text-dim" title="sessions routing here: active / queued">
+                    {l.active} act · {l.queued} q
+                  </span>
+                  <span className={`whitespace-nowrap text-[10px] font-semibold ${TONE[w.tone]}`} title={w.note}>
+                    {w.label}
+                    {sig?.idle && sig.idle_for_s != null ? ` · ${durFmt(sig.idle_for_s)}` : ""}
+                  </span>
+                </div>
+                {(sig?.cache_efficiency != null || sig?.avg_generation_tps != null || sig?.avg_prefill_tps != null) && (
+                  <div className="flex flex-wrap gap-x-1.5 text-[10px] text-dim">
+                    {typeof sig?.cache_efficiency === "number" && sig.cache_efficiency <= 1 && (
+                      <span title="KV-cache hit ratio, the engine's own reported number (since boot)">KV cache: {Math.round(sig.cache_efficiency * 100)}% hit</span>
+                    )}
+                    {typeof sig?.avg_generation_tps === "number" && (
+                      <span title="average decode rate the engine reports (since-boot average)">≈{fmt(Math.round(sig.avg_generation_tps))} t/s gen</span>
+                    )}
+                    {typeof sig?.avg_prefill_tps === "number" && (
+                      <span title="average prompt-eval (prefill) rate the engine reports (since-boot average)">≈{fmt(Math.round(sig.avg_prefill_tps))} t/s prefill</span>
+                    )}
+                  </div>
+                )}
               </div>
             );
           })}
@@ -1264,7 +1390,7 @@ function FlowView({ st }: { st: StateSnapshot }) {
         </svg>
       </CardContent>
       <div className="border-t border-border px-4 py-1.5 text-[11px] text-dim">
-        the connectors draw the session→engine edge the rows already name — the pin select on a row (rows mode) re-routes it; the agent never learns the engine changed
+        the connectors draw the session→engine edge the rows already name — the pin select on a row (rows mode) re-routes it; the agent never learns the engine changed. the “outside idlefill” cards appear only when an engine&apos;s own status names more in-flight requests than the router holds — the engine&apos;s count, never a guess
       </div>
     </Card>
   );

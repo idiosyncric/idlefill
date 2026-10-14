@@ -274,8 +274,11 @@ test('parseOmlxStatus: the idle 0.7.0 envelope → REAL zero counts, model_loade
     omlx_loaded_count: 0,
     model_mem_used_bytes: 0,
     model_mem_max_bytes: 38332312276,
+    cache_efficiency: 0.41,
+    avg_prefill_tps: 312.5,
+    avg_generation_tps: 128.7,
     counters: { requests: 4211, tokens_in: 8123456, tokens_out: 987654, tokens_cached: 123456 },
-  }, 'the payload names no loaded model when nothing is resident (D5/D8); the mem keys + the internal counters block ride');
+  }, 'the payload names no loaded model when nothing is resident (D5/D8); the mem keys + the KV axis + the internal counters block ride');
 });
 
 test('parseOmlxStatus: a busy envelope → in_flight=active_requests, queue_depth=waiting_requests, real loaded ids + quant', () => {
@@ -296,8 +299,24 @@ test('parseOmlxStatus: a busy envelope → in_flight=active_requests, queue_dept
       omlx_loaded_count: 1,
       model_mem_used_bytes: 12345678,
       model_mem_max_bytes: 38332312276,
+      cache_efficiency: 0.41,
+      avg_prefill_tps: 312.5,
+      avg_generation_tps: 128.7,
       counters: { requests: 4211, tokens_in: 8123456, tokens_out: 987654, tokens_cached: 123456 },
     },
+  );
+});
+
+test('parseOmlxStatus: the KV axis is tolerant — a named ratio outside [0,1] or garbage drops the KEY', () => {
+  assert.deepEqual(
+    parseOmlxStatus({ active_requests: 0, cache_efficiency: 1.7, avg_prefill_tps: -2, avg_generation_tps: 'oops' }),
+    { in_flight: 0 },
+    'out-of-range/negative/non-number KV values never ride — no fake axis, no fake zero',
+  );
+  assert.deepEqual(
+    parseOmlxStatus({ active_requests: 0, cache_efficiency: 0.85, avg_generation_tps: 96.1 }),
+    { in_flight: 0, cache_efficiency: 0.85, avg_generation_tps: 96.1 },
+    'a named axis rides verbatim; an unnamed one stays ABSENT',
   );
 });
 

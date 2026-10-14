@@ -74,6 +74,12 @@ export interface LoadReading {
   model_mem_used_bytes?: number;
   /** oMLX `/api/status` `model_memory_max` — the model pool's RAM ceiling. ADD key. */
   model_mem_max_bytes?: number;
+  /** oMLX `/api/status` `cache_efficiency` — the engine-reported KV-cache hit ratio (0..1, since boot). Display only, never a verdict input. Absent = the read named no cache axis. ADD key. */
+  cache_efficiency?: number;
+  /** oMLX `/api/status` `avg_prefill_tps` — engine-reported prompt-eval rate (tokens/s, since-boot average). Display only. ADD key. */
+  avg_prefill_tps?: number;
+  /** oMLX `/api/status` `avg_generation_tps` — engine-reported decode rate (tokens/s, since-boot average). Display only. ADD key. */
+  avg_generation_tps?: number;
   /**
    * The oMLX status envelope's since-boot counters (`total_requests`,
    * `total_prompt_tokens`, `total_completion_tokens`,
@@ -146,6 +152,11 @@ export interface LoadSignalView {
    */
   model_mem_used_bytes?: number;
   model_mem_max_bytes?: number;
+  /** oMLX-reported KV-cache hit ratio (0..1, since-boot). Display only — the flow view's cache axis. ADD key. */
+  cache_efficiency?: number;
+  /** oMLX-reported prompt-eval / decode rates (tokens/s, since-boot averages). Display only. ADD keys. */
+  avg_prefill_tps?: number;
+  avg_generation_tps?: number;
 }
 
 /** Minimal response shape the collectors need (a real fetch Response fits). */
@@ -285,6 +296,9 @@ export function parseOmlxStatus(body: unknown): {
   omlx_loaded_count?: number;
   model_mem_used_bytes?: number;
   model_mem_max_bytes?: number;
+  cache_efficiency?: number;
+  avg_prefill_tps?: number;
+  avg_generation_tps?: number;
   /** INTERNAL (stripped at publish): the status envelope's since-boot counters. */
   counters?: EngineCounters;
 } | null {
@@ -333,6 +347,24 @@ export function parseOmlxStatus(body: unknown): {
         ...(memUsed !== undefined ? { model_mem_used_bytes: memUsed } : {}),
         ...(memMax !== undefined ? { model_mem_max_bytes: memMax } : {}),
       };
+    })(),
+    // The KV/rate axis (the flow view's cache + t/s cards): the engine's
+    // own since-boot numbers, tolerant per key — a value that is not a
+    // finite non-negative number drops the KEY (never a fake zero). The
+    // ratio is clamped to [0,1]; an out-of-range value is not the axis.
+    ...(() => {
+      const keys: {
+        cache_efficiency?: number;
+        avg_prefill_tps?: number;
+        avg_generation_tps?: number;
+      } = {};
+      const cache = count(j.cache_efficiency);
+      if (cache !== undefined && cache <= 1) keys.cache_efficiency = cache;
+      const prefill = count(j.avg_prefill_tps);
+      if (prefill !== undefined) keys.avg_prefill_tps = prefill;
+      const gen = count(j.avg_generation_tps);
+      if (gen !== undefined) keys.avg_generation_tps = gen;
+      return keys;
     })(),
     ...(counters ? { counters } : {}),
   };
