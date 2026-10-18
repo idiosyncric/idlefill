@@ -1451,6 +1451,19 @@ export class ClientDaemon {
       // daemon without a Hermes home (or with aggregate_port=0) omits it —
       // the roster pane hides rather than showing an empty list.
       ...(roster ? { agent_roster: roster } : {}),
+      // Egress self-diagnosis (the 2026-10-18 firewall-blindness fix): the
+      // aggregate router's RECENT connection-level forward failures, per
+      // engine row — the machine testifying that its own sockets to the
+      // engines are broken (errno + row + age), which no arbiter-side view
+      // can see (engine rows stay green because the ENGINES register
+      // themselves). Exception-only on the ROW (the arbiter deletes the key
+      // on an empty report), but the KEY itself is published on every tick
+      // whenever an aggregate router exists — an explicit `[]` is the
+      // "egress recovered" report that clears the stored badge within one
+      // heartbeat (the client_log rule, not the sticky gate_posture rule).
+      // ADD-key: an old arbiter ignores it; a daemon without the aggregate
+      // listener omits it.
+      ...(this.aggregate ? { egress_failures: this.aggregate.egressFailures() } : {}),
       // Code-staleness verdict (#61 step 3 A1): the client is the ONLY
       // process holding both facts — the boot revision it loaded code from
       // and the live HEAD of the same checkout (it runs FROM that tree).
@@ -2002,6 +2015,19 @@ export class ClientDaemon {
       // posture + which profiles carry a key (NEVER the values), PUT
       // persists the enable flag (config.json block) and the per-profile
       // keys (0600 key file). Restart stays a launchd action, same promise.
+      // Egress self-test: the dashboard's "run it now" probe, answered by
+      // THIS process (whose egress is the one that forwards agent traffic).
+      // Targets are read at CLICK time: the arbiter URL, the machine's
+      // default target, and the aggregate's live engine rows (empty when no
+      // aggregate listener — the arbiter + target lines still answer).
+      clientSelfTest: {
+        token: this.cfg.token,
+        targets: () => ({
+          arbiter: this.cfg.server_url,
+          default_target: this.cfg.llm_target,
+          engines: this.aggregate ? this.aggregate.engineRows() : [],
+        }),
+      },
       clientHermes: {
         token: this.cfg.token,
         configPath: this.cfg.config_path ?? null,

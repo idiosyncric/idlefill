@@ -518,6 +518,21 @@ export interface ClientRecord {
    */
   agent_roster?: AgentRosterRow[];
   /**
+   * Egress self-diagnosis (the 2026-10-18 firewall-blindness fix): the
+   * client's OWN recent connection-level forward failures against engine
+   * rows — the pair (row, errno) the aggregate listener recorded when its
+   * socket to an engine died (EHOSTUNREACH, EACCES, ETIMEDOUT…). No
+   * arbiter-side view can see this: engine rows stay green because the
+   * ENGINES register themselves, while the machine that cannot reach them
+   * says nothing. The client publishes the KEY on every heartbeat whenever
+   * its aggregate listener exists — an explicit EMPTY report is the
+   * "recovered" signal that CLEARS the stored exception within one
+   * heartbeat (the client_log rule: present replaces, cleaned-empty
+   * deletes, absent (old client / no aggregate) never clears). Surfaces
+   * render it exception-only: no key = the healthy machine.
+   */
+  egress_failures?: EgressFailure[];
+  /**
    * #73: the version of the Hermes gateway the client's GATEWAY API
    * connector reached (from the gateway's unauthenticated
    * `GET /v1/health` — the inbound plane, the OBSERVED complement to the
@@ -645,6 +660,25 @@ export interface AgentRosterRow {
   provider?: string;
   /** The endpoint URL justifying the posture (absent for unset / userinfo). */
   base_url?: string;
+}
+
+/**
+ * Egress self-diagnosis: one row of a client's published `egress_failures`
+ * — the last connection-level forward failure its aggregate listener saw
+ * against one engine row. The client records it where the truth lives (the
+ * forwarding socket's errno); the arbiter re-sanitizes on arrival
+ * (`cleanEgressFailures`) and stores/echoes verbatim — it has no view of
+ * any client's network. Display only; never a gate.
+ */
+export interface EgressFailure {
+  /** The engine row the forward targeted (server_id). */
+  server_id: string;
+  /** The Node errno of the failed connect (EHOSTUNREACH, EACCES, …). */
+  code: string;
+  /** The engine host the connect attempted (hostname only). */
+  host: string;
+  /** Epoch-ms of the failed connect (the client's clock). */
+  at: number;
 }
 
 /**

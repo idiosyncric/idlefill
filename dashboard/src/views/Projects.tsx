@@ -14,6 +14,7 @@ import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { StatTiles, TilesSkeleton } from "@/components/stat-tiles";
 import { projectTiles } from "@/lib/project-stats";
+import { egressWord } from "@/lib/egress";
 import {
   Dialog,
   DialogContent,
@@ -364,6 +365,11 @@ function WorkerRowView({ w, projectName }: { w: WorkerRow; projectName: string }
   };
 
   const statKeys = Object.keys(w.stats ?? {});
+  // Egress self-diagnosis (exception-only): the worker's OWN broken sockets
+  // to engine rows — invisible from any engine-side view. Date.now() is the
+  // honest clock here (the row re-renders on the page's 5 s poll; ages ride
+  // the client-reported epoch-ms, not the poll instant).
+  const egress = egressWord(w.egress_failures, Date.now());
 
   return (
     <div className="flex flex-col gap-0.5">
@@ -390,6 +396,11 @@ function WorkerRowView({ w, projectName }: { w: WorkerRow; projectName: string }
         {w.daemon_behind === true && (
           <Badge variant="outline" className="rounded-pill border-warn/50 px-1.5 py-0 text-[10px] font-normal text-warn" title="this daemon runs code older than its own checkout — restart it (native toolbar, or launchctl kickstart) to pick up the current tree">
             daemon behind
+          </Badge>
+        )}
+        {egress && (
+          <Badge variant="outline" className={`rounded-pill px-1.5 py-0 text-[10px] font-normal ${egress.tone === "err" ? "border-err/50 text-err" : "border-warn/50 text-warn"}`} title={egress.note}>
+            {egress.label}
           </Badge>
         )}
         <span className="text-[11px] text-dim">

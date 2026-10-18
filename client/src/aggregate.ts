@@ -11,13 +11,14 @@
  *     engine, adding that row's Authorization header from the router's
  *     IN-MEMORY key table (pull-scoped loopback route #64 D2 — tokens
  *     are never persisted, never logged, never re-published);
- *   - falls back to the machine's default `llm_target` (exact today
- *     behavior) for an unknown/absent model or an empty catalog —
- *     NARROWED by alias-stability D2 (2026-10-12): a name this process
- *     has EVER seen in a published `model_aliases` block, resolving in
- *     neither the alias map nor the bare catalog, NEVER falls through —
- *     it answers local 503 `model_unavailable` (OpenAI body, zero bytes
- *     upstream, before the gate);
+ *   - NEVER routes a named model to the machine's default `llm_target` —
+ *     route-hold (owner posture 2026-10-18): a model name that resolves in
+ *     neither map HOLDS (body unconsumed, before the gate, zero upstream
+ *     bytes) until a poll makes it routable, then proceeds exactly like a
+ *     request dispatched after the update; on hold-expiry it answers local
+ *     503 `model_unavailable` (OpenAI body). A POST naming no model answers
+ *     local 400 `invalid_request_error`. `llm_target` remains the
+ *     GET/DELETE/HEAD passthrough base only (it never receives POST bytes);
  *   - runs 8800 traffic through the SAME gate (D5: one shared slot cap —
  *     a second gate instance would double the cap against shared engines).
  *
@@ -38,11 +39,14 @@
  * posture, 2026-10-06: the llama.cpp family drops chunked bodies). Every
  * non-aliased route keeps today's `req.pipe` posture byte-for-byte.
  *
- * The #45 trap this walks around: the model is sniffed from the FIRST
- * body chunk, then the chunk is put BACK (`unshift`) and the stream
- * paused, so a parked request keeps its body unconsumed and the
- * forward-on-admission pipes it intact. No standing `data` listener ever
- * attaches to a parked req.
+ * The #45 trap this walks around: the model is sniffed from the body
+ * WITHOUT consuming it — the sniffed chunks go back (`unshift`) and the
+ * stream pauses again, so a parked request keeps its body unconsumed and
+ * the forward-on-admission pipes it intact. No standing `data` listener
+ * ever attaches to a parked req. Since 2026-10-18 the sniff ACCUMULATES
+ * chunks until the `"model"` field matches (the first-chunk-only sniff
+ * could miss the field when a huge leading value pushed it past the first
+ * TCP chunk — that miss is the 2026-10-18 hypnotist incident).
  */
 
 import http from 'node:http';
@@ -112,6 +116,62 @@ export interface AggregateAliasFallbackTarget {
 }
 
 /**
+ * Egress self-diagnosis: one recent connection-level forward failure against
+ * a catalog row. The silent-failure case this exists for: an engine-local
+ * view (arbiter state, peer snapshots) can stay green while THIS process
+ * cannot open a single socket to the engine (firewall block, dead route —
+ * the 2026-10-18 Little Snitch incident: every hypnotist request died as a
+ * 502 `llm target down` while every dashboard tile looked healthy). The
+ * router answers the 502 either way; the difference now is that the pair
+ * (server_id, errno) is RECORDED here, aged out on recovery, published on
+ * the register heartbeat as `egress_failures`, and rendered by the
+ * dashboard — the machine itself testifies when its own egress is broken.
+ */
+export interface AggregateEgressFailure {
+  server_id: string;
+  /** The Node errno code of the failed connect (EHOSTUNREACH, EACCES, …). */
+  code: string;
+  /** The engine host the connect attempted (hostname only — no path, no token). */
+  host: string;
+  /** Epoch-ms of the failed connect. */
+  at: number;
+}
+
+/**
+ * Egress self-diagnosis: which errno codes count as "this process could not
+ * reach the row". The set is connection-level on purpose: HTTP statuses
+ * (even 401/500) PROVE egress and record nothing; these codes mean the
+ * socket itself failed — refused/reset (row down), unreachable/un-net/
+ * timeout (route or firewall), EACCES (a local policy DENIED the connect —
+ * the exact firewall signature), DNS (ENOENT/EAI_AGAIN). EPIPE (mid-stream
+ * reset after bytes flowed) is NOT egress failure and records nothing.
+ */
+const EGRESS_CODES = new Set([
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'ECONNABORTED',
+  'EHOSTUNREACH',
+  'EHOSTDOWN',
+  'ENETUNREACH',
+  'ENETDOWN',
+  'ENETHOSTDOWN',
+  'ETIMEDOUT',
+  'EACCES',
+  'ENOENT',
+  'ENOTFOUND',
+  'EAI_AGAIN',
+]);
+
+/** Egress self-diagnosis: how long a recorded failure stays publishable.
+ *  A row that answers again clears its entry at the response seam, so the
+ *  TTL only ages out entries no one exercised (a quiet row is not proof of
+ *  recovery — but 15 min without traffic is not worth a badge either). */
+export const EGRESS_FAILURE_TTL_MS = 15 * 60_000;
+
+/** Egress self-diagnosis: heartbeat publish cap (rows per machine). */
+export const EGRESS_FAILURE_CAP = 8;
+
+/**
  * alias-stability D3: validate the published `fallback_targets` array
  * (drop-don't-reject, the established posture): a non-array = undefined
  * (the key is absent); a malformed element drops individually; an empty
@@ -147,6 +207,27 @@ export const QUEUE_DIGEST_FRESH_MS = 20_000;
  * traffic never buffers: today's `req.pipe` posture byte-for-byte.
  */
 export const ALIAS_BODY_BUFFER_CAP = 64 * 1024 * 1024; // 64 MiB
+
+/**
+ * route-hold (owner posture 2026-10-18): the default hold window — how long
+ * a request naming an unresolvable model waits for a serving engine to
+ * appear before the named 503. 120 s mirrors the session gate's hold cap
+ * (the arbiter re-publishes every ~15 s, so one poll cycle is minutes away
+ * from a whole window). Configurable via `aggregate_route_wait_ms`; `0`
+ * means "no hold — answer the named 503 at once".
+ */
+export const ROUTE_HOLD_DEFAULT_MS = 120_000;
+
+/** route-hold: the hard ceiling on `aggregate_route_wait_ms` (garbage-proof). */
+export const ROUTE_HOLD_MAX_MS = 15 * 60_000;
+
+/**
+ * route-hold: how many requests may wait on unresolvable names at once.
+ * Beyond the cap a request answers the named 503 immediately (the queue is
+ * a churn absorber, not an unbounded park lot — a dead engine for minutes
+ * with a retry-looping client must not pile up unbounded held sockets).
+ */
+export const ROUTE_HOLD_CAP = 64;
 
 /** One row of GET /api/server-keys (loopback-scoped pull, #64 D2). */
 export interface ServerKeyRow {
@@ -194,6 +275,21 @@ export interface AggregateRouter {
   catalogSize(): number;
   /** Current alias size (tests + live check). */
   aliasSize(): number;
+  /**
+   * Egress self-diagnosis: the recent connection-level forward failures this
+   * process observed, per row (freshest first, ≤ EGRESS_FAILURE_CAP, aged at
+   * EGRESS_FAILURE_TTL_MS). The register heartbeat publishes this verbatim as
+   * `egress_failures` — an EMPTY array is still returned (and published)
+   * when nothing is failing: the explicit empty report is what CLEARS the
+   * arbiter's stored exception (the client_log rule).
+   */
+  egressFailures(): AggregateEgressFailure[];
+  /**
+   * Egress self-test: the engine rows this router routes to (catalog +
+   * aliases + published failover targets, deduped by server_id, first url
+   * wins) — the probe list the loopback `/client/egress-test` surface walks.
+   */
+  engineRows(): { server_id: string; url: string }[];
   stop(): Promise<void>;
 }
 
@@ -228,7 +324,7 @@ function cleanKey(v: unknown): string | undefined {
  * quoted `model` value from the requested alias to the engine's OWN id.
  *
  * The regex is the SNIFF's own class, character for character
- * (`peekModelFromFirstChunk` above, `client/src/session-gate.ts:183-187`):
+ * (`peekModelName` above, `client/src/session-gate.ts:183-187`):
  * rewrite feasibility is therefore identical to routing feasibility — the
  * same find, the same class. Only the FIRST match is replaced, and only
  * when the value equals the requested name exactly. Everything before and
@@ -254,39 +350,61 @@ export function spliceModelName(body: Buffer, fromModel: string, toModel: string
 }
 
 /**
- * #45 posture: read the model name out of the body's FIRST chunk without
- * consuming the stream — the chunk goes back via `unshift` and the stream
- * pauses again, so a parked request still pipes its full body on
- * admission (the #45 wedge: a standing `data` listener drains a parked
- * req and the forward-on-admission never finishes).
+ * How far into a body the model sniff reads before it gives up. A JSON body
+ * that carries no `"model"` field within this prefix is treated as naming no
+ * model. 1 MiB is far past every real chat body's sniff horizon while staying
+ * cheap (the bytes stay in the stream, never copied out of it).
  */
-function peekModelFromFirstChunk(req: http.IncomingMessage): Promise<string | undefined> {
+export const MODEL_PEEK_SCAN_CAP = 1024 * 1024;
+
+/**
+ * #45 posture: read the model name out of the body WITHOUT consuming it —
+ * the sniffed chunks go back via `unshift` and the stream pauses again, so a
+ * parked request keeps its body unconsumed and the forward-on-admission pipes
+ * it intact (the #45 wedge: a standing `data` listener drains a parked req
+ * and the forward-on-admission never finishes).
+ *
+ * SNIFF 2.0 (2026-10-18): the sniff ACCUMULATES chunks until the `"model"`
+ * field matches — reading ONLY the first TCP chunk misses the field whenever
+ * a huge leading value (a tool-result-heavy conversation) pushes it past that
+ * chunk. That miss is the 2026-10-18 hypnotist incident: the unnamed request
+ * fell to the machine default target, arrived at a keyed oMLX with the agent
+ * key stripped, and died as a baffling 401. Settles `undefined` only when the
+ * body ENDS (or aborts/closes) without the field inside the scan window —
+ * never just because the first chunk lacked it.
+ */
+function peekModelName(req: http.IncomingMessage): Promise<string | undefined> {
   return new Promise((resolvePeek) => {
     let settled = false;
+    let scanned = 0;
+    const chunks: Buffer[] = [];
     const settle = (model: string | undefined): void => {
       if (settled) return;
       settled = true;
+      req.removeListener('data', onChunk);
       req.removeListener('aborted', onEnd);
       req.removeListener('end', onEnd);
       req.removeListener('close', onEnd);
+      if (chunks.length > 0) req.unshift(Buffer.concat(chunks)); // put the bytes BACK — body stays whole
       req.pause(); // stop flowing again; the buffered body pipes on demand
       resolvePeek(model);
     };
     const onChunk = (chunk: Buffer): void => {
-      req.removeListener('data', onChunk);
-      req.unshift(chunk); // put the bytes BACK — body stays whole
-      const text = chunk.toString('utf8');
+      chunks.push(chunk);
+      scanned += chunk.length;
+      const text = Buffer.concat(chunks).toString('utf8');
       const m = /"model"\s*:\s*"([^"\\\x00-\x1f\x7f]{1,80})"/.exec(text);
-      settle(m ? m[1] : undefined);
+      // Only the field itself can settle a MATCH; absence settles only at
+      // the end of the body or the scan window (a split field must not read
+      // as "no model" — the incident shape).
+      if (m) settle(m[1]);
+      else if (scanned >= MODEL_PEEK_SCAN_CAP) settle(undefined);
     };
-    const onEnd = (): void => {
-      req.removeListener('data', onChunk);
-      settle(undefined);
-    };
-    req.once('aborted', onEnd);
-    req.once('end', onEnd);
-    req.once('close', onEnd);
-    req.once('data', onChunk);
+    const onEnd = (): void => settle(undefined);
+    req.on('aborted', onEnd);
+    req.on('end', onEnd);
+    req.on('close', onEnd);
+    req.on('data', onChunk);
   });
 }
 
@@ -327,6 +445,15 @@ export function startAggregateRouter(opts: {
    * demonstrably still working → extend the wait, never fail over.
    */
   queueDepthCap?: number;
+  /**
+   * route-hold (owner posture 2026-10-18): `aggregate_route_wait_ms` — how
+   * long a request naming a model with NO resolvable engine waits for one to
+   * appear (a republished alias/catalog pair, a mesh row returning) before
+   * the named 503. Absent = ROUTE_HOLD_DEFAULT_MS; `0` disables the hold
+   * (immediate named 503). The machine default target never receives a
+   * named POST at either setting.
+   */
+  routeHoldMs?: number;
 }): AggregateRouter {
   const log = opts.log ?? (() => {});
   const bodyCap = opts.aliasBodyCapBytes ?? ALIAS_BODY_BUFFER_CAP;
@@ -342,6 +469,26 @@ export function startAggregateRouter(opts: {
   /** D3: the watchdog runs only when BOTH knobs agree (failover + a real deadline). */
   const watchdogActive = slowHandling === 'failover' && ttfbTimeoutMs > 0;
   const target = new URL(opts.defaultTarget);
+  /**
+   * Egress self-diagnosis: server_id → the last connection-level forward
+   * failure this process saw against that row. One entry per row (the
+   * latest), replaced on every new failure, DELETED the moment a forward
+   * to that row gets ANY upstream response (headers are proof the socket
+   * works). Never persisted, never logged with a token — the entry is
+   * (server_id, errno, host, at), nothing else.
+   */
+  const egressFailures = new Map<string, AggregateEgressFailure>();
+  const noteForwardError = (serverId: string | undefined, base: URL, err: Error): void => {
+    if (serverId === undefined || serverId === '') return;
+    const code = (err as NodeJS.ErrnoException).code;
+    if (typeof code !== 'string' || !EGRESS_CODES.has(code)) return;
+    egressFailures.set(serverId, { server_id: serverId, code, host: base.hostname, at: Date.now() });
+  };
+  const noteForwardOk = (serverId: string | undefined): void => {
+    if (serverId !== undefined && egressFailures.delete(serverId)) {
+      log(`aggregate: egress recovered for ${serverId}`);
+    }
+  };
   let catalog: AggregateCatalogEntry[] = [];
   const catalogByName = new Map<string, AggregateCatalogEntry>();
   // #66 D2: the alias map rides BESIDE the catalog map, fed by the
@@ -360,6 +507,41 @@ export function startAggregateRouter(opts: {
    * agent key stripped → 401 from an unrelated engine).
    */
   const configuredAliasNames = new Set<string>();
+  /**
+   * route-hold (2026-10-18): the same monotonic memory for BARE catalog
+   * names — every name EVER accepted into the catalog, process-lifetime.
+   * Feeds the 503 wording only (a name this machine has ever served reads
+   * "configured … no engine currently serves it"; one it never knew reads
+   * "not served by any engine on this machine"). Routing never consults it:
+   * route-hold holds EVERY unresolvable named request, seen or not.
+   */
+  const configuredCatalogNames = new Set<string>();
+  /**
+   * route-hold (owner posture 2026-10-18): requests naming a model that
+   * resolves in NEITHER map wait HERE — never at `llm_target`. Each hold
+   * carries the dispatch continuation closed over an UNCONSUMED body (the
+   * #45 sniff posture), so a release forwards exactly what a post-update
+   * dispatch would have: same precedence, same gate, same splice, same
+   * `onSessionRoute`. `updateCatalog`/`updateAliases` flush after every map
+   * swap; a hold-expiry answers the named 503; a client abort drops it.
+   */
+  interface RouteHold {
+    model: string;
+    req: http.IncomingMessage;
+    res: http.ServerResponse;
+    rawUrl: string;
+    headerKey: string | undefined;
+    since: number;
+    timer: ReturnType<typeof setTimeout>;
+    drop: () => void;
+  }
+  const routeHolds: RouteHold[] = [];
+  /** Sanitized `aggregate_route_wait_ms` (absent/garbage → the default; `0` = hold OFF). */
+  const routeHoldMs = (() => {
+    const v = opts.routeHoldMs;
+    if (typeof v === 'number' && Number.isFinite(v) && v >= 0) return Math.min(Math.floor(v), ROUTE_HOLD_MAX_MS);
+    return ROUTE_HOLD_DEFAULT_MS;
+  })();
   /** In-memory engine keys (#64 D2) — never persisted, never logged. */
   let keys = new Map<string, string>();
   /**
@@ -500,6 +682,9 @@ export function startAggregateRouter(opts: {
     body: Buffer,
     onResponse?: (up: http.IncomingMessage) => void,
     onError?: (err: Error) => void,
+    /** Egress self-diagnosis: the row this dispatch targets (undefined = the
+     *  machine default target — no row, nothing to record). */
+    serverId?: string,
   ): http.ClientRequest => {
     const headers = copyRequestHeaders(req, authToken);
     delete headers['content-length'];
@@ -510,9 +695,17 @@ export function startAggregateRouter(opts: {
     const transport = base.protocol === 'https:' ? https : http;
     const upstream = transport.request(
       { ...upstreamOpts(base, req, headers), path: rawUrl },
-      onResponse ?? ((up) => relayUpstream(up, res)),
+      (up) => {
+        noteForwardOk(serverId); // any response = the socket works
+        (onResponse ?? ((u: http.IncomingMessage) => relayUpstream(u, res)))(up);
+      },
     );
-    upstream.on('error', onError ?? ((err) => {
+    upstream.on('error', (err) => {
+      noteForwardError(serverId, base, err);
+      if (onError) {
+        onError(err);
+        return;
+      }
       if (!res.headersSent) {
         res.writeHead(502, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: 'llm target down', detail: `${base.hostname}: ${err.message}` }));
@@ -523,7 +716,7 @@ export function startAggregateRouter(opts: {
           /* ignore */
         }
       }
-    }));
+    });
     upstream.end(body);
     return upstream;
   };
@@ -579,7 +772,9 @@ export function startAggregateRouter(opts: {
       if (!watchdogActive) {
         // BYTE-FOR-BYTE fence (D3 rule 6): `wait` mode or watchdog-off
         // installs NO timer — today's flow exactly, socket errors only.
-        sendBuffered(req, res, rawUrl, base, authToken, spliced);
+        // (Egress self-diagnosis rides the seams: recording adds no byte and
+        // no timer — the fence holds.)
+        sendBuffered(req, res, rawUrl, base, authToken, spliced, undefined, undefined, failoverCtx?.serverId);
         return;
       }
       // alias-stability D3 — the TTFB watchdog, THIS forward only (the
@@ -622,11 +817,13 @@ export function startAggregateRouter(opts: {
           sentBody,
           (up) => {
             if (ctx !== self) return; // an abandoned dispatch never relays over a newer one
+            noteForwardOk(serverId); // egress self-diagnosis: THIS attempt got a response
             clearTimer(); // response headers — the watchdog is DISARMED forever, the relay stands
             relayUpstream(up, res);
           },
           (err) => {
             if (ctx !== self) return; // destroyed by failover: its error is silence, not our event
+            noteForwardError(serverId, b, err); // egress self-diagnosis: only the CURRENT attempt's socket truth
             clearTimer();
             if (!res.headersSent) {
               res.writeHead(502, { 'content-type': 'application/json' });
@@ -701,6 +898,9 @@ export function startAggregateRouter(opts: {
     path: string,
     base: URL,
     authToken?: string | null,
+    /** Egress self-diagnosis: the row this forward targets (undefined = the
+     *  machine default target — no row, nothing to record). */
+    serverId?: string,
   ): void => {
     const headers = copyRequestHeaders(req, authToken);
     const transport = base.protocol === 'https:' ? https : http;
@@ -713,9 +913,13 @@ export function startAggregateRouter(opts: {
         method: req.method,
         headers,
       },
-      (up) => relayUpstream(up, res),
+      (up) => {
+        noteForwardOk(serverId); // egress self-diagnosis: any response = the socket works
+        relayUpstream(up, res);
+      },
     );
     upstream.on('error', (err) => {
+      noteForwardError(serverId, base, err);
       if (!res.headersSent) {
         res.writeHead(502, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: 'llm target down', detail: `${base.hostname}: ${err.message}` }));
@@ -772,14 +976,32 @@ export function startAggregateRouter(opts: {
         });
         return;
       }
-      forwardTo(req, res, path, base, auth);
+      forwardTo(req, res, path, base, auth, entry.server_id);
       return;
     }
-    // Default target (unknown/absent model): today's posture is the
-    // caller's headers pass through. With the #68 plane ON the caller's
-    // header is an IDLEFILL key — strip it here too, so it never rides to
-    // an engine that never issued it.
-    forwardTo(req, res, path, target, clientKeyDigests.size > 0 ? null : undefined);
+    // route-hold (owner posture 2026-10-18): UNREACHABLE by construction —
+    // dispatch holds an unresolvable name until it resolves, so every entry
+    // reaching the forward seam exists. Kept as a LOUD local answer rather
+    // than the old `llm_target` fall-through: the fall-through is closed at
+    // every seam, so no future slip can resurrect the 2026-10-12/2026-10-18
+    // shape (a named request stripped to an unrelated keyed engine).
+    log(`aggregate: unreachable no-entry forward for ${requestedName ?? '<no model>'} — answered locally, llm_target untouched`);
+    if (!res.headersSent) {
+      res.writeHead(503, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          error: {
+            message:
+              requestedName !== undefined
+                ? `model "${requestedName}" is configured on this machine but no engine currently serves it`
+                : 'request names no model and idlefill never routes to the machine default target',
+            type: 'model_unavailable',
+            code: 'model_unavailable',
+            model: requestedName ?? null,
+          },
+        }),
+      );
+    }
     };
 
   /**
@@ -810,6 +1032,9 @@ export function startAggregateRouter(opts: {
     return () => {
       const pin = gate.pinFor(key);
       if (!pin) return fallback;
+      // route-hold made `fallback` total for NAMED traffic (dispatch holds
+      // until an entry exists); an undefined fall-through here would be a
+      // bug, and forwardFor answers it LOCALLY — never to `llm_target`.
       // #67 acceptance guard (drop-don't-reject, the documented posture
       // for an unprovable pin): an ALIAS-named request needs the pinned
       // row's OWN engine id for the splice. A block without
@@ -823,6 +1048,128 @@ export function startAggregateRouter(opts: {
       if (model && aliasByName.has(model) && !('engine_model' in pin)) return fallback;
       return { server_id: pin.server_id, url: pin.url, ...(pin.engine_model !== undefined ? { engine_model: pin.engine_model } : {}) };
     };
+  };
+
+  /** Route precedence (#66 D2): the alias map WINS over a bare catalog row of
+   *  the same name — at routing as well as at publish. */
+  const resolveEntry = (model: string | undefined): AggregateCatalogEntry | AggregateAliasEntry | undefined =>
+    model === undefined ? undefined : aliasByName.get(model) ?? catalogByName.get(model);
+
+  /** The ONE seam a RESOLVED request proceeds through: heartbeat → gate
+   *  (D5, same slot cap) → forward (#67: the entry is re-resolved at call
+   *  time so an operator pin written between park and release moves it).
+   *  A released hold enters HERE — byte-identical to a post-update dispatch. */
+  const proceed = (
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    rawUrl: string,
+    headerKey: string | undefined,
+    model: string,
+    entry: AggregateCatalogEntry | AggregateAliasEntry,
+  ): void => {
+    const key = headerKey ?? model;
+    if (key) opts.onSessionRoute?.(key, entry.server_id);
+    if (opts.gate && key) {
+      opts.gate.route(req, res, key, rawUrl, forwardFor(pinnedEntryFor(key, model, entry), model));
+      return;
+    }
+    forwardFor(() => entry, model)(req, res, rawUrl);
+  };
+
+  /** route-hold: the named 503. The exact OpenAI-style body, error.model
+   *  echoes the name; a name this machine has EVER served (alias or catalog)
+   *  reads as configured. ZERO bytes upstream — `llm_target` never sees it. */
+  const answerUnavailable = (res: http.ServerResponse, model: string): void => {
+    if (res.writableEnded || res.destroyed) return;
+    const known = configuredAliasNames.has(model) || configuredCatalogNames.has(model);
+    res.writeHead(503, { 'content-type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        error: {
+          message: known
+            ? `model "${model}" is configured on this machine but no engine currently serves it`
+            : `model "${model}" is not served by any engine on this machine`,
+          type: 'model_unavailable',
+          code: 'model_unavailable',
+          model,
+        },
+      }),
+    );
+  };
+
+  /** A POST body that names no model: nothing to route, nothing to wait
+   *  for (a hold exists to await a SERVING engine for a NAMED model). Local
+   *  400 — never the default target. (GET/DELETE/HEAD are the untouched
+   *  admin passthrough and never reach this seam.) */
+  const answerNoModel = (res: http.ServerResponse): void => {
+    if (res.writableEnded || res.destroyed) return;
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        error: {
+          message: 'chat request names no model — the aggregate routes by name and never falls through to the machine default target',
+          type: 'invalid_request_error',
+          code: 'no_model',
+          param: 'model',
+        },
+      }),
+    );
+  };
+
+  /** route-hold: park one named request until its engine appears (or the
+   *  hold expires with the named 503, or the client goes away). Body stays
+   *  UNCONSUMED (the #45 sniff posture), no gate slot, no registration. */
+  const armHold = (
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    rawUrl: string,
+    headerKey: string | undefined,
+    model: string,
+  ): void => {
+    if (routeHoldMs === 0) {
+      log(`aggregate: unroutable ${model} — hold off (aggregate_route_wait_ms=0), 503 model_unavailable`);
+      answerUnavailable(res, model);
+      return;
+    }
+    if (routeHolds.length >= ROUTE_HOLD_CAP) {
+      log(`aggregate: unroutable ${model} — ${routeHolds.length} holds already waiting, 503 model_unavailable (cap ${ROUTE_HOLD_CAP})`);
+      answerUnavailable(res, model);
+      return;
+    }
+    const held: Omit<RouteHold, 'timer' | 'drop'> = { model, req, res, rawUrl, headerKey, since: Date.now() };
+    const drop = (): void => {
+      const at = routeHolds.findIndex((h) => h.model === held.model && h.req === req);
+      if (at !== -1) routeHolds.splice(at, 1);
+    };
+    const timer = setTimeout(() => {
+      drop();
+      req.removeListener('aborted', drop);
+      res.removeListener('close', drop);
+      log(`aggregate: hold ${model} expired after ${routeHoldMs}ms (503 model_unavailable)`);
+      answerUnavailable(res, model);
+    }, routeHoldMs);
+    timer.unref?.();
+    const hold: RouteHold = { ...held, timer, drop };
+    req.on('aborted', drop);
+    res.on('close', drop); // client left before any answer: the hold is moot
+    routeHolds.push(hold);
+    log(`aggregate: hold ${model} — no engine serves it yet, waiting up to ${routeHoldMs}ms (route-hold)`);
+  };
+
+  /** route-hold: called after EVERY routing-map swap. A held name that now
+   *  resolves proceeds through the SAME seam a fresh dispatch would. */
+  const flushHolds = (): void => {
+    for (const hold of [...routeHolds]) {
+      const entry = resolveEntry(hold.model);
+      if (!entry) continue;
+      hold.drop();
+      clearTimeout(hold.timer);
+      hold.req.removeListener('aborted', hold.drop);
+      hold.res.removeListener('close', hold.drop);
+      log(`aggregate: hold ${hold.model} released → ${entry.server_id} (waited ${Date.now() - hold.since}ms)`);
+      if (hold.res.writableEnded || hold.res.destroyed) continue;
+      proceed(hold.req, hold.res, hold.rawUrl, hold.headerKey, hold.model, entry);
+    }
   };
 
   const serveModelList = (_req: http.IncomingMessage, res: http.ServerResponse): void => {
@@ -865,70 +1212,41 @@ export function startAggregateRouter(opts: {
 
     const headerKey = cleanKey(req.headers[SESSION_ID_HEADER]);
 
+    // route-hold (owner posture 2026-10-18) — THE DEFAULT TARGET IS DEAD
+    // TRAFFIC for named requests. A named model resolves (alias > bare
+    // precedence, #66 D2) and proceeds, or HOLDS here — body unconsumed,
+    // no gate slot, zero bytes to any upstream — until a poll makes it
+    // routable, then it proceeds through the identical seam. Hold-expiry
+    // answers the named 503; a body naming no model is a local 400. This
+    // closes BOTH historical shapes: the 2026-10-12 fall-through (stripped
+    // key → unrelated keyed engine's 401) AND its D2 narrowing (instant
+    // 503 during a publish gap) — a cold start or arbiter churn now WAITS
+    // the gap out instead of failing or misrouting.
     const dispatch = (model: string | undefined): void => {
-      // #66 D2 precedence: the alias map WINS over a bare catalog entry of
-      // the same name — at routing as well as at publish. An unknown or
-      // absent model leaves the machine `llm_target` untouched (D6 fence,
-      // NARROWED by alias-stability D2 below).
-      const alias = model ? aliasByName.get(model) : undefined;
-      const entry = alias ?? (model ? catalogByName.get(model) : undefined);
-      // alias-stability D2 — the default-target fence: a name this process
-      // has EVER seen published, resolving in NEITHER map (alias map cleared
-      // by an empty/absent block, no bare catalog row either), answers
-      // LOCALLY with 503 `model_unavailable` — BEFORE the gate (no slot
-      // consumed), before `onSessionRoute`, and with ZERO bytes to any
-      // upstream (never `llm_target`, never another engine's 401 — the
-      // 2026-10-12 shape). A bare catalog row of the same name DOES resolve
-      // → routes normally (that is not a machine-default fall-through);
-      // genuinely unknown names keep the D6 fall-through byte-for-byte.
-      if (model && !entry && configuredAliasNames.has(model)) {
-        log(`aggregate: fence ${model} — configured alias with no resolvable entry (503 model_unavailable)`);
-        res.writeHead(503, { 'content-type': 'application/json' });
-        res.end(
-          JSON.stringify({
-            error: {
-              message: `model "${model}" is configured on this machine but no engine currently serves it`,
-              type: 'model_unavailable',
-              code: 'model_unavailable',
-              model,
-            },
-          }),
-        );
+      if (model === undefined) {
+        answerNoModel(res);
         return;
       }
-      const key = headerKey ?? model;
-      if (entry && key) opts.onSessionRoute?.(key, entry.server_id);
-      // #67: the forward seam resolves its entry AT CALL TIME — at
-      // dispatch for an admitted request, at ADMISSION for a parked one
-      // (releaseHoldsOf calls the held ForwardFn then). An operator pin
-      // written between park and release moves the target; the body was
-      // never consumed and rides to the new engine whole.
-      if (opts.gate && key) {
-        // D5: aggregate traffic is session traffic — same gate, same cap,
-        // overrides by derived key, fail-open.
-        opts.gate.route(req, res, key, rawUrl, forwardFor(pinnedEntryFor(key, model, entry), model));
+      const entry = resolveEntry(model);
+      if (entry) {
+        proceed(req, res, rawUrl, headerKey, model, entry);
         return;
       }
-      // Gate off (session_gate=false) or no identity to key on: still
-      // model-routed when the catalog knows the model; unknown/absent
-      // model falls to the machine's default target (today behavior).
-      forwardFor(() => entry, model)(req, res, rawUrl);
+      armHold(req, res, rawUrl, headerKey, model);
     };
 
-    if (headerKey) {
-      // Identity from the header — no body peek needed for the key. The
-      // target still follows the model when the catalog has one; peek the
-      // first chunk (unshift-safe) to choose it.
-      void peekModelFromFirstChunk(req).then((model) => dispatch(model));
-      return;
-    }
     if (req.method === 'GET' || req.method === 'DELETE' || req.method === 'HEAD') {
       // No body to derive a key from: default target, ungated (a GET has
-      // no session body; today's passthrough posture).
+      // no session body; today's passthrough posture — the admin plane,
+      // never chat traffic; `llm_target` is ONLY this surface and the
+      // 11435 proxy, never a chat-routing decision).
       forwardTo(req, res, rawUrl, target);
       return;
     }
-    void peekModelFromFirstChunk(req).then((model) => dispatch(model));
+    // Body method: sniff the model (unshift-safe, accumulating across
+    // chunks), then route / hold on the name. Identity: the session header
+    // when present, else the model name (D3) — applied in `proceed`.
+    void peekModelName(req).then((model) => dispatch(model));
   });
 
   server.on('error', (err) => {
@@ -1030,6 +1348,35 @@ export function startAggregateRouter(opts: {
     },
     aliasSize() {
       return aliases.length;
+    },
+    egressFailures() {
+      // Fresh entries only (a quiet row is not a live exception), freshest
+      // first, capped. An empty array is the explicit no-exception report —
+      // the register heartbeat publishes it and the arbiter CLEARS the
+      // stored list on it (the client_log rule).
+      const now = Date.now();
+      return [...egressFailures.values()]
+        .filter((f) => now - f.at <= EGRESS_FAILURE_TTL_MS)
+        .sort((a, b) => b.at - a.at)
+        .slice(0, EGRESS_FAILURE_CAP);
+    },
+    engineRows() {
+      // Every row this router can forward to: catalog entries, alias winner
+      // pairs, published failover targets. Deduped by server_id (first url
+      // seen wins — the self-test probes the ROW's reachability, and one
+      // connect per row is the row).
+      const seen = new Map<string, string>();
+      const add = (serverId: unknown, url: unknown): void => {
+        if (typeof serverId !== 'string' || serverId === '') return;
+        if (typeof url !== 'string' || url === '') return;
+        if (!seen.has(serverId)) seen.set(serverId, url);
+      };
+      for (const e of catalog) add(e.server_id, e.url);
+      for (const a of aliases) {
+        add(a.server_id, a.url);
+        for (const t of a.fallback_targets ?? []) add(t.server_id, t.url);
+      }
+      return [...seen.entries()].map(([server_id, url]) => ({ server_id, url }));
     },
     stop() {
       return new Promise<void>((resolveStop) => {

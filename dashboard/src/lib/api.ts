@@ -125,6 +125,17 @@ export type RebuildRunState = {
   queue_after: number;
 };
 
+/** One row of a client's published egress self-diagnosis (the machine's OWN
+ *  recent connection-level forward failures per engine row — errno + host +
+ *  epoch-ms). Exception-only: present = the machine's egress to that row was
+ *  broken; the client's explicit clean report clears it within a heartbeat. */
+export type EgressFailure = {
+  server_id: string;
+  code: string;
+  host: string;
+  at: number;
+};
+
 export type WorkerRow = {
   client: string;
   model: string;
@@ -142,6 +153,8 @@ export type WorkerRow = {
   gate_posture?: "armed" | "fail_open";
   proxy_port?: number;
   daemon_behind?: boolean;
+  /** Egress self-diagnosis (exception-only; see the EgressFailure type). */
+  egress_failures?: EgressFailure[];
   /** HERMES' OWN scheduled jobs (#85 slice D) — Hermes cron on this worker's
    *  machine, sanitized client-side and echoed exception-only. ABSENT when the
    *  connector never answered `GET /api/jobs` (old client / gateway outage).
@@ -186,6 +199,8 @@ export type ClientRow = {
   proxy_port?: number;
   aggregate_port?: number;
   daemon_behind?: boolean;
+  /** Egress self-diagnosis (exception-only; see the EgressFailure type). */
+  egress_failures?: EgressFailure[];
   /** The client's local Hermes profile roster (#80); absent on old clients / no Hermes home. */
   agent_roster?: AgentRosterRow[];
   /** HERMES' OWN scheduled jobs (#85 slice D) — Hermes cron on this client's
@@ -1170,6 +1185,31 @@ export async function writeLocalHermesGateway(
   const parsed = (await res.json().catch(() => ({}))) as { restart_required?: boolean; stored_profiles?: string[]; error?: string };
   if (!res.ok) throw new Error(parsed.error ?? `HTTP ${res.status}`);
   return { restart_required: parsed.restart_required === true, stored_profiles: parsed.stored_profiles ?? [] };
+}
+
+// Egress self-test (the 2026-10-18 firewall-blindness fix): the ACTIVE
+// probe, run by the LOCAL client daemon itself (same loopback + edit-token
+// posture as the surfaces above). One bounded GET per engine row + the
+// arbiter + the machine target — ANY HTTP status proves the path; a
+// connection errno names itself. No agent traffic needed.
+export interface EgressTestResult {
+  kind: "arbiter" | "engine" | "target";
+  label: string;
+  url: string;
+  ok: boolean;
+  status?: number;
+  code?: string;
+  ms: number;
+}
+
+export async function runClientEgressTest(port: number): Promise<{ at: number; ok: boolean; results: EgressTestResult[] }> {
+  const res = await fetch(`http://127.0.0.1:${port}/client/egress-test`, {
+    method: "POST",
+    headers: { "content-type": "application/json", [EDIT_HEADER]: apiToken() ?? "" },
+  });
+  const body = (await res.json().catch(() => ({}))) as { at?: number; ok?: boolean; results?: EgressTestResult[]; error?: string };
+  if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
+  return { at: body.at ?? Date.now(), ok: body.ok === true, results: body.results ?? [] };
 }
 
 // #85 slice A: the REAL conversation for one Hermes session, fetched ON-DEMAND

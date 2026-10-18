@@ -10,7 +10,9 @@ import {
   apiToken,
   readLocalHermesGateway,
   writeLocalHermesGateway,
+  runClientEgressTest,
   type HermesGatewayStatus,
+  type EgressTestResult,
   type StateSnapshot,
 } from "@/lib/api";
 import { THEME_KEYS, DEFAULT_THEME, isHexColor, applyTheme } from "@/lib/theme";
@@ -168,7 +170,97 @@ export function Settings({ st }: { st: StateSnapshot | null }) {
           (loopback page origin only — the card talks to the client's own
           loopback proxy, same posture as the Projects local-config editor). */}
       <HermesGatewaySection st={st} />
+
+      {/* Egress self-test: the ACTIVE connectivity probe per ONLINE local
+          client — one click asks the daemon "can YOUR sockets reach the
+          arbiter and every engine row?" (the 2026-10-18 lesson: passive
+          views stayed green while a local firewall denied every outbound
+          connect; only the forwarding daemon itself can answer that). */}
+      <EgressSelfTestSection st={st} />
     </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Egress self-test card. POSTs the client's loopback /client/egress-test
+// (same edit-token posture as the connector card); renders one honest line
+// per target: ANY HTTP status = the path works (the status is shown, the
+// verdict is ok); a connection errno names itself. Read-only on every
+// target (bounded GETs), never on the 5 s poll — only on click.
+// ---------------------------------------------------------------------------
+
+function EgressSelfTestSection({ st }: { st: StateSnapshot | null }) {
+  const hosted = (st?.clients ?? [])
+    .filter((c) => c.proxy_port && st && st.now - (c.last_seen ?? 0) < 90_000)
+    .sort((a, b) => a.name.localeCompare(b.name));
+  if (!pageOriginLoopback() || hosted.length === 0) return null;
+  return (
+    <div className="mt-3 flex flex-col gap-2">
+      <h3 className="text-[12px] font-semibold uppercase tracking-wide text-dim">Egress self-test</h3>
+      {hosted.map((c) => (
+        <EgressSelfTestCard key={c.name} name={c.name} port={c.proxy_port!} />
+      ))}
+    </div>
+  );
+}
+
+function EgressSelfTestCard({ name, port }: { name: string; port: number }) {
+  const [running, setRunning] = React.useState(false);
+  const [res, setRes] = React.useState<{ at: number; ok: boolean; results: EgressTestResult[] } | null>(null);
+  const [err, setErr] = React.useState<string | null>(null);
+
+  const run = async () => {
+    if (!apiToken()) {
+      setErr("the test needs the arbiter token — paste it in the header first");
+      return;
+    }
+    setRunning(true);
+    setErr(null);
+    try {
+      setRes(await runClientEgressTest(port));
+    } catch (e) {
+      setRes(null);
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  return (
+    <Card className="py-2 shadow-none">
+      <CardHeader className="flex-row items-center gap-2 px-3 py-0">
+        <CardTitle className="text-[13px] font-semibold">{name}</CardTitle>
+        <span className="text-[11px] text-dim">127.0.0.1:{port}</span>
+        <CardAction>
+          <Button size="sm" variant="outline" onClick={() => void run()} disabled={running}>
+            {running ? "probing…" : "run egress test"}
+          </Button>
+        </CardAction>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-0.5 px-3 py-2">
+        {err && <div className="text-[11px] text-err">{err}</div>}
+        {!err && res === null && !running && (
+          <div className="text-[11px] text-dim">asks THIS machine's daemon whether its own sockets reach the arbiter, its engines and its target — run it when an agent's traffic stalls but every tile looks green</div>
+        )}
+        {res && (
+          <>
+            <div className={`text-[11px] font-semibold ${res.ok ? "text-ok" : "text-err"}`} title="the verdict is the daemon's own egress: ANY HTTP reply proves the path; a connection errno means the socket itself could not complete">
+              {res.ok ? "egress ok" : "egress blocked"}
+              <span className="ml-1 font-normal text-dim">· {res.results.length} {res.results.length === 1 ? "target" : "targets"}</span>
+            </div>
+            {res.results.map((r, i) => (
+              <div key={`${r.label}-${i}`} className="flex items-center gap-2 text-[11px]" title={`${r.kind}: ${r.url}`}>
+                <span className={`size-1.5 shrink-0 rounded-full ${r.ok ? "bg-ok" : "bg-err"}`} />
+                <span className="min-w-0 truncate">{r.label}</span>
+                <span className={`ml-auto whitespace-nowrap ${r.ok ? "text-dim" : "text-err"}`}>
+                  {r.ok ? `HTTP ${r.status} · ${r.ms}ms` : `${r.code} · ${r.ms}ms`}
+                </span>
+              </div>
+            ))}
+          </>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 

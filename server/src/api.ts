@@ -18,6 +18,7 @@ import os from 'node:os';
 import fastify, { type FastifyInstance, type FastifyReply } from 'fastify';
 import { WebSocketServer } from 'ws';
 import { utcDay, type Arbiter, WATCHED_SERVER_ID } from './arbiter.js';
+import type { EgressFailure } from './types.js';
 import { seriesKeyOf, type MetricsBucket, type MetricsSeries, type MetricsStore } from './metrics.js';
 import { buildMeshSnapshot, type MeshFederation } from './mesh.js';
 import { collectHostStats } from './host.js';
@@ -122,7 +123,7 @@ function bearer(req: { headers: Record<string, unknown>; query: unknown }): stri
 function projectView(
   arbiter: Arbiter,
   cfg: ServerConfig,
-  clients: { name: string; last_seen: number; projects: { name: string; model: string; estimated_seconds: number; queue_depth: number; queue_preview?: QueuePreviewRow[]; stats?: Record<string, number | string>; last_rebuild?: RebuildRunState; cycles?: CycleStatusRow[]; cycle_cap?: number }[]; version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open'; proxy_port?: number; daemon_behind?: boolean; hermes_version?: string; gateway_reachable?: boolean; hermes_jobs?: HermesJobRow[] }[],
+  clients: { name: string; last_seen: number; projects: { name: string; model: string; estimated_seconds: number; queue_depth: number; queue_preview?: QueuePreviewRow[]; stats?: Record<string, number | string>; last_rebuild?: RebuildRunState; cycles?: CycleStatusRow[]; cycle_cap?: number }[]; version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open'; proxy_port?: number; daemon_behind?: boolean; egress_failures?: EgressFailure[]; hermes_version?: string; gateway_reachable?: boolean; hermes_jobs?: HermesJobRow[] }[],
   day: string,
   now: number,
   today: Record<string, { finished: number; failed: number }>,
@@ -171,6 +172,12 @@ function projectView(
           // display facts (absent = current or a pre-#61-step-3 client —
           // both render the row unchanged).
           ...(c.daemon_behind ? { daemon_behind: true } : {}),
+          // Egress self-diagnosis (the 2026-10-18 firewall-blindness fix):
+          // the worker's OWN recent forward failures, echoed exception-only
+          // (the arbiter stores the list only when non-empty, so a present
+          // key here is always the exception; absent = the machine reports
+          // clean egress or predates the key — the row renders unchanged).
+          ...(c.egress_failures && c.egress_failures.length > 0 ? { egress_failures: c.egress_failures } : {}),
           // #73: the Hermes gateway host facts (slice B), echoed
           // exception-only like the other display facts. `gateway_reachable`
           // rides on BOTH values: false is the exception the dashboard
@@ -430,7 +437,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   // ------------------------------------------------------------------
 
   app.post('/api/clients/register', async (req, reply) => {
-    const body = (req.body ?? {}) as { name?: string; ip?: string; projects?: ProjectAllocation[]; version?: unknown; protocol?: unknown; revision?: unknown; gate_posture?: unknown; proxy_port?: unknown; aggregate_port?: unknown; daemon_behind?: unknown; client_log?: unknown; agent_roster?: unknown; hermes_version?: unknown; gateway_reachable?: unknown; hermes_jobs?: unknown; hermes_host_facts?: unknown; hermes_skills?: unknown; hermes_toolsets?: unknown; hermes_models?: unknown; hermes_model_options?: unknown };
+    const body = (req.body ?? {}) as { name?: string; ip?: string; projects?: ProjectAllocation[]; version?: unknown; protocol?: unknown; revision?: unknown; gate_posture?: unknown; proxy_port?: unknown; aggregate_port?: unknown; daemon_behind?: unknown; client_log?: unknown; agent_roster?: unknown; egress_failures?: unknown; hermes_version?: unknown; gateway_reachable?: unknown; hermes_jobs?: unknown; hermes_host_facts?: unknown; hermes_skills?: unknown; hermes_toolsets?: unknown; hermes_models?: unknown; hermes_model_options?: unknown };
     const name = typeof body.name === 'string' ? body.name.trim() : '';
     if (!name) return reply.code(400).send({ error: 'name required' });
     const remote = (req.ip ?? '').split(':').pop() ?? 'unknown';
@@ -577,6 +584,14 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     // via cleanAgentRoster. Absent on old clients and on daemons without a
     // Hermes home: absent NEVER clears the stored roster.
     const agent_roster = Array.isArray(body.agent_roster) ? (body.agent_roster as unknown) : undefined;
+    // Egress self-diagnosis (the 2026-10-18 firewall-blindness fix): the
+    // client's recent per-row forward failures. A plain array pass-through
+    // here — sanitized (bounded rows, malformed members dropped, errno
+    // shape enforced) in registerClient via cleanEgressFailures. The KEY's
+    // presence is the report: an empty array is the explicit "recovered"
+    // signal that clears the stored exception; an absent key (old client,
+    // no aggregate listener) never clears it.
+    const egress_failures = Array.isArray(body.egress_failures) ? (body.egress_failures as unknown) : undefined;
     // #73: the gateway host facts (slice B) — plain pass-throughs,
     // sanitized in registerClient (hermes_version: string ≤64;
     // gateway_reachable: exact boolean). Absent on old clients and on
@@ -619,8 +634,8 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       remote,
       projects,
       undefined,
-      version !== undefined || protocol !== undefined || revision !== undefined || gate_posture !== undefined || proxy_port !== undefined || aggregate_port !== undefined || daemon_behind !== undefined || client_log !== undefined || agent_roster !== undefined || hermes_version !== undefined || gateway_reachable !== undefined || hermes_jobs !== undefined || hermes_host_facts !== undefined || hermes_skills !== undefined || hermes_toolsets !== undefined || hermes_models !== undefined || hermes_model_options !== undefined
-        ? { version, protocol, revision, gate_posture, proxy_port, aggregate_port, daemon_behind, client_log, agent_roster, hermes_version, gateway_reachable, hermes_jobs, hermes_host_facts, hermes_skills, hermes_toolsets, hermes_models, hermes_model_options }
+      version !== undefined || protocol !== undefined || revision !== undefined || gate_posture !== undefined || proxy_port !== undefined || aggregate_port !== undefined || daemon_behind !== undefined || client_log !== undefined || agent_roster !== undefined || egress_failures !== undefined || hermes_version !== undefined || gateway_reachable !== undefined || hermes_jobs !== undefined || hermes_host_facts !== undefined || hermes_skills !== undefined || hermes_toolsets !== undefined || hermes_models !== undefined || hermes_model_options !== undefined
+        ? { version, protocol, revision, gate_posture, proxy_port, aggregate_port, daemon_behind, client_log, agent_roster, egress_failures, hermes_version, gateway_reachable, hermes_jobs, hermes_host_facts, hermes_skills, hermes_toolsets, hermes_models, hermes_model_options }
         : undefined,
     );
     return reply.code(200).send({ client_id: res.client_id, created: res.created });

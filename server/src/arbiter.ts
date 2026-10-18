@@ -72,7 +72,7 @@ import type {
   ThemeColors,
 } from './types.js';
 import type { StateStore } from './state.js';
-import type { ClientOverride, Lease, ProjectAllocation, ServerConfig, ServerConnection, ServerProvider, UtcDate, AgentRosterRow, HermesJobRow, HermesHostFactsSummary, HostFactStatus, HermesSkillRow, HermesToolsetRow, HermesModelRow, HermesModelProviderRow } from './types.js';
+import type { ClientOverride, Lease, ProjectAllocation, ServerConfig, ServerConnection, ServerProvider, UtcDate, AgentRosterRow, EgressFailure, HermesJobRow, HermesHostFactsSummary, HostFactStatus, HermesSkillRow, HermesToolsetRow, HermesModelRow, HermesModelProviderRow } from './types.js';
 import { PROVIDER_KINDS, THEME_DEFAULTS, THEME_HEX_RE, THEME_TOKEN_KEYS } from './types.js';
 
 /**
@@ -179,6 +179,47 @@ export function cleanAgentRoster(raw: unknown): AgentRosterRow[] | undefined {
     out.push(row);
   }
   return out.length > 0 ? out : undefined;
+}
+
+/**
+ * Sanitize a reported `egress_failures` block (egress self-diagnosis — the
+ * 2026-10-18 firewall-blindness fix) for storage on the client row. Edge
+ * posture follows the CLIENT_LOG rule, not the roster rule, because the
+ * block is an EXCEPTION ledger: an explicit empty report MEANS something
+ * ("my egress is clean — clear the badge"), while an absent report means
+ * "this client cannot know" (old client, no aggregate listener):
+ *   - a non-array (or missing report) → undefined = ABSENT (never clears
+ *     the stored list);
+ *   - each member checked INDIVIDUALLY: `server_id` a non-empty string
+ *     ≤64, `code` an uppercase errno shape (A–Z 0–9 _ , 1..32 — display
+ *     text only, never interpolated anywhere it could hurt), `host` a
+ *     non-empty string ≤256 (hostname only; no scheme/path/token has a
+ *     member here), `at` a finite integer epoch-ms (< 1e15). A malformed
+ *     member drops alone;
+ *   - bounded hard at 8 rows (freshest-first by client contract; the
+ *     arbiter keeps the FIRST 8 and does not re-sort).
+ *
+ * Returns an array (possibly empty) for a present array — the caller maps
+ * cleaned-empty to DELETE (the recovered report); undefined only for a
+ * non-array (absent, never clears).
+ */
+export function cleanEgressFailures(raw: unknown): EgressFailure[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const CODE_RE = /^[A-Z][A-Z0-9_]{0,31}$/;
+  const out: EgressFailure[] = [];
+  for (const r of raw as unknown[]) {
+    if (out.length >= 8) break;
+    if (!r || typeof r !== 'object' || Array.isArray(r)) continue;
+    const o = r as Record<string, unknown>;
+    const server_id = typeof o.server_id === 'string' ? o.server_id.trim() : '';
+    if (server_id === '' || server_id.length > 64) continue;
+    if (typeof o.code !== 'string' || !CODE_RE.test(o.code)) continue;
+    const host = typeof o.host === 'string' ? o.host.trim() : '';
+    if (host === '' || host.length > 256) continue;
+    if (typeof o.at !== 'number' || !Number.isFinite(o.at) || o.at < 0 || o.at >= 1e15) continue;
+    out.push({ server_id, code: o.code, host, at: Math.floor(o.at) });
+  }
+  return out;
 }
 
 /**
@@ -914,7 +955,7 @@ export class Arbiter {
     observedIp: string,
     projects?: ProjectAllocation[],
     now?: number,
-    info?: { version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open'; proxy_port?: number; aggregate_port?: number; daemon_behind?: boolean; client_log?: string[]; agent_roster?: unknown; hermes_version?: unknown; gateway_reachable?: unknown; hermes_jobs?: unknown; hermes_host_facts?: unknown; hermes_skills?: unknown; hermes_toolsets?: unknown; hermes_models?: unknown; hermes_model_options?: unknown },
+    info?: { version?: string; protocol?: number; revision?: string; gate_posture?: 'armed' | 'fail_open'; proxy_port?: number; aggregate_port?: number; daemon_behind?: boolean; client_log?: string[]; agent_roster?: unknown; egress_failures?: unknown; hermes_version?: unknown; gateway_reachable?: unknown; hermes_jobs?: unknown; hermes_host_facts?: unknown; hermes_skills?: unknown; hermes_toolsets?: unknown; hermes_models?: unknown; hermes_model_options?: unknown },
   ): { client_id: string; created: boolean } {
     const s = this.store.state;
     const seen = now ?? Date.now();
@@ -1004,6 +1045,17 @@ export class Arbiter {
     //     stored value: a daemon without a Hermes home omits the key, so an
     //     old client's roster survives a mixed-version re-registration).
     const roster = cleanAgentRoster(info?.agent_roster);
+    // Egress self-diagnosis (the 2026-10-18 firewall-blindness fix): the
+    // CLIENT_LOG edge, not the roster edge — a present array REPLACES the
+    // stored list (a cleaned-empty report DELETES the key: the explicit
+    // "egress recovered" report), an absent report NEVER clears it (old
+    // client / no aggregate listener leaves the row byte-for-byte).
+    let egressFailures: EgressFailure[] | undefined;
+    let egressFailuresPresent = false;
+    if (Array.isArray(info?.egress_failures)) {
+      egressFailuresPresent = true;
+      egressFailures = cleanEgressFailures(info?.egress_failures);
+    }
     // #85 slice E: the richer gateway host facts. Re-sanitized at the edge
     // (the client already caps the block; the arbiter does not trust a
     // client's caps — the whitelist, the verdict enum, and the integer
@@ -1096,6 +1148,13 @@ export class Arbiter {
       // undefined, so a re-register carrying an all-malformed roster does
       // NOT wipe the previously stored one.
       if (roster !== undefined) existing.agent_roster = roster;
+      // Egress self-diagnosis: the client_log rule — a present report
+      // replaces (non-empty stores, cleaned-empty DELETES the key = the
+      // recovered report); absent leaves the row exactly as it was.
+      if (egressFailuresPresent) {
+        if (egressFailures && egressFailures.length > 0) existing.egress_failures = egressFailures;
+        else delete existing.egress_failures;
+      }
       // #73 gateway host facts (slice B): same heartbeat rule as
       // version/revision — a present, valid report updates the row (both
       // the `true` and the exception `false`); absent (old client /
@@ -1149,6 +1208,10 @@ export class Arbiter {
       // Agent roster (#80): lands only when a valid (non-empty) roster was
       // reported — same ADD-key store rule as the heartbeat path.
       ...(roster !== undefined ? { agent_roster: roster } : {}),
+      // Egress self-diagnosis: lands only when the report carried a
+      // non-empty cleaned list (an empty report = no exception = no key,
+      // the same store rule as the heartbeat path).
+      ...(egressFailures && egressFailures.length > 0 ? { egress_failures: egressFailures } : {}),
       // #73 gateway host facts (slice B): land only on a present, valid
       // report (same ADD-key store rule as the heartbeat path).
       ...(hermesVersion ? { hermes_version: hermesVersion } : {}),

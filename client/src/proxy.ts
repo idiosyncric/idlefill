@@ -24,6 +24,7 @@ import { SESSION_PATH_RE, type SessionGate } from './session-gate.js';
 import { handleClientProjects, type ClientProjectsOpts } from './client-projects.js';
 import { handleSessionControl, type SessionControlOpts } from './session-control.js';
 import { handleClientHermes, type ClientHermesOpts } from './client-hermes.js';
+import { handleClientSelfTest, type SelfTestOpts } from './client-self-test.js';
 import { handleHermesTranscript, type HermesTranscriptOpts } from './hermes-transcript.js';
 import { handleHermesLifecycle, type HermesLifecycleOpts } from './hermes-lifecycle.js';
 
@@ -115,6 +116,15 @@ export function startLlmProxy(opts: {
    * path falls to plain passthrough exactly as before.
    */
   clientHermes?: ClientHermesOpts;
+  /**
+   * Egress self-test (the 2026-10-18 firewall-blindness fix). When set,
+   * POST `/client/egress-test` is answered ON THIS SAME loopback server
+   * (guarded Host/Origin/token inside handleClientSelfTest) with one
+   * bounded probe per engine row + the arbiter + the machine target — the
+   * daemon's OWN egress, testable with zero agent traffic. Absent = the
+   * path falls to plain passthrough exactly as before.
+   */
+  clientSelfTest?: SelfTestOpts;
   /**
    * #85 slice A: the on-demand transcript surface. When set, GET
    * `/client/hermes-transcript/<session_id>?offset=…&limit=…` is answered
@@ -261,6 +271,19 @@ export function startLlmProxy(opts: {
         u84 = new URL('http://127.0.0.1/');
       }
       if (handleClientHermes(req, res, u84, opts.clientHermes)) return;
+    }
+    // Egress self-test (same loopback bind, answered BEFORE passthrough —
+    // a probe can never reach the LLM target as traffic). The handler
+    // answers every guard synchronously and the probe walk itself; absent
+    // ⇒ the path falls through untouched.
+    if (opts.clientSelfTest) {
+      let us: URL;
+      try {
+        us = new URL(rawUrl, 'http://127.0.0.1');
+      } catch {
+        us = new URL('http://127.0.0.1/');
+      }
+      if (handleClientSelfTest(req, res, us, opts.clientSelfTest)) return;
     }
     // #85 slice A: the on-demand transcript surface (same loopback bind,
     // answered BEFORE passthrough — a gateway proxy call can never reach the
