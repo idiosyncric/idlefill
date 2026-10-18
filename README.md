@@ -146,6 +146,18 @@ buffered body, its row token from the arbiter key plane) — or a clean
 `504 upstream_timeout` when there is nothing to fail over to. One retry,
 no chains.
 
+**Route-hold** (2026-10-18, owner posture — the default target is NOT a
+routing target). A request naming a model that resolves in neither the alias
+map nor the catalog is HELD (body unconsumed, no gate slot, zero bytes
+upstream) until a poll makes it routable, then routed through the same seam;
+only hold-expiry answers the named `503 model_unavailable`. A body naming no
+model is a local `400`. `llm_target` therefore NEVER receives a named POST —
+it stays the GET/DELETE/HEAD passthrough base and the legacy :11435 target.
+
+| key | default | meaning |
+| --- | --- | --- |
+| `aggregate_route_wait_ms` | `120000` | how long an unroutable named request waits for its engine to appear (arbiter churn, cold start, mesh row down) before the named 503; `0` = no wait, instant named 503. Capped at 15 min; a queue-depth cap keeps a retry-looping client from parking sockets unbounded |
+
 ### How background work gets an engine (leases) — and the self-traffic trap
 
 ```

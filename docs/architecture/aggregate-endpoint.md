@@ -13,7 +13,10 @@ The rest are PROPOSED for the owner.
 every keyed Hermes profile since the #63 build wave, with the alias surface,
 the :8800 default-target fence and the slow-engine policy added on top
 (docs/architecture/alias-stability-and-slow-engines.md). Items still marked
-PROPOSED await the owner.
+PROPOSED await the owner. **Amended 2026-10-18:** the default-target
+fall-through is CLOSED for named traffic by route-hold (see "The default
+target CLOSED for named traffic" below) — `llm_target` now only answers the
+GET/DELETE/HEAD no-body passthrough and the legacy :11435 proxy.
 
 ## The gap, re-verified against the code
 
@@ -163,6 +166,10 @@ Rules for the endpoint:
 - With the catalog empty or the model unknown, the router forwards to
   the machine's default `llm_target` exactly as today. A profile on 8800
   can never be worse than a profile on 11435 passthrough.
+  **SUPERSEDED 2026-10-18 (route-hold):** a NAMED model with no resolvable
+  engine now HOLDS (then the named 503 on expiry), and a body naming no
+  model is a local 400 — neither ever falls through to `llm_target`. The
+  passthrough that survives is the GET/DELETE/HEAD no-body admin surface.
 
 ## D2 — The credential plane: the router asks the arbiter to fetch, never to hand over
 
@@ -522,6 +529,51 @@ configured alias name is no longer "unknown/absent".
   the arbiter published nothing for a name has never SEEN it — the fence can
   only fence what it has seen. Alias-stability D1 removes that server-side
   window.
+
+## The default target CLOSED for named traffic — route-hold (2026-10-18, owner posture)
+
+**LOCKED (owner, 2026-10-18): "idlefill should hold requests until the
+endpoint being routed to is available again. There shouldn't be a default
+that overrides."** This supersedes both the D6 fall-through (named POSTs →
+`llm_target`) and the D2 fence above (instant 503 during a publish gap).
+
+The fence's own escape hatch is what actually re-ran the incident on
+2026-10-18 (hypnotist): the model sniff read ONLY the first TCP chunk, and
+a tool-result-heavy body pushed the `"model"` field past it — `model`
+resolved to "absent", which the fence never guarded, and the request fell
+to `llm_target` (oMLX :8000) with the agent key stripped → the exact
+2026-10-12 401 "API key required" shape.
+
+- **Sniff 2.0:** the sniff ACCUMULATES body chunks until the `"model"`
+  field matches (or the body ends / a 1 MiB scan window is read), then puts
+  every sniffed chunk BACK (`unshift`) and pauses — the #45 unconsumed-body
+  invariant stands. A split `"model":"…"` field can no longer read as
+  "no model".
+- **Route-hold:** a named model that resolves in NEITHER map no longer
+  falls through and no longer fails fast — it HOLDS: before the gate (no
+  slot), before `onSessionRoute`, zero bytes to any upstream, body
+  unconsumed — until a map update (`updateCatalog`/`updateAliases`, i.e.
+  the next /api/state poll) makes it routable, at which point it proceeds
+  through the IDENTICAL seam (precedence, pin re-resolution, splice,
+  heartbeat, gate admission — byte-identical to a request dispatched after
+  the update). EVERY unknown name holds too: the cold-start honesty limit
+  is gone, a request that arrives before the first publish simply waits.
+- **Expiry:** the hold is bounded — `aggregate_route_wait_ms` (default
+  120 000; `0` = instant named 503, the old D2 posture; capped at 15 min)
+  — and capped in queue depth (`ROUTE_HOLD_CAP` 64; over-cap answers the
+  named 503 at once so a retry-looping client cannot park sockets
+  unbounded). On expiry the request answers the SAME OpenAI-style 503 body
+  the D2 fence defined (name-ever-seen wording "is configured on this
+  machine but no engine currently serves it"; never-seen wording "is not
+  served by any engine on this machine"). A client that leaves mid-hold is
+  dropped silently (logged) and never resurrected by a later release.
+- **No model named:** a body method that ends without a `"model"` field
+  answers a local `400` `invalid_request_error` — there is no name to wait
+  on and never a fall-through.
+- **`llm_target` survives ONLY as the GET/DELETE/HEAD no-body passthrough
+  base** (the admin plane) and for the legacy :11435 proxy. It never
+  receives a named POST at any setting; the aggregate's no-entry forward
+  branch is a LOUD local 503, unreachable by construction.
 
 ## The D3 slow-engine policy SHIPPED — TTFB watchdog + pre-first-byte failover (2026-10-12)
 

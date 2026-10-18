@@ -146,6 +146,17 @@ export interface ClientConfig {
    */
   aggregate_queue_depth_cap?: number;
   /**
+   * route-hold (owner posture 2026-10-18): how long a request at :8800
+   * naming a model with no resolvable engine HOLDS (body unconsumed, zero
+   * bytes upstream) waiting for a poll to make it routable, before the
+   * named 503 `model_unavailable`. Absent = 120000; `0` = no hold (instant
+   * named 503). Either way the machine default `llm_target` NEVER receives
+   * a named POST — it stays the GET/DELETE/HEAD passthrough base. ADD key;
+   * optional so hand-built ClientConfig fixtures stay valid; the loader
+   * always sets it (anything invalid → the default).
+   */
+  aggregate_route_wait_ms?: number;
+  /**
    * Session gate (issue #9 Part A): when true (default) the loopback proxy
    * also acts as the per-Mac router/gate for interactive agent traffic on
    * `/s/<token>/v1/...` — self-registration, capacity-limited admission,
@@ -240,6 +251,11 @@ const DEFAULTS = {
   // `aggregate_ttfb_timeout_ms` are both set (intentionally UNSET here).
   aggregate_slow_handling: 'wait',
   aggregate_queue_depth_cap: 3,
+  // route-hold (owner posture 2026-10-18): unroutable named requests WAIT
+  // for their engine (the arbiter re-publishes every ~15 s); 120 s spans
+  // several publish cycles. `0` = no hold, instant named 503. The default
+  // target never receives a named POST at either setting.
+  aggregate_route_wait_ms: 120_000,
   session_gate: true,
   max_active_agent_sessions: 2,
   session_hold_cap_ms: 120_000,
@@ -319,6 +335,13 @@ export function loadClientConfig(
       ? { aggregate_ttfb_timeout_ms: Math.floor(r.aggregate_ttfb_timeout_ms) }
       : {}),
     aggregate_queue_depth_cap: Math.max(0, Math.floor(num(r.aggregate_queue_depth_cap, DEFAULTS.aggregate_queue_depth_cap))),
+    // route-hold (owner posture 2026-10-18): explicit `0` = no hold; any
+    // finite value is clamped to [0, 15 min]; garbage/negative → default.
+    aggregate_route_wait_ms: (() => {
+      const v = num(r.aggregate_route_wait_ms, DEFAULTS.aggregate_route_wait_ms);
+      if (!Number.isFinite(v) || v < 0) return DEFAULTS.aggregate_route_wait_ms;
+      return Math.min(900_000, Math.floor(v));
+    })(),
     // Session gate (issue #9 Part A). `session_gate` accepts an explicit
     // boolean; anything else falls back to the default (true).
     session_gate: typeof r.session_gate === 'boolean' ? r.session_gate : DEFAULTS.session_gate,

@@ -79,7 +79,9 @@ function startSilentServer(): Promise<{ url: string; close: () => Promise<void> 
 }
 
 async function startRouterOn(port: number, defaultTarget: string): Promise<AggregateRouter> {
-  const r = startAggregateRouter({ port, defaultTarget });
+  // routeHoldMs=0: these tests pin the FORWARD ledger, never the hold; an
+  // unroutable name answers its named 503 at once instead of waiting.
+  const r = startAggregateRouter({ port, defaultTarget, routeHoldMs: 0 });
   cleanup.push(() => r.stop());
   await waitProxyReady(r.server);
   return r;
@@ -132,12 +134,13 @@ test('a connection-level forward failure to a row records (server_id, errno, hos
   assert.deepEqual(r.egressFailures(), [], 'the successful forward cleared the row');
 });
 
-test('the default-target fall-through records NOTHING (no row identity to attribute)', async () => {
+test('route-hold: an unroutable name NEVER reaches the default target — the named 503 is local, the ledger stays empty', async () => {
   const dead = await pickDeadPort();
   const r = await startRouterOn(0, `http://127.0.0.1:${dead}`);
   const res = await postChat(r.base_url, 'UnknownModel');
-  assert.equal(res.status, 502, 'the dead default target still answers 502');
-  assert.deepEqual(r.egressFailures(), [], 'no catalog row was targeted → the ledger stays empty');
+  assert.equal(res.status, 503, 'route-hold (0ms) answers the named 503 — the dead default target is never contacted');
+  assert.equal(((await res.json()) as { error: { type: string } }).error.type, 'model_unavailable');
+  assert.deepEqual(r.egressFailures(), [], 'no forward ever ran → the ledger stays empty');
 });
 
 test('an HTTP error STATUS records nothing (401 from the engine PROVES egress)', async () => {

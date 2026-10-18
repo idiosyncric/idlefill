@@ -415,7 +415,9 @@ function peekModelName(req: http.IncomingMessage): Promise<string | undefined> {
  */
 export function startAggregateRouter(opts: {
   port: number;
-  /** Machine default target — unknown/absent model falls here (exact today behavior). */
+  /** Machine default target — since route-hold (2026-10-18) ONLY the
+   *  GET/DELETE/HEAD no-body passthrough lands here; a named POST never
+   *  does (it routes by name or holds). */
   defaultTarget: string;
   gate?: SessionGate | null;
   /** Fires when a request is keyed to a catalog row: (gate key, chosen server_id). */
@@ -497,14 +499,14 @@ export function startAggregateRouter(opts: {
   let aliases: AggregateAliasEntry[] = [];
   const aliasByName = new Map<string, AggregateAliasEntry>();
   /**
-   * alias-stability D2 (2026-10-12): the fence memory. Every alias name EVER
-   * accepted into the routing map, process-lifetime, MONOTONIC — never
-   * removed. An empty/absent publish block still CLEARS the routing map
-   * (no stale pin), but it must not wipe the memory that this name is
-   * CONFIGURED on the machine: a configured alias never silently falls
-   * through to `llm_target` (the incident shape — arbiter cold start
-   * published `model_aliases: []`, the request fell to oMLX :8000 with the
-   * agent key stripped → 401 from an unrelated engine).
+   * alias-stability D2 (2026-10-12): every alias name EVER accepted into
+   * the routing map, process-lifetime, MONOTONIC — never removed. An
+   * empty/absent publish block still CLEARS the routing map (no stale pin),
+   * but it must not wipe the memory that this name is CONFIGURED on the
+   * machine. Since route-hold (2026-10-18) closes the `llm_target`
+   * fall-through for EVERY named request, this set no longer gates routing
+   * — it only feeds the named 503's wording (a name EVER configured reads
+   * "configured … no engine currently serves it").
    */
   const configuredAliasNames = new Set<string>();
   /**
@@ -533,7 +535,9 @@ export function startAggregateRouter(opts: {
     headerKey: string | undefined;
     since: number;
     timer: ReturnType<typeof setTimeout>;
-    drop: () => void;
+    /** Remove this hold from the queue (once — the second call is a no-op).
+     *  True = THIS call removed it; false = someone else already did. */
+    drop: () => boolean;
   }
   const routeHolds: RouteHold[] = [];
   /** Sanitized `aggregate_route_wait_ms` (absent/garbage → the default; `0` = hold OFF). */
@@ -946,8 +950,10 @@ export function startAggregateRouter(opts: {
    *
    * #66: an ALIAS-routed entry whose engine id differs from the requested
    * name takes the scoped buffered forward (Q3 owner posture). Every other
-   * route — bare catalog entry, alias whose engine id EQUALS the name, the
-   * default target — keeps today's `req.pipe` posture byte-for-byte.
+   * route — bare catalog entry, alias whose engine id EQUALS the name —
+   * keeps today's `req.pipe` posture byte-for-byte. (The old default-target
+   * route through here is gone: route-hold holds named traffic, and the
+   * GET/DELETE/HEAD passthrough uses `forwardTo` directly.)
    */
   const forwardFor =
     (entryFor: () => AggregateCatalogEntry | AggregateAliasEntry | PinEntry | undefined, requestedName?: string): ForwardFn =>
@@ -1137,21 +1143,43 @@ export function startAggregateRouter(opts: {
       return;
     }
     const held: Omit<RouteHold, 'timer' | 'drop'> = { model, req, res, rawUrl, headerKey, since: Date.now() };
-    const drop = (): void => {
-      const at = routeHolds.findIndex((h) => h.model === held.model && h.req === req);
-      if (at !== -1) routeHolds.splice(at, 1);
+    let spliced = false;
+    const spliceOut = (): boolean => {
+      if (spliced) return false;
+      const at = routeHolds.findIndex((h) => h.req === req);
+      if (at === -1) return false;
+      spliced = true;
+      routeHolds.splice(at, 1);
+      return true;
+    };
+    const detach = (): void => {
+      req.removeListener('aborted', onGone);
+      res.removeListener('close', onGone);
+    };
+    const onGone = (): void => {
+      if (!spliceOut()) return;
+      clearTimeout(timer);
+      detach();
+      log(`aggregate: hold ${model} dropped — the client left before any answer`);
     };
     const timer = setTimeout(() => {
-      drop();
-      req.removeListener('aborted', drop);
-      res.removeListener('close', drop);
+      if (!spliceOut()) return; // client left / released first — the expiry is moot
+      detach();
       log(`aggregate: hold ${model} expired after ${routeHoldMs}ms (503 model_unavailable)`);
       answerUnavailable(res, model);
     }, routeHoldMs);
     timer.unref?.();
-    const hold: RouteHold = { ...held, timer, drop };
-    req.on('aborted', drop);
-    res.on('close', drop); // client left before any answer: the hold is moot
+    const hold: RouteHold = {
+      ...held,
+      timer,
+      drop: () => {
+        if (!spliceOut()) return false;
+        detach();
+        return true;
+      },
+    };
+    req.on('aborted', onGone);
+    res.on('close', onGone); // client left before any answer: the hold is moot
     routeHolds.push(hold);
     log(`aggregate: hold ${model} — no engine serves it yet, waiting up to ${routeHoldMs}ms (route-hold)`);
   };
@@ -1162,12 +1190,10 @@ export function startAggregateRouter(opts: {
     for (const hold of [...routeHolds]) {
       const entry = resolveEntry(hold.model);
       if (!entry) continue;
-      hold.drop();
+      if (!hold.drop()) continue; // vanished mid-flush (client left): its own path answered nothing
       clearTimeout(hold.timer);
-      hold.req.removeListener('aborted', hold.drop);
-      hold.res.removeListener('close', hold.drop);
       log(`aggregate: hold ${hold.model} released → ${entry.server_id} (waited ${Date.now() - hold.since}ms)`);
-      if (hold.res.writableEnded || hold.res.destroyed) continue;
+      if (hold.res.writableEnded || hold.res.destroyed || hold.req.destroyed) continue;
       proceed(hold.req, hold.res, hold.rawUrl, hold.headerKey, hold.model, entry);
     }
   };
@@ -1282,7 +1308,9 @@ export function startAggregateRouter(opts: {
         if (catalogByName.has(e.name)) continue;
         catalogByName.set(e.name, e);
         catalog.push(e);
+        configuredCatalogNames.add(e.name); // route-hold memory (monotonic, never cleared)
       }
+      flushHolds(); // route-hold: a pair this poll made routable releases its holds
     },
     updateAliases(entries) {
       // Same defensive posture as updateCatalog: a malformed entry is
@@ -1312,6 +1340,7 @@ export function startAggregateRouter(opts: {
         aliases.push(kept);
         configuredAliasNames.add(kept.name);
       }
+      flushHolds(); // route-hold: a pair this poll made routable releases its holds
     },
     updateKeys(rows, clientKeyHashes) {
       keys = new Map<string, string>();

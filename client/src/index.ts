@@ -70,7 +70,7 @@ import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import { loadClientConfig, type ClientConfig, type ClientProjectConfig, type ScheduledRebuildConfig } from './config.js';
 import { startLlmProxy, waitProxyReady, type LlmProxy } from './proxy.js';
-import { startAggregateRouter, type AggregateAliasEntry, type AggregateCatalogEntry, type AggregateRouter, type ServerKeyRow } from './aggregate.js';
+import { ROUTE_HOLD_DEFAULT_MS, startAggregateRouter, type AggregateAliasEntry, type AggregateCatalogEntry, type AggregateRouter, type ServerKeyRow } from './aggregate.js';
 import { SessionGate, type SessionStateRow } from './session-gate.js';
 import { HermesGatewayConnector, resolveHermesGatewayConfig, type HermesGatewayConfig } from './hermes-gateway.js';
 import { resolveVersion } from './version.js';
@@ -2108,11 +2108,15 @@ export class ClientDaemon {
         slowHandling: this.cfg.aggregate_slow_handling ?? 'wait',
         ttfbTimeoutMs: this.cfg.aggregate_ttfb_timeout_ms ?? 0,
         queueDepthCap: this.cfg.aggregate_queue_depth_cap ?? 3,
+        // route-hold (owner posture 2026-10-18): a named model with no
+        // resolvable engine WAITS for one here — the machine default target
+        // never receives a named POST. `0` skips the wait (instant named 503).
+        routeHoldMs: this.cfg.aggregate_route_wait_ms ?? ROUTE_HOLD_DEFAULT_MS,
       });
       try {
         await waitProxyReady(this.aggregate.server);
         this.log.info(
-          `aggregate endpoint up: ${this.aggregate.base_url}/v1 → catalog-routed (default ${this.cfg.llm_target})${
+          `aggregate endpoint up: ${this.aggregate.base_url}/v1 → catalog-routed (unresolvable model: hold ${this.cfg.aggregate_route_wait_ms ?? ROUTE_HOLD_DEFAULT_MS}ms → 503; llm_target ${this.cfg.llm_target} = GET/DELETE/HEAD passthrough only)${
             this.cfg.aggregate_slow_handling === 'failover' && this.cfg.aggregate_ttfb_timeout_ms
               ? ` (slow handling: failover, ttfb ${this.cfg.aggregate_ttfb_timeout_ms}ms, queue cap ${this.cfg.aggregate_queue_depth_cap ?? 3})`
               : ''

@@ -24,14 +24,15 @@
  *     posture the llama.cpp family demands)
  *   - NON-aliased traffic byte-identical to today: splice never happens,
  *     the pipe posture keeps a chunked client chunked
- *   - chunk-boundary name spanning: the sniff misses → default-target
- *     fallback PARITY (the fix is deferred to #67; this pins it)
+ *   - chunk-boundary name spanning: the sniff ACCUMULATES chunks until the
+ *     field matches (2026-10-18) — the name routes, the body arrives whole
  *   - over-cap aliased body → 413 before any engine byte (bounded cap)
  *   - re-pin propagation: updateAliases (simulating the next poll) → the
  *     next request serves the OTHER winner row
- *   - unknown/absent model: the machine default target untouched (D6,
- *     NARROWED by alias-stability D2: an EVER-published alias name with a
- *     cleared map is FENCED — local 503 model_unavailable, never llm_target)
+ *   - unknown/absent model: route-hold (owner posture 2026-10-18) — a
+ *     named model with no resolvable engine HOLDS to a local 503
+ *     model_unavailable; a body naming no model is a local 400. The
+ *     machine default target never receives a named POST at all.
  */
 
 import { test, after } from 'node:test';
@@ -110,12 +111,15 @@ async function startRouter(opts: {
   keys?: { id: string; name: string; url: string; auth_token: string }[];
   onSessionRoute?: (key: string, serverId: string) => void;
   aliasBodyCapBytes?: number;
+  /** route-hold window under test; absent = SHORT (fast expiry). */
+  routeHoldMs?: number;
 }): Promise<AggregateRouter> {
   const r = startAggregateRouter({
     port: 0,
     defaultTarget: opts.defaultTarget,
     ...(opts.onSessionRoute ? { onSessionRoute: opts.onSessionRoute } : {}),
     ...(opts.aliasBodyCapBytes !== undefined ? { aliasBodyCapBytes: opts.aliasBodyCapBytes } : {}),
+    routeHoldMs: opts.routeHoldMs ?? 150,
   });
   cleanup.push(() => r.stop());
   if (!r.server.listening) await new Promise<void>((r2) => r.server.once('listening', r2));
@@ -373,7 +377,7 @@ test('#66 bytes: NON-aliased traffic byte-identical — bare name pipes untouche
   assert.ok(bare.hits[1]!.raw.equals(Buffer.from(sent, 'utf8')), 'chunked non-aliased bytes still identical');
 });
 
-test('#66 parity: model name spanning the chunk boundary — the sniff misses, the request falls to the DEFAULT target (fix deferred to #67)', async () => {
+test('#66 spanning (FIXED 2026-10-18): model name split across the chunk boundary — the sniff accumulates, the alias ROUTES, the body arrives whole', async () => {
   const def = await startEcho('default');
   const eng = await startEcho('engine-A');
   cleanup.push(() => def.close());
@@ -384,15 +388,13 @@ test('#66 parity: model name spanning the chunk boundary — the sniff misses, t
   });
 
   const body = chatBody(ALIAS_NAME);
-  const cut = body.indexOf(ALIAS_NAME) + 3; // first chunk ends INSIDE the name: the quoted-name regex cannot match
+  const cut = body.indexOf(ALIAS_NAME) + 3; // first chunk ends INSIDE the name: no single chunk can match alone
   const port = new URL(r.base_url).port;
   const out = await postChunked(Number(port), [body.slice(0, cut), body.slice(cut)]);
   assert.equal(out.status, 200);
-  await waitFor(() => def.hits.length === 1, 3000, 'default target hit');
-  assert.equal(eng.hits.length, 0, 'the alias engine was NOT chosen — routing could not see the name (same as an unknown model today)');
-  assert.ok(def.hits[0]!.raw.equals(Buffer.from(body, 'utf8')), 'the default target got the bytes untouched (fallback posture unchanged)');
-  // PARITY claim: same shape an unknown model takes today. NOT a fix —
-  // the bounded multi-chunk peek lands in #67.
+  await waitFor(() => eng.hits.length === 1, 3000, 'alias engine hit');
+  assert.ok(eng.hits[0]!.raw.toString('utf8').includes(`"model":"${ENGINE_ID_A}"`), 'the accumulated sniff crossed the split, routed the alias, and the splice applied');
+  assert.equal(def.hits.length, 0, 'the default target is NEVER the split-miss landing zone anymore (route-hold closed it)');
 });
 
 test('#66 413: an aliased body over the bounded cap is refused before the engine sees a byte', async () => {
@@ -454,31 +456,33 @@ test('#66 re-pin propagation: updateAliases (the next poll lands) → the next r
   assert.deepEqual(routes, [[ALIAS_NAME, 'srv-a'], [ALIAS_NAME, 'srv-b']], 'heartbeats follow the new engine honestly (D6)');
 });
 
-test('#66 D6 fence (NARROWED by alias-stability D2): unknown model → default untouched; a CLEARED alias name is FENCED with 503 model_unavailable, never llm_target', async () => {
+test('route-hold (supersedes the D2/D6 fence): unknown AND cleared names never touch llm_target — both hold to a local 503 model_unavailable', async () => {
   const def = await startEcho('default');
   const eng = await startEcho('engine-A');
   cleanup.push(() => def.close());
   cleanup.push(() => eng.close());
   const r = await startRouter({
     defaultTarget: def.url,
+    routeHoldMs: 150,
     aliases: [{ name: ALIAS_NAME, server_id: 'srv-win', url: eng.url, auth_set: false, engine_model: ENGINE_ID_A, catalog_source: 'probed' }],
   });
 
   const unknown = await postChat(r.base_url, chatBody('NoSuchAlias'));
-  assert.equal(((await unknown.json()) as { model: string }).model, 'default', 'unknown model → llm_target (the narrowed D6 fence still stands for genuinely unknown names)');
-  assert.ok(def.hits[0]!.raw.toString('utf8').includes('NoSuchAlias'), 'the unknown body forwarded untouched');
+  assert.equal(unknown.status, 503, 'a genuinely unknown name HOLDS too (owner posture 2026-10-18) — never the default-target fall-through');
+  const unknownErr = (await unknown.json()) as { error: { type: string } };
+  assert.equal(unknownErr.error.type, 'model_unavailable');
 
   r.updateAliases([]); // the arbiter published no aliases this tick (the 2026-10-12 cold-start shape)
   assert.equal(r.aliasSize(), 0, 'an empty block CLEARS the alias map (no stale pin)');
-  const fenced = await postChat(r.base_url, chatBody(ALIAS_NAME));
-  assert.equal(fenced.status, 503, 'an EVER-published alias name resolves in neither map → local 503, NOT the default-target fall-through (D2)');
-  const err = (await fenced.json()) as { error: { message: string; type: string; code: string; model: string } };
+  const held = await postChat(r.base_url, chatBody(ALIAS_NAME));
+  assert.equal(held.status, 503, 'an EVER-published alias name resolves in neither map → held, then local 503, NOT the default-target fall-through');
+  const err = (await held.json()) as { error: { message: string; type: string; code: string; model: string } };
   assert.equal(err.error.type, 'model_unavailable');
   assert.equal(err.error.code, 'model_unavailable');
-  assert.equal(err.error.model, ALIAS_NAME, 'the fenced name echoed');
+  assert.equal(err.error.model, ALIAS_NAME, 'the held name echoed');
   assert.equal(err.error.message, `model "${ALIAS_NAME}" is configured on this machine but no engine currently serves it`);
   assert.equal(eng.hits.length, 0, 'the alias engine never served after the block cleared');
-  assert.equal(def.hits.length, 1, 'the fenced name never crossed to the default target (only the unknown-name request did)');
+  assert.equal(def.hits.length, 0, 'the default target recorded ZERO requests — the route-hold closed the POST fall-through for good');
 });
 
 test('#66 updateAliases defensive posture: malformed entries dropped, a repeated name keeps the first', () => {

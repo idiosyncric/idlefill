@@ -16,9 +16,12 @@
  *   - chat-completions route by the body's `model` to the catalog row's
  *     engine, WITH that row's Authorization header from the in-memory key
  *     table
- *   - unknown model / absent model / empty catalog fall back to the
- *     machine's default llm_target (exact today behavior, client's own
- *     auth passes through untouched)
+ *   - route-hold (owner posture 2026-10-18): a named model that resolves in
+ *     neither map HOLDS (zero bytes upstream, body unconsumed) until a map
+ *     update makes it routable, then proceeds through the same seam; on
+ *     hold-expiry it answers the local 503 model_unavailable. A body naming
+ *     no model is a local 400. The machine default llm_target NEVER receives
+ *     a named POST — it stays the GET/DELETE/HEAD passthrough base
  *   - gate derived-key registration: X-Hermes-Session-Id present → the
  *     header is the key; absent → the model name is the key (D3)
  *   - onSessionRoute fires (key, catalog-chosen server_id) so the daemon's
@@ -27,11 +30,12 @@
  *     11435 /s/<token> session on the SAME gate (D5 — a second gate would
  *     double the cap)
  *   - engineBase strips an operator-pasted /v1 suffix
- *   - alias-stability D2 fence: an EVER-published alias name with an empty
- *     published block answers local 503 model_unavailable (exact body, zero
- *     upstream bytes, before the gate); unknown names keep the llm_target
- *     fall-through; a same-name bare catalog row routes; a republished
- *     block restores routing; the empty-block /v1/models list stays empty
+ *   - route-hold (supersedes the alias-stability D2 fence): an EVER-published
+ *     alias name with an empty published block HOLDS (zero upstream bytes,
+ *     before the gate, no registration) and is released by the republish;
+ *     expired holds answer the local 503 model_unavailable (exact body);
+ *     genuinely unknown names hold too (never llm_target); a same-name bare
+ *     catalog row routes; the empty-block /v1/models list stays empty
  *   - alias-stability D3 slow-engine policy: wait (default) installs NO
  *     timer byte-for-byte; failover arms a TTFB watchdog on the buffered
  *     aliased forward only — ONE retry into fallback_targets (re-spliced
@@ -47,7 +51,7 @@ import http from 'node:http';
 import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { startAggregateRouter, engineBase, type AggregateRouter, type AggregateCatalogEntry, type AggregateAliasEntry } from '../src/aggregate.js';
+import { startAggregateRouter, engineBase, ROUTE_HOLD_CAP, ROUTE_HOLD_DEFAULT_MS, type AggregateRouter, type AggregateCatalogEntry, type AggregateAliasEntry } from '../src/aggregate.js';
 import { startLlmProxy, waitProxyReady, type LlmProxy } from '../src/proxy.js';
 import { SessionGate, type SessionGateSnapshot, type SessionHistory } from '../src/session-gate.js';
 
@@ -148,6 +152,8 @@ async function startRouter(opts: {
   slowHandling?: 'wait' | 'failover';
   ttfbTimeoutMs?: number;
   queueDepthCap?: number;
+  /** route-hold: the hold window under test; absent = SHORT (fast expiry). */
+  routeHoldMs?: number;
 }): Promise<AggregateRouter> {
   const r = startAggregateRouter({
     port: 0,
@@ -158,6 +164,7 @@ async function startRouter(opts: {
     ...(opts.slowHandling ? { slowHandling: opts.slowHandling } : {}),
     ...(opts.ttfbTimeoutMs !== undefined ? { ttfbTimeoutMs: opts.ttfbTimeoutMs } : {}),
     ...(opts.queueDepthCap !== undefined ? { queueDepthCap: opts.queueDepthCap } : {}),
+    routeHoldMs: opts.routeHoldMs ?? 150,
   });
   cleanup.push(() => r.stop());
   await waitProxyReady(r.server);
@@ -166,13 +173,14 @@ async function startRouter(opts: {
   return r;
 }
 
-function postChat(base: string, path: string, model?: string, headers?: Record<string, string>): Promise<Response> {
+function postChat(base: string, path: string, model?: string, headers?: Record<string, string>, signal?: AbortSignal): Promise<Response> {
   const body: Record<string, unknown> = { messages: [{ role: 'user', content: 'hi' }] };
   if (model !== undefined) body.model = model;
   return fetch(`${base}${path}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', ...(headers ?? {}) },
     body: JSON.stringify(body),
+    ...(signal !== undefined ? { signal } : {}),
   });
 }
 
@@ -268,31 +276,47 @@ test('chat-completions route by model to the catalog row, adding the row Authori
   assert.equal(def.hits.length, 0, 'default target untouched for a known model');
 });
 
-test('fallback to llm_target: unknown model, absent model, and empty catalog all take today-behavior passthrough', async () => {
+test('route-hold closes the fall-through: unknown name holds to the named 503, no-model POSTs 400, cleared catalog holds too — the default target records ZERO POST bytes', async () => {
   const def = await startEngine('default');
   const omlx = await startEngine('omlx-engine');
   cleanup.push(() => def.close());
   cleanup.push(() => omlx.close());
+  // Helper default hold: 150 ms — every unroutable name below expires fast,
+  // every answer is LOCAL (the hold never forwards a byte anywhere).
   const r = await startRouter({ defaultTarget: def.url, catalog: CATALOG.map((e) => ({ ...e, url: omlx.url })) });
 
   const unknown = await postChat(r.base_url, '/v1/chat/completions', 'NotInCatalog');
-  assert.equal(unknown.status, 200);
-  assert.equal(((await unknown.json()) as { model: string }).model, 'default', 'unknown model → default target');
+  assert.equal(unknown.status, 503, 'an unroutable name is HELD, then answered locally — never the default target');
+  const err = (await unknown.json()) as { error: { type: string; code: string; model: string; message: string } };
+  assert.equal(err.error.type, 'model_unavailable');
+  assert.equal(err.error.code, 'model_unavailable');
+  assert.equal(err.error.model, 'NotInCatalog', 'the name echoed');
+  assert.match(err.error.message, /not served by any engine on this machine/, 'a name never seen reads honestly (not "configured")');
 
   const noModel = await fetch(`${r.base_url}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: 'Bearer ' + 'clientkey' },
     body: JSON.stringify({ messages: [] }),
   });
-  assert.equal(noModel.status, 200);
-  assert.equal(def.hits[1]!.auth, 'Bearer clientkey', 'client auth passes through untouched (today behavior)');
+  assert.equal(noModel.status, 400, 'a POST that names no model has nothing to wait for — named local 400, not a fall-through');
+  const bad = (await noModel.json()) as { error: { type: string; code: string } };
+  assert.equal(bad.error.type, 'invalid_request_error');
+  assert.equal(bad.error.code, 'no_model');
 
   r.updateCatalog([]);
   assert.equal(r.catalogSize(), 0);
   const empty = await postChat(r.base_url, '/v1/chat/completions', 'MlxModel');
-  assert.equal(empty.status, 200);
-  assert.equal(((await empty.json()) as { model: string }).model, 'default', 'empty catalog → default target');
-  assert.equal(omlx.hits.length, 0, 'the row engine never served a fallback request');
+  assert.equal(empty.status, 503, 'an ever-cataloged name on an empty map holds, then answers the named 503');
+  const emptied = (await empty.json()) as { error: { message: string } };
+  assert.equal(
+    emptied.error.message,
+    'model "MlxModel" is configured on this machine but no engine currently serves it',
+    'a name this machine HAS served reads as configured (the D2 exact body)',
+  );
+
+  assert.equal(omlx.hits.length, 0, 'the row engine never served a held request');
+  assert.equal(def.hits.length, 0, 'the default target recorded ZERO requests — route-hold closed the POST fall-through');
+  assert.equal(bytesTo(def.hits), 0, 'ZERO bytes ever crossed to the default target');
 });
 
 test('gate key (D3): X-Hermes-Session-Id wins when present; otherwise the body model names the session', async () => {
@@ -457,7 +481,12 @@ test('#65 posture: an engine 200 SSE keeps status 200 with byte-identical frames
       sse.close(() => r());
     }),
   );
-  const r = await startRouter({ defaultTarget: `http://127.0.0.1:${ssePort}` });
+  // route-hold: the default target takes no named POST, so the stream rides
+  // a catalog row pointed at the SSE server (the relay posture under test).
+  const r = await startRouter({
+    defaultTarget: `http://127.0.0.1:${ssePort}`,
+    catalog: [{ name: 'StreamModel', server_id: 'srv-sse', url: `http://127.0.0.1:${ssePort}`, auth_set: false }],
+  });
 
   const res = await postChat(r.base_url, '/v1/chat/completions', 'StreamModel');
   assert.equal(res.status, 200, 'a 200 SSE stays a 200');
@@ -674,7 +703,7 @@ test('#68 plane ON: no credential 401s (models list too), wrong key 401s, the mi
   assert.equal(engine.hits.length, 1, 'only the authenticated request reached the engine');
 });
 
-test('#68 upstream posture: the agent key never rides to an engine — keyed row injects its own credential, keyless row and default target strip it', async () => {
+test('#68 upstream posture: the agent key never rides to an engine — keyed row injects its own credential, keyless row strips it; an unroutable name never reaches the default target at all', async () => {
   const keyed = await startEngine('keyed');
   const keyless = await startEngine('keyless');
   const def = await startEngine('default');
@@ -697,8 +726,9 @@ test('#68 upstream posture: the agent key never rides to an engine — keyed row
   await postChat(r.base_url, '/v1/chat/completions', 'U', { authorization: BEARER(AGENT) });
   assert.equal(keyless.hits[0]!.auth, undefined, 'the agent key is STRIPPED for a keyless row — never forwarded to an engine that never issued it');
 
-  await postChat(r.base_url, '/v1/chat/completions', 'NotInCatalog', { authorization: BEARER(AGENT) });
-  assert.equal(def.hits[0]!.auth, undefined, 'the default target gets the agent key stripped too');
+  const unroutable = await postChat(r.base_url, '/v1/chat/completions', 'NotInCatalog', { authorization: BEARER(AGENT) });
+  assert.equal(unroutable.status, 503, 'route-hold: the name waits for an engine and answers locally — no stripped-key hop to an unrelated engine (the hypnotist 401 shape, closed)');
+  assert.equal(def.hits.length, 0, 'the default target never sees the request — with it, the agent key itself');
 });
 
 test('#68 plane OFF (no digests): the any-caller pass-through stays byte-for-byte', async () => {
@@ -716,18 +746,19 @@ test('#68 plane OFF (no digests): the any-caller pass-through stays byte-for-byt
 });
 
 // ---------------------------------------------------------------------------
-// alias-stability D2 (2026-10-12) — the DEFAULT-TARGET FENCE. The incident:
-// the arbiter cold-started and published `model_aliases: []` for its first
-// ~15s; updateAliases([]) cleared the router's alias map, and the next
-// request naming `Qwen3.8-Flash-Next` fell to `llm_target` (oMLX :8000) with
-// the agent key STRIPPED → 401 "API key required" from an unrelated engine.
-// Posture now: every alias name EVER accepted into the routing map is
-// remembered for the process lifetime (monotonic); such a name resolving in
-// NEITHER map answers local 503 model_unavailable — before the gate, no
-// onSessionRoute, ZERO bytes to any upstream. Unknown names keep the D6
-// fall-through byte-for-byte; a bare catalog row of the same name still
-// routes; a republished block restores normal routing; /v1/models keeps its
-// empty-block posture.
+// ROUTE-HOLD (2026-10-18, owner posture) — THE DEFAULT TARGET IS NOT A
+// ROUTING TARGET. The 2026-10-12 incident (arbiter cold start published
+// `model_aliases: []`, the request fell to `llm_target` with the agent key
+// stripped → 401 "API key required" from an unrelated engine) was fenced
+// that day with an instant 503; the 2026-10-18 follow-up (the hypnotist: a
+// huge leading tool-result body pushed the `"model"` field past the first
+// TCP chunk, the first-chunk-only sniff read "no model", and the request
+// fell through again) CLOSED it: a named model that resolves in neither map
+// HOLDS — body unconsumed, before the gate, no onSessionRoute, zero bytes
+// upstream — until a poll makes it routable (then it proceeds through the
+// SAME seam), and only hold-expiry answers the local 503 model_unavailable.
+// Genuinely unknown names hold too (never llm_target); a bare catalog row
+// of the same name still routes; /v1/models keeps its empty-block posture.
 // ---------------------------------------------------------------------------
 
 const FENCE_ALIAS = 'Qwen3.8-Flash-Next'; // the exact incident name
@@ -742,19 +773,55 @@ const FENCE_BODY = (name: string): string =>
   });
 const bytesTo = (hits: { body: string }[]): number => hits.reduce((n, h) => n + Buffer.byteLength(h.body), 0);
 
-test('D2 fence (the incident shape): alias published once, empty block published → 503 model_unavailable, ZERO llm_target bytes', async () => {
+test('route-hold (the incident shape): alias published once, empty block published → the request HOLDS (zero bytes anywhere); the next poll republishes and the held body routes whole', async () => {
   const def = await startEngine('default'); // the oMLX :8000 stand-in
-  const eng = await startEngine('engine'); // the row that used to serve the alias
+  const eng = await startEngine('engine'); // the row that serves the alias
+  cleanup.push(() => def.close());
+  cleanup.push(() => eng.close());
+  const logs: string[] = [];
+  const routes: [string, string][] = [];
+  const r = await startRouter({
+    defaultTarget: def.url,
+    logs,
+    onSessionRoute: (key, serverId) => routes.push([key, serverId]),
+    routeHoldMs: 5_000, // outlives the republish below
+  });
+  const pair = [{ name: FENCE_ALIAS, server_id: 'srv-omlx', url: eng.url, auth_set: false, engine_model: 'engine-own-id', catalog_source: 'probed' as const }];
+  r.updateAliases(pair);
+  r.updateAliases([]); // the arbiter cold start: model_aliases: [] published
+  assert.equal(r.aliasSize(), 0, 'the empty block still CLEARS the routing map (no stale pin)');
+
+  const pending = postChat(r.base_url, '/v1/chat/completions', FENCE_ALIAS);
+  await waitFor(() => logs.some((m) => m.includes(`hold ${FENCE_ALIAS}`)), 3000, 'hold armed');
+  assert.equal(def.hits.length, 0, 'while held: the default target recorded ZERO requests');
+  assert.equal(eng.hits.length, 0, 'while held: no engine saw a byte');
+  assert.equal(routes.length, 0, 'while held: no onSessionRoute, no registration, no slot');
+
+  r.updateAliases(pair); // the next poll republishes the healthy pair
+  const res = await pending;
+  assert.equal(res.status, 200, 'the held request rides the republished route — the churn is waited out, not failed');
+  const json = (await res.json()) as { model: string };
+  assert.equal(json.model, 'engine', 'the alias engine answered the held request');
+  await waitFor(() => eng.hits.length === 1, 3000, 'alias engine hit');
+  assert.match(eng.hits[0]!.body, /"model":"engine-own-id"/, 'the body arrived WHOLE and the #66 splice applied (unconsumed through the hold)');
+  assert.deepEqual(routes, [[FENCE_ALIAS, 'srv-omlx']], 'the heartbeat fires at RELEASE, paired with the engine that actually served');
+  assert.equal(def.hits.length, 0, 'the default target stayed untouched through the whole incident replay');
+  assert.equal(bytesTo(def.hits), 0, 'ZERO bytes ever crossed to the default target');
+});
+
+test('route-hold expiry: no republish inside the window → the exact named 503, ZERO llm_target bytes, no registration', async () => {
+  const def = await startEngine('default');
+  const eng = await startEngine('engine');
   cleanup.push(() => def.close());
   cleanup.push(() => eng.close());
   const routes: [string, string][] = [];
   const r = await startRouter({
     defaultTarget: def.url,
     onSessionRoute: (key, serverId) => routes.push([key, serverId]),
+    routeHoldMs: 150,
   });
   r.updateAliases([{ name: FENCE_ALIAS, server_id: 'srv-omlx', url: eng.url, auth_set: false, engine_model: FENCE_ALIAS, catalog_source: 'probed' }]);
-  r.updateAliases([]); // the arbiter cold start: model_aliases: [] published
-  assert.equal(r.aliasSize(), 0, 'the empty block still CLEARS the routing map (no stale pin)');
+  r.updateAliases([]); // the block vanishes and never returns within the window
 
   const res = await postChat(r.base_url, '/v1/chat/completions', FENCE_ALIAS);
   assert.equal(res.status, 503, 'a configured-but-unresolvable alias NEVER falls through to llm_target');
@@ -763,7 +830,64 @@ test('D2 fence (the incident shape): alias published once, empty block published
   assert.equal(def.hits.length, 0, 'the default target recorded ZERO requests');
   assert.equal(bytesTo(def.hits), 0, 'ZERO bytes ever crossed to the default target');
   assert.equal(eng.hits.length, 0, 'no engine saw a byte either');
-  assert.equal(routes.length, 0, 'no onSessionRoute fires for a fenced request (no register heartbeat, no slot)');
+  assert.equal(routes.length, 0, 'no onSessionRoute fires for a held-then-expired request');
+});
+
+test('route-hold cap: the queue is a churn absorber, not a park lot — the over-cap request answers the named 503 at once while the rest wait', async () => {
+  const def = await startEngine('default');
+  const eng = await startEngine('engine');
+  cleanup.push(() => def.close());
+  cleanup.push(() => eng.close());
+  const logs: string[] = [];
+  const r = await startRouter({ defaultTarget: def.url, logs, routeHoldMs: 5_000 });
+  const pair = [{ name: FENCE_ALIAS, server_id: 'srv-omlx', url: eng.url, auth_set: false, engine_model: FENCE_ALIAS, catalog_source: 'probed' as const }];
+  r.updateAliases(pair);
+  r.updateAliases([]);
+
+  const pending = Array.from({ length: ROUTE_HOLD_CAP }, () => postChat(r.base_url, '/v1/chat/completions', FENCE_ALIAS));
+  await waitFor(() => logs.filter((m) => m.includes(`hold ${FENCE_ALIAS}`)).length === ROUTE_HOLD_CAP, 3000, 'all holds armed');
+  const overflow = await postChat(r.base_url, '/v1/chat/completions', FENCE_ALIAS);
+  assert.equal(overflow.status, 503, 'the over-cap request is named immediately, not queued behind a dead engine');
+  assert.match(overflow.headers.get('content-type') ?? '', /application\/json/);
+  assert.equal(def.hits.length, 0, 'the cap answer is LOCAL — zero bytes to the default target');
+
+  r.updateAliases(pair); // the engine returns: every queued request rides it
+  const all = await Promise.all(pending);
+  assert.ok(all.every((res) => res.status === 200), 'all queued requests released together');
+  assert.equal(eng.hits.length, ROUTE_HOLD_CAP, 'the engine served exactly the queued holds');
+});
+
+test('route-hold before the gate: a held request consumes no slot, registers nothing, and the release path goes through the SAME gate', async () => {
+  const def = await startEngine('default');
+  const eng = await startEngine('engine');
+  cleanup.push(() => def.close());
+  cleanup.push(() => eng.close());
+  const logs: string[] = [];
+  const { gate, registered } = makeGate(1); // cap 1: a gate leak would show as queue/registration
+  const routes: [string, string][] = [];
+  const r = await startRouter({
+    defaultTarget: def.url,
+    gate,
+    logs,
+    onSessionRoute: (key, serverId) => routes.push([key, serverId]),
+    routeHoldMs: 5_000,
+  });
+  const pair = [{ name: FENCE_ALIAS, server_id: 'srv-omlx', url: eng.url, auth_set: false, engine_model: FENCE_ALIAS, catalog_source: 'probed' as const }];
+  r.updateAliases(pair);
+  r.updateAliases([]);
+
+  const pending = postChat(r.base_url, '/v1/chat/completions', FENCE_ALIAS, { 'x-hermes-session-id': 'conv-held' });
+  await waitFor(() => logs.some((m) => m.includes(`hold ${FENCE_ALIAS}`)), 3000, 'hold armed');
+  assert.equal(registered.length, 0, 'the gate never saw the request while held — no registration');
+  assert.equal(gate.queueDepth, 0, 'no slot consumed, nothing parked');
+  assert.equal(routes.length, 0, 'onSessionRoute never fired while held');
+
+  r.updateAliases(pair);
+  const res = await pending;
+  assert.equal(res.status, 200);
+  await waitFor(() => registered.length === 1, 3000, 'gate registration at release');
+  assert.equal(registered[0], 'conv-held', 'the released request keyed the gate by its session header (D3)');
+  assert.equal(def.hits.length, 0, 'still zero bytes to the default target');
 });
 
 test('D2 fence: fires BEFORE the gate — no slot consumed, no registration, on a gated router', async () => {
@@ -791,19 +915,21 @@ test('D2 fence: fires BEFORE the gate — no slot consumed, no registration, on 
   assert.equal(eng.hits.length, 0);
 });
 
-test('D2 fence scope: a genuinely unknown name with an empty published block still forwards to the default target (D6 stand)', async () => {
+test('route-hold scope: a genuinely unknown name HOLDS too and expires to the named 503 — the default target never receives it (owner posture 2026-10-18)', async () => {
   const def = await startEngine('default');
   cleanup.push(() => def.close());
-  const r = await startRouter({ defaultTarget: def.url });
-  r.updateAliases([]); // empty published block — the fence knows NO names yet
+  const r = await startRouter({ defaultTarget: def.url, routeHoldMs: 150 });
+  r.updateAliases([]); // empty published block — this name was never seen
 
   const res = await postChat(r.base_url, '/v1/chat/completions', 'NoSuchNameAnywhere');
-  assert.equal(res.status, 200, 'today fall-through byte-for-byte: unknown names ride llm_target');
-  assert.equal(((await res.json()) as { model: string }).model, 'default');
-  assert.match(def.hits[0]!.body, /NoSuchNameAnywhere/, 'the body forwarded untouched to the default target');
+  assert.equal(res.status, 503, 'even a never-configured name is held then answered LOCALLY — llm_target fall-through is CLOSED');
+  const err = (await res.json()) as { error: { type: string; message: string } };
+  assert.equal(err.error.type, 'model_unavailable');
+  assert.match(err.error.message, /is not served by any engine on this machine/, 'honest wording for a name never configured');
+  assert.equal(def.hits.length, 0, 'the default target recorded ZERO requests, ZERO bytes');
 });
 
-test('D2 fence scope: alias map cleared but a bare catalog row of the same name → routes to that row, not fenced, not default', async () => {
+test('route-hold scope: alias map cleared but a bare catalog row of the same name → routes to that row, no hold, not default', async () => {
   const def = await startEngine('default');
   const eng = await startEngine('engine');
   cleanup.push(() => def.close());
@@ -822,18 +948,23 @@ test('D2 fence scope: alias map cleared but a bare catalog row of the same name 
   assert.equal(def.hits.length, 0, 'the default target stayed untouched');
 });
 
-test('D2 fence never poisons a healthy block: republishing the alias after a 503 restores normal routing', async () => {
+test('route-hold posture: the production default is the 120 s wait, capped at 15 min (owner posture 2026-10-18)', () => {
+  assert.equal(ROUTE_HOLD_DEFAULT_MS, 120_000, 'a hold long enough to ride out arbiter churn/re-publish cycles by default');
+  assert.ok(ROUTE_HOLD_CAP >= 32 && ROUTE_HOLD_CAP <= 128, 'the queue absorbs a retry-looping client without parking sockets unbounded');
+});
+
+test('route-hold never poisons a healthy block: an expired hold then a republished alias restores normal routing', async () => {
   const def = await startEngine('default');
   const eng = await startEngine('engine');
   cleanup.push(() => def.close());
   cleanup.push(() => eng.close());
-  const r = await startRouter({ defaultTarget: def.url });
+  const r = await startRouter({ defaultTarget: def.url, routeHoldMs: 150 });
   const pair = [{ name: FENCE_ALIAS, server_id: 'srv-omlx', url: eng.url, auth_set: false, engine_model: 'engine-own-id', catalog_source: 'probed' as const }];
 
   r.updateAliases(pair);
   r.updateAliases([]);
   const fenced = await postChat(r.base_url, '/v1/chat/completions', FENCE_ALIAS);
-  assert.equal(fenced.status, 503);
+  assert.equal(fenced.status, 503, 'hold expires to the named 503 (the block never returned within the window)');
 
   r.updateAliases(pair); // the next poll republishes the healthy block
   const ok = await postChat(r.base_url, '/v1/chat/completions', FENCE_ALIAS);
@@ -856,6 +987,79 @@ test('D2 posture: GET /v1/models with an empty published block still answers the
   assert.equal(list.object, 'list');
   assert.deepEqual(list.data, [], 'the published empty block still means an empty advertised list (unchanged posture)');
   assert.equal(def.hits.length, 0, 'the router never probes an engine to answer (D1)');
+});
+
+test('sniff across chunks (the 2026-10-18 hypnotist incident): a `"model"` field pushed past the first TCP chunk by a huge leading value STILL ROUTES — no fall-through, no 401', async () => {
+  const def = await startEngine('default'); // the oMLX :8000 stand-in
+  const row = await startEngine('row-engine');
+  cleanup.push(() => def.close());
+  cleanup.push(() => row.close());
+  const r = await startRouter({
+    defaultTarget: def.url,
+    catalog: [{ name: 'MlxModel', server_id: 'srv-omlx', url: row.url, auth_set: false }],
+  });
+
+  // A tool-result-heavy body: 200 KB of content BEFORE the model field, so
+  // the field cannot live in the first read window. Two temporally separate
+  // writes force the chunk split the old first-chunk-only sniff misread as
+  // "no model" (→ default-target fall-through → a stripped-key 401).
+  const body = JSON.stringify({ messages: [{ role: 'user', content: 'a'.repeat(200_000) }], model: 'MlxModel' });
+  const cut = body.length - 24;
+  const port = Number(new URL(r.base_url).port);
+  const res = await new Promise<{ status: number; body: string }>((resolveP, rejectP) => {
+    const req = http.request(
+      {
+        host: '127.0.0.1',
+        port,
+        path: '/v1/chat/completions',
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(body)) },
+      },
+      (up) => {
+        let text = '';
+        up.on('data', (c) => (text += c));
+        up.on('end', () => resolveP({ status: up.statusCode ?? 0, body: text }));
+      },
+    );
+    req.on('error', rejectP);
+    req.write(body.slice(0, cut));
+    setTimeout(() => {
+      req.write(body.slice(cut));
+      req.end();
+    }, 60);
+  });
+
+  assert.equal(res.status, 200, 'the accumulated sniff found the name across the split and routed it');
+  assert.equal(((await JSON.parse(res.body)) as { model: string }).model, 'row-engine', 'the catalog row answered');
+  await waitFor(() => row.hits.length === 1, 3000, 'row engine hit');
+  assert.equal(row.hits[0]!.body.length, Buffer.byteLength(body), 'the body arrived byte-complete (every sniffed chunk was put back)');
+  assert.match(row.hits[0]!.body, /"model":"MlxModel"}$/, 'the model field rode untouched');
+  assert.equal(def.hits.length, 0, 'ZERO bytes to the default target — the incident never re-runs');
+});
+
+test('route-hold: a client that aborts while held is dropped silently — the later release forwards nothing to any engine', async () => {
+  const def = await startEngine('default');
+  const eng = await startEngine('engine');
+  cleanup.push(() => def.close());
+  cleanup.push(() => eng.close());
+  const logs: string[] = [];
+  const r = await startRouter({ defaultTarget: def.url, logs, routeHoldMs: 5_000 });
+  const pair = [{ name: FENCE_ALIAS, server_id: 'srv-omlx', url: eng.url, auth_set: false, engine_model: FENCE_ALIAS, catalog_source: 'probed' as const }];
+  r.updateAliases(pair);
+  r.updateAliases([]);
+
+  const ac = new AbortController();
+  const pending = postChat(r.base_url, '/v1/chat/completions', FENCE_ALIAS, {}, ac.signal);
+  await waitFor(() => logs.some((m) => m.includes(`hold ${FENCE_ALIAS}`)), 3000, 'hold armed');
+  ac.abort();
+  await pending.catch(() => undefined); // the client left; the rejection is the point
+  await waitFor(() => logs.some((m) => m.includes('dropped')), 3000, 'server noticed the departure');
+
+  r.updateAliases(pair); // the engine returns — the departed request must NOT resurrect
+  await new Promise((res) => setTimeout(res, 50));
+  assert.equal(eng.hits.length, 0, 'nothing was forwarded for the aborted hold');
+  assert.equal(logs.filter((m) => m.includes('released')).length, 0, 'the departed hold was dropped at abort, never released');
+  assert.equal(def.hits.length, 0, 'the default target never saw it either');
 });
 
 // ---------------------------------------------------------------------------
