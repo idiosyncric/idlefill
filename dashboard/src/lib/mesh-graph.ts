@@ -33,6 +33,14 @@
 // tooltip is the shared pipeTitle — the graph never says something the
 // functional session row does not. Stale sessions (sessStale) are not
 // flows: the graph shows LIVE traffic, the Sessions tab keeps the history.
+//
+// The MODEL-hop law (owner ask 2026-10-19): a pipe spells the whole published
+// connection — session → abstraction → engine. The model NAME is the session
+// row's own, first-named-wins (gateway-ledger stamp → operator pin → router
+// sniff, the source RECORDED, never inferred); idlefill's abstraction joins
+// EXACTLY: a model_aliases winner whose server_id IS the pipe's engine row
+// AND whose engine_model IS that name. A unique winner names the alias on
+// the pipe; zero or ambiguous winners name nothing (the raw model stays).
 // ---------------------------------------------------------------------------
 
 import dagre from "@dagrejs/dagre";
@@ -97,13 +105,26 @@ export type MeshEngineSlot = {
   watched: boolean;
 };
 
+/** Where a flow's model NAME came from (row facts only, first-named-wins). */
+export type MeshModelSource = "ledger" | "pin" | "sniffed";
+export const MODEL_SOURCE_NOTE: Record<MeshModelSource, string> = {
+  ledger: "stamped by the gateway ledger",
+  pin: "named by the operator pin",
+  sniffed: "the model the router last sniffed",
+};
+
 /** One live session LISTED on its profile card — the same facts the flow
  *  edge carries (shared pipe + tooltip), never more than the edge says. */
 export type MeshProfileSession = {
   flowId: string;
   shortToken: string;
+  /** The model / idlefill alias to spell as the card's middle hop (null =
+   *  the row names none — the line reads session ⇢ engine, no invented hop). */
+  model: string | null;
+  alias: string | null;
   engineName: string;
-  /** The shared pipe tooltip (pipeTitle) — card and edge never disagree. */
+  /** The shared pipe tooltip (pipeTitle + the model clause) — card and edge
+   *  never disagree. */
   title: string;
   phase: PipePhase;
   animated: boolean;
@@ -197,7 +218,15 @@ export type MeshFlow = {
   token: string;
   shortToken: string;
   profile: string | null;
+  /** The model NAME the session row carries, first-named-wins (see the
+   *  MODEL-hop law); null = no row fact names one ("model not named"). */
   model: string | null;
+  /** Which row fact named it — the tooltip words the source honestly. */
+  modelSource: MeshModelSource | null;
+  /** idlefill's abstraction: the EXACT model_aliases winner for this
+   *  (engine row, model) pair; null = none names it, or the names are not
+   *  unique (never picked by similarity). */
+  alias: string | null;
   engineName: string;
   pinned: boolean;
   /** true = the request crosses a machine boundary. */
@@ -394,6 +423,19 @@ export function buildMeshGraph(st: StateSnapshot, now: number): MeshGraph {
   const agentSeen = new Set<string>();
   for (const f of frames) for (const a of f.agents) agentSeen.add(a.id);
   const signalOf = new Map(st.servers.map((s) => [s.id, s.signal]));
+  // The abstraction indexes (both directions, EXACT names only): an alias
+  // winner names its (engine row, engine_model) pair, and its own name
+  // resolves to an engine_model there. Ambiguous pairs/names name nothing —
+  // never an alias picked by similarity.
+  const aliasByEnginePair = new Map<string, string[]>();
+  const engineModelByAliasName = new Map<string, string[]>();
+  for (const a of st.model_aliases ?? []) {
+    if (!a.server_id || !a.engine_model) continue;
+    const k = `${a.server_id}|${a.engine_model}`;
+    (aliasByEnginePair.get(k) ?? aliasByEnginePair.set(k, []).get(k)!).push(a.name);
+    const n = `${a.server_id}|${a.name}`;
+    (engineModelByAliasName.get(n) ?? engineModelByAliasName.set(n, []).get(n)!).push(a.engine_model);
+  }
 
   const flows: MeshFlow[] = [];
   const unflowed = { noClient: 0, noEngine: 0, stale: 0 };
@@ -432,6 +474,33 @@ export function buildMeshGraph(st: StateSnapshot, now: number): MeshGraph {
     const pipe = pipeEdge(s, edge, now);
     const shortToken = s.token.slice(0, 6);
     const machine = machineOfEngine.get(row.id) ?? null;
+    // The model hop: the session row's own name, first-named-wins; then the
+    // abstraction's EXACT joins on this engine row — the winner whose
+    // engine_model IS the name (the name is then the abstraction), else the
+    // winner whose NAME IS it (the row's name already IS the alias; the
+    // tooltip names what it lands as). Unique joins only.
+    const model = s.hermes_meta?.model ?? s.engine_pin?.engine_model ?? s.history?.model ?? null;
+    const modelSource: MeshModelSource | null = s.hermes_meta?.model
+      ? "ledger"
+      : s.engine_pin?.engine_model
+        ? "pin"
+        : s.history?.model
+          ? "sniffed"
+          : null;
+    const viaAlias = model ? (aliasByEnginePair.get(`${row.id}|${model}`)?.[0] ?? null) : null;
+    const viaAliasCount = model ? (aliasByEnginePair.get(`${row.id}|${model}`)?.length ?? 0) : 0;
+    const landsAs =
+      model && viaAliasCount === 0 ? (engineModelByAliasName.get(`${row.id}|${model}`)?.[0] ?? null) : null;
+    const landsAsCount = model ? (engineModelByAliasName.get(`${row.id}|${model}`)?.length ?? 0) : 0;
+    const alias = viaAliasCount === 1 ? viaAlias : null;
+    const landsAsModel = landsAsCount === 1 ? landsAs : null;
+    // The shared pipe tooltip, extended with the model facts the ROW names
+    // (the Sessions tab shows the same facts; the graph adds no claim).
+    const title =
+      pipeTitle(shortToken, row.name, edge, pipe) +
+      (model ? ` · model ${model} (${MODEL_SOURCE_NOTE[modelSource!]})` : "") +
+      (alias ? ` · via alias ${alias} on this engine` : "") +
+      (landsAsModel ? ` · lands at this engine as ${landsAsModel}` : "");
     const flow: MeshFlow = {
       id: `flow:${s.token}`,
       from,
@@ -439,13 +508,15 @@ export function buildMeshGraph(st: StateSnapshot, now: number): MeshGraph {
       token: s.token,
       shortToken,
       profile: s.hermes_meta?.profile ?? null,
-      model: s.hermes_meta?.model ?? s.engine_pin?.engine_model ?? null,
+      model,
+      modelSource,
+      alias,
       engineName: row.name,
       pinned: s.engine_pin != null,
       cross: machine !== null && machineOfClient.get(daemon) !== undefined && machine !== machineOfClient.get(daemon),
       edge,
       pipe,
-      title: pipeTitle(shortToken, row.name, edge, pipe),
+      title,
       curvature: 0.25,
       offset: 0,
     };
@@ -454,6 +525,8 @@ export function buildMeshGraph(st: StateSnapshot, now: number): MeshGraph {
       slot.sessions.push({
         flowId: flow.id,
         shortToken,
+        model,
+        alias,
         engineName: row.name,
         title: flow.title,
         phase: pipe.phase,

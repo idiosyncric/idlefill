@@ -481,3 +481,78 @@ test("two daemons' same-named profiles never share a card or steal each other's 
   const cliA = g.frames[0].agents.find((a) => a.name === "cli-a")!;
   assert.deepEqual(cliA.profiles[0].sessions, []); // cli-a's same-named card claims nothing
 });
+
+// --- the model hop (owner ask 2026-10-19: session ⇢ idlefill's abstraction
+// ⇢ engine). The model NAME is the session row's own, first-named-wins; the
+// alias joins ONLY on a model_aliases winner whose (server, engine_model) —
+// or (server, name) — pair is named EXACTLY and UNIQUELY. ------------------
+
+const alias = (name: string, serverId: string, engineModel: string) =>
+  ({ name, server_id: serverId, url: "http://127.0.0.1:1", auth_set: true, engine_model: engineModel, catalog_source: "probed" }) as never;
+
+const hopGraph = buildMeshGraph(
+  st({
+    servers: [srv("eng1", "http://127.0.0.1:8000")],
+    clients: [client("c", "127.0.0.1", NOW - 1_000)],
+    model_aliases: [
+      alias("Flash", "eng1", "qwen-real"),
+      alias("Flash-alt", "eng1", "qwen-real"), // SAME pair — ambiguity names nothing
+      alias("Solo", "eng1", "other-real"),
+      alias("Elsewhere", "other-engine", "other-real"), // another row — no join
+    ],
+    sessions: [
+      sess("s-sniff", "c", "eng1", { history: { rpm: [], model: "other-real", reported_at: NOW - 1_000 } }),
+      sess("s-ambig", "c", "eng1", { history: { rpm: [], model: "qwen-real", reported_at: NOW - 1_000 } }),
+      sess("s-meta", "c", "eng1", { hermes_meta: { model: "Solo" } }),
+      sess("s-pin", "c", "eng1", { engine_pin: { server_id: "eng1", url: "http://127.0.0.1:8000", engine_model: "other-real", set_at: 0 } }),
+      sess("s-none", "c", "eng1"),
+    ],
+  }),
+  NOW,
+);
+
+test("a pipe names the model its ROW names, sourced — ledger stamp first, then pin, then the router sniff", () => {
+  const flow = (t: string) => hopGraph.flows.find((f) => f.token === t)!;
+  assert.deepEqual([flow("s-sniff").model, flow("s-sniff").modelSource], ["other-real", "sniffed"]);
+  assert.deepEqual([flow("s-meta").model, flow("s-meta").modelSource], ["Solo", "ledger"]);
+  assert.deepEqual([flow("s-pin").model, flow("s-pin").modelSource], ["other-real", "pin"]);
+  assert.deepEqual([flow("s-none").model, flow("s-none").modelSource], [null, null]);
+  assert.doesNotMatch(flow("s-none").title, /model/); // honest absence, never a claim
+  assert.match(flow("s-sniff").title, /model other-real \(the model the router last sniffed\)/);
+});
+
+test("idlefill's abstraction joins EXACTLY and uniquely: one winner names the alias, two name nothing", () => {
+  const flow = (t: string) => hopGraph.flows.find((f) => f.token === t)!;
+  // unique (row, engine_model) winner → the pipe reads session ⇢ alias ⇢ engine
+  assert.equal(flow("s-sniff").alias, "Solo");
+  assert.match(flow("s-sniff").title, /· via alias Solo on this engine/);
+  // TWO winners for the same pair → no alias claimed, the raw model stands
+  assert.equal(flow("s-ambig").alias, null);
+  assert.equal(flow("s-ambig").model, "qwen-real");
+  assert.doesNotMatch(flow("s-ambig").title, /via alias/);
+  // the row's name IS an alias → it stays the name; the tooltip says what it LANDS as
+  assert.equal(flow("s-meta").alias, null); // no separate alias hop (the name already is it)
+  assert.match(flow("s-meta").title, /lands at this engine as other-real/);
+  // a pin naming the engine_model rides the same unique join
+  assert.equal(flow("s-pin").alias, "Solo");
+});
+
+test("a profile card's listed line spells the full chain (shared facts, card never outruns the row)", () => {
+  const g = buildMeshGraph(
+    st({
+      servers: [srv("eng1", "http://127.0.0.1:8000")],
+      clients: [rosterClient([{ profile: "flash", posture: "adopted" }])],
+      model_aliases: [alias("Qwen3.8-Flash-Next", "eng1", "qwen3.8-flash-next-q2_0")],
+      sessions: [
+        sess("tok-hop", "cli-a", "eng1", {
+          hermes_meta: { profile: "flash" },
+          history: { rpm: [], model: "qwen3.8-flash-next-q2_0", reported_at: NOW - 1_000 },
+        }),
+      ],
+    }),
+    NOW,
+  );
+  const line = g.frames[0].agents[0].profiles[0].sessions[0];
+  assert.deepEqual([line.shortToken, line.model, line.alias, line.engineName], ["tok-ho", "qwen3.8-flash-next-q2_0", "Qwen3.8-Flash-Next", "eng1"]);
+  assert.match(line.title, /model qwen3\.8-flash-next-q2_0 .* via alias Qwen3\.8-Flash-Next/);
+});

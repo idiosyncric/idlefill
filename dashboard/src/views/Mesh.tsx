@@ -42,6 +42,7 @@ import {
   machineShape,
   meshChildOffsets,
   meshFrameSize,
+  MODEL_SOURCE_NOTE,
   type MeshAgentSlot,
   type MeshEngineSlot,
   type MeshFlow,
@@ -75,11 +76,16 @@ import type { StateSnapshot } from "@/lib/api";
 // names it exactly (no stamp / no roster match → the pipe stays on the
 // daemon card, counted there as "no profile named"). Edges:
 //   · FLOW edges (agent/profile card → engine card) reuse the Sessions flow
-//     vocabulary untouched — lib/pipe-phases decides the color and motion
+//     vocabulary untouched — lib/pipe-phases.ts decides the color and motion
 //     (queued warn · thinking green · output blue · tools purple · base
 //     hairline, motion only on a live stream) and the tooltip is the SAME
-//     pipeTitle the session row shows. A cross-machine session (an agent
-//     here, an engine on another machine) is one visible arc between frames.
+//     pipeTitle the session row shows, extended ONLY with facts the row
+//     itself names: the model (ledger stamp → operator pin → router sniff,
+//     the source worded) and idlefill's alias when a model_aliases winner
+//     joins this engine row + model name EXACTLY. Listed rows spell the
+//     chain: session ⇢ alias/model ⇢ engine. A cross-machine session (an
+//     agent here, an engine on another machine) is one visible arc between
+//     frames.
 //   · CONTROL edges (frame → frame) draw the pairing direction: the arrow
 //     points AT the controlled machine (fleet.md D4, `from controls to`).
 //
@@ -378,6 +384,7 @@ function AgentNode({ data }: NodeProps) {
  *  flow edge carries (dot color = the pipe phase, tooltip = the shared
  *  pipeTitle). Writes (gate, pin) stay on the Sessions tab. */
 function ProfileSessionLine({ s }: { s: MeshProfileSession }) {
+  const mid = s.alias ?? s.model; // the idlefill abstraction when it joins, else the row's model name
   return (
     <div
       className="flex h-[15px] items-center gap-1.5 overflow-hidden px-2.5 text-[10px]"
@@ -388,6 +395,14 @@ function ProfileSessionLine({ s }: { s: MeshProfileSession }) {
         style={{ background: PIPE_STROKE[s.phase], opacity: s.muted ? 0.45 : s.phase === "queued" ? 0.8 : 1 }}
       />
       <span className="shrink-0 font-mono text-dim">{s.shortToken}</span>
+      {mid && (
+        <>
+          <span className="shrink-0 text-accent/70">⇢</span>
+          <span className="min-w-0 shrink truncate text-accent/90" title={s.alias ? "idlefill alias — resolves on the engine" : undefined}>
+            {mid}
+          </span>
+        </>
+      )}
       <span className="shrink-0 text-accent/70">⇢</span>
       <span className="min-w-0 truncate font-mono">{s.engineName}</span>
     </div>
@@ -1145,11 +1160,18 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
   const flowLine = (fl: MeshFlow, disabled: boolean, label: ReactNode) => {
     const fhid = hiddenSet.has(fl.id);
     const em = engineMachine.get(fl.to);
+    // The model clause reads exactly like the card row: the abstraction when
+    // its winner join is unique, else the row's own model name, sourced.
+    const modelText = fl.alias
+      ? `alias ${fl.alias} → ${fl.model}`
+      : fl.model
+        ? `${fl.model} (${MODEL_SOURCE_NOTE[fl.modelSource!]})`
+        : "model not named";
     return (
       <div key={fl.id} className="flex items-center gap-1 pl-7">
         <label
           className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 py-[1px]"
-          title={`${fl.shortToken} · ${fl.model ?? "model not named"} → ${fl.engineName}${em ? ` on ${em}` : ""}${fl.cross ? " · crosses machines" : ""}`}
+          title={`${fl.shortToken} · ${modelText} → ${fl.engineName}${em ? ` on ${em}` : ""}${fl.cross ? " · crosses machines" : ""}`}
         >
           <input type="checkbox" checked={!fhid} disabled={disabled} onChange={() => toggleHidden(fl.id)} />
           <span className={`truncate font-mono text-[10px] ${fhid || disabled ? "text-dim line-through" : "text-dim"}`}>
