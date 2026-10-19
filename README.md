@@ -772,15 +772,18 @@ node scripts/idlefill-control.mjs clear  <name-or-id>
 HTTP equivalent (token-authed): `POST /api/clients/:ref/override` with body
 `{"override":"pause"|"force"|null, "until":<epoch_ms>}` — `null` clears.
 
-The dashboard also drives this: the right side of the header is split into
-three elements — a color-coded live-state word (`Idle` green / `Busy` amber /
-`Running Idle Tasks` blue / `Degraded` red, or `unreachable` when the poll
-fails), the **Engine gate** combobox (`Engine Paused` / `Engine Running`, one
-global gate across all clients), and the **gate token** field (paste the
-arbiter token once per browser — it lives next to the gates it enables, is
-stored in `localStorage`, and accepts a clear by emptying it). *Engine
-Paused* sets the `pause` override on every registered worker; *Engine
-Running* clears it and clients run their normal idle-gated schedule.
+The dashboard also drives this: the header's right side carries the
+color-coded live-state word (`Idle` green / `Busy` amber / `Running Idle
+Tasks` blue / `Degraded` red, or `unreachable` when the poll fails), and the
+**gate token** — the credential every write needs — is entered on the
+**Settings** tab's `API token` card (paste the arbiter token once per
+browser; it is stored in `localStorage`, shows a stored-check while one is
+held, and the clear button forgets it). Owner ask 2026-10-19: entering the
+token is a settings task, not chrome on every page — the "paste it in
+Settings first" toasts point at that card. The **Engine gate** is one global
+gate across all clients: *Engine Paused* sets the `pause` override on every
+registered worker; *Engine Running* clears it and clients run their normal
+idle-gated schedule.
 
 ## Project-level controls (pause + grant knobs)
 
@@ -968,8 +971,8 @@ records-to-show — a dock, not a tab: it stays reachable from every view).
   `Agent hand-off` card), `copy url` and `copy token` — there, NOT in the
   header bar (owner ask 2026-10-19: a config hand-off is a settings task, so
   the pair is invisible from every other part of the UI; the gate-token field
-  alone stays always-visible chrome, since writes are one keystroke away from
-  every view). They put the two values an agent config needs to reach this
+  moved to the same tab's `API token` card for the same reason). They put the
+  two values an agent config needs to reach this
   arbiter on the clipboard: `server_url` and the API token. One button per
   value (the paste targets are two different config fields, so one combined
   button would force the operator to split the string by hand). `copy url`
@@ -1056,8 +1059,8 @@ records-to-show — a dock, not a tab: it stays reachable from every view).
   only the changed fields are sent), and the pane head carries a **+ add
   server** editor (create; name + an http(s) url required, a duplicate
   url + activity path is a 400 shown in the form). All settings editors are
-  token-gated: with no gate token the write is refused and the header
-  points at the token field.
+  token-gated: with no gate token the write is refused and the refusal
+  toast points at the Settings tab's `API token` card.
 - **queue detail (deep link)** — a worker row with queued jobs gets a
   **view** link into `/[project]/[worker]/queue`; the arbiter resolves
   every such deep link to the dashboard SPA shell (the built React
