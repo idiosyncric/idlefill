@@ -212,7 +212,7 @@ function ProjectCard({ p, st }: { p: ProjectRow; st: StateSnapshot }) {
 
   const setPaused = async (paused: boolean) => {
     if (!apiToken()) {
-      toast.error("needs the arbiter API token — paste it in the header first");
+      toast.error("needs the arbiter API token — paste it in Settings first");
       return;
     }
     try {
@@ -352,7 +352,7 @@ function WorkerRowView({ w, projectName }: { w: WorkerRow; projectName: string }
 
   const setGate = async (value: string) => {
     if (!apiToken()) {
-      toast.error("needs the arbiter API token — paste it in the header first");
+      toast.error("needs the arbiter API token — paste it in Settings first");
       return;
     }
     const ref = w.client_id ?? w.client;
@@ -588,7 +588,7 @@ function LocalConfigEditor({ name, port }: { name: string; port: number }) {
 
   const load = async () => {
     if (!apiToken()) {
-      setMsg({ text: "the edit needs the arbiter token — paste it in the header first", cls: "text-err" });
+      setMsg({ text: "the edit needs the arbiter token — paste it in Settings first", cls: "text-err" });
       return;
     }
     setLoading(true);
@@ -629,7 +629,7 @@ function LocalConfigEditor({ name, port }: { name: string; port: number }) {
 
   const save = async () => {
     if (!apiToken()) {
-      setMsg({ text: "the edit needs the arbiter token — paste it in the header first", cls: "text-err" });
+      setMsg({ text: "the edit needs the arbiter token — paste it in Settings first", cls: "text-err" });
       return;
     }
     setSaving(true);

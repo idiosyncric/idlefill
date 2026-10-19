@@ -672,7 +672,7 @@ function UpdateButton({ p }: { p: MeshPeer }) {
   const fire = async () => {
     disarm();
     if (!apiToken()) {
-      toast.error("needs the arbiter API token — paste it in the header first");
+      toast.error("needs the arbiter API token — paste it in Settings first");
       return;
     }
     setBusy(true);

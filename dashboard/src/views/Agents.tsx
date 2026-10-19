@@ -54,8 +54,8 @@ import { StatTiles, TilesSkeleton } from "@/components/stat-tiles";
 // ---------------------------------------------------------------------------
 // Agent keys (#68 server plane, #72 dashboard flow): idlefill's own
 // credential for agents (a Hermes profile, any OpenAI client).
-// CREDENTIAL MAP: the header's gate-token field (+ the Settings tab's
-// hand-off pair) = the CONTROL-API token (writes to this arbiter); an agent
+// CREDENTIAL MAP: the Settings tab's gate-token field (+ its hand-off pair)
+// = the CONTROL-API token (writes to this arbiter); an agent
 // key minted here = the AGENT-INFERENCE credential (the agent presents it at
 // the aggregate endpoint). Two different credentials — never merged.
 //
@@ -198,7 +198,7 @@ export function Agents({ st }: { st: StateSnapshotLike | null }) {
           className="ml-auto h-6 text-[12px]"
           onClick={() => {
             if (!apiToken()) {
-              toast.error("needs the arbiter API token — paste it in the header first");
+              toast.error("needs the arbiter API token — paste it in Settings first");
               return;
             }
             setPrefillLabel("");

@@ -102,7 +102,7 @@ export function Models({ st }: { st: StateSnapshot | null }) {
   const reorder = React.useCallback(
     async (names: string[]) => {
       if (!apiToken()) {
-        toast.error("needs the arbiter API token — paste it in the header first");
+        toast.error("needs the arbiter API token — paste it in Settings first");
         return;
       }
       const current = aliases.map((a) => a.alias);
@@ -151,7 +151,7 @@ export function Models({ st }: { st: StateSnapshot | null }) {
           className="ml-auto h-6 text-[12px]"
           onClick={() => {
             if (!apiToken()) {
-              toast.error("needs the arbiter API token — paste it in the header first");
+              toast.error("needs the arbiter API token — paste it in Settings first");
               return;
             }
             setAdding(true);
@@ -375,7 +375,7 @@ function AliasCard({
 
   const pin = async (server_id: string | null) => {
     if (!apiToken()) {
-      toast.error("needs the arbiter API token — paste it in the header first");
+      toast.error("needs the arbiter API token — paste it in Settings first");
       return;
     }
     try {
@@ -392,7 +392,7 @@ function AliasCard({
 
   const del = async () => {
     if (!apiToken()) {
-      toast.error("needs the arbiter API token — paste it in the header first");
+      toast.error("needs the arbiter API token — paste it in Settings first");
       return;
     }
     if (!window.confirm(`delete the alias ${a.alias}? the name falls back to the bare catalog routing`)) return;

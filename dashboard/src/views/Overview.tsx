@@ -518,7 +518,7 @@ function ThrottledCard({ st, jobs }: { st: StateSnapshot; jobs: ThrottledJob[] }
   const [pending, setPending] = React.useState<string | null>(null);
   const unthrottle = async (t: ThrottledJob) => {
     if (!apiToken()) {
-      toast.error("needs the arbiter API token — paste it in the header first");
+      toast.error("needs the arbiter API token — paste it in Settings first");
       return;
     }
     const key = `${t.project}/${t.job_id}`;

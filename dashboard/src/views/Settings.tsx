@@ -8,6 +8,7 @@ import { Separator } from "@/components/ui/separator";
 import {
   setTheme,
   apiToken,
+  setApiToken,
   readLocalHermesGateway,
   writeLocalHermesGateway,
   runClientEgressTest,
@@ -62,7 +63,7 @@ export function Settings({ st }: { st: StateSnapshot | null }) {
 
   const requireToken = (): boolean => {
     if (apiToken()) return true;
-    toast.error("needs the arbiter API token — paste it in the header first");
+    toast.error("needs the arbiter API token — paste it in the API token card below first");
     return false;
   };
 
@@ -94,7 +95,9 @@ export function Settings({ st }: { st: StateSnapshot | null }) {
     <section>
       <div className="flex items-center gap-3 mb-3">
         <h2 className="text-[12px] font-semibold uppercase tracking-wide text-dim">Settings</h2>
-        <p className="text-[12px] text-dim">the color scheme, the agent hand-off, and the per-machine connectors.</p>
+        <p className="text-[12px] text-dim">
+          the arbiter API token, the color scheme, the agent hand-off, and the per-machine connectors.
+        </p>
       </div>
       <Card>
         <CardHeader>
@@ -167,6 +170,11 @@ export function Settings({ st }: { st: StateSnapshot | null }) {
         </CardFooter>
       </Card>
 
+      {/* The gate-token field — moved out of the every-view header chrome on
+          the owner ask 2026-10-19: entering the token is a settings task, so
+          the field lives on this tab only. */}
+      <ApiTokenSection />
+
       {/* Hand-off pair — moved out of the every-view header chrome on the
           owner ask 2026-10-19: a config hand-off is a settings task, so the
           two buttons live on this tab only. */}
@@ -188,6 +196,81 @@ export function Settings({ st }: { st: StateSnapshot | null }) {
 }
 
 // ---------------------------------------------------------------------------
+// Gate-token field (owner ask 2026-10-19: Settings-tab only, never header
+// chrome). The arbiter API token THIS browser holds: reads work anonymously,
+// every write carries it. Save writes it to localStorage only — the arbiter
+// never serves the value back over any route (the hand-off card below is the
+// copy side of the same credential). Clear forgets it: reads keep working,
+// writes stop. Enter in the field commits the same way as the save button.
+// ---------------------------------------------------------------------------
+
+function ApiTokenSection() {
+  const [draft, setDraft] = React.useState(apiToken() ?? "");
+  const [stored, setStored] = React.useState<string | null>(apiToken());
+
+  const apply = (token: string | null) => {
+    setApiToken(token);
+    setStored(token);
+  };
+  const commit = () => {
+    const t = draft.trim();
+    apply(t || null);
+    if (t) setDraft(t);
+    toast.success(t ? "token stored in this browser" : "token cleared");
+  };
+
+  const dirty = draft.trim() !== (stored ?? "");
+  return (
+    <div className="mt-3 flex flex-col gap-2">
+      <h3 className="text-[12px] font-semibold uppercase tracking-wide text-dim">API token</h3>
+      <Card className="py-2 shadow-none">
+        <CardHeader className="flex-row items-center gap-2 px-3 py-0">
+          <CardTitle className="text-[13px] font-semibold">Arbiter API token</CardTitle>
+          <CardAction className="flex items-center gap-2">
+            {stored && <span className="text-[11px] text-ok">stored ✓</span>}
+            {stored && (
+              <Button
+                variant="outline"
+                size="xs"
+                title="forget the token in this browser — reads keep working, writes stop"
+                onClick={() => {
+                  apply(null);
+                  setDraft("");
+                  toast.success("token cleared");
+                }}
+              >
+                clear
+              </Button>
+            )}
+            <Button size="xs" disabled={!dirty} onClick={commit}>
+              save
+            </Button>
+          </CardAction>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-1.5 px-3 py-2">
+          <Input
+            type="password"
+            className="h-6 w-full max-w-72 font-mono text-[12px]"
+            placeholder="arbiter API token (enables writes)"
+            value={draft}
+            spellCheck={false}
+            autoComplete="off"
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && dirty) commit();
+            }}
+          />
+          <p className="text-[11px] text-dim">
+            paste the arbiter's API token to enable writes on every tab. it is kept in this browser only —
+            the arbiter never serves it back. empty + save forgets it.
+          </p>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Hand-off pair (owner ask 2026-10-19: Settings-tab only, never header
 // chrome). The two values an agent config needs to reach this arbiter —
 // server_url and the API token. One button per value (the paste targets are
@@ -197,8 +280,8 @@ export function Settings({ st }: { st: StateSnapshot | null }) {
 // in (__IDLEFILL_DEV_API__, see vite.config.ts) because the page's own
 // origin there is Vite, not the arbiter. The token is copied, never
 // rendered: it is the value THIS browser already holds — the arbiter never
-// serves it over any route. "copied" / "copy failed" / "paste it in first"
-// rides the button label for ~1.4s, then the label resets.
+// serves it over any route. "copied" / "copy failed" / "paste it in Settings
+// first" rides the button label for ~1.4s, then the label resets.
 // ---------------------------------------------------------------------------
 
 function HandoffSection() {
@@ -236,7 +319,7 @@ function HandoffSection() {
               variant="outline"
               size="xs"
               title="copy the arbiter API token stored in this browser — what an agent's token points at"
-              onClick={() => doCopy(apiToken(), "paste it in first", setTokFlash)}
+              onClick={() => doCopy(apiToken(), "paste it in Settings first", setTokFlash)}
             >
               {tokFlash ?? "copy token"}
             </Button>
@@ -285,7 +368,7 @@ function EgressSelfTestCard({ name, port }: { name: string; port: number }) {
 
   const run = async () => {
     if (!apiToken()) {
-      setErr("the test needs the arbiter token — paste it in the header first");
+      setErr("the test needs the arbiter token — paste it in Settings first");
       return;
     }
     setRunning(true);
@@ -377,7 +460,7 @@ function HermesGatewayEditor({ name, port }: { name: string; port: number }) {
 
   const load = async () => {
     if (!apiToken()) {
-      setMsg({ text: "the edit needs the arbiter token — paste it in the header first", cls: "text-err" });
+      setMsg({ text: "the edit needs the arbiter token — paste it in Settings first", cls: "text-err" });
       return;
     }
     try {
@@ -404,7 +487,7 @@ function HermesGatewayEditor({ name, port }: { name: string; port: number }) {
 
   const save = async () => {
     if (!apiToken()) {
-      setMsg({ text: "the edit needs the arbiter token — paste it in the header first", cls: "text-err" });
+      setMsg({ text: "the edit needs the arbiter token — paste it in Settings first", cls: "text-err" });
       return;
     }
     const body: { enabled?: boolean; keys?: Record<string, string | null> } = {};

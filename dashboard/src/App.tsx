@@ -22,10 +22,8 @@ import { NavMain, type NavItem } from "@/components/nav-main";
 import { SiteHeader } from "@/components/site-header";
 import { NAV_IDS, RES_SUBTABS, type ResTab } from "@/nav";
 import { encodeTabFocus, machineKey, parseHash, serverKey, MACHINE_PREFIX, SERVER_PREFIX } from "@/lib/hash-nav";
-import { Input } from "@/components/ui/input";
 import { Toaster } from "@/components/ui/sonner";
-import { toast } from "sonner";
-import { getState, apiToken, setApiToken, type StateSnapshot } from "@/lib/api";
+import { getState, type StateSnapshot } from "@/lib/api";
 import { InferenceServers } from "@/views/InferenceServers";
 import { Overview } from "@/views/Overview";
 import { Sessions } from "@/views/Sessions";
@@ -118,7 +116,6 @@ export function App() {
   const [openMap, setOpenMap] = React.useState<Record<string, boolean> | null>(readSubOpen);
   const [st, setSt] = React.useState<StateSnapshot | null>(null);
   const [stErr, setStErr] = React.useState<string | null>(null);
-  const [tokenDraft, setTokenDraft] = React.useState(apiToken() ?? "");
 
   // 5s poll, like the legacy dashboard (the WS push plane comes later). The
   // apply channel for the color scheme (#68): at boot and on every poll, if
@@ -281,25 +278,10 @@ export function App() {
       />
       <SidebarInset>
         <SiteHeader crumb={crumb} globalWord={globalWord} />
-        {/* The gate-token field: writes stay one keystroke away from every
-            view (the "paste it in the header first" toasts point here). The
-            hand-off pair (copy url / copy token) moved to the Settings tab
-            (owner ask 2026-10-19): a config hand-off is a settings task, not
-            chrome for every part of the UI. */}
-        <div className="flex flex-wrap items-center gap-1.5 border-b border-border px-5 py-2.5">
-          <Input
-            type="password"
-            className="h-6 w-48 text-[12px]"
-            placeholder="arbiter API token (enables writes)"
-            value={tokenDraft}
-            onChange={(e) => setTokenDraft(e.target.value)}
-            onBlur={() => {
-              setApiToken(tokenDraft.trim() || null);
-              toast.success("token stored in this browser");
-            }}
-          />
-          {apiToken() && <span className="text-[11px] text-ok">stored ✓</span>}
-        </div>
+        {/* The gate-token field moved to the Settings tab (owner ask
+            2026-10-19), same reasoning as the hand-off pair: entering the
+            token is a settings task, not chrome for every part of the UI.
+            The "paste it in Settings first" toasts point there. */}
         <main className="flex-1 px-5 py-4">
           {stErr && (
             <div className="mb-3 border border-err/40 bg-err/10 px-3 py-2 text-[12px] text-err">

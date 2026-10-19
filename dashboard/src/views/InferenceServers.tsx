@@ -181,7 +181,7 @@ export function InferenceServers({
 
   const requireToken = (): boolean => {
     if (apiToken()) return true;
-    toast.error("needs the arbiter API token — paste it in the header first");
+    toast.error("needs the arbiter API token — paste it in Settings first");
     return false;
   };
 

@@ -749,7 +749,7 @@ function SessionRowView({ s, st }: { s: SessionRow; st: StateSnapshot }) {
 
   const setOverride = async (value: string) => {
     if (!apiToken()) {
-      toast.error("needs the arbiter API token — paste it in the header first");
+      toast.error("needs the arbiter API token — paste it in Settings first");
       return;
     }
     const ov = value === "paused" ? "pause" : value === "forced" ? "force" : null;
@@ -763,7 +763,7 @@ function SessionRowView({ s, st }: { s: SessionRow; st: StateSnapshot }) {
 
   const setPin = async (value: string) => {
     if (!apiToken()) {
-      toast.error("needs the arbiter API token — paste it in the header first");
+      toast.error("needs the arbiter API token — paste it in Settings first");
       return;
     }
     const sid = value === "" ? null : value;
@@ -858,7 +858,7 @@ function SessionRowView({ s, st }: { s: SessionRow; st: StateSnapshot }) {
           title={`the engine behind this session looks slow — ${edge.slowReasons.join("; ")} — pick one of the model's alias pairs (the EXISTING engine-pin write; lands at release time, a running stream never moves)`}
           onClick={() => {
             if (!apiToken()) {
-              toast.error("needs the arbiter API token — paste it in the header first");
+              toast.error("needs the arbiter API token — paste it in Settings first");
               return;
             }
             setRerouteOpen(true);
