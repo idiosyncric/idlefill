@@ -6,6 +6,7 @@ import {
   LayoutDashboard,
   Server,
   Settings as SettingsIcon,
+  Waypoints,
 } from "lucide-react";
 import {
   Sidebar,
@@ -38,6 +39,11 @@ import { Usage } from "@/views/Usage";
 import { Settings } from "@/views/Settings";
 import { applyTheme } from "@/lib/theme";
 
+// The Mesh view pulls in the React Flow runtime (~half the old bundle);
+// lazy-loaded so the graph never weighs on the Overview first paint. The
+// Suspense fallback is the same "waiting" line the view shows on load.
+const Mesh = React.lazy(() => import("@/views/Mesh").then((m) => ({ default: m.Mesh })));
+
 // The sidebar nav (shadcn sidebar-16 shape). Every parent item is itself a
 // view: picking "Resources" lands on its Overview. The chevron beside it
 // toggles the sub-tab list — a sub-tab shows that sub-view directly.
@@ -49,6 +55,7 @@ const NAV: NavItem[] = [
     icon: Server,
     items: RES_SUBTABS.map((t) => ({ id: t.id, title: t.title })),
   },
+  { id: "mesh", title: "Mesh", icon: Waypoints },
   { id: "sessions", title: "Sessions", icon: Activity },
   { id: "usage", title: "Usage", icon: BarChart3 },
   { id: "settings", title: "Settings", icon: SettingsIcon },
@@ -334,6 +341,11 @@ export function App() {
             </div>
           )}
           {view === "overview" && <Overview st={st} />}
+          {view === "mesh" && (
+            <React.Suspense fallback={<div className="text-[12px] text-dim">loading the mesh graph…</div>}>
+              <Mesh st={st} />
+            </React.Suspense>
+          )}
           {view === "sessions" && <Sessions st={st} />}
           {view === "usage" && <Usage />}
           {view === "resources" && resTab === "servers" && (

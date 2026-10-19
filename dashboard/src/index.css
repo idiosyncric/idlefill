@@ -182,3 +182,108 @@
     stroke-dashoffset: 160;
   }
 }
+
+/* Mesh tab (React Flow): the canvas shells themed onto the DESIGN tokens —
+   machine frames are TRANSLUCENT (flow edges are drawn under the node pane,
+   so they must read through the frame), engine/agent cards are opaque
+   panels, handles are invisible anchors, and react-flow's own chrome
+   (controls, minimap, attribution) wears the ramp. Zero shadows (the law):
+   every override kills the library's default shadow explicitly. */
+.mesh-frame {
+  position: relative;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--panel) 45%, transparent);
+  box-shadow: none;
+}
+.mesh-card {
+  position: relative;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  box-shadow: none;
+}
+.mesh-section {
+  position: absolute;
+  left: 12px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--dim);
+  pointer-events: none;
+}
+.mesh-canvas .react-flow__handle {
+  width: 1px;
+  height: 1px;
+  min-width: 0;
+  min-height: 0;
+  border: none;
+  background: transparent;
+  opacity: 0;
+}
+.mesh-canvas .react-flow__edge {
+  cursor: default;
+}
+.mesh-control-label {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 10px;
+  color: var(--dim);
+  background: color-mix(in srgb, var(--bg) 80%, transparent);
+  padding: 0 4px;
+  border-radius: var(--radius-xs);
+  pointer-events: none;
+}
+.mesh-canvas .react-flow__controls {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  box-shadow: none;
+}
+.mesh-canvas .react-flow__controls-button {
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  color: var(--dim);
+  fill: var(--dim);
+  width: 22px;
+  height: 22px;
+}
+.mesh-canvas .react-flow__controls-button:hover {
+  background: var(--bg);
+  color: var(--text);
+  fill: var(--text);
+}
+.mesh-canvas .react-flow__controls-button svg {
+  fill: currentColor;
+}
+.mesh-canvas .react-flow__minimap {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  box-shadow: none;
+}
+.mesh-canvas .react-flow__attribution {
+  background: transparent;
+  color: var(--dim);
+  font-size: 10px;
+}
+
+/* Mesh breakout: the break-out / dock toggle on a machine card — hairline,
+   quiet, lights on hover; it rides the node header's ml-auto group. */
+.mesh-canvas .mesh-pop {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 10px;
+  color: var(--dim);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  padding: 1px 6px;
+  background: transparent;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.mesh-canvas .mesh-pop:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
