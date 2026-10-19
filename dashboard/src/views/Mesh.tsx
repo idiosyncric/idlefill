@@ -45,6 +45,18 @@ import {
   type MeshFrame,
   type MeshGraph,
 } from "@/lib/mesh-graph";
+import {
+  MESH_LAYERS,
+  applyMeshView,
+  defaultMeshPrefs,
+  emptyMeshTally,
+  sanitizeMeshPrefs,
+  sanitizeMeshViews,
+  type MeshLayer,
+  type MeshViewMode,
+  type MeshViewPrefs,
+  type SavedMeshView,
+} from "@/lib/mesh-view";
 import type { StateSnapshot } from "@/lib/api";
 
 // ---------------------------------------------------------------------------
@@ -82,12 +94,23 @@ import type { StateSnapshot } from "@/lib/api";
 // The 5s poll refreshes the DATA; positions stay put, so nothing jumps
 // while you work in the canvas. Layout/breakout/positions live in
 // localStorage, same posture as the tab prefs.
-// ---------------------------------------------------------------------------
+//
+ // SIDEBAR (lib/mesh-view.ts does the filtering): LAYERS toggle whole
+ // element classes (agent cards, engine cards, flow pipes, control edges,
+ // hosts hairlines); the ELEMENTS tree toggles one machine (subtree and
+ // all) or one card; a card whose endpoint is hidden drops its edges — and
+ // the tally line NAMEDS what the lens hides, never a silent gap. Saved
+ // VIEWS store a lens + a layout mode under a name (positions stay the
+ // browser's single map — a view picks the lens, not the coordinates). All
+ // of it rides localStorage like the layout pick.
+ // ---------------------------------------------------------------------------
 
 const MODE_KEY = "idlefill.meshLayout";
 const POS_KEY = "idlefill.meshPos";
 const BROKEN_KEY = "idlefill.meshBroken";
-type Mode = "rank" | "row" | "free";
+const VIEW_KEY = "idlefill.meshView";
+const VIEWS_KEY = "idlefill.meshViews";
+type Mode = MeshViewMode;
 
 const TONE: Record<StateWord["tone"], string> = {
   ok: "text-ok",
@@ -450,6 +473,44 @@ function readBroken(): Set<string> {
     return new Set();
   }
 }
+// The sidebar lens (layers + hidden elements) and the saved views ride the
+// same localStorage posture; BOTH sanitize on read — a hand-edited or stale
+// entry yields the default lens, never a crash or a half-trusted shape.
+function readPrefs(): MeshViewPrefs {
+  try {
+    return sanitizeMeshPrefs(JSON.parse(localStorage.getItem(VIEW_KEY) ?? "null"));
+  } catch {
+    return defaultMeshPrefs();
+  }
+}
+function writePrefs(prefs: MeshViewPrefs) {
+  localStorage.setItem(VIEW_KEY, JSON.stringify(prefs));
+}
+function readViews(): SavedMeshView[] {
+  try {
+    return sanitizeMeshViews(JSON.parse(localStorage.getItem(VIEWS_KEY) ?? "null"));
+  } catch {
+    return [];
+  }
+}
+function writeViews(views: SavedMeshView[]) {
+  localStorage.setItem(VIEWS_KEY, JSON.stringify(views));
+}
+
+const LAYER_LABEL: Record<MeshLayer, string> = {
+  agents: "agents",
+  engines: "engines",
+  flows: "flow pipes",
+  controls: "control edges",
+  hosts: "hosts hairlines",
+};
+const LAYER_HINT: Record<MeshLayer, string> = {
+  agents: "show the client-daemon cards (their flow pipes drop with them)",
+  engines: "show the inference-engine cards (their flow pipes drop with them)",
+  flows: "show the session pipes between agents and engines",
+  controls: "show the paired-control arrows between machines",
+  hosts: 'show the dim hairlines tying broken-out cards back to their machine',
+};
 
 // --- the canvas (inside the provider: fitView on first draw + on layout
 // picks only — the 5s data poll NEVER re-centers the view) -------------------
@@ -460,6 +521,7 @@ function Canvas({
   tick,
   detached,
   detachedKey,
+  showHosts,
   onMachineAction,
   onSetResource,
   onDragged,
@@ -469,6 +531,7 @@ function Canvas({
   tick: number;
   detached: ReadonlySet<string>;
   detachedKey: string;
+  showHosts: boolean;
   onMachineAction: (name: string) => void;
   onSetResource: (id: string, on: boolean) => void;
   onDragged: (id: string, pos: { x: number; y: number }) => Map<string, { x: number; y: number }>;
@@ -623,7 +686,7 @@ function Canvas({
         data: { label: "controls" } satisfies ControlData,
       });
     }
-    for (const h of hostEdgesFor(graph, detached)) {
+    for (const h of showHosts ? hostEdgesFor(graph, detached) : []) {
       nextEdges.push({
         id: h.id,
         source: h.from,
@@ -660,7 +723,7 @@ function Canvas({
       fitted.current = true;
       window.setTimeout(() => rf.fitView({ padding: 0.08, duration: 300 }), 60);
     }
-  }, [graph, mode, tick, detached, detachedKey, superHeld, gesture, onMachineAction, setNodes, setEdges, rf]);
+  }, [graph, mode, tick, detached, detachedKey, showHosts, superHeld, gesture, onMachineAction, setNodes, setEdges, rf]);
 
   // A layout pick, re-layout, or a break/dock re-frames the graph (a
   // deliberate action).
@@ -786,25 +849,39 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
   // expands them to that machine's resources once the graph exists, and the
   // first write persists the new spelling.
   const [brokenRaw, setBrokenRaw] = useState<Set<string>>(readBroken);
+  // The SIDEBAR lens: layer visibility + individually hidden elements, and
+  // the saved (named) views that store a lens + a layout mode. Persisted in
+  // this browser like the layout pick; the sidebar reads/writes both.
+  const [prefs, setPrefs] = useState<MeshViewPrefs>(readPrefs);
+  const [views, setViews] = useState<SavedMeshView[]>(readViews);
+  const [viewName, setViewName] = useState("");
 
   const graph: MeshGraph | null = useMemo(
     () => (st ? buildMeshGraph(st, st.now ?? Date.now()) : null),
     [st],
   );
 
+  // The DRAWN graph. Everything downstream of here (layout, frames, edges,
+  // the summary counts) reads the LENS-ed graph; the sidebar's element tree
+  // reads the full `graph` so a hidden machine stays listed to be shown
+  // again. What the lens dropped rides `tally`, named — never a silent gap.
+  const lens = useMemo(() => (graph ? applyMeshView(graph, prefs) : null), [graph, prefs]);
+  const viewGraph = lens?.graph ?? null;
+  const tally = lens?.tally ?? emptyMeshTally();
+
   const detached = useMemo(() => {
     const isResourceId = (t: string) => t.startsWith("eng:") || t.startsWith("agt:");
-    if (!graph || [...brokenRaw].every(isResourceId)) return brokenRaw;
+    if (!viewGraph || [...brokenRaw].every(isResourceId)) return brokenRaw;
     const out = new Set<string>();
     for (const t of brokenRaw) {
       if (isResourceId(t)) out.add(t);
       else {
-        const f = graph.frames.find((fr) => fr.name === t);
+        const f = viewGraph.frames.find((fr) => fr.name === t);
         if (f) for (const id of frameResourceIds(f)) out.add(id);
       }
     }
     return out;
-  }, [brokenRaw, graph]);
+  }, [brokenRaw, viewGraph]);
   const detachedKey = [...detached].sort().join("|");
 
   const setResources = useCallback(
@@ -822,16 +899,77 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
   // One card (the ⌘-drag gesture).
   const setResource = useCallback((id: string, on: boolean) => setResources([id], on), [setResources]);
   // A machine card's button: "break out" floats every resource, "dock"/
-  // "dock all" brings every floating one home.
+  // "dock all" brings every floating one home. Operates on the VISIBLE
+  // graph: a hidden card cannot break out, and "dock all" never resurrects
+  // one the operator hid.
   const machineAction = useCallback(
     (name: string) => {
-      const f = graph?.frames.find((fr) => fr.name === name);
+      const f = viewGraph?.frames.find((fr) => fr.name === name);
       if (!f) return;
       const ids = frameResourceIds(f);
       setResources(ids, !ids.some((id) => detached.has(id)));
     },
-    [graph, detached, setResources],
+    [viewGraph, detached, setResources],
   );
+
+  // --- the sidebar lens -----------------------------------------------------
+  const hiddenSet = useMemo(() => new Set(prefs.hidden), [prefs]);
+  const toggleLayer = useCallback((l: MeshLayer) => {
+    setPrefs((p) => {
+      const next = { ...p, layers: { ...p.layers, [l]: !p.layers[l] } };
+      writePrefs(next);
+      return next;
+    });
+  }, []);
+  const toggleHidden = useCallback((id: string) => {
+    setPrefs((p) => {
+      const next = {
+        ...p,
+        hidden: p.hidden.includes(id) ? p.hidden.filter((x) => x !== id) : [...p.hidden, id],
+      };
+      writePrefs(next);
+      return next;
+    });
+  }, []);
+  const showAll = useCallback(() => {
+    const next = defaultMeshPrefs();
+    writePrefs(next);
+    setPrefs(next);
+  }, []);
+
+  // --- saved views ----------------------------------------------------------
+  // A view stores the LENS (layers + hidden) and the layout MODE — not the
+  // positions, which stay the browser's single stored map (a view picks the
+  // lens, not the coordinates).
+  const upsertView = useCallback(
+    (name: string) => {
+      const clean = name.trim().slice(0, 48);
+      if (!clean) return;
+      setViews((vs) => {
+        const next = [...vs.filter((v) => v.name !== clean), { name: clean, mode, prefs }];
+        writeViews(next);
+        return next;
+      });
+    },
+    [mode, prefs],
+  );
+  const saveView = useCallback(() => {
+    upsertView(viewName);
+    setViewName("");
+  }, [upsertView, viewName]);
+  const applyView = useCallback((v: SavedMeshView) => {
+    setMode(v.mode);
+    localStorage.setItem(MODE_KEY, v.mode);
+    writePrefs(v.prefs);
+    setPrefs(v.prefs);
+  }, []);
+  const deleteView = useCallback((name: string) => {
+    setViews((vs) => {
+      const next = vs.filter((v) => v.name !== name);
+      writeViews(next);
+      return next;
+    });
+  }, []);
 
   const onDragged = useCallback((id: string, pos: { x: number; y: number }) => {
     const map = readPos();
@@ -849,23 +987,32 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
     setTick((t) => t + 1);
   };
 
-  const engines = graph?.frames.reduce((a, f) => a + f.engines.length, 0) ?? 0;
-  const agents = graph?.frames.reduce((a, f) => a + f.agents.length, 0) ?? 0;
-  const brokenMachines = graph?.frames.filter((f) => frameResourceIds(f).some((id) => detached.has(id))).length ?? 0;
-  const liveFlows = graph?.flows.length ?? 0;
-  const held = graph?.flows.filter((f) => f.pipe.phase === "queued").length ?? 0;
-  const uf = graph?.unflowed;
+  // Counts read the DRAWN graph; what the lens hid is named separately
+  // (honesty posture: a hidden element is accounted for, never absent).
+  const engines = viewGraph?.frames.reduce((a, f) => a + f.engines.length, 0) ?? 0;
+  const agents = viewGraph?.frames.reduce((a, f) => a + f.agents.length, 0) ?? 0;
+  const brokenMachines = viewGraph?.frames.filter((f) => frameResourceIds(f).some((id) => detached.has(id))).length ?? 0;
+  const liveFlows = viewGraph?.flows.length ?? 0;
+  const held = viewGraph?.flows.filter((f) => f.pipe.phase === "queued").length ?? 0;
+  const uf = viewGraph?.unflowed;
   const notShown = (uf?.noClient ?? 0) + (uf?.noEngine ?? 0) + (uf?.stale ?? 0);
+  const hiddenElems = tally.machines + tally.agents + tally.engines;
+  const hiddenEdges = tally.flows + tally.controls;
 
   const summary =
-    `${graph?.frames.length ?? 0} machines · ${engines} engines · ${agents} agents · ` +
+    `${viewGraph?.frames.length ?? 0} machines · ${engines} engines · ${agents} agents · ` +
     `${liveFlows} live ${liveFlows === 1 ? "flow" : "flows"}${held > 0 ? ` (${held} waiting)` : ""}` +
+    (hiddenElems > 0
+      ? ` · ${hiddenElems} ${hiddenElems === 1 ? "element" : "elements"} hidden${
+          hiddenEdges > 0 ? ` (${hiddenEdges} ${hiddenEdges === 1 ? "edge" : "edges"} dropped with them${prefs.layers.flows && prefs.layers.controls ? "" : ", layers off"})` : ""
+        }`
+      : "") +
     (notShown > 0
       ? ` · ${notShown} ${notShown === 1 ? "session" : "sessions"} not shown${
           uf ? ` (${uf.stale} quiet, ${uf.noClient} no machine named, ${uf.noEngine} no engine row)` : ""
         }`
       : "") +
-    ((graph?.unhosted ?? 0) > 0 ? ` · ${graph!.unhosted} engines name no machine (whole on the Servers tab)` : "");
+    ((viewGraph?.unhosted ?? 0) > 0 ? ` · ${viewGraph!.unhosted} engines name no machine (whole on the Servers tab)` : "");
 
   return (
     <div className="flex h-[calc(100svh-190px)] min-h-[420px] flex-col gap-2">
@@ -931,20 +1078,132 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
           into the picture. The frame below is this machine.
         </div>
       )}
-      <div className="mesh-canvas relative flex-1 overflow-hidden rounded-md border border-border bg-bg">
-        <ReactFlowProvider>
-          <Canvas
-            graph={graph}
-            mode={mode}
-            tick={tick}
-            detached={detached}
-            detachedKey={detachedKey}
-            onMachineAction={machineAction}
-            onSetResource={setResource}
-            onDragged={onDragged}
-          />
-        </ReactFlowProvider>
-        {st && !graph && <div className="absolute inset-0 grid place-items-center text-[12px] text-dim">nothing to draw yet</div>}
+      <div className="flex min-h-0 flex-1 gap-2">
+        <div className="mesh-canvas relative min-w-0 flex-1 overflow-hidden rounded-md border border-border bg-bg">
+          <ReactFlowProvider>
+            <Canvas
+              graph={viewGraph}
+              mode={mode}
+              tick={tick}
+              detached={detached}
+              detachedKey={detachedKey}
+              showHosts={prefs.layers.hosts}
+              onMachineAction={machineAction}
+              onSetResource={setResource}
+              onDragged={onDragged}
+            />
+          </ReactFlowProvider>
+          {st && !viewGraph && <div className="absolute inset-0 grid place-items-center text-[12px] text-dim">nothing to draw yet</div>}
+          {st && viewGraph && viewGraph.frames.length === 0 && (
+            <div className="absolute inset-0 grid place-items-center text-[12px] text-dim">
+              every machine is hidden — show one from the sidebar
+            </div>
+          )}
+        </div>
+        <aside className="flex w-56 shrink-0 flex-col gap-3 overflow-y-auto rounded-md border border-border bg-bg p-3 text-[11px]" aria-label="mesh view controls">
+          <section>
+            <h3 className="mb-1 font-mono text-[10px] uppercase tracking-[0.08em] text-dim">layers</h3>
+            {MESH_LAYERS.map((l) => (
+              <label key={l} className="flex cursor-pointer items-center gap-2 py-[3px]" title={LAYER_HINT[l]}>
+                <input type="checkbox" checked={prefs.layers[l]} onChange={() => toggleLayer(l)} />
+                <span className={prefs.layers[l] ? "" : "text-dim line-through"}>{LAYER_LABEL[l]}</span>
+              </label>
+            ))}
+          </section>
+          <section>
+            <div className="mb-1 flex items-center gap-1.5">
+              <h3 className="font-mono text-[10px] uppercase tracking-[0.08em] text-dim">elements</h3>
+              {hiddenElems > 0 && (
+                <button className="ml-auto text-dim hover:text-text" onClick={showAll} title="show every machine, agent and engine">
+                  show all
+                </button>
+              )}
+            </div>
+            {graph && graph.frames.length === 0 && <div className="text-dim">nothing to draw yet</div>}
+            {graph?.frames.map((f) => {
+              const mHidden = hiddenSet.has(f.id);
+              return (
+                <div key={f.id} className="mb-2">
+                  <label className="flex cursor-pointer items-center gap-2" title={f.local ? "this machine" : "mesh peer"}>
+                    <input type="checkbox" checked={!mHidden} onChange={() => toggleHidden(f.id)} />
+                    <span className={`truncate font-mono font-semibold ${mHidden ? "text-dim line-through" : ""}`}>{f.name}</span>
+                  </label>
+                  {f.agents.length > 0 && (
+                    <div className="mt-0.5 pl-4">
+                      <div className={`text-[10px] ${prefs.layers.agents ? "text-dim" : "text-dim/50"}`}>agents</div>
+                      {f.agents.map((a) => {
+                        const hid = hiddenSet.has(a.id);
+                        return (
+                          <label key={a.id} className="flex items-center gap-2 py-[2px] pl-1" title={`${a.machine} · client daemon`}>
+                            <input type="checkbox" checked={!hid} disabled={mHidden} onChange={() => toggleHidden(a.id)} />
+                            <span className={`truncate ${hid || mHidden ? "text-dim line-through" : ""}`}>{a.name}</span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  )}
+                  {f.engines.length > 0 && (
+                    <div className="mt-0.5 pl-4">
+                      <div className={`text-[10px] ${prefs.layers.engines ? "text-dim" : "text-dim/50"}`}>engines</div>
+                      {f.engines.map((e) => {
+                        const hid = hiddenSet.has(e.id);
+                        return (
+                          <label key={e.id} className="flex items-center gap-2 py-[2px] pl-1" title={`${e.machine} · inference engine`}>
+                            <input type="checkbox" checked={!hid} disabled={mHidden} onChange={() => toggleHidden(e.id)} />
+                            <span className={`truncate ${hid || mHidden ? "text-dim line-through" : ""}`}>{e.name}</span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </section>
+          <section>
+            <h3 className="mb-1 font-mono text-[10px] uppercase tracking-[0.08em] text-dim">views</h3>
+            <div className="flex gap-1">
+              <input
+                value={viewName}
+                onChange={(e) => setViewName(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && saveView()}
+                placeholder="name this view"
+                className="h-6 min-w-0 flex-1 rounded border border-border bg-panel px-1.5 text-[11px] text-text outline-none placeholder:text-dim"
+              />
+              <Button variant="outline" size="xs" onClick={saveView} disabled={!viewName.trim()} title="save the current mode + visibility under this name">
+                save
+              </Button>
+            </div>
+            {views.length === 0 && <div className="mt-1 text-dim">none saved</div>}
+            {views.map((v) => (
+              <div key={v.name} className="mt-0.5 flex items-center gap-1">
+                <button
+                  className="min-w-0 flex-1 truncate text-left font-mono hover:text-text"
+                  title={`apply — ${v.mode} layout, ${v.prefs.hidden.length} hidden, layers ${MESH_LAYERS.filter((l) => v.prefs.layers[l]).join(",")}`}
+                  onClick={() => applyView(v)}
+                >
+                  {v.name}
+                </button>
+                <button
+                  className="text-dim hover:text-text"
+                  title="update this view with the current mode + visibility"
+                  onClick={() => upsertView(v.name)}
+                >
+                  ↺
+                </button>
+                <button className="text-dim hover:text-err" title="delete this view" onClick={() => deleteView(v.name)}>
+                  ✕
+                </button>
+              </div>
+            ))}
+          </section>
+          {(hiddenElems > 0 || hiddenEdges > 0) && (
+            <div className="mt-auto border-t border-border pt-2 text-[10px] text-dim">
+              hidden: {tally.machines} machines · {tally.agents} agents · {tally.engines} engines · {tally.flows}{" "}
+              {tally.flows === 1 ? "flow" : "flows"} · {tally.controls} controls
+            </div>
+          )}
+        </aside>
       </div>
     </div>
   );
