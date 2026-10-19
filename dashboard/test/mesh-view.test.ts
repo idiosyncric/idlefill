@@ -16,6 +16,7 @@ import {
   engineNodeId,
   frameId,
   meshFrameSize,
+  profileNodeId,
 } from "../src/lib/mesh-graph.js";
 import {
   applyMeshView,
@@ -48,13 +49,14 @@ const srv = (id: string, url: string) =>
 const client = (id: string, ip: string) =>
   ({ client_id: id, name: id, ip, last_seen: NOW - 5_000, projects: [] }) as never;
 
-const sess = (token: string, clientId: string | undefined, serverId: string | undefined) =>
+const sess = (token: string, clientId: string | undefined, serverId: string | undefined, patch: Record<string, unknown> = {}) =>
   ({
     token,
     client_id: clientId,
     server_id: serverId,
     registered_at: NOW - 60_000,
     last_seen: NOW - 5_000,
+    ...(patch as object),
   }) as never;
 
 const base = st({
@@ -243,4 +245,75 @@ test("saved views sanitize: junk entries drop, a repeated name keeps the last wr
     [["ops", "free"]],
   );
   assert.equal(sanitizeMeshViews("nope").length, 0);
+});
+
+// --- profile cards under the lens (per-profile cards, owner ask 2026-10-19):
+// one card hides alone; the daemon hides as a SUBTREE; a profile isolate
+// keeps its host daemon; the tally counts cards AND daemons as agents. ------
+
+const rosterGraph = buildMeshGraph(
+  st({
+    servers: [srv("eng1", "http://127.0.0.1:8000")],
+    clients: [
+      {
+        client_id: "cli-a",
+        name: "cli-a",
+        ip: "127.0.0.1",
+        last_seen: NOW - 5_000,
+        projects: [],
+        agent_roster: [
+          { profile: "web-dev", posture: "adopted" },
+          { profile: "pr-agent", posture: "external" },
+        ],
+      } as never,
+    ],
+    sessions: [sess("tok-p1", "cli-a", "eng1", { hermes_meta: { profile: "web-dev" } }), sess("tok-d1", "cli-a", "eng1")],
+  }),
+  NOW,
+);
+
+test("the default lens over profile cards is still the identity", () => {
+  const { graph: out, tally } = applyMeshView(rosterGraph, defaultMeshPrefs());
+  assert.equal(out, rosterGraph);
+  assert.deepEqual(tally, { machines: 0, agents: 0, engines: 0, flows: 0, controls: 0 });
+});
+
+test("hiding one profile card drops exactly that card and the pipe starting on it", () => {
+  const { graph: out, tally } = applyMeshView(rosterGraph, prefs({ hidden: [profileNodeId("cli-a", "web-dev")] }));
+  const agent = out.frames[0].agents[0];
+  assert.equal(agent.id, agentNodeId("cli-a")); // the daemon stands
+  assert.deepEqual(agent.profiles.map((p) => p.name), ["pr-agent"]);
+  assert.deepEqual(out.flows.map((f) => f.id), ["flow:tok-d1"]); // the daemon-held pipe stands
+  assert.equal(tally.agents, 1); // one card counted
+  assert.equal(tally.flows, 1);
+  // the frame shrinks with the card (size follows the DRAWN stack)
+  assert.ok(meshFrameSize(out.frames[0]).h < meshFrameSize(rosterGraph.frames[0]).h);
+});
+
+test("hiding a daemon takes its profile cards as a subtree, and every pipe anchored in the subtree", () => {
+  const { graph: out, tally } = applyMeshView(rosterGraph, prefs({ hidden: [agentNodeId("cli-a")] }));
+  assert.deepEqual(out.frames[0].agents, []);
+  assert.deepEqual(out.flows, []);
+  assert.equal(tally.agents, 3); // daemon + both profile cards counted — never a silent gap
+  assert.equal(tally.flows, 2);
+});
+
+test("ISOLATE a profile card: the hop keeps its host daemon, its own pipes, and the far ends", () => {
+  const { graph: out, tally } = applyMeshView(rosterGraph, prefs({ isolated: profileNodeId("cli-a", "web-dev") }));
+  const agent = out.frames[0].agents[0];
+  assert.equal(agent.id, agentNodeId("cli-a")); // host daemon drawn (containment)
+  assert.deepEqual(agent.profiles.map((p) => p.id), [profileNodeId("cli-a", "web-dev")]); // sibling card away
+  assert.deepEqual(out.flows.map((f) => f.id), ["flow:tok-p1"]); // the daemon-held pipe is not this hop
+  assert.deepEqual(out.frames[0].engines.map((e) => e.id), [engineNodeId("eng1")]); // far end drawn
+  assert.equal(tally.agents, 1); // pr-agent counted away
+  assert.equal(tally.flows, 1);
+  assert.equal(tally.engines, 0);
+});
+
+test("ISOLATE a machine keeps the profile cards inside it and the pipes between its own cards", () => {
+  const { graph: out, tally } = applyMeshView(rosterGraph, prefs({ isolated: frameId(LOCAL_MACHINE) }));
+  assert.deepEqual(out.frames[0].agents[0].profiles.map((p) => p.name), ["web-dev", "pr-agent"]);
+  assert.deepEqual(out.flows.map((f) => f.id).sort(), ["flow:tok-d1", "flow:tok-p1"]);
+  assert.equal(tally.agents, 0);
+  assert.equal(tally.flows, 0);
 });

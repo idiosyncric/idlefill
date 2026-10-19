@@ -17,11 +17,14 @@ import {
   engineNodeId,
   frameId,
   frameResourceIds,
+  framedAgentCards,
   hostEdgesFor,
   layoutMesh,
   machineShape,
   meshChildOffsets,
   meshFrameSize,
+  profileCardH,
+  profileNodeId,
 } from "../src/lib/mesh-graph.js";
 import { LOCAL_MACHINE } from "../src/lib/hierarchy.js";
 import type { StateSnapshot } from "../src/lib/api.js";
@@ -334,4 +337,147 @@ test("header height grows with the glance lines a machine actually renders", () 
   const [local, urza, scan] = graph.frames;
   assert.ok(urza.headerH > scan.headerH, "urza's report lines make it taller than the bare offline row");
   assert.ok(local.headerH >= 39 + 2 * 18, "the counts row always counts");
+});
+
+// --- profile cards (owner ask 2026-10-19: one card per Hermes profile,
+// its active sessions listed under it; the pipe starts on the card the
+// gateway-ledger provenance stamp EXACTLY joins) -----------------------------
+
+const rosterClient = (roster: { profile: string; posture: string }[]) =>
+  ({ client_id: "cli-a", name: "cli-a", ip: "127.0.0.1", last_seen: NOW - 1_000, projects: [], agent_roster: roster }) as never;
+
+const rosterState = (roster: { profile: string; posture: string }[], sessions: never[]) =>
+  st({
+    servers: [srv("eng1", "http://127.0.0.1:8000")],
+    clients: [rosterClient(roster)],
+    sessions,
+  });
+
+const ROSTER = [
+  { profile: "web-dev", posture: "adopted" },
+  { profile: "pr-agent", posture: "external" },
+];
+
+const rosterGraph = buildMeshGraph(
+  rosterState(
+    ROSTER,
+    [
+      sess("tok-owned1", "cli-a", "eng1", { hermes_meta: { profile: "web-dev" } }),
+      sess("tok-owned2", "cli-a", "eng1", { hermes_meta: { profile: "web-dev" }, gate: { state: "queued", waiting: 1 } }),
+      sess("tok-nostamp", "cli-a", "eng1"),
+      sess("tok-offroster", "cli-a", "eng1", { hermes_meta: { profile: "ghost" } }),
+      sess("tok-dead", "cli-a", "eng1", { hermes_meta: { profile: "web-dev" }, last_seen: NOW - 600_000 }),
+    ] as never[],
+  ),
+  NOW,
+);
+
+test("the published roster renders as one profile card per row under its daemon", () => {
+  const daemon = rosterGraph.frames[0].agents[0];
+  assert.equal(daemon.name, "cli-a");
+  assert.deepEqual(
+    daemon.profiles.map((p) => [p.id, p.name, p.posture, p.daemon, p.machine]),
+    [
+      [profileNodeId("cli-a", "web-dev"), "web-dev", "adopted", agentNodeId("cli-a"), LOCAL_MACHINE],
+      [profileNodeId("cli-a", "pr-agent"), "pr-agent", "external", agentNodeId("cli-a"), LOCAL_MACHINE],
+    ],
+  );
+  // a roster-less client stays exactly one card (old clients unchanged)
+  assert.deepEqual(graph.frames[0].agents[0].profiles, []);
+});
+
+test("a stamped session's pipe starts on its profile card; no-stamp / off-roster / stale keep the daemon", () => {
+  const webDev = profileNodeId("cli-a", "web-dev");
+  const flows = new Map(rosterGraph.flows.map((f) => [f.id, f.from]));
+  assert.equal(flows.get("flow:tok-owned1"), webDev);
+  assert.equal(flows.get("flow:tok-owned2"), webDev);
+  assert.equal(flows.get("flow:tok-nostamp"), agentNodeId("cli-a"));
+  assert.equal(flows.get("flow:tok-offroster"), agentNodeId("cli-a"));
+  assert.equal(flows.has("flow:tok-dead"), false); // stale: no flow at all (unchanged law)
+  assert.deepEqual(rosterGraph.unflowed, { noClient: 0, noEngine: 0, stale: 1 });
+  // the daemon card COUNTS the sessions it still anchors — never absorbs them
+  assert.equal(rosterGraph.frames[0].agents[0].unprofiled, 2);
+});
+
+test("profile cards LIST their live sessions (shared pipe facts, card never contradicts the edge)", () => {
+  const [webDev, prAgent] = rosterGraph.frames[0].agents[0].profiles;
+  assert.deepEqual(
+    webDev.sessions.map((s) => [s.shortToken, s.engineName, s.phase, s.flowId]),
+    [
+      ["tok-ow", "eng1", "base", "flow:tok-owned1"],
+      ["tok-ow", "eng1", "queued", "flow:tok-owned2"],
+    ],
+  );
+  assert.match(webDev.sessions[1].title, /queued at the router/); // the shared pipeTitle
+  assert.deepEqual(prAgent.sessions, []); // no stamp names it — honest zero rows, no guess
+  // card height: base + one row per session; stale never counted
+  assert.equal(webDev.h, profileCardH(2));
+  assert.equal(prAgent.h, profileCardH(0));
+});
+
+test("frame size and offsets include the profile cards under their daemon (no overflow)", () => {
+  const f = rosterGraph.frames[0];
+  const { h } = meshFrameSize(f);
+  const offs = meshChildOffsets(f);
+  const stack = framedAgentCards(f);
+  assert.deepEqual(stack.map((c) => c.id), [agentNodeId("cli-a"), profileNodeId("cli-a", "web-dev"), profileNodeId("cli-a", "pr-agent")]);
+  for (const c of stack) {
+    const o = offs.get(c.id)!;
+    assert.ok(o.y >= 0 && o.y + c.h <= h, `${c.id} overflows the frame`);
+  }
+  // stacked right below the daemon, the two profile cards follow in order
+  assert.ok(offs.get(profileNodeId("cli-a", "web-dev"))!.y > offs.get(agentNodeId("cli-a"))!.y);
+  assert.ok(offs.get(profileNodeId("cli-a", "pr-agent"))!.y > offs.get(profileNodeId("cli-a", "web-dev"))!.y);
+});
+
+test("profile cards ride the breakout vocabulary: resources, chip, hosts edges, layout", () => {
+  const f = rosterGraph.frames[0];
+  const webDev = profileNodeId("cli-a", "web-dev");
+  assert.ok(frameResourceIds(f).includes(webDev));
+  // a daemon out but its cards in: still a frame; everything out: a chip
+  assert.equal(machineShape(f, new Set([agentNodeId("cli-a")])), "frame");
+  const all = new Set(frameResourceIds(f));
+  assert.equal(machineShape(f, all), "chip");
+  // one card floating: hosts edge from the machine box only for it
+  const edges = hostEdgesFor(rosterGraph, new Set([webDev]));
+  assert.deepEqual(edges.map((e) => `${e.from}>${e.to}`), [`${frameId(LOCAL_MACHINE)}>${webDev}`]);
+  assert.match(edges[0].label, /hosts web-dev \(cli-a\)/);
+  for (const mode of ["rank", "row"] as const) {
+    const pos = layoutMesh(rosterGraph, mode, new Set([webDev]));
+    assert.ok(pos.has(webDev), `${mode}: the floating profile was not placed`);
+    assert.ok(!pos.has(agentNodeId("cli-a")), `${mode}: framed daemon leaked top-level`);
+    assert.ok(pos.has(f.id), `${mode}: machine box missing`);
+    // every top-level box gets a finite position (layout stays TOTAL)
+    for (const [, p] of pos) assert.ok(Number.isFinite(p.x) && Number.isFinite(p.y));
+  }
+});
+
+test("a capped profile card stays bounded: 8 sessions render 5 + a more line, never 8 rows", () => {
+  const many = Array.from({ length: 8 }, (_, i) => sess(`tok-many-${i}`, "cli-a", "eng1", { hermes_meta: { profile: "web-dev" } }) as never);
+  const g = buildMeshGraph(rosterState(ROSTER, many), NOW);
+  const p = g.frames[0].agents[0].profiles[0];
+  assert.equal(p.sessions.length, 8);
+  assert.equal(p.h, profileCardH(8));
+  assert.equal(p.h, 40 + 5 * 15 + 15); // the view's cap + one "+N more" row
+  // and the frame still contains it
+  const offs = meshChildOffsets(g.frames[0]);
+  assert.ok(offs.get(p.id)!.y + p.h <= meshFrameSize(g.frames[0]).h);
+});
+
+test("two daemons' same-named profiles never share a card or steal each other's sessions", () => {
+  const g = buildMeshGraph(
+    st({
+      servers: [srv("eng1", "http://127.0.0.1:8000")],
+      clients: [
+        rosterClient(ROSTER),
+        { client_id: "cli-b", name: "cli-b", ip: "127.0.0.1", last_seen: NOW - 1_000, projects: [], agent_roster: [{ profile: "web-dev", posture: "adopted" }] },
+      ] as never,
+      sessions: [sess("tok-x", "cli-b", "eng1", { hermes_meta: { profile: "web-dev" } }) as never],
+    }),
+    NOW,
+  );
+  const flow = g.flows[0];
+  assert.equal(flow.from, profileNodeId("cli-b", "web-dev")); // its OWN daemon's card
+  const cliA = g.frames[0].agents.find((a) => a.name === "cli-a")!;
+  assert.deepEqual(cliA.profiles[0].sessions, []); // cli-a's same-named card claims nothing
 });

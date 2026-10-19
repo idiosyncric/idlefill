@@ -32,8 +32,10 @@ import {
   CHIP_W,
   ENGINE_H,
   FRAME_PAD,
+  PROFILE_ROWS_MAX,
   SECTION_H,
   buildMeshGraph,
+  framedAgentCards,
   frameResourceIds,
   hostEdgesFor,
   layoutMesh,
@@ -45,6 +47,8 @@ import {
   type MeshFlow,
   type MeshFrame,
   type MeshGraph,
+  type MeshProfileSession,
+  type MeshProfileSlot,
 } from "@/lib/mesh-graph";
 import {
   MESH_LAYERS,
@@ -63,9 +67,14 @@ import type { StateSnapshot } from "@/lib/api";
 // ---------------------------------------------------------------------------
 // Mesh — the whole fleet as one graph (React Flow). The hierarchy the
 // operator reads off the page: MACHINES are the frames; inside each frame
-// its AGENTS (client daemons + rosters) stack above the ENGINES it hosts
-// (the lib/hierarchy.ts joins, exact, never guessed). Edges:
-//   · FLOW edges (agent card → engine card) reuse the Sessions flow
+// its AGENTS stack above the ENGINES it hosts (the lib/hierarchy.ts joins,
+// exact, never guessed). The agent stack is per-profile since the owner ask
+// 2026-10-19: each daemon card is followed by one card per published roster
+// profile, its live sessions LISTED inside the card — and the session's
+// pipe starts at the profile card when the gateway-ledger provenance stamp
+// names it exactly (no stamp / no roster match → the pipe stays on the
+// daemon card, counted there as "no profile named"). Edges:
+//   · FLOW edges (agent/profile card → engine card) reuse the Sessions flow
 //     vocabulary untouched — lib/pipe-phases decides the color and motion
 //     (queued warn · thinking green · output blue · tools purple · base
 //     hairline, motion only on a live stream) and the tooltip is the SAME
@@ -99,8 +108,9 @@ import type { StateSnapshot } from "@/lib/api";
 // SIDEBAR (lib/mesh-view.ts does the filtering): LAYERS toggle whole
 // element classes (agent cards, engine cards, flow pipes, control edges,
 // hosts hairlines); the TREE is a Fusion-style OUTLINER of the nesting —
-// fleet → machine → agents/engines → the running sessions under the daemon
-// that runs them (each spelled as the hop: agent → engine) — with an eye
+// fleet → machine → agents/engines → profile cards under their daemon →
+// the running sessions listed on the card the pipe starts from (daemon-held
+// sessions spelled as the hop: agent → engine) — with an eye
 // per row (hide one machine / card / pipe) and an ISOLATE button (◎/◉)
 // that keeps one element and its HOPS on the canvas (a session's isolate
 // is exactly its daemon, its pipe and the engine it is routed to, across
@@ -139,6 +149,7 @@ type FrameData = { kind: "machine"; frame: MeshFrame; detached: ReadonlySet<stri
 type ChipData = { kind: "chip"; frame: MeshFrame; onAction: (name: string) => void };
 type EngineData = { kind: "engine"; engine: MeshEngineSlot; detached: boolean };
 type AgentData = { kind: "agent"; agent: MeshAgentSlot; detached: boolean };
+type ProfileData = { kind: "profile"; profile: MeshProfileSlot; detached: boolean };
 type FlowData = { pipe: PipeEdge; title: string; curvature: number; offset: number };
 type ControlData = { label: string };
 type HostData = { label: string };
@@ -198,7 +209,10 @@ function MachineNode({ data }: NodeProps) {
   // framed section — the same offsets the layout used (detached cards are
   // gone from the stack), so they never drift.
   const offsets = meshChildOffsets(f, detached);
-  const agentOff = f.agents.map((a) => offsets.get(a.id)).find((o): o is { x: number; y: number } => !!o);
+  // The agents section starts at the first card of the framed agent stack —
+  // a daemon or, when the daemon floated out, its first profile card.
+  const firstAgentCard = framedAgentCards(f, detached)[0];
+  const agentOff = firstAgentCard ? offsets.get(firstAgentCard.id) : undefined;
   const engineOff = f.engines.map((e) => offsets.get(e.id)).find((o): o is { x: number; y: number } => !!o);
   const ids = frameResourceIds(f);
   const breakable = ids.length > 0;
@@ -346,6 +360,12 @@ function AgentNode({ data }: NodeProps) {
       </div>
       <div className="truncate px-2.5 pt-0.5 text-[11px] text-dim">
         {parts.length > 0 ? parts.join(" · ") : "idle"}
+        {a.unprofiled > 0 && (
+          <span title="live sessions this daemon runs whose gateway-ledger provenance names no roster profile — their pipes start here, not on a profile card">
+            {" "}
+            · {a.unprofiled} no profile named
+          </span>
+        )}
         {a.behind && <span className="text-warn"> · daemon behind</span>}
       </div>
       <Handle id="agt-r" type="source" position={Position.Right} className="mesh-handle" />
@@ -354,7 +374,76 @@ function AgentNode({ data }: NodeProps) {
   );
 }
 
-const nodeTypes = { machine: MachineNode, chip: ChipNode, engine: EngineNode, agent: AgentNode };
+/** One live session LISTED on its profile card — the same pipe facts the
+ *  flow edge carries (dot color = the pipe phase, tooltip = the shared
+ *  pipeTitle). Writes (gate, pin) stay on the Sessions tab. */
+function ProfileSessionLine({ s }: { s: MeshProfileSession }) {
+  return (
+    <div
+      className="flex h-[15px] items-center gap-1.5 overflow-hidden px-2.5 text-[10px]"
+      title={`${s.title}${s.cross ? " · crosses machines" : ""} — nests here on the gateway ledger's provenance stamp`}
+    >
+      <span
+        className="size-1.5 shrink-0 rounded-full"
+        style={{ background: PIPE_STROKE[s.phase], opacity: s.muted ? 0.45 : s.phase === "queued" ? 0.8 : 1 }}
+      />
+      <span className="shrink-0 font-mono text-dim">{s.shortToken}</span>
+      <span className="shrink-0 text-accent/70">⇢</span>
+      <span className="min-w-0 truncate font-mono">{s.engineName}</span>
+    </div>
+  );
+}
+
+/** One Hermes profile as its OWN card: the roster posture, and the live
+ *  sessions whose provenance stamp names it listed underneath. */
+function ProfileNode({ data }: NodeProps) {
+  const { profile: p, detached } = data as unknown as ProfileData;
+  const anyStream = p.sessions.some((s) => s.animated);
+  const anyQueued = p.sessions.some((s) => s.phase === "queued");
+  const word: StateWord =
+    p.sessions.length === 0
+      ? { label: "idle", tone: "dim", note: "no live session's provenance stamp names this profile" }
+      : anyStream
+        ? { label: "live", tone: "ok", note: "a session on this profile is streaming" }
+        : anyQueued
+          ? { label: "waiting", tone: "warn", note: "a session on this profile is held at the router" }
+          : { label: "active", tone: "ok", note: "live session(s) on this profile (no fresh stream signal)" };
+  const shown = p.sessions.slice(0, PROFILE_ROWS_MAX);
+  const more = p.sessions.length - shown.length;
+  const posture = p.posture === "adopted" ? "idlefill" : p.posture === "external" ? "elsewhere" : "no config";
+  return (
+    <div className="mesh-card h-full w-full">
+      <div className="flex items-center gap-1.5 px-2.5 pt-1.5">
+        <PresenceDot word={word} />
+        <span className="truncate font-mono text-[11px] font-semibold" title={`Hermes profile · published by the daemon above`}>
+          {p.name}
+        </span>
+        {detached && (
+          <span className="shrink-0 text-[10px] text-dim" title={`this profile's daemon runs on ${p.machine} (exact join)`}>
+            on {p.machine.toLowerCase()}
+          </span>
+        )}
+        <span
+          className={`shrink-0 text-[9px] ${p.posture === "adopted" ? "text-accent" : "text-dim/70"}`}
+          title={`roster posture: ${p.posture}${p.posture === "adopted" ? " — routes through idlefill" : ""}`}
+        >
+          {posture}
+        </span>
+        <span className={`ml-auto shrink-0 text-[10px] ${TONE[word.tone]}`} title={word.note}>
+          {p.sessions.length > 0 ? `${p.sessions.length} ${p.sessions.length === 1 ? "session" : "sessions"}` : word.label}
+        </span>
+      </div>
+      {shown.map((s) => (
+        <ProfileSessionLine key={s.flowId} s={s} />
+      ))}
+      {more > 0 && <div className="h-[15px] px-2.5 text-[10px] text-dim/70">+{more} more (Sessions tab)</div>}
+      <Handle id="agt-r" type="source" position={Position.Right} className="mesh-handle" />
+      {detached && <Handle id="host-t" type="target" position={Position.Top} className="mesh-handle" />}
+    </div>
+  );
+}
+
+const nodeTypes = { machine: MachineNode, chip: ChipNode, engine: EngineNode, agent: AgentNode, profile: ProfileNode };
 
 // --- edge components -------------------------------------------------------
 
@@ -510,7 +599,7 @@ const LAYER_LABEL: Record<MeshLayer, string> = {
   hosts: "hosts hairlines",
 };
 const LAYER_HINT: Record<MeshLayer, string> = {
-  agents: "show the client-daemon cards (their flow pipes drop with them)",
+  agents: "show the client-daemon cards and their profile cards (their flow pipes drop with them)",
   engines: "show the inference-engine cards (their flow pipes drop with them)",
   flows: "show the session pipes between agents and engines",
   controls: "show the paired-control arrows between machines",
@@ -639,7 +728,7 @@ function Canvas({
       // Cards still inside the frame (never when the whole machine floats).
       if (!isChip) {
         const offsets = meshChildOffsets(f, detached);
-        for (const a of f.agents)
+        for (const a of f.agents) {
           if (!detached.has(a.id))
             next.push({
               id: a.id,
@@ -653,6 +742,23 @@ function Canvas({
               selectable: false,
               data: { kind: "agent", agent: a, detached: false } satisfies AgentData,
             });
+          // The daemon's roster profiles: each its own card, nested under
+          // it in the same frame (containment — the exact roster join).
+          for (const p of a.profiles)
+            if (!detached.has(p.id))
+              next.push({
+                id: p.id,
+                type: "profile",
+                position: offsets.get(p.id) ?? { x: FRAME_PAD, y: FRAME_PAD },
+                parentId: f.id,
+                extent: superHeld ? undefined : "parent",
+                width: CARD_W,
+                height: p.h,
+                draggable: childDraggable,
+                selectable: false,
+                data: { kind: "profile", profile: p, detached: false } satisfies ProfileData,
+              });
+        }
         for (const e of f.engines)
           if (!detached.has(e.id))
             next.push({
@@ -670,7 +776,7 @@ function Canvas({
       }
       // Cards floating free of their machine (all of them for a chip, some
       // of them for a partially broken-out frame).
-      for (const a of f.agents)
+      for (const a of f.agents) {
         if (detached.has(a.id))
           next.push({
             id: a.id,
@@ -682,6 +788,19 @@ function Canvas({
             selectable: false,
             data: { kind: "agent", agent: a, detached: true } satisfies AgentData,
           });
+        for (const p of a.profiles)
+          if (detached.has(p.id))
+            next.push({
+              id: p.id,
+              type: "profile",
+              position: (mode === "free" ? dragPos.current.get(p.id) : undefined) ?? auto.get(p.id) ?? { x: 0, y: 0 },
+              width: CARD_W,
+              height: p.h,
+              draggable: resDraggable,
+              selectable: false,
+              data: { kind: "profile", profile: p, detached: true } satisfies ProfileData,
+            });
+      }
       for (const e of f.engines)
         if (detached.has(e.id))
           next.push({
@@ -811,7 +930,7 @@ function Canvas({
       if (!(meta || superHeld) || !graph) return;
       const abs = absOf(n);
       const cx = abs.x + CARD_W / 2;
-      const cy = abs.y + (n.type === "engine" ? ENGINE_H : AGENT_H) / 2;
+      const cy = abs.y + (n.height ?? AGENT_H) / 2; // profile cards carry their own height
       if (n.parentId) {
         const box = machineRect(n.parentId);
         if (!box) return;
@@ -853,7 +972,9 @@ function Canvas({
         pannable
         zoomable
         maskColor="color-mix(in srgb, var(--bg) 70%, transparent)"
-        nodeColor={(n) => (n.type === "machine" ? "#30363d" : n.type === "engine" ? "#58a6ff" : "#3fb950")}
+        nodeColor={(n) =>
+          n.type === "machine" ? "#30363d" : n.type === "engine" ? "#58a6ff" : n.type === "profile" ? "#d29922" : "#3fb950"
+        }
       />
       <Controls showInteractive={false} />
     </ReactFlow>
@@ -989,6 +1110,10 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
     for (const fr of graph.frames) {
       const a = fr.agents.find((x) => x.id === id);
       if (a) return a.name;
+      for (const ag of fr.agents) {
+        const p = ag.profiles.find((x) => x.id === id);
+        if (p) return `${p.name} → ${ag.name}`;
+      }
       const e = fr.engines.find((x) => x.id === id);
       if (e) return e.name;
     }
@@ -996,9 +1121,10 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
     if (fl) return `${fl.profile ?? fl.shortToken} → ${fl.engineName}`;
     return null;
   }, [prefs.isolated, graph]);
-  // The outliner nests each session under the daemon that runs it (the
-  // flow's OWN from-join — never a guessed grouping), and names the engine's
-  // machine for the cross-machine hop note.
+  // The outliner nests each session under the CARD the pipe starts from:
+  // the profile card on the exact provenance join, otherwise the daemon
+  // (the flow's OWN from-join — never a guessed grouping), and names the
+  // engine's machine for the cross-machine hop note.
   const flowsByAgent = useMemo(() => {
     const m = new Map<string, MeshFlow[]>();
     for (const fl of graph?.flows ?? []) {
@@ -1013,6 +1139,31 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
     for (const f of graph?.frames ?? []) for (const e of f.engines) m.set(e.id, f.name);
     return m;
   }, [graph]);
+  // One outliner row for one session pipe — shared by the daemon's direct
+  // children and by the profile cards (same hop vocabulary, same eye, same
+  // isolate; `disabled` = an ancestor card is hidden).
+  const flowLine = (fl: MeshFlow, disabled: boolean, label: ReactNode) => {
+    const fhid = hiddenSet.has(fl.id);
+    const em = engineMachine.get(fl.to);
+    return (
+      <div key={fl.id} className="flex items-center gap-1 pl-7">
+        <label
+          className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 py-[1px]"
+          title={`${fl.shortToken} · ${fl.model ?? "model not named"} → ${fl.engineName}${em ? ` on ${em}` : ""}${fl.cross ? " · crosses machines" : ""}`}
+        >
+          <input type="checkbox" checked={!fhid} disabled={disabled} onChange={() => toggleHidden(fl.id)} />
+          <span className={`truncate font-mono text-[10px] ${fhid || disabled ? "text-dim line-through" : "text-dim"}`}>
+            <span className="text-accent/70">⇢</span> {label}
+          </span>
+        </label>
+        <IsoBtn
+          active={prefs.isolated === fl.id}
+          title="isolate — just this session's hop: its card, the pipe, the engine"
+          onClick={() => toggleIsolate(fl.id)}
+        />
+      </div>
+    );
+  };
 
   // --- saved views ----------------------------------------------------------
   // A view stores the LENS (layers + hidden) and the layout MODE — not the
@@ -1068,6 +1219,7 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
   // (honesty posture: a hidden element is accounted for, never absent).
   const engines = viewGraph?.frames.reduce((a, f) => a + f.engines.length, 0) ?? 0;
   const agents = viewGraph?.frames.reduce((a, f) => a + f.agents.length, 0) ?? 0;
+  const profiles = viewGraph?.frames.reduce((a, f) => a + f.agents.reduce((x, ag) => x + ag.profiles.length, 0), 0) ?? 0;
   const brokenMachines = viewGraph?.frames.filter((f) => frameResourceIds(f).some((id) => detached.has(id))).length ?? 0;
   const liveFlows = viewGraph?.flows.length ?? 0;
   const held = viewGraph?.flows.filter((f) => f.pipe.phase === "queued").length ?? 0;
@@ -1077,7 +1229,8 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
   const hiddenEdges = tally.flows + tally.controls;
 
   const summary =
-    `${viewGraph?.frames.length ?? 0} machines · ${engines} engines · ${agents} agents · ` +
+    `${viewGraph?.frames.length ?? 0} machines · ${engines} engines · ${agents} ${agents === 1 ? "daemon" : "daemons"} · ` +
+    `${profiles} ${profiles === 1 ? "profile" : "profiles"} · ` +
     `${liveFlows} live ${liveFlows === 1 ? "flow" : "flows"}${held > 0 ? ` (${held} waiting)` : ""}` +
     (prefs.isolated !== null
       ? ` · ⊙ isolated: ${isolatedLost ? "element gone — showing all" : (isolatedLabel ?? "?")}`
@@ -1245,34 +1398,44 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
                               </label>
                               <IsoBtn
                                 active={prefs.isolated === a.id}
-                                title="isolate — this daemon, every pipe it runs, and the engines (and machines) at the far ends"
+                                title="isolate — this daemon, its profiles, every pipe it runs, and the engines (and machines) at the far ends"
                                 onClick={() => toggleIsolate(a.id)}
                               />
                             </div>
-                            {/* Sessions nest under the daemon that runs them (the flow's own join),
-                                spelled as the hop: this agent → that engine. */}
-                            {flows.map((fl) => {
-                              const fhid = hiddenSet.has(fl.id);
-                              const em = engineMachine.get(fl.to);
+                            {/* Profiles get their own rows (the published
+                                roster); a session nests under its profile
+                                card ONLY on the provenance stamp's exact
+                                match — the rest stay under the daemon. */}
+                            {a.profiles.map((p) => {
+                              const phid = hiddenSet.has(p.id);
+                              const pflows = flowsByAgent.get(p.id) ?? [];
                               return (
-                                <div key={fl.id} className="flex items-center gap-1 pl-7">
-                                  <label
-                                    className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 py-[1px]"
-                                    title={`${fl.shortToken} · ${fl.model ?? "model not named"} → ${fl.engineName}${em ? ` on ${em}` : ""}${fl.cross ? " · crosses machines" : ""}`}
-                                  >
-                                    <input type="checkbox" checked={!fhid} disabled={mHidden || hid} onChange={() => toggleHidden(fl.id)} />
-                                    <span className={`truncate font-mono text-[10px] ${fhid || mHidden || hid ? "text-dim line-through" : "text-dim"}`}>
-                                      <span className="text-accent/70">⇢</span> {fl.profile ?? fl.shortToken} → {fl.engineName}
-                                    </span>
-                                  </label>
-                                  <IsoBtn
-                                    active={prefs.isolated === fl.id}
-                                    title="isolate — just this session's hop: its daemon, the pipe, the engine"
-                                    onClick={() => toggleIsolate(fl.id)}
-                                  />
+                                <div key={p.id}>
+                                  <div className="flex items-center gap-1 py-[1px] pl-4">
+                                    <label
+                                      className="flex min-w-0 flex-1 cursor-pointer items-center gap-2"
+                                      title={`${p.machine} · Hermes profile (roster posture: ${p.posture})`}
+                                    >
+                                      <input type="checkbox" checked={!phid} disabled={mHidden || hid} onChange={() => toggleHidden(p.id)} />
+                                      <span className={`truncate font-mono text-[10px] ${phid || mHidden || hid ? "text-dim line-through" : "text-dim"}`}>
+                                        {p.name}
+                                        {p.sessions.length > 0 ? ` · ${p.sessions.length}` : ""}
+                                      </span>
+                                    </label>
+                                    <IsoBtn
+                                      active={prefs.isolated === p.id}
+                                      title="isolate — this profile, its session pipes, and the engines (and machines) at the far ends"
+                                      onClick={() => toggleIsolate(p.id)}
+                                    />
+                                  </div>
+                                  {pflows.map((fl) => flowLine(fl, mHidden || hid || phid, fl.shortToken))}
                                 </div>
                               );
                             })}
+                            {/* Sessions with no profile named nest under the
+                                daemon that runs them (the flow's own join),
+                                spelled as the hop: this agent → that engine. */}
+                            {flows.map((fl) => flowLine(fl, mHidden || hid, `${fl.profile ?? fl.shortToken} → ${fl.engineName}`))}
                           </div>
                         );
                       })}

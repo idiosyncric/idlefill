@@ -12,6 +12,16 @@
 // client or engine row is absent yields NO flow edge (counted in
 // `unflowed`, never anchored by name similarity).
 //
+// The PROFILE law (owner ask 2026-10-19): the agents section is not one card
+// per daemon shared by every Hermes profile — EACH published roster profile
+// gets its OWN card listing its live sessions under it, and the session's
+// pipe starts there. The join is the Agents tab's, verbatim: the client's
+// published `agent_roster` names the profile EXACTLY and the session's
+// gateway-ledger provenance stamp (`hermes_meta.profile`) on that same
+// client names the card. A session with no stamp, or a stamp no roster row
+// matches, keeps riding its DAEMON card (counted as `unprofiled` there) —
+// never a guessed profile.
+//
 // The honesty law (the load-read precedent): every field is a PUBLISHED
 // fact or null/absent — never a fake zero. Peer snapshot numbers ride the
 // frame ATTRIBUTED as the peer's own report (`reported`, `reportedEngines`),
@@ -30,7 +40,7 @@ import type { ClientRow, MeshPeer, ServerRow, StateSnapshot } from "./api";
 import { LOCAL_MACHINE, hostedServers, machineClients, machineSummary, type MachineSummary } from "./hierarchy";
 import { hostLine } from "./mesh-stats";
 import { engineEdge, type EngineEdge } from "./session-edge";
-import { pipeEdge, pipeTitle, type PipeEdge } from "./pipe-phases";
+import { pipeEdge, pipeTitle, type PipeEdge, type PipePhase } from "./pipe-phases";
 import { liveWord, sessStale, type StateWord } from "./format";
 import { LOAD_FRESHNESS_DEFAULT_S } from "./load-read";
 
@@ -38,6 +48,9 @@ import { LOAD_FRESHNESS_DEFAULT_S } from "./load-read";
 export const frameId = (machine: string): string => `mch:${machine}`;
 export const engineNodeId = (serverId: string): string => `eng:${serverId}`;
 export const agentNodeId = (clientId: string): string => `agt:${clientId}`;
+/** A roster profile's card node: the daemon it is published under + the
+ *  EXACT roster profile name (the same join the Agents tab nests on). */
+export const profileNodeId = (clientId: string, profile: string): string => `agt:${clientId}#${profile}`;
 
 // --- sizes the layout and the view share (fixed heights, no measuring) ---
 export const FRAME_W = 330;
@@ -52,6 +65,16 @@ export const CHIP_W = 260;
 /** The resource card width (a frame's inner width — identical whether the
  *  card rides inside its frame or floats free). */
 export const CARD_W = FRAME_W - FRAME_PAD * 2;
+
+/** A profile card: the header row plus ONE row per live session it lists,
+ *  capped (the "+N more" line keeps the card bounded — the Sessions tab
+ *  stays the surface for the full list). The view renders exactly this
+ *  many rows, the layout reserves exactly this height. */
+export const PROFILE_H_BASE = 40;
+export const PROFILE_ROW_H = 15;
+export const PROFILE_ROWS_MAX = 5;
+export const profileCardH = (sessions: number): number =>
+  PROFILE_H_BASE + Math.min(sessions, PROFILE_ROWS_MAX) * PROFILE_ROW_H + (sessions > PROFILE_ROWS_MAX ? PROFILE_ROW_H : 0);
 
 export type MeshEngineSlot = {
   id: string;
@@ -74,6 +97,38 @@ export type MeshEngineSlot = {
   watched: boolean;
 };
 
+/** One live session LISTED on its profile card — the same facts the flow
+ *  edge carries (shared pipe + tooltip), never more than the edge says. */
+export type MeshProfileSession = {
+  flowId: string;
+  shortToken: string;
+  engineName: string;
+  /** The shared pipe tooltip (pipeTitle) — card and edge never disagree. */
+  title: string;
+  phase: PipePhase;
+  animated: boolean;
+  muted: boolean;
+  cross: boolean;
+};
+
+/** One Hermes profile (the daemon's published roster row) as its OWN card,
+ *  its live sessions listed underneath. */
+export type MeshProfileSlot = {
+  id: string;
+  /** The roster row's profile name, EXACT. */
+  name: string;
+  /** The published roster posture (adopted routes through idlefill). */
+  posture: "adopted" | "external" | "unset";
+  machine: string;
+  /** The daemon card this one nests under (agentNodeId). */
+  daemon: string;
+  /** The live sessions whose provenance stamp names this profile EXACTLY. */
+  sessions: MeshProfileSession[];
+  /** The card height (profileCardH over the session count) — the layout
+   *  and the view share it (fixed heights, no measuring). */
+  h: number;
+};
+
 export type MeshAgentSlot = {
   id: string;
   name: string;
@@ -87,6 +142,13 @@ export type MeshAgentSlot = {
   agents: number | null;
   override: "pause" | "force" | null;
   behind: boolean;
+  /** The published roster rendered as per-profile cards (nested under this
+   *  daemon card — containment, the hierarchy's own join). */
+  profiles: MeshProfileSlot[];
+  /** Live sessions this daemon runs that anchor HERE instead of a profile
+   *  card: no provenance stamp, or a stamp no roster row matches. Named on
+   *  the card, never silently absorbed. */
+  unprofiled: number;
 };
 
 export type MeshFrame = {
@@ -116,6 +178,8 @@ export type MeshFrame = {
   controls: string[];
   controlledBy: string[];
   engines: MeshEngineSlot[];
+  /** The machine's client daemons; each carries its published roster
+   *  profiles as nested cards (`profiles`). */
   agents: MeshAgentSlot[];
   /** The machine's own header block height: name row + the glance lines it
    *  actually renders (counts · host · peer-report · not-watched · control ·
@@ -199,6 +263,23 @@ function engineSlot(st: StateSnapshot, s: ServerRow, machine: string): MeshEngin
 }
 
 function agentSlot(c: ClientRow, now: number, machine: string): MeshAgentSlot {
+  // The published roster, deduped by profile name (first row wins) — a
+  // roster with a repeated name is a malformed publish, never two cards.
+  const seen = new Set<string>();
+  const profiles: MeshProfileSlot[] = [];
+  for (const r of c.agent_roster ?? []) {
+    if (seen.has(r.profile)) continue;
+    seen.add(r.profile);
+    profiles.push({
+      id: profileNodeId(c.client_id, r.profile),
+      name: r.profile,
+      posture: r.posture,
+      machine,
+      daemon: agentNodeId(c.client_id),
+      sessions: [],
+      h: profileCardH(0),
+    });
+  }
   return {
     id: agentNodeId(c.client_id),
     name: c.name,
@@ -209,6 +290,8 @@ function agentSlot(c: ClientRow, now: number, machine: string): MeshAgentSlot {
     agents: c.agent_roster ? c.agent_roster.length : null,
     override: c.override?.override ?? null,
     behind: !!c.daemon_behind,
+    profiles,
+    unprofiled: 0,
   };
 }
 
@@ -314,6 +397,15 @@ export function buildMeshGraph(st: StateSnapshot, now: number): MeshGraph {
 
   const flows: MeshFlow[] = [];
   const unflowed = { noClient: 0, noEngine: 0, stale: 0 };
+  // Profile-card lookups for the re-anchor: the EXACT (daemon, profile) pair
+  // only. A session never anchors on another daemon's same-named profile.
+  const profileSlotOf = new Map<string, MeshProfileSlot>();
+  const agentSlotOf = new Map<string, MeshAgentSlot>();
+  for (const f of frames)
+    for (const a of f.agents) {
+      agentSlotOf.set(a.id, a);
+      for (const p of a.profiles) profileSlotOf.set(`${a.id}#${p.name}`, p);
+    }
   for (const s of st.sessions ?? []) {
     if (sessStale(s, now)) {
       unflowed.stale++;
@@ -325,17 +417,22 @@ export function buildMeshGraph(st: StateSnapshot, now: number): MeshGraph {
       unflowed.noEngine++;
       continue;
     }
-    const from = s.client_id ? agentNodeId(s.client_id) : null;
-    if (!from || !agentSeen.has(from)) {
+    const daemon = s.client_id ? agentNodeId(s.client_id) : null;
+    if (!daemon || !agentSeen.has(daemon)) {
       unflowed.noClient++;
       continue;
     }
+    // The pipe starts at the profile card ONLY on the exact join (the
+    // client's roster names the profile AND the session's stamp is it);
+    // anything else rides the daemon card, counted as unprofiled there.
+    const slot = s.hermes_meta?.profile ? profileSlotOf.get(`${daemon}#${s.hermes_meta.profile}`) : undefined;
+    const from = slot ? slot.id : daemon;
     const to = engineNodeId(row.id);
     const edge = engineEdge(s, signalOf.get(row.id));
     const pipe = pipeEdge(s, edge, now);
     const shortToken = s.token.slice(0, 6);
     const machine = machineOfEngine.get(row.id) ?? null;
-    flows.push({
+    const flow: MeshFlow = {
       id: `flow:${s.token}`,
       from,
       to,
@@ -345,14 +442,29 @@ export function buildMeshGraph(st: StateSnapshot, now: number): MeshGraph {
       model: s.hermes_meta?.model ?? s.engine_pin?.engine_model ?? null,
       engineName: row.name,
       pinned: s.engine_pin != null,
-      cross: machine !== null && machineOfClient.get(from) !== undefined && machine !== machineOfClient.get(from),
+      cross: machine !== null && machineOfClient.get(daemon) !== undefined && machine !== machineOfClient.get(daemon),
       edge,
       pipe,
       title: pipeTitle(shortToken, row.name, edge, pipe),
       curvature: 0.25,
       offset: 0,
-    });
+    };
+    flows.push(flow);
+    if (slot)
+      slot.sessions.push({
+        flowId: flow.id,
+        shortToken,
+        engineName: row.name,
+        title: flow.title,
+        phase: pipe.phase,
+        animated: pipe.animated,
+        muted: pipe.muted,
+        cross: flow.cross,
+      });
+    else agentSlotOf.get(daemon)!.unprofiled++;
   }
+  // The profile cards size to the sessions they now list.
+  for (const p of profileSlotOf.values()) p.h = profileCardH(p.sessions.length);
   // Fan-out: parallel edges between the same pair curve apart, centered.
   const byPair = new Map<string, MeshFlow[]>();
   for (const f of flows) {
@@ -373,10 +485,10 @@ export function buildMeshGraph(st: StateSnapshot, now: number): MeshGraph {
 
 export type MeshLayoutMode = "rank" | "row";
 
-/** Every resource node id a frame owns (agents first, then engines) — the
- *  vocabulary the DETACHED set is spelled in. */
+/** Every resource node id a frame owns (agent daemons with their profile
+ *  cards, then engines) — the vocabulary the DETACHED set is spelled in. */
 export function frameResourceIds(f: MeshFrame): string[] {
-  return [...f.agents.map((a) => a.id), ...f.engines.map((e) => e.id)];
+  return [...f.agents.flatMap((a) => [a.id, ...a.profiles.map((p) => p.id)]), ...f.engines.map((e) => e.id)];
 }
 
 /** How a machine RENDERS given the detached-resource set: "chip" only when
@@ -403,9 +515,13 @@ export function hostEdgesFor(
   const edges: { id: string; from: string; to: string; machine: string; label: string }[] = [];
   if (detached.size === 0) return edges;
   for (const f of graph.frames) {
-    for (const a of f.agents)
+    for (const a of f.agents) {
       if (detached.has(a.id))
         edges.push({ id: `host:${f.id}>${a.id}`, from: f.id, to: a.id, machine: f.name, label: `hosts ${a.name}` });
+      for (const p of a.profiles)
+        if (detached.has(p.id))
+          edges.push({ id: `host:${f.id}>${p.id}`, from: f.id, to: p.id, machine: f.name, label: `hosts ${p.name} (${a.name})` });
+    }
     for (const e of f.engines)
       if (detached.has(e.id))
         edges.push({ id: `host:${f.id}>${e.id}`, from: f.id, to: e.id, machine: f.name, label: `hosts ${e.name}` });
@@ -413,10 +529,24 @@ export function hostEdgesFor(
   return edges;
 }
 
+/** The framed stack's cards, in render order: each daemon card followed by
+ *  its profile cards. Detached cards are gone from the stack (they are their
+ *  own boxes — see layoutMesh); every card carries its own height. */
+export type MeshStackCard = { id: string; h: number };
+
+export function framedAgentCards(f: MeshFrame, detached: ReadonlySet<string> = EMPTY_DETACHED): MeshStackCard[] {
+  const out: MeshStackCard[] = [];
+  for (const a of f.agents) {
+    if (!detached.has(a.id)) out.push({ id: a.id, h: AGENT_H });
+    for (const p of a.profiles) if (!detached.has(p.id)) out.push({ id: p.id, h: p.h });
+  }
+  return out;
+}
+
 export function meshFrameSize(f: MeshFrame, detached: ReadonlySet<string> = EMPTY_DETACHED): { w: number; h: number } {
-  const na = f.agents.filter((a) => !detached.has(a.id)).length;
+  const aCards = framedAgentCards(f, detached);
   const ne = f.engines.filter((e) => !detached.has(e.id)).length;
-  const agentsH = na > 0 ? SECTION_H + na * AGENT_H + (na - 1) * NODE_GAP : 0;
+  const agentsH = aCards.length > 0 ? SECTION_H + aCards.reduce((s, c) => s + c.h, 0) + (aCards.length - 1) * NODE_GAP : 0;
   const enginesH = ne > 0 ? SECTION_H + ne * ENGINE_H + (ne - 1) * NODE_GAP : 0;
   const seam = agentsH > 0 && enginesH > 0 ? NODE_GAP : 0;
   return { w: FRAME_W, h: FRAME_PAD + f.headerH + agentsH + seam + enginesH + FRAME_PAD };
@@ -424,19 +554,20 @@ export function meshFrameSize(f: MeshFrame, detached: ReadonlySet<string> = EMPT
 
 const EMPTY_DETACHED: ReadonlySet<string> = new Set();
 
-/** Children's positions RELATIVE to the frame (agents stacked, then engines).
- *  Detached resources are NOT in the map — they are their own boxes (see
- *  layoutMesh) and the framed stack closes the gap they left. */
+/** Children's positions RELATIVE to the frame (the agent stack — daemons
+ *  with their profile cards — then engines). Detached resources are NOT in
+ *  the map — they are their own boxes (see layoutMesh) and the framed stack
+ *  closes the gap they left. */
 export function meshChildOffsets(f: MeshFrame, detached: ReadonlySet<string> = EMPTY_DETACHED): Map<string, { x: number; y: number }> {
   const out = new Map<string, { x: number; y: number }>();
-  const agents = f.agents.filter((a) => !detached.has(a.id));
+  const agents = framedAgentCards(f, detached);
   const engines = f.engines.filter((e) => !detached.has(e.id));
   let y = FRAME_PAD + f.headerH;
   if (agents.length > 0) {
     y += SECTION_H;
     for (const a of agents) {
       out.set(a.id, { x: FRAME_PAD, y });
-      y += AGENT_H + NODE_GAP;
+      y += a.h + NODE_GAP;
     }
   }
   if (engines.length > 0) {
@@ -481,7 +612,6 @@ export function layoutMesh(
   const boxOf = new Map<string, string>();
 
   for (const f of graph.frames) {
-    const framedAgents = f.agents.filter((a) => !detached.has(a.id));
     const framedEngines = f.engines.filter((e) => !detached.has(e.id));
     const outAgents = f.agents.filter((a) => detached.has(a.id));
     const outEngines = f.engines.filter((e) => detached.has(e.id));
@@ -490,12 +620,20 @@ export function layoutMesh(
       ? { id: f.id, w: CHIP_W, h: f.headerH } // rep keyed by machine id
       : { id: f.id, ...meshFrameSize(f, detached) };
     const members: Box[] = [];
-    for (const a of framedAgents) boxOf.set(a.id, f.id);
+    // Every card still framed (daemons AND their profile cards) rides the
+    // machine's box; a floating card is its own box, sized to itself.
+    for (const c of framedAgentCards(f, detached)) boxOf.set(c.id, f.id);
     for (const e of framedEngines) boxOf.set(e.id, f.id);
     for (const a of outAgents) {
       members.push({ id: a.id, w: CARD_W, h: AGENT_H });
       boxOf.set(a.id, a.id);
     }
+    for (const a of f.agents)
+      for (const p of a.profiles)
+        if (detached.has(p.id)) {
+          members.push({ id: p.id, w: CARD_W, h: p.h });
+          boxOf.set(p.id, p.id);
+        }
     for (const e of outEngines) {
       members.push({ id: e.id, w: CARD_W, h: ENGINE_H });
       boxOf.set(e.id, e.id);

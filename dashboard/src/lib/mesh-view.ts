@@ -2,9 +2,10 @@
 // mesh-view.ts — the pure VISIBILITY model behind the Mesh tab's sidebar.
 // mesh-graph.ts says what EXISTS (the exact joins); this module says what is
 // DRAWN: layer toggles (agents / engines / flows / control edges / hosts
-// edges) and per-element hides (machine / agent / engine node ids), plus the
-// shape of a saved view. No DOM, no React, no localStorage: the view reads
-// and writes its own browser storage and hands these functions plain values.
+// edges) and per-element hides (machine / daemon / profile-card / engine node
+// ids), plus the shape of a saved view. No DOM, no React, no localStorage:
+// the view reads and writes its own browser storage and hands these functions
+// plain values.
 //
 // The honesty law carries: filtering is the OPERATOR's deliberate lens, so
 // what it drops is COUNTED (`tally`), never silently absent — the summary
@@ -29,8 +30,9 @@ export type MeshViewMode = "rank" | "row" | "free";
 export type MeshViewPrefs = {
   layers: Record<MeshLayer, boolean>;
   /** Hidden node ids: `mch:<machine>` hides the machine AND its subtree,
-   *  `agt:<client>` / `eng:<server>` hide one card, `flow:<token>` hides one
-   *  session pipe. */
+   *  `agt:<client>` hides a daemon card AND its profile cards,
+   *  `agt:<client>#<profile>` hides one profile card, `eng:<server>` hides
+   *  one engine card, `flow:<token>` hides one session pipe. */
   hidden: string[];
   /** ISOLATE (the outliner's ⊙): when set, the canvas shows ONLY this
    *  element's subtree and its hops — `mch:` the machine's whole interior,
@@ -101,17 +103,24 @@ export type MeshLens = { graph: MeshGraph; tally: MeshViewTally; /** true = an i
 /** The ISOLATE focus: which frame/card/flow ids an isolate keeps visible.
  *  The hop discipline: `flow:` keeps exactly the session's two cards, its
  *  two machines and the one pipe (the agent → engine hop, spelled out);
- *  `agt:`/`eng:` keep the card plus every pipe it touches plus the far
- *  ends and their machines (all of THIS element's hops); `mch:` keeps the
- *  machine's whole interior plus only the pipes BETWEEN its own cards.
+ *  `agt:` (a daemon OR its `#profile` card) / `eng:` keep the card plus
+ *  every pipe it touches plus the far ends and their machines (all of
+ *  THIS element's hops; a daemon's own profile cards ride its subtree);
+ *  `mch:` keeps the machine's whole interior plus only the pipes BETWEEN
+ *  its own cards.
  *  null = the isolate targets nothing in this graph (gone). */
 export function focusOf(graph: MeshGraph, iso: string): { frames: Set<string>; cards: Set<string>; flows: Set<string> } | null {
   const machineOfCard = new Map<string, string>();
-  for (const f of graph.frames) for (const c of [...f.agents, ...f.engines]) machineOfCard.set(c.id, f.id);
+  for (const f of graph.frames)
+    for (const c of [...f.agents, ...f.agents.flatMap((a) => a.profiles), ...f.engines]) machineOfCard.set(c.id, f.id);
   if (iso.startsWith("mch:")) {
     const fr = graph.frames.find((f) => f.id === iso);
     if (!fr) return null;
-    const cards = new Set([...fr.agents.map((a) => a.id), ...fr.engines.map((e) => e.id)]);
+    const cards = new Set([
+      ...fr.agents.map((a) => a.id),
+      ...fr.agents.flatMap((a) => a.profiles.map((p) => p.id)),
+      ...fr.engines.map((e) => e.id),
+    ]);
     return {
       frames: new Set([fr.id]),
       cards,
@@ -162,7 +171,7 @@ export function applyMeshView(graph: MeshGraph, prefs: MeshViewPrefs): MeshLens 
 
   const hidden = new Set(prefs.hidden);
   const tally = emptyMeshTally();
-  const allAgents = graph.frames.reduce((a, f) => a + f.agents.length, 0);
+  const allAgents = graph.frames.reduce((a, f) => a + f.agents.reduce((x, ag) => x + 1 + ag.profiles.length, 0), 0);
   const allEngines = graph.frames.reduce((a, f) => a + f.engines.length, 0);
 
   const keep = graph.frames.filter((f) => !hidden.has(f.id) && (!focus || focus.frames.has(f.id)));
@@ -170,7 +179,21 @@ export function applyMeshView(graph: MeshGraph, prefs: MeshViewPrefs): MeshLens 
 
   const visibleFrames = new Set(keep.map((f) => f.name));
   const frames: MeshFrame[] = keep.map((f) => {
-    const agents = prefs.layers.agents ? f.agents.filter((a) => !hidden.has(a.id) && (!focus || focus.cards.has(a.id))) : [];
+    const agents = prefs.layers.agents
+      ? f.agents
+          // A daemon stays if it is not hidden and the focus touches it or
+          // one of its profile cards (a flow landing on a profile card
+          // needs its host daemon drawn).
+          .filter((a) => !hidden.has(a.id) && (!focus || focus.cards.has(a.id) || a.profiles.some((p) => focus.cards.has(p.id))))
+          // Profile cards filter INSIDE their surviving daemon (containment:
+          // a hidden daemon takes its profiles with it, like a machine).
+          .map((a) => {
+            const profiles = a.profiles.filter(
+              (p) => !hidden.has(p.id) && (!focus || focus.cards.has(a.id) || focus.cards.has(p.id)),
+            );
+            return profiles.length === a.profiles.length ? a : { ...a, profiles };
+          })
+      : [];
     const engines = prefs.layers.engines ? f.engines.filter((e) => !hidden.has(e.id) && (!focus || focus.cards.has(e.id))) : [];
     // The glance lines name machines that are still DRAWN (a hidden peer
     // must not be named); the controls LAYER toggles the edge, not the fact.
@@ -190,7 +213,7 @@ export function applyMeshView(graph: MeshGraph, prefs: MeshViewPrefs): MeshLens 
     return out;
   });
 
-  const agentSeen = new Set(frames.flatMap((f) => f.agents.map((a) => a.id)));
+  const agentSeen = new Set(frames.flatMap((f) => f.agents.flatMap((a) => [a.id, ...a.profiles.map((p) => p.id)])));
   const engineSeen = new Set(frames.flatMap((f) => f.engines.map((e) => e.id)));
   const frameIds = new Set(frames.map((f) => f.id));
 
