@@ -29,8 +29,18 @@ export type MeshViewMode = "rank" | "row" | "free";
 export type MeshViewPrefs = {
   layers: Record<MeshLayer, boolean>;
   /** Hidden node ids: `mch:<machine>` hides the machine AND its subtree,
-   *  `agt:<client>` / `eng:<server>` hide one card. */
+   *  `agt:<client>` / `eng:<server>` hide one card, `flow:<token>` hides one
+   *  session pipe. */
   hidden: string[];
+  /** ISOLATE (the outliner's ⊙): when set, the canvas shows ONLY this
+   *  element's subtree and its hops — `mch:` the machine's whole interior,
+   *  `agt:`/`eng:` the card plus every pipe it touches plus the far ends
+   *  and their machines, `flow:` just that session's pipe, its two cards
+   *  and the two machines (the hop, spelled out). Layers still apply on
+   *  top: isolate picks the subset, layers pick the kinds. A target that
+   *  vanishes (a session that ended) degrades honestly to no-isolate and
+   *  the view says so (`isolatedLost`). */
+  isolated: string | null;
 };
 
 /** A saved view: a NAMED lens over the mesh — mode + visibility prefs.
@@ -41,6 +51,7 @@ export type SavedMeshView = { name: string; mode: MeshViewMode; prefs: MeshViewP
 export const defaultMeshPrefs = (): MeshViewPrefs => ({
   layers: { agents: true, engines: true, flows: true, controls: true, hosts: true },
   hidden: [],
+  isolated: null,
 });
 
 const isMode = (v: unknown): v is MeshViewMode => v === "rank" || v === "row" || v === "free";
@@ -59,7 +70,8 @@ export function sanitizeMeshPrefs(raw: unknown): MeshViewPrefs {
     }
   }
   const hidden = Array.isArray(r.hidden) ? r.hidden.filter((x): x is string => typeof x === "string") : [];
-  return { layers, hidden: [...new Set(hidden)] };
+  const isolated = typeof r.isolated === "string" && r.isolated !== "" ? r.isolated : null;
+  return { layers, hidden: [...new Set(hidden)], isolated };
 }
 
 /** Same discipline for the saved-views list: junk entries drop, names must
@@ -84,33 +96,82 @@ export type MeshViewTally = { machines: number; agents: number; engines: number;
 
 export const emptyMeshTally = (): MeshViewTally => ({ machines: 0, agents: 0, engines: 0, flows: 0, controls: 0 });
 
-/** Apply the lens to a graph. Deterministic and pure: frames hidden by id
- *  drop WITH their subtree; remaining frames keep only the visible agents/
- *  engines (layer off, or the card hidden by id); flows and control edges
- *  need BOTH endpoints visible (and their layer on). `unflowed` / `unhosted`
- *  are untouched — they count JOIN failures, not operator hides (those ride
- *  the tally). The graph is returned unchanged (same reference) when the
- *  lens is the default, so the 5s poll never rebuilds what nothing changed. */
-export function applyMeshView(
-  graph: MeshGraph,
-  prefs: MeshViewPrefs,
-): { graph: MeshGraph; tally: MeshViewTally } {
+export type MeshLens = { graph: MeshGraph; tally: MeshViewTally; /** true = an isolate named an element the graph no longer has (the session ended, the card went away) — the lens falls back to the full view and the sidebar SAYS so. */ isolatedLost: boolean };
+
+/** The ISOLATE focus: which frame/card/flow ids an isolate keeps visible.
+ *  The hop discipline: `flow:` keeps exactly the session's two cards, its
+ *  two machines and the one pipe (the agent → engine hop, spelled out);
+ *  `agt:`/`eng:` keep the card plus every pipe it touches plus the far
+ *  ends and their machines (all of THIS element's hops); `mch:` keeps the
+ *  machine's whole interior plus only the pipes BETWEEN its own cards.
+ *  null = the isolate targets nothing in this graph (gone). */
+export function focusOf(graph: MeshGraph, iso: string): { frames: Set<string>; cards: Set<string>; flows: Set<string> } | null {
+  const machineOfCard = new Map<string, string>();
+  for (const f of graph.frames) for (const c of [...f.agents, ...f.engines]) machineOfCard.set(c.id, f.id);
+  if (iso.startsWith("mch:")) {
+    const fr = graph.frames.find((f) => f.id === iso);
+    if (!fr) return null;
+    const cards = new Set([...fr.agents.map((a) => a.id), ...fr.engines.map((e) => e.id)]);
+    return {
+      frames: new Set([fr.id]),
+      cards,
+      flows: new Set(graph.flows.filter((fl) => cards.has(fl.from) && cards.has(fl.to)).map((fl) => fl.id)),
+    };
+  }
+  if (iso.startsWith("flow:")) {
+    const fl = graph.flows.find((x) => x.id === iso);
+    if (!fl) return null;
+    const frames = new Set<string>();
+    for (const c of [fl.from, fl.to]) {
+      const m = machineOfCard.get(c);
+      if (m) frames.add(m);
+    }
+    return { frames, cards: new Set([fl.from, fl.to]), flows: new Set([fl.id]) };
+  }
+  const machine = machineOfCard.get(iso);
+  if (!machine) return null;
+  const frames = new Set([machine]);
+  const cards = new Set([iso]);
+  const flows = new Set<string>();
+  for (const fl of graph.flows) {
+    if (fl.from !== iso && fl.to !== iso) continue;
+    flows.add(fl.id);
+    const far = fl.from === iso ? fl.to : fl.from;
+    cards.add(far);
+    const m = machineOfCard.get(far);
+    if (m) frames.add(m);
+  }
+  return { frames, cards, flows };
+}
+
+/** Apply the lens to a graph. Deterministic and pure: the isolate focus
+ *  first (when set), then layers, then per-element hides — isolate picks
+ *  the subset, layers pick the kinds inside it, hides subtract. Frames
+ *  outside drop WITH their subtree; flows need BOTH endpoints visible,
+ *  their layer on, and no `flow:<token>` hide. `unflowed` / `unhosted`
+ *  are untouched — they count JOIN failures, not operator hides (those
+ *  ride the tally). The graph is returned unchanged (same reference) when
+ *  the lens is the default, so the 5s poll never rebuilds what nothing
+ *  changed. */
+export function applyMeshView(graph: MeshGraph, prefs: MeshViewPrefs): MeshLens {
+  const focus = prefs.isolated ? focusOf(graph, prefs.isolated) : null;
+  const isolatedLost = prefs.isolated !== null && focus === null;
   const defaultLens =
-    MESH_LAYERS.every((l) => prefs.layers[l]) && prefs.hidden.length === 0;
-  if (defaultLens) return { graph, tally: emptyMeshTally() };
+    !focus && !isolatedLost && MESH_LAYERS.every((l) => prefs.layers[l]) && prefs.hidden.length === 0;
+  if (defaultLens) return { graph, tally: emptyMeshTally(), isolatedLost: false };
 
   const hidden = new Set(prefs.hidden);
   const tally = emptyMeshTally();
   const allAgents = graph.frames.reduce((a, f) => a + f.agents.length, 0);
   const allEngines = graph.frames.reduce((a, f) => a + f.engines.length, 0);
 
-  const keep = graph.frames.filter((f) => !hidden.has(f.id));
+  const keep = graph.frames.filter((f) => !hidden.has(f.id) && (!focus || focus.frames.has(f.id)));
   tally.machines = graph.frames.length - keep.length;
 
   const visibleFrames = new Set(keep.map((f) => f.name));
   const frames: MeshFrame[] = keep.map((f) => {
-    const agents = prefs.layers.agents ? f.agents.filter((a) => !hidden.has(a.id)) : [];
-    const engines = prefs.layers.engines ? f.engines.filter((e) => !hidden.has(e.id)) : [];
+    const agents = prefs.layers.agents ? f.agents.filter((a) => !hidden.has(a.id) && (!focus || focus.cards.has(a.id))) : [];
+    const engines = prefs.layers.engines ? f.engines.filter((e) => !hidden.has(e.id) && (!focus || focus.cards.has(e.id))) : [];
     // The glance lines name machines that are still DRAWN (a hidden peer
     // must not be named); the controls LAYER toggles the edge, not the fact.
     const controls = f.controls.filter((n) => visibleFrames.has(n));
@@ -134,8 +195,13 @@ export function applyMeshView(
   const frameIds = new Set(frames.map((f) => f.id));
 
   // A flow needs its agent AND its engine visible; the flows layer off drops
-  // every one of them. Same endpoint rule for the control edges.
-  const shownFlows = prefs.layers.flows ? graph.flows.filter((fl) => agentSeen.has(fl.from) && engineSeen.has(fl.to)) : [];
+  // every one of them; a `flow:<token>` hide drops one pipe. Same endpoint
+  // rule for the control edges.
+  const shownFlows = prefs.layers.flows
+    ? graph.flows.filter(
+        (fl) => !hidden.has(fl.id) && (!focus || focus.flows.has(fl.id)) && agentSeen.has(fl.from) && engineSeen.has(fl.to),
+      )
+    : [];
   const controls = prefs.layers.controls
     ? graph.controls.filter((c) => frameIds.has(c.from) && frameIds.has(c.to))
     : [];
@@ -145,5 +211,5 @@ export function applyMeshView(
   tally.flows = graph.flows.length - shownFlows.length;
   tally.controls = graph.controls.length - controls.length;
 
-  return { graph: { ...graph, frames, flows: shownFlows, controls }, tally };
+  return { graph: { ...graph, frames, flows: shownFlows, controls }, tally, isolatedLost };
 }

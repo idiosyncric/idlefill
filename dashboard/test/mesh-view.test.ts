@@ -83,14 +83,21 @@ const base = st({
   },
   servers: [srv("srv-omlx", "http://127.0.0.1:8000"), srv("srv-remote", "http://100.105.225.1:11434")],
   clients: [client("cli-mac", "127.0.0.1"), client("cli-urza", "100.105.225.1")],
-  sessions: [sess("tok-aaaaaa", "cli-mac", "srv-remote"), sess("tok-bbbbbb", "cli-urza", "srv-omlx")],
+  sessions: [
+    sess("tok-aaaaaa", "cli-mac", "srv-remote"),
+    sess("tok-bbbbbb", "cli-urza", "srv-omlx"),
+    sess("tok-gggggg", "cli-mac", "srv-omlx"),
+  ],
 });
 
 const graph = buildMeshGraph(base, NOW);
 
-const prefs = (patch: Partial<MeshViewPrefs> & { layers?: Partial<MeshViewPrefs["layers"]> } = {}): MeshViewPrefs => ({
+const prefs = (
+  patch: Partial<MeshViewPrefs> & { layers?: Partial<MeshViewPrefs["layers"]> } = {},
+): MeshViewPrefs => ({
   layers: { ...defaultMeshPrefs().layers, ...(patch.layers ?? {}) },
   hidden: patch.hidden ?? [],
+  isolated: patch.isolated ?? null,
 });
 
 test("the default lens is the identity — same reference, nothing counted", () => {
@@ -104,7 +111,7 @@ test("agents layer off: agent cards and every flow pipe drop, engines and contro
   for (const f of out.frames) assert.deepEqual(f.agents, []);
   assert.deepEqual(out.flows, []);
   assert.equal(tally.agents, 2);
-  assert.equal(tally.flows, 2);
+  assert.equal(tally.flows, 3);
   assert.equal(out.controls.length, graph.controls.length);
   assert.deepEqual(
     out.frames.flatMap((f) => f.engines.map((e) => e.id)),
@@ -118,10 +125,10 @@ test("hiding one engine: its card is gone, its frame shrinks, its flows count in
   assert.deepEqual(local.engines, []);
   const urza = out.frames.find((f) => f.name === "urza")!;
   assert.deepEqual(urza.engines.map((e) => e.id), [engineNodeId("srv-remote")]);
-  // the cross-machine flow into srv-omlx drops, the one into srv-remote stands
+  // the two pipes into srv-omlx drop, the one into srv-remote stands
   assert.deepEqual(out.flows.map((f) => f.id), ["flow:tok-aaaaaa"]);
   assert.equal(tally.engines, 1);
-  assert.equal(tally.flows, 1);
+  assert.equal(tally.flows, 2);
   // JOIN honesty is untouched: the lens hid it, the data never lacked it.
   assert.deepEqual(out.unflowed, graph.unflowed);
   assert.equal(out.unhosted, graph.unhosted);
@@ -135,7 +142,8 @@ test("hiding a machine takes the subtree, its control edges, and drops its name 
   assert.equal(tally.machines, 1);
   assert.equal(tally.agents, 1); // cli-urza went with its machine
   assert.equal(tally.engines, 1);
-  assert.equal(tally.flows, 2); // both pipes touched the hidden subtree
+  assert.equal(tally.flows, 2); // the two pipes touching urza drop; the local-only one stands
+  assert.deepEqual(out.flows.map((f) => f.id), ["flow:tok-gggggg"]);
   assert.equal(tally.controls, 1); // the local→urza control edge is gone
   assert.deepEqual(out.controls, []);
   const local = out.frames[0];
@@ -155,6 +163,61 @@ test("controls layer off: the edges drop, the glance lines (facts) stay", () => 
   );
 });
 
+test("hiding one pipe: a flow:<token> entry in `hidden` drops exactly that pipe", () => {
+  const { graph: out, tally } = applyMeshView(graph, prefs({ hidden: ["flow:tok-bbbbbb"] }));
+  assert.deepEqual(out.flows.map((f) => f.id).sort(), ["flow:tok-aaaaaa", "flow:tok-gggggg"]);
+  assert.equal(tally.flows, 1);
+  assert.equal(tally.agents, 0); // the cards stand; only the pipe is hidden
+  assert.equal(tally.engines, 0);
+});
+
+test("ISOLATE a session pipe: exactly its two cards, the two machines and the one hop", () => {
+  const { graph: out, tally } = applyMeshView(graph, prefs({ isolated: "flow:tok-aaaaaa" }));
+  // tok-aaaaaa = cli-mac (local) → srv-remote (urza): the cross-machine hop.
+  assert.deepEqual(out.flows.map((f) => f.id), ["flow:tok-aaaaaa"]);
+  const [local, urza] = out.frames;
+  assert.deepEqual(local.agents.map((a) => a.id), [agentNodeId("cli-mac")]);
+  assert.deepEqual(local.engines, []); // srv-omlx is not part of THIS hop
+  assert.deepEqual(urza.agents, []);
+  assert.deepEqual(urza.engines.map((e) => e.id), [engineNodeId("srv-remote")]);
+  assert.equal(tally.agents, 1);
+  assert.equal(tally.engines, 1);
+  assert.equal(tally.flows, 2); // the other two pipes counted away
+  assert.equal(tally.machines, 0); // both machines are the hop's context
+  assert.equal(tally.controls, 0); // local→urza stands: both endpoints drawn
+  assert.equal(out.controls.length, 1);
+});
+
+test("ISOLATE an engine: every pipe feeding it, back to the daemons and their machines", () => {
+  const { graph: out, tally } = applyMeshView(graph, prefs({ isolated: engineNodeId("srv-omlx") }));
+  assert.deepEqual(out.flows.map((f) => f.id).sort(), ["flow:tok-bbbbbb", "flow:tok-gggggg"]);
+  const [local, urza] = out.frames;
+  assert.deepEqual(local.agents.map((a) => a.id), [agentNodeId("cli-mac")]);
+  assert.deepEqual(local.engines.map((e) => e.id), [engineNodeId("srv-omlx")]);
+  assert.deepEqual(urza.agents.map((a) => a.id), [agentNodeId("cli-urza")]);
+  assert.deepEqual(urza.engines, []); // srv-remote feeds nothing into this isolate
+  assert.equal(tally.flows, 1); // tok-aaaaaa (into srv-remote) counted away
+  assert.equal(tally.engines, 1);
+});
+
+test("ISOLATE a machine: its whole interior, only the pipes BETWEEN its own cards", () => {
+  const { graph: out, tally } = applyMeshView(graph, prefs({ isolated: frameId(LOCAL_MACHINE) }));
+  assert.deepEqual(out.frames.map((f) => f.name), [LOCAL_MACHINE]);
+  assert.deepEqual(out.flows.map((f) => f.id), ["flow:tok-gggggg"]); // internal hop only
+  assert.deepEqual(out.controls, []); // the cross-machine control edge is not interior
+  assert.equal(tally.machines, 1);
+  assert.equal(tally.flows, 2);
+  assert.equal(tally.controls, 1);
+});
+
+test("ISOLATE a vanished element degrades honestly: full view back, named lost", () => {
+  const { graph: out, tally, isolatedLost } = applyMeshView(graph, prefs({ isolated: "flow:tok-zzzzzz" }));
+  assert.equal(isolatedLost, true);
+  assert.equal(out.frames.length, graph.frames.length);
+  assert.equal(out.flows.length, graph.flows.length);
+  assert.deepEqual(tally, { machines: 0, agents: 0, engines: 0, flows: 0, controls: 0 });
+});
+
 test("prefs sanitize: junk yields the default, partial layers merge, hidden dedupes", () => {
   assert.deepEqual(sanitizeMeshPrefs(undefined), defaultMeshPrefs());
   assert.deepEqual(sanitizeMeshPrefs("nope"), defaultMeshPrefs());
@@ -162,6 +225,9 @@ test("prefs sanitize: junk yields the default, partial layers merge, hidden dedu
   assert.equal(merged.layers.agents, false);
   assert.equal(merged.layers.engines, true); // untouched keys keep the default
   assert.deepEqual(merged.hidden, ["eng:a", "mch:b"]);
+  assert.equal(merged.isolated, null); // absent stays null
+  assert.equal(sanitizeMeshPrefs({ isolated: "flow:tok-a" }).isolated, "flow:tok-a");
+  assert.equal(sanitizeMeshPrefs({ isolated: 7 }).isolated, null);
 });
 
 test("saved views sanitize: junk entries drop, a repeated name keeps the last write", () => {

@@ -42,6 +42,7 @@ import {
   meshFrameSize,
   type MeshAgentSlot,
   type MeshEngineSlot,
+  type MeshFlow,
   type MeshFrame,
   type MeshGraph,
 } from "@/lib/mesh-graph";
@@ -95,15 +96,19 @@ import type { StateSnapshot } from "@/lib/api";
 // while you work in the canvas. Layout/breakout/positions live in
 // localStorage, same posture as the tab prefs.
 //
- // SIDEBAR (lib/mesh-view.ts does the filtering): LAYERS toggle whole
- // element classes (agent cards, engine cards, flow pipes, control edges,
- // hosts hairlines); the ELEMENTS tree toggles one machine (subtree and
- // all) or one card; a card whose endpoint is hidden drops its edges — and
- // the tally line NAMEDS what the lens hides, never a silent gap. Saved
- // VIEWS store a lens + a layout mode under a name (positions stay the
- // browser's single map — a view picks the lens, not the coordinates). All
- // of it rides localStorage like the layout pick.
- // ---------------------------------------------------------------------------
+// SIDEBAR (lib/mesh-view.ts does the filtering): LAYERS toggle whole
+// element classes (agent cards, engine cards, flow pipes, control edges,
+// hosts hairlines); the TREE is a Fusion-style OUTLINER of the nesting —
+// fleet → machine → agents/engines → the running sessions under the daemon
+// that runs them (each spelled as the hop: agent → engine) — with an eye
+// per row (hide one machine / card / pipe) and an ISOLATE button (◎/◉)
+// that keeps one element and its HOPS on the canvas (a session's isolate
+// is exactly its daemon, its pipe and the engine it is routed to, across
+// machines when it crosses). What the lens hides is NAMED, never a silent
+// gap. Saved VIEWS store a lens (incl. the isolate) + a layout mode (posi-
+// tions stay the browser's single map — a view picks the lens, not the
+// coordinates). All of it rides localStorage like the layout pick.
+// ---------------------------------------------------------------------------
 
 const MODE_KEY = "idlefill.meshLayout";
 const POS_KEY = "idlefill.meshPos";
@@ -512,6 +517,22 @@ const LAYER_HINT: Record<MeshLayer, string> = {
   hosts: 'show the dim hairlines tying broken-out cards back to their machine',
 };
 
+/** The outliner's ISOLATE button (◎ / ◉ when active): one element's
+ *  subtree + hops on the canvas, everything else counted away. Clicking
+ *  the active one clears the isolate. */
+function IsoBtn({ active, title, onClick }: { active: boolean; title: string; onClick: () => void }) {
+  return (
+    <button
+      className={`shrink-0 px-0.5 leading-none ${active ? "text-accent" : "text-dim/40 hover:text-text"}`}
+      title={title}
+      aria-label={title}
+      onClick={onClick}
+    >
+      {active ? "◉" : "◎"}
+    </button>
+  );
+}
+
 // --- the canvas (inside the provider: fitView on first draw + on layout
 // picks only — the 5s data poll NEVER re-centers the view) -------------------
 
@@ -522,6 +543,7 @@ function Canvas({
   detached,
   detachedKey,
   showHosts,
+  isoKey,
   onMachineAction,
   onSetResource,
   onDragged,
@@ -532,6 +554,7 @@ function Canvas({
   detached: ReadonlySet<string>;
   detachedKey: string;
   showHosts: boolean;
+  isoKey: string;
   onMachineAction: (name: string) => void;
   onSetResource: (id: string, on: boolean) => void;
   onDragged: (id: string, pos: { x: number; y: number }) => Map<string, { x: number; y: number }>;
@@ -725,13 +748,13 @@ function Canvas({
     }
   }, [graph, mode, tick, detached, detachedKey, showHosts, superHeld, gesture, onMachineAction, setNodes, setEdges, rf]);
 
-  // A layout pick, re-layout, or a break/dock re-frames the graph (a
-  // deliberate action).
+  // A layout pick, re-layout, a break/dock or an isolate change re-frames
+  // the graph (a deliberate action).
   const framesLen = graph?.frames.length ?? 0;
   useEffect(() => {
     const id = window.setTimeout(() => rf.fitView({ padding: 0.08, duration: 300 }), 60);
     return () => window.clearTimeout(id);
-  }, [mode, tick, framesLen, detachedKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [mode, tick, framesLen, detachedKey, isoKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const saveDrag = useCallback(
     (_: unknown, n: Node) => {
@@ -868,6 +891,7 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
   const lens = useMemo(() => (graph ? applyMeshView(graph, prefs) : null), [graph, prefs]);
   const viewGraph = lens?.graph ?? null;
   const tally = lens?.tally ?? emptyMeshTally();
+  const isolatedLost = lens?.isolatedLost ?? false;
 
   const detached = useMemo(() => {
     const isResourceId = (t: string) => t.startsWith("eng:") || t.startsWith("agt:");
@@ -931,11 +955,64 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
       return next;
     });
   }, []);
+  // ISOLATE (⊙, the outliner's command): set — or, clicking the isolated
+  // row again, clear — the focus. Everything but the focus's subtree and
+  // its hops drops out of the picture (and is counted, as always).
+  const toggleIsolate = useCallback((id: string) => {
+    setPrefs((p) => {
+      const next = { ...p, isolated: p.isolated === id ? null : id };
+      writePrefs(next);
+      return next;
+    });
+  }, []);
   const showAll = useCallback(() => {
     const next = defaultMeshPrefs();
     writePrefs(next);
     setPrefs(next);
   }, []);
+  const clearIsolate = useCallback(() => {
+    setPrefs((p) => {
+      const next = { ...p, isolated: null };
+      writePrefs(next);
+      return next;
+    });
+  }, []);
+  const lensing =
+    prefs.hidden.length > 0 || prefs.isolated !== null || !MESH_LAYERS.every((l) => prefs.layers[l]);
+  // The isolate's NAME for the chip / summary line (read off the FULL
+  // graph; null = the target is gone, which `isolatedLost` already names).
+  const isolatedLabel = useMemo(() => {
+    const id = prefs.isolated;
+    if (!id || !graph) return null;
+    const f = graph.frames.find((fr) => fr.id === id);
+    if (f) return f.name;
+    for (const fr of graph.frames) {
+      const a = fr.agents.find((x) => x.id === id);
+      if (a) return a.name;
+      const e = fr.engines.find((x) => x.id === id);
+      if (e) return e.name;
+    }
+    const fl = graph.flows.find((x) => x.id === id);
+    if (fl) return `${fl.profile ?? fl.shortToken} → ${fl.engineName}`;
+    return null;
+  }, [prefs.isolated, graph]);
+  // The outliner nests each session under the daemon that runs it (the
+  // flow's OWN from-join — never a guessed grouping), and names the engine's
+  // machine for the cross-machine hop note.
+  const flowsByAgent = useMemo(() => {
+    const m = new Map<string, MeshFlow[]>();
+    for (const fl of graph?.flows ?? []) {
+      const arr = m.get(fl.from);
+      if (arr) arr.push(fl);
+      else m.set(fl.from, [fl]);
+    }
+    return m;
+  }, [graph]);
+  const engineMachine = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const f of graph?.frames ?? []) for (const e of f.engines) m.set(e.id, f.name);
+    return m;
+  }, [graph]);
 
   // --- saved views ----------------------------------------------------------
   // A view stores the LENS (layers + hidden) and the layout MODE — not the
@@ -1002,6 +1079,9 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
   const summary =
     `${viewGraph?.frames.length ?? 0} machines · ${engines} engines · ${agents} agents · ` +
     `${liveFlows} live ${liveFlows === 1 ? "flow" : "flows"}${held > 0 ? ` (${held} waiting)` : ""}` +
+    (prefs.isolated !== null
+      ? ` · ⊙ isolated: ${isolatedLost ? "element gone — showing all" : (isolatedLabel ?? "?")}`
+      : "") +
     (hiddenElems > 0
       ? ` · ${hiddenElems} ${hiddenElems === 1 ? "element" : "elements"} hidden${
           hiddenEdges > 0 ? ` (${hiddenEdges} ${hiddenEdges === 1 ? "edge" : "edges"} dropped with them${prefs.layers.flows && prefs.layers.controls ? "" : ", layers off"})` : ""
@@ -1088,6 +1168,7 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
               detached={detached}
               detachedKey={detachedKey}
               showHosts={prefs.layers.hosts}
+              isoKey={`${prefs.isolated ?? ""}|${isolatedLost}`}
               onMachineAction={machineAction}
               onSetResource={setResource}
               onDragged={onDragged}
@@ -1112,11 +1193,25 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
           </section>
           <section>
             <div className="mb-1 flex items-center gap-1.5">
-              <h3 className="font-mono text-[10px] uppercase tracking-[0.08em] text-dim">elements</h3>
-              {hiddenElems > 0 && (
-                <button className="ml-auto text-dim hover:text-text" onClick={showAll} title="show every machine, agent and engine">
+              <h3 className="font-mono text-[10px] uppercase tracking-[0.08em] text-dim">tree</h3>
+              {lensing && (
+                <button className="ml-auto text-dim hover:text-text" onClick={showAll} title="clear every hide, isolate and layer-off">
                   show all
                 </button>
+              )}
+            </div>
+            {isolatedLost && (
+              <div className="mb-1 text-warn" title="the isolated element is gone from the mesh — the lens fell back to the full view">
+                isolated element gone — showing all
+              </div>
+            )}
+            <div className="mb-1 flex items-center gap-1">
+              <span className="font-mono text-[10px] text-dim">fleet</span>
+              {prefs.isolated !== null && (
+                <span className="ml-auto flex min-w-0 items-center gap-1 text-accent">
+                  <span className="truncate" title={`isolated: ${isolatedLabel ?? prefs.isolated}`}>⊙ {isolatedLabel ?? "?"}</span>
+                  <button className="shrink-0 hover:text-text" onClick={clearIsolate} title="leave the isolate">✕</button>
+                </span>
               )}
             </div>
             {graph && graph.frames.length === 0 && <div className="text-dim">nothing to draw yet</div>}
@@ -1124,20 +1219,61 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
               const mHidden = hiddenSet.has(f.id);
               return (
                 <div key={f.id} className="mb-2">
-                  <label className="flex cursor-pointer items-center gap-2" title={f.local ? "this machine" : "mesh peer"}>
-                    <input type="checkbox" checked={!mHidden} onChange={() => toggleHidden(f.id)} />
-                    <span className={`truncate font-mono font-semibold ${mHidden ? "text-dim line-through" : ""}`}>{f.name}</span>
-                  </label>
+                  <div className="flex items-center gap-1">
+                    <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2" title={f.local ? "this machine" : "mesh peer"}>
+                      <input type="checkbox" checked={!mHidden} onChange={() => toggleHidden(f.id)} />
+                      <span className={`truncate font-mono font-semibold ${mHidden ? "text-dim line-through" : ""}`}>{f.name}</span>
+                    </label>
+                    <IsoBtn
+                      active={prefs.isolated === f.id}
+                      title="isolate — this machine's interior and the pipes BETWEEN its own cards"
+                      onClick={() => toggleIsolate(f.id)}
+                    />
+                  </div>
                   {f.agents.length > 0 && (
                     <div className="mt-0.5 pl-4">
                       <div className={`text-[10px] ${prefs.layers.agents ? "text-dim" : "text-dim/50"}`}>agents</div>
                       {f.agents.map((a) => {
                         const hid = hiddenSet.has(a.id);
+                        const flows = flowsByAgent.get(a.id) ?? [];
                         return (
-                          <label key={a.id} className="flex items-center gap-2 py-[2px] pl-1" title={`${a.machine} · client daemon`}>
-                            <input type="checkbox" checked={!hid} disabled={mHidden} onChange={() => toggleHidden(a.id)} />
-                            <span className={`truncate ${hid || mHidden ? "text-dim line-through" : ""}`}>{a.name}</span>
-                          </label>
+                          <div key={a.id}>
+                            <div className="flex items-center gap-1 py-[2px] pl-1">
+                              <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2" title={`${a.machine} · client daemon`}>
+                                <input type="checkbox" checked={!hid} disabled={mHidden} onChange={() => toggleHidden(a.id)} />
+                                <span className={`truncate ${hid || mHidden ? "text-dim line-through" : ""}`}>{a.name}</span>
+                              </label>
+                              <IsoBtn
+                                active={prefs.isolated === a.id}
+                                title="isolate — this daemon, every pipe it runs, and the engines (and machines) at the far ends"
+                                onClick={() => toggleIsolate(a.id)}
+                              />
+                            </div>
+                            {/* Sessions nest under the daemon that runs them (the flow's own join),
+                                spelled as the hop: this agent → that engine. */}
+                            {flows.map((fl) => {
+                              const fhid = hiddenSet.has(fl.id);
+                              const em = engineMachine.get(fl.to);
+                              return (
+                                <div key={fl.id} className="flex items-center gap-1 pl-7">
+                                  <label
+                                    className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 py-[1px]"
+                                    title={`${fl.shortToken} · ${fl.model ?? "model not named"} → ${fl.engineName}${em ? ` on ${em}` : ""}${fl.cross ? " · crosses machines" : ""}`}
+                                  >
+                                    <input type="checkbox" checked={!fhid} disabled={mHidden || hid} onChange={() => toggleHidden(fl.id)} />
+                                    <span className={`truncate font-mono text-[10px] ${fhid || mHidden || hid ? "text-dim line-through" : "text-dim"}`}>
+                                      <span className="text-accent/70">⇢</span> {fl.profile ?? fl.shortToken} → {fl.engineName}
+                                    </span>
+                                  </label>
+                                  <IsoBtn
+                                    active={prefs.isolated === fl.id}
+                                    title="isolate — just this session's hop: its daemon, the pipe, the engine"
+                                    onClick={() => toggleIsolate(fl.id)}
+                                  />
+                                </div>
+                              );
+                            })}
+                          </div>
                         );
                       })}
                     </div>
@@ -1148,10 +1284,17 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
                       {f.engines.map((e) => {
                         const hid = hiddenSet.has(e.id);
                         return (
-                          <label key={e.id} className="flex items-center gap-2 py-[2px] pl-1" title={`${e.machine} · inference engine`}>
-                            <input type="checkbox" checked={!hid} disabled={mHidden} onChange={() => toggleHidden(e.id)} />
-                            <span className={`truncate ${hid || mHidden ? "text-dim line-through" : ""}`}>{e.name}</span>
-                          </label>
+                          <div key={e.id} className="flex items-center gap-1 py-[2px] pl-1">
+                            <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2" title={`${e.machine} · inference engine`}>
+                              <input type="checkbox" checked={!hid} disabled={mHidden} onChange={() => toggleHidden(e.id)} />
+                              <span className={`truncate ${hid || mHidden ? "text-dim line-through" : ""}`}>{e.name}</span>
+                            </label>
+                            <IsoBtn
+                              active={prefs.isolated === e.id}
+                              title="isolate — this engine and every session pipe feeding it, back to their daemons (and machines)"
+                              onClick={() => toggleIsolate(e.id)}
+                            />
+                          </div>
                         );
                       })}
                     </div>
