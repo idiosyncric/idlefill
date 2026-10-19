@@ -16,8 +16,10 @@ import {
   buildMeshGraph,
   engineNodeId,
   frameId,
+  frameResourceIds,
   hostEdgesFor,
   layoutMesh,
+  machineShape,
   meshChildOffsets,
   meshFrameSize,
 } from "../src/lib/mesh-graph.js";
@@ -237,7 +239,7 @@ test("a pinned session follows the pin, and the tooltip is the shared pipe text"
   assert.match(g.flows[0].title, /operator pin/);
 });
 
-// --- breakout (per-machine break-out of resources) ------------------------
+// --- breakout (per-CARD break-out of resources; the ⌘-drag vocabulary) -----
 
 test("slots carry their machine label (the floating card's on-<machine> chip)", () => {
   for (const f of graph.frames) {
@@ -246,9 +248,22 @@ test("slots carry their machine label (the floating card's on-<machine> chip)", 
   }
 });
 
-test("hostEdgesFor: only broken machines get hosts edges, chip → each resource", () => {
-  const broken = new Set(["urza"]);
-  const edges = hostEdgesFor(graph, broken);
+test("machineShape: chip only when EVERY resource floats; frame otherwise", () => {
+  const urza = graph.frames.find((f) => f.name === "urza")!;
+  const local = graph.frames.find((f) => f.local)!;
+  const scan = graph.frames.find((f) => f.name === "scanbot")!;
+  const all = new Set([...frameResourceIds(urza)]);
+  assert.equal(machineShape(urza, new Set()), "frame"); // nothing out — a frame
+  assert.equal(machineShape(urza, new Set([agentNodeId("cli-urza")])), "frame"); // partial — still a frame
+  assert.equal(machineShape(urza, all), "chip"); // everything out — a chip
+  assert.equal(machineShape(scan, new Set()), "frame"); // no resources — never a chip
+  // the empty-detached-set default never chips a resource-bearing machine
+  assert.equal(machineShape(local, new Set()), "frame");
+});
+
+test("hostEdgesFor: every detached resource gets a hosts edge from its machine box", () => {
+  const det = new Set([agentNodeId("cli-urza"), engineNodeId("srv-remote")]);
+  const edges = hostEdgesFor(graph, det);
   assert.deepEqual(
     edges.map((e) => `${e.from}>${e.to}`).sort(),
     [`mch:urza>${engineNodeId("srv-remote")}`, `mch:urza>${agentNodeId("cli-urza")}`].sort(),
@@ -257,35 +272,50 @@ test("hostEdgesFor: only broken machines get hosts edges, chip → each resource
   assert.deepEqual(hostEdgesFor(graph, new Set()), []); // framed: containment says it
 });
 
-test("layout honors breakout: a broken machine contributes chip + card boxes; framed machines stay one box", () => {
-  const broken = new Set(["urza"]);
+test("hostEdgesFor: a partially broken machine edges ONLY for the card that floated", () => {
+  const local = graph.frames.find((f) => f.local)!;
+  const det = new Set([engineNodeId("srv-omlx")]); // the agent stays framed
+  const edges = hostEdgesFor(graph, det);
+  assert.deepEqual(edges.map((e) => `${e.from}>${e.to}`), [`${local.id}>${engineNodeId("srv-omlx")}`]);
+});
+
+test("a broken frame closes the gap: size and offsets track the cards still inside", () => {
+  const local = graph.frames.find((f) => f.local)!; // 1 agent + 1 engine
+  const full = meshFrameSize(local);
+  const noEngine = meshFrameSize(local, new Set([engineNodeId("srv-omlx")]));
+  const none = meshFrameSize(local, new Set(frameResourceIds(local)));
+  assert.ok(noEngine.h < full.h && none.h < noEngine.h, "the frame shrinks as cards leave");
+  const offs = meshChildOffsets(local, new Set([engineNodeId("srv-omlx")]));
+  assert.ok(offs.has(agentNodeId("cli-mac")));
+  assert.ok(!offs.has(engineNodeId("srv-omlx")), "a floating card has no framed slot");
+});
+
+test("layout honors per-card break-out: chip + cards, or frame + the floater", () => {
+  const full = new Set([agentNodeId("cli-urza"), engineNodeId("srv-remote")]);
+  const partial = new Set([engineNodeId("srv-omlx")]);
   for (const mode of ["rank", "row"] as const) {
-    const pos = layoutMesh(graph, mode, broken);
-    // the broken machine's chip keeps the machine box id, cards appear as their own
+    const pos = layoutMesh(graph, mode, new Set([...full, ...partial]));
+    // the fully broken machine: chip keeps the machine box id, cards are their own
     assert.ok(pos.has(frameId("urza")), `${mode}: urza chip missing`);
     assert.ok(pos.has(agentNodeId("cli-urza")), `${mode}: broken agent not placed`);
     assert.ok(pos.has(engineNodeId("srv-remote")), `${mode}: broken engine not placed`);
-    // framed machines stay a single box — their children are NOT top-level
-    assert.ok(pos.has(frameId(LOCAL_MACHINE)));
+    // the partially broken machine: still ONE frame box, plus the floater only
+    assert.ok(pos.has(frameId(LOCAL_MACHINE)), `${mode}: local machine box missing`);
+    assert.ok(pos.has(engineNodeId("srv-omlx")), `${mode}: the floater was not placed`);
     assert.ok(!pos.has(agentNodeId("cli-mac")), `${mode}: framed child leaked top-level`);
-    assert.ok(!pos.has(engineNodeId("srv-omlx")), `${mode}: framed child leaked top-level`);
     // offline scanbot (framed, empty) still gets a box
     assert.ok(pos.has(frameId("scanbot")));
   }
 });
 
-test("broken layout boxes never overlap", () => {
-  const broken = new Set(["urza"]);
-  const pos = layoutMesh(graph, "rank", broken);
+test("broken layout boxes never overlap (full break-out on one machine, partial on another)", () => {
+  const det = new Set([agentNodeId("cli-urza"), engineNodeId("srv-remote"), engineNodeId("srv-omlx")]);
+  const pos = layoutMesh(graph, "rank", det);
   const boxOf = new Map<string, { w: number; h: number }>();
   for (const f of graph.frames) {
-    if (broken.has(f.name)) {
-      boxOf.set(f.id, { w: 260, h: f.headerH });
-      for (const a of f.agents) boxOf.set(a.id, { w: 306, h: 78 });
-      for (const e of f.engines) boxOf.set(e.id, { w: 306, h: 100 });
-    } else {
-      boxOf.set(f.id, meshFrameSize(f));
-    }
+    boxOf.set(f.id, machineShape(f, det) === "chip" ? { w: 260, h: f.headerH } : meshFrameSize(f, det));
+    for (const id of frameResourceIds(f))
+      if (det.has(id)) boxOf.set(id, id.startsWith("agt:") ? { w: 306, h: 78 } : { w: 306, h: 100 });
   }
   const rects = [...pos.entries()].map(([id, p]) => {
     const s = boxOf.get(id)!;

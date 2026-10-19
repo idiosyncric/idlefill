@@ -34,8 +34,10 @@ import {
   FRAME_PAD,
   SECTION_H,
   buildMeshGraph,
+  frameResourceIds,
   hostEdgesFor,
   layoutMesh,
+  machineShape,
   meshChildOffsets,
   meshFrameSize,
   type MeshAgentSlot,
@@ -69,10 +71,14 @@ import type { StateSnapshot } from "@/lib/api";
 // Layout: Rank (dagre layered left→right — machines that feed engines
 // elsewhere rank upstream), Row (one line, This Machine first), Free (drag
 // frames anywhere; positions persist in this browser). And BREAKOUT, per
-// machine: "break out" shrinks a frame to its chip and lets that machine's
-// agents and engines float as their own nodes (each card then carries its
-// "on <machine>" chip, tied back by a dim hosts edge; "dock" tucks them
-// home). Mixed states are fine — some machines framed, some broken out.
+// CARD: a machine's agents and engines can each float free as their own
+// nodes (each floating card carries its "on <machine>" chip, tied back by a
+// dim hosts edge). Break them out all at once with the frame's "break out"
+// button, one at a time with the ⌘-drag gesture: hold super and drag a card
+// OUT of its machine to dock it free, or drag a floating card back ONTO its
+// machine to tuck it home. A machine whose every card floats shrinks to its
+// chip ("dock" brings them all back); a partially broken one stays a frame
+// sized to the cards still inside. Mixed states are fine.
 // The 5s poll refreshes the DATA; positions stay put, so nothing jumps
 // while you work in the canvas. Layout/breakout/positions live in
 // localStorage, same posture as the tab prefs.
@@ -101,8 +107,8 @@ const PIPE_STROKE: Record<PipeEdge["phase"], string> = {
   tools: "var(--pipe-tools)",
 };
 
-type FrameData = { kind: "machine"; frame: MeshFrame; onToggle: (name: string) => void };
-type ChipData = { kind: "chip"; frame: MeshFrame; onToggle: (name: string) => void };
+type FrameData = { kind: "machine"; frame: MeshFrame; detached: ReadonlySet<string>; onAction: (name: string) => void };
+type ChipData = { kind: "chip"; frame: MeshFrame; onAction: (name: string) => void };
 type EngineData = { kind: "engine"; engine: MeshEngineSlot; detached: boolean };
 type AgentData = { kind: "agent"; agent: MeshAgentSlot; detached: boolean };
 type FlowData = { pipe: PipeEdge; title: string; curvature: number; offset: number };
@@ -159,13 +165,16 @@ function MachineInfo({ f, action }: { f: MeshFrame; action?: ReactNode }) {
 }
 
 function MachineNode({ data }: NodeProps) {
-  const { frame: f, onToggle } = data as unknown as FrameData;
-  // The section hairline labels sit exactly above the first child of each
-  // section — the same offsets the layout used, so they never drift.
-  const offsets = meshChildOffsets(f);
-  const firstAgent = f.agents[0] ? offsets.get(f.agents[0].id) : undefined;
-  const firstEngine = f.engines[0] ? offsets.get(f.engines[0].id) : undefined;
-  const breakable = f.agents.length + f.engines.length > 0;
+  const { frame: f, detached, onAction } = data as unknown as FrameData;
+  // The section hairline labels sit exactly above the first card of each
+  // framed section — the same offsets the layout used (detached cards are
+  // gone from the stack), so they never drift.
+  const offsets = meshChildOffsets(f, detached);
+  const agentOff = f.agents.map((a) => offsets.get(a.id)).find((o): o is { x: number; y: number } => !!o);
+  const engineOff = f.engines.map((e) => offsets.get(e.id)).find((o): o is { x: number; y: number } => !!o);
+  const ids = frameResourceIds(f);
+  const breakable = ids.length > 0;
+  const nDetached = ids.filter((id) => detached.has(id)).length;
   return (
     <div className={`mesh-frame h-full w-full ${f.online ? "" : "opacity-55"}`}>
       <MachineInfo
@@ -174,36 +183,42 @@ function MachineNode({ data }: NodeProps) {
           breakable ? (
             <button
               className="mesh-pop nodrag nopan"
-              title="break this machine's agents and engines out into their own nodes"
-              onClick={() => onToggle(f.name)}
+              title={
+                nDetached === 0
+                  ? "break this machine's agents and engines out into their own nodes"
+                  : "put every floating card of this machine back into the frame"
+              }
+              onClick={() => onAction(f.name)}
             >
-              break out
+              {nDetached === 0 ? "break out" : "dock all"}
             </button>
           ) : undefined
         }
       />
-      {f.agents.length > 0 && firstAgent && (
-        <div className="mesh-section" style={{ top: firstAgent.y - SECTION_H + 4 }}>
+      {agentOff && (
+        <div className="mesh-section" style={{ top: agentOff.y - SECTION_H + 4 }}>
           agents
         </div>
       )}
-      {f.engines.length > 0 && firstEngine && (
-        <div className="mesh-section" style={{ top: firstEngine.y - SECTION_H + 4 }}>
+      {engineOff && (
+        <div className="mesh-section" style={{ top: engineOff.y - SECTION_H + 4 }}>
           engines
         </div>
       )}
-      {/* Control edges attach to the frame sides. */}
+      {/* Control edges attach to the frame sides; a partially broken frame
+          draws its hosts edges from the bottom, same as the chip. */}
       <Handle id="ctl-l" type="target" position={Position.Left} className="mesh-handle" />
       <Handle id="ctl-r" type="source" position={Position.Right} className="mesh-handle" />
+      <Handle id="host-b" type="source" position={Position.Bottom} className="mesh-handle" />
     </div>
   );
 }
 
-/** A BROKEN-OUT machine: the same glance block, minus the containment. Its
- *  resources float as their own nodes, tied back by a dim hosts edge from
- *  this chip's bottom handle; a dock button tucks them all back in. */
+/** A machine whose EVERY resource floats free: the same glance block, minus
+ *  the containment. Its cards ride dim hosts edges back to this chip's
+ *  bottom handle; a dock button tucks them all back in. */
 function ChipNode({ data }: NodeProps) {
-  const { frame: f, onToggle } = data as unknown as ChipData;
+  const { frame: f, onAction } = data as unknown as ChipData;
   const breakable = f.agents.length + f.engines.length > 0;
   return (
     <div className={`mesh-card h-full w-full ${f.online ? "" : "opacity-55"}`}>
@@ -214,7 +229,7 @@ function ChipNode({ data }: NodeProps) {
             <button
               className="mesh-pop nodrag nopan"
               title="put this machine's agents and engines back into a frame"
-              onClick={() => onToggle(f.name)}
+              onClick={() => onAction(f.name)}
             >
               dock
             </button>
@@ -380,9 +395,9 @@ function ControlEdgeView(props: EdgeProps) {
   );
 }
 
-/** The dim hairline a broken-out machine draws to each of its floating
- *  cards: chip bottom → card top. Attribution, not traffic — deliberately
- *  quieter than every flow pipe. */
+/** The dim hairline a machine draws to each of its floating cards: machine
+ *  box (frame or chip) bottom → card top. Attribution, not traffic —
+ *  deliberately quieter than every flow pipe. */
 function HostEdgeView(props: EdgeProps) {
   const { sourceX, sourceY, targetX, targetY, data } = props;
   const d = data as unknown as HostData;
@@ -424,6 +439,9 @@ function readPos(): Map<string, { x: number; y: number }> {
     return new Map();
   }
 }
+// A floating resource CARD id is "eng:<server>"/"agt:<client>"; legacy
+// stored values were machine NAMES — the view expands those once the graph
+// is drawn, and the first write persists the new spelling.
 function readBroken(): Set<string> {
   try {
     const raw = localStorage.getItem(BROKEN_KEY);
@@ -440,17 +458,19 @@ function Canvas({
   graph,
   mode,
   tick,
-  broken,
-  brokenKey,
-  onToggle,
+  detached,
+  detachedKey,
+  onMachineAction,
+  onSetResource,
   onDragged,
 }: {
   graph: MeshGraph | null;
   mode: Mode;
   tick: number;
-  broken: ReadonlySet<string>;
-  brokenKey: string;
-  onToggle: (name: string) => void;
+  detached: ReadonlySet<string>;
+  detachedKey: string;
+  onMachineAction: (name: string) => void;
+  onSetResource: (id: string, on: boolean) => void;
   onDragged: (id: string, pos: { x: number; y: number }) => Map<string, { x: number; y: number }>;
 }) {
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
@@ -458,10 +478,51 @@ function Canvas({
   const rf = useReactFlow();
   const fitted = useRef(false);
   const dragPos = useRef<Map<string, { x: number; y: number }>>(readPos());
+  // SUPER (⌘) held = the dock/undock gesture is armed: resource cards become
+  // draggable (framed children leave their "parent" extent so they can be
+  // pulled out). Releases are deferred while a drag is in flight so a
+  // mid-drag key release never rebuilds the canvas under the pointer.
+  const [superHeld, setSuperHeld] = useState(false);
+  const draggingRef = useRef(false);
+  const pendingSuper = useRef<boolean | null>(null);
+  // Bumped to re-run the build after an inconclusive gesture (the dragged
+  // card snaps back home instead of hanging where it was dropped).
+  const [gesture, setGesture] = useState(0);
+
+  useEffect(() => {
+    const apply = (on: boolean) => {
+      if (draggingRef.current) pendingSuper.current = on;
+      else setSuperHeld(on);
+    };
+    const down = (e: KeyboardEvent) => {
+      if (e.key === "Meta") apply(true);
+    };
+    const up = (e: KeyboardEvent) => {
+      if (e.key === "Meta") apply(false);
+    };
+    const blur = () => apply(false);
+    window.addEventListener("keydown", down);
+    window.addEventListener("keyup", up);
+    window.addEventListener("blur", blur);
+    return () => {
+      window.removeEventListener("keydown", down);
+      window.removeEventListener("keyup", up);
+      window.removeEventListener("blur", blur);
+    };
+  }, []);
 
   useEffect(() => {
     dragPos.current = readPos();
   }, [tick]);
+
+  // resource node id → its machine's box id: the ONLY legal dock target (a
+  // card belongs to its machine by the hierarchy's exact join — membership
+  // never follows the drop).
+  const machineOf = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const f of graph?.frames ?? []) for (const id of frameResourceIds(f)) m.set(id, f.id);
+    return m;
+  }, [graph]);
 
   useEffect(() => {
     if (!graph) {
@@ -469,90 +530,84 @@ function Canvas({
       setEdges([]);
       return;
     }
-    const auto = layoutMesh(graph, mode === "free" ? "rank" : mode, broken);
+    const auto = layoutMesh(graph, mode === "free" ? "rank" : mode, detached);
     const next: Node[] = [];
+    const resDraggable = mode === "free" || superHeld; // floating cards: free-move, or super-dock
+    const childDraggable = superHeld; // framed cards: draggable ONLY for the gesture
     for (const f of graph.frames) {
-      const isBroken = broken.has(f.name);
+      const isChip = machineShape(f, detached) === "chip";
       const pos = (mode === "free" ? dragPos.current.get(f.id) : undefined) ?? auto.get(f.id) ?? { x: 0, y: 0 };
-      if (isBroken) {
-        // The machine shrinks to its chip; its resources become top-level
-        // nodes placed by the same layout pass.
-        next.push({
-          id: f.id,
-          type: "chip",
-          position: pos,
-          width: CHIP_W,
-          height: f.headerH,
-          draggable: mode === "free",
-          selectable: false,
-          data: { kind: "chip", frame: f, onToggle } satisfies ChipData,
-        });
-        for (const a of f.agents) {
+      const size = isChip ? { w: CHIP_W, h: f.headerH } : meshFrameSize(f, detached);
+      next.push({
+        id: f.id,
+        type: isChip ? "chip" : "machine",
+        position: pos,
+        width: size.w,
+        height: size.h,
+        draggable: mode === "free",
+        selectable: false,
+        data: isChip
+          ? { kind: "chip", frame: f, onAction: onMachineAction } satisfies ChipData
+          : { kind: "machine", frame: f, detached, onAction: onMachineAction } satisfies FrameData,
+      });
+      // Cards still inside the frame (never when the whole machine floats).
+      if (!isChip) {
+        const offsets = meshChildOffsets(f, detached);
+        for (const a of f.agents)
+          if (!detached.has(a.id))
+            next.push({
+              id: a.id,
+              type: "agent",
+              position: offsets.get(a.id) ?? { x: FRAME_PAD, y: FRAME_PAD },
+              parentId: f.id,
+              extent: superHeld ? undefined : "parent",
+              width: CARD_W,
+              height: AGENT_H,
+              draggable: childDraggable,
+              selectable: false,
+              data: { kind: "agent", agent: a, detached: false } satisfies AgentData,
+            });
+        for (const e of f.engines)
+          if (!detached.has(e.id))
+            next.push({
+              id: e.id,
+              type: "engine",
+              position: offsets.get(e.id) ?? { x: FRAME_PAD, y: FRAME_PAD },
+              parentId: f.id,
+              extent: superHeld ? undefined : "parent",
+              width: CARD_W,
+              height: ENGINE_H,
+              draggable: childDraggable,
+              selectable: false,
+              data: { kind: "engine", engine: e, detached: false } satisfies EngineData,
+            });
+      }
+      // Cards floating free of their machine (all of them for a chip, some
+      // of them for a partially broken-out frame).
+      for (const a of f.agents)
+        if (detached.has(a.id))
           next.push({
             id: a.id,
             type: "agent",
             position: (mode === "free" ? dragPos.current.get(a.id) : undefined) ?? auto.get(a.id) ?? { x: 0, y: 0 },
             width: CARD_W,
             height: AGENT_H,
-            draggable: mode === "free",
+            draggable: resDraggable,
             selectable: false,
             data: { kind: "agent", agent: a, detached: true } satisfies AgentData,
           });
-        }
-        for (const e of f.engines) {
+      for (const e of f.engines)
+        if (detached.has(e.id))
           next.push({
             id: e.id,
             type: "engine",
             position: (mode === "free" ? dragPos.current.get(e.id) : undefined) ?? auto.get(e.id) ?? { x: 0, y: 0 },
             width: CARD_W,
             height: ENGINE_H,
-            draggable: mode === "free",
+            draggable: resDraggable,
             selectable: false,
             data: { kind: "engine", engine: e, detached: true } satisfies EngineData,
           });
-        }
-        continue;
-      }
-      const size = meshFrameSize(f);
-      next.push({
-        id: f.id,
-        type: "machine",
-        position: pos,
-        width: size.w,
-        height: size.h,
-        draggable: mode === "free",
-        selectable: false,
-        data: { kind: "machine", frame: f, onToggle } satisfies FrameData,
-      });
-      const offsets = meshChildOffsets(f);
-      for (const a of f.agents) {
-        next.push({
-          id: a.id,
-          type: "agent",
-          position: offsets.get(a.id) ?? { x: FRAME_PAD, y: FRAME_PAD },
-          parentId: f.id,
-          extent: "parent",
-          width: CARD_W,
-          height: AGENT_H,
-          draggable: false,
-          selectable: false,
-          data: { kind: "agent", agent: a, detached: false } satisfies AgentData,
-        });
-      }
-      for (const e of f.engines) {
-        next.push({
-          id: e.id,
-          type: "engine",
-          position: offsets.get(e.id) ?? { x: FRAME_PAD, y: FRAME_PAD },
-          parentId: f.id,
-          extent: "parent",
-          width: CARD_W,
-          height: ENGINE_H,
-          draggable: false,
-          selectable: false,
-          data: { kind: "engine", engine: e, detached: false } satisfies EngineData,
-        });
-      }
     }
     const nextEdges: Edge[] = [];
     for (const c of graph.controls) {
@@ -568,7 +623,7 @@ function Canvas({
         data: { label: "controls" } satisfies ControlData,
       });
     }
-    for (const h of hostEdgesFor(graph, broken)) {
+    for (const h of hostEdgesFor(graph, detached)) {
       nextEdges.push({
         id: h.id,
         source: h.from,
@@ -605,7 +660,7 @@ function Canvas({
       fitted.current = true;
       window.setTimeout(() => rf.fitView({ padding: 0.08, duration: 300 }), 60);
     }
-  }, [graph, mode, tick, broken, brokenKey, onToggle, setNodes, setEdges, rf]);
+  }, [graph, mode, tick, detached, detachedKey, superHeld, gesture, onMachineAction, setNodes, setEdges, rf]);
 
   // A layout pick, re-layout, or a break/dock re-frames the graph (a
   // deliberate action).
@@ -613,14 +668,80 @@ function Canvas({
   useEffect(() => {
     const id = window.setTimeout(() => rf.fitView({ padding: 0.08, duration: 300 }), 60);
     return () => window.clearTimeout(id);
-  }, [mode, tick, framesLen, brokenKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [mode, tick, framesLen, detachedKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const saveDrag = useCallback(
     (_: unknown, n: Node) => {
-      if (n.parentId) return; // framed children never drag; top-level ones persist
+      if (n.parentId) return; // framed children never persist; top-level ones do
       dragPos.current = onDragged(n.id, n.position);
     },
     [onDragged],
+  );
+
+  const onDragStart = useCallback(() => {
+    draggingRef.current = true;
+  }, []);
+
+  // Where the dragged card actually is in flow space (a framed child's
+  // position is PARENT-relative — the parent is always top-level here).
+  const absOf = useCallback(
+    (n: Node) => {
+      if (!n.parentId) return n.position;
+      const p = rf.getNode(n.parentId);
+      return p ? { x: p.position.x + n.position.x, y: p.position.y + n.position.y } : n.position;
+    },
+    [rf],
+  );
+
+  // The machine's box in flow space, from the same geometry the build used
+  // (never from the DOM measure, which can lag the 5s data poll).
+  const machineRect = useCallback(
+    (machineId: string) => {
+      const f = graph?.frames.find((fr) => fr.id === machineId);
+      const n = rf.getNode(machineId);
+      if (!f || !n) return null;
+      const s = machineShape(f, detached) === "chip" ? { w: CHIP_W, h: f.headerH } : meshFrameSize(f, detached);
+      return { x: n.position.x, y: n.position.y, w: s.w, h: s.h };
+    },
+    [graph, rf, detached],
+  );
+
+  const overBox = (cx: number, cy: number, b: { x: number; y: number; w: number; h: number }) =>
+    cx >= b.x && cx <= b.x + b.w && cy >= b.y && cy <= b.y + b.h;
+
+  // The ⌘-gesture verdict on release: a framed card released OUTSIDE its
+  // machine undocks; a floating card released over its OWN machine docks.
+  // Membership never follows the drop — only the card's own machine accepts
+  // it (the hierarchy's join, not a guess). Plain (no-super) releases never
+  // change docking: free mode simply moves the card.
+  const onDragStop = useCallback(
+    (event: MouseEvent | TouchEvent, n: Node) => {
+      draggingRef.current = false;
+      saveDrag(event, n);
+      const pending = pendingSuper.current;
+      pendingSuper.current = null;
+      if (pending !== null) setSuperHeld(pending);
+      const meta = (event as MouseEvent).metaKey === true;
+      if (!(meta || superHeld) || !graph) return;
+      const abs = absOf(n);
+      const cx = abs.x + CARD_W / 2;
+      const cy = abs.y + (n.type === "engine" ? ENGINE_H : AGENT_H) / 2;
+      if (n.parentId) {
+        const box = machineRect(n.parentId);
+        if (!box) return;
+        if (overBox(cx, cy, box)) setGesture((g) => g + 1); // back home — snap to the framed stack
+        else {
+          dragPos.current = onDragged(n.id, abs); // remember where it was let go
+          onSetResource(n.id, true);
+        }
+      } else {
+        const machine = machineOf.get(n.id);
+        const box = machine ? machineRect(machine) : null;
+        if (box && overBox(cx, cy, box)) onSetResource(n.id, false);
+        else if (mode !== "free") setGesture((g) => g + 1); // rank/row own the positions
+      }
+    },
+    [graph, mode, superHeld, saveDrag, absOf, machineRect, machineOf, onDragged, onSetResource],
   );
 
   return (
@@ -631,8 +752,9 @@ function Canvas({
       onEdgesChange={onEdgesChange}
       nodeTypes={nodeTypes}
       edgeTypes={edgeTypes}
+      onNodeDragStart={onDragStart}
       onNodeDrag={saveDrag}
-      onNodeDragStop={saveDrag}
+      onNodeDragStop={onDragStop}
       nodesConnectable={false}
       elementsSelectable={false}
       minZoom={0.12}
@@ -657,24 +779,58 @@ function Canvas({
 export function Mesh({ st }: { st: StateSnapshot | null }) {
   const [mode, setMode] = useState<Mode>(readMode);
   const [tick, setTick] = useState(0);
-  // BROKEN-OUT machines (per-machine breakout): the names whose agents and
-  // engines float as their own nodes instead of stacking inside the frame.
-  // A view preference — persisted here in the browser, like the layout pick.
-  const [broken, setBroken] = useState<Set<string>>(readBroken);
-  const brokenKey = [...broken].sort().join("|");
-  const toggleMachine = useCallback((name: string) => {
-    setBroken((prev) => {
-      const next = new Set(prev);
-      if (next.has(name)) next.delete(name);
-      else next.add(name);
-      localStorage.setItem(BROKEN_KEY, JSON.stringify([...next]));
-      return next;
-    });
-  }, []);
+  // BROKEN-OUT resource cards (per-card breakout, the ⌘-drag vocabulary):
+  // agent/engine node ids floating as their own nodes instead of stacking
+  // inside the frame. A view preference — persisted here in the browser,
+  // like the layout pick. Legacy entries are machine NAMES; the memo below
+  // expands them to that machine's resources once the graph exists, and the
+  // first write persists the new spelling.
+  const [brokenRaw, setBrokenRaw] = useState<Set<string>>(readBroken);
 
   const graph: MeshGraph | null = useMemo(
     () => (st ? buildMeshGraph(st, st.now ?? Date.now()) : null),
     [st],
+  );
+
+  const detached = useMemo(() => {
+    const isResourceId = (t: string) => t.startsWith("eng:") || t.startsWith("agt:");
+    if (!graph || [...brokenRaw].every(isResourceId)) return brokenRaw;
+    const out = new Set<string>();
+    for (const t of brokenRaw) {
+      if (isResourceId(t)) out.add(t);
+      else {
+        const f = graph.frames.find((fr) => fr.name === t);
+        if (f) for (const id of frameResourceIds(f)) out.add(id);
+      }
+    }
+    return out;
+  }, [brokenRaw, graph]);
+  const detachedKey = [...detached].sort().join("|");
+
+  const setResources = useCallback(
+    (ids: string[], on: boolean) => {
+      const next = new Set(detached);
+      for (const id of ids) {
+        if (on) next.add(id);
+        else next.delete(id);
+      }
+      localStorage.setItem(BROKEN_KEY, JSON.stringify([...next]));
+      setBrokenRaw(next);
+    },
+    [detached],
+  );
+  // One card (the ⌘-drag gesture).
+  const setResource = useCallback((id: string, on: boolean) => setResources([id], on), [setResources]);
+  // A machine card's button: "break out" floats every resource, "dock"/
+  // "dock all" brings every floating one home.
+  const machineAction = useCallback(
+    (name: string) => {
+      const f = graph?.frames.find((fr) => fr.name === name);
+      if (!f) return;
+      const ids = frameResourceIds(f);
+      setResources(ids, !ids.some((id) => detached.has(id)));
+    },
+    [graph, detached, setResources],
   );
 
   const onDragged = useCallback((id: string, pos: { x: number; y: number }) => {
@@ -695,6 +851,7 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
 
   const engines = graph?.frames.reduce((a, f) => a + f.engines.length, 0) ?? 0;
   const agents = graph?.frames.reduce((a, f) => a + f.agents.length, 0) ?? 0;
+  const brokenMachines = graph?.frames.filter((f) => frameResourceIds(f).some((id) => detached.has(id))).length ?? 0;
   const liveFlows = graph?.flows.length ?? 0;
   const held = graph?.flows.filter((f) => f.pipe.phase === "queued").length ?? 0;
   const uf = graph?.unflowed;
@@ -759,11 +916,14 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
         <span>
           <span className="text-accent">→</span> paired control
         </span>
-        {broken.size > 0 && (
+        {brokenMachines > 0 && (
           <span>
-            <span className="text-dim">┈</span> hosts (broken out: {broken.size})
+            <span className="text-dim">┈</span> hosts (broken out: {brokenMachines})
           </span>
         )}
+        <span title="hold ⌘ and drag an agent/engine card out of its machine to float it — drop it back on the machine to dock it">
+          <span className="text-accent">⌘</span> drag a card — dock / undock
+        </span>
       </div>
       {st && !st.mesh && (
         <div className="text-[11px] text-dim">
@@ -777,9 +937,10 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
             graph={graph}
             mode={mode}
             tick={tick}
-            broken={broken}
-            brokenKey={brokenKey}
-            onToggle={toggleMachine}
+            detached={detached}
+            detachedKey={detachedKey}
+            onMachineAction={machineAction}
+            onSetResource={setResource}
             onDragged={onDragged}
           />
         </ReactFlowProvider>

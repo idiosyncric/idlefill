@@ -373,46 +373,75 @@ export function buildMeshGraph(st: StateSnapshot, now: number): MeshGraph {
 
 export type MeshLayoutMode = "rank" | "row";
 
-/** The dim "hosts" edges that attribute a BROKEN-OUT machine's floating
- *  cards back to its chip: chip (keyed by machine id) → each agent/engine.
- *  Empty for machines that stayed framed (containment already says it).
- *  Pure + exported so the view and the tests share one definition. */
+/** Every resource node id a frame owns (agents first, then engines) — the
+ *  vocabulary the DETACHED set is spelled in. */
+export function frameResourceIds(f: MeshFrame): string[] {
+  return [...f.agents.map((a) => a.id), ...f.engines.map((e) => e.id)];
+}
+
+/** How a machine RENDERS given the detached-resource set: "chip" only when
+ *  it HAS resources and every one of them floats free (containment is gone
+ *  entirely); "frame" otherwise — a fully framed machine, or a partially
+ *  broken-out one (its remaining children still stack inside, the floaters
+ *  carry hosts edges back to it). */
+export function machineShape(f: MeshFrame, detached: ReadonlySet<string>): "frame" | "chip" {
+  const ids = frameResourceIds(f);
+  if (ids.length === 0) return "frame";
+  return ids.every((id) => detached.has(id)) ? "chip" : "frame";
+}
+
+/** The dim "hosts" edges that attribute a BROKEN-OUT resource back to its
+ *  machine: machine box (frame or chip, keyed by machine id) → the floating
+ *  agent/engine card. Empty while every resource stays framed (containment
+ *  already says it). `detached` holds RESOURCE node ids (per-card break-out,
+ *  the ⌘-drag gesture's vocabulary). Pure + exported so the view and the
+ *  tests share one definition. */
 export function hostEdgesFor(
   graph: MeshGraph,
-  broken: ReadonlySet<string>,
+  detached: ReadonlySet<string>,
 ): { id: string; from: string; to: string; machine: string; label: string }[] {
   const edges: { id: string; from: string; to: string; machine: string; label: string }[] = [];
+  if (detached.size === 0) return edges;
   for (const f of graph.frames) {
-    if (!broken.has(f.name)) continue;
     for (const a of f.agents)
-      edges.push({ id: `host:${f.id}>${a.id}`, from: f.id, to: a.id, machine: f.name, label: `hosts ${a.name}` });
+      if (detached.has(a.id))
+        edges.push({ id: `host:${f.id}>${a.id}`, from: f.id, to: a.id, machine: f.name, label: `hosts ${a.name}` });
     for (const e of f.engines)
-      edges.push({ id: `host:${f.id}>${e.id}`, from: f.id, to: e.id, machine: f.name, label: `hosts ${e.name}` });
+      if (detached.has(e.id))
+        edges.push({ id: `host:${f.id}>${e.id}`, from: f.id, to: e.id, machine: f.name, label: `hosts ${e.name}` });
   }
   return edges;
 }
 
-export function meshFrameSize(f: MeshFrame): { w: number; h: number } {
-  const agentsH = f.agents.length > 0 ? SECTION_H + f.agents.length * AGENT_H + (f.agents.length - 1) * NODE_GAP : 0;
-  const enginesH = f.engines.length > 0 ? SECTION_H + f.engines.length * ENGINE_H + (f.engines.length - 1) * NODE_GAP : 0;
+export function meshFrameSize(f: MeshFrame, detached: ReadonlySet<string> = EMPTY_DETACHED): { w: number; h: number } {
+  const na = f.agents.filter((a) => !detached.has(a.id)).length;
+  const ne = f.engines.filter((e) => !detached.has(e.id)).length;
+  const agentsH = na > 0 ? SECTION_H + na * AGENT_H + (na - 1) * NODE_GAP : 0;
+  const enginesH = ne > 0 ? SECTION_H + ne * ENGINE_H + (ne - 1) * NODE_GAP : 0;
   const seam = agentsH > 0 && enginesH > 0 ? NODE_GAP : 0;
   return { w: FRAME_W, h: FRAME_PAD + f.headerH + agentsH + seam + enginesH + FRAME_PAD };
 }
 
-/** Children's positions RELATIVE to the frame (agents stacked, then engines). */
-export function meshChildOffsets(f: MeshFrame): Map<string, { x: number; y: number }> {
+const EMPTY_DETACHED: ReadonlySet<string> = new Set();
+
+/** Children's positions RELATIVE to the frame (agents stacked, then engines).
+ *  Detached resources are NOT in the map — they are their own boxes (see
+ *  layoutMesh) and the framed stack closes the gap they left. */
+export function meshChildOffsets(f: MeshFrame, detached: ReadonlySet<string> = EMPTY_DETACHED): Map<string, { x: number; y: number }> {
   const out = new Map<string, { x: number; y: number }>();
+  const agents = f.agents.filter((a) => !detached.has(a.id));
+  const engines = f.engines.filter((e) => !detached.has(e.id));
   let y = FRAME_PAD + f.headerH;
-  if (f.agents.length > 0) {
+  if (agents.length > 0) {
     y += SECTION_H;
-    for (const a of f.agents) {
+    for (const a of agents) {
       out.set(a.id, { x: FRAME_PAD, y });
       y += AGENT_H + NODE_GAP;
     }
   }
-  if (f.engines.length > 0) {
+  if (engines.length > 0) {
     y += SECTION_H;
-    for (const e of f.engines) {
+    for (const e of engines) {
       out.set(e.id, { x: FRAME_PAD, y });
       y += ENGINE_H + NODE_GAP;
     }
@@ -420,62 +449,64 @@ export function meshChildOffsets(f: MeshFrame): Map<string, { x: number; y: numb
   return out;
 }
 
-/** Frame positions for one layout mode, honoring which machines are BROKEN
- *  OUT. A machine that is NOT broken out is one box (its frame; the view
- *  places its child cards inside via meshChildOffsets). A BROKEN-OUT machine
- *  becomes several boxes: its compact chip (keyed by the machine id) plus one
- *  box per agent and per engine, each keyed by that resource's node id. The
- *  returned map covers EVERY top-level node (frames, chips, broken resources);
- *  children that stayed inside a frame are NOT in it (they are offset in-view).
+/** Frame positions for one layout mode, honoring which RESOURCES are broken
+ *  OUT (a set of resource node ids — per-card granularity, the ⌘-drag
+ *  gesture's vocabulary). A machine whose resources all stayed framed is one
+ *  box (its frame; the view places the child cards inside via
+ *  meshChildOffsets). A machine with FLOATING cards contributes its machine
+ *  box — the compact chip once EVERY card is out, otherwise the frame sized
+ *  to its remaining children — plus one box per floating card, each keyed by
+ *  that resource's node id. The returned map covers EVERY top-level node
+ *  (frames, chips, floating cards); children that stayed inside a frame are
+ *  NOT in it (they are offset in-view).
  *  "rank" = dagre layered left→right along control + aggregated cross-machine
- *  flow edges (a machine whose agents feed another's engines ranks upstream);
- *  a broken chip keeps a weak pull to its own cards so they don't scatter.
- *  "row" = one row grouped by machine (local first, a broken machine's chip
- *  followed by its cards), no edges read. */
+ *  flow edges (a machine whose agents feed engines elsewhere ranks upstream);
+ *  a machine box keeps a weak pull to its own cards so they don't scatter.
+ *  "row" = one row grouped by machine (local first, a machine's box followed
+ *  by its cards), no edges read. */
 export function layoutMesh(
   graph: MeshGraph,
   mode: MeshLayoutMode,
-  broken: ReadonlySet<string> = new Set(),
+  detached: ReadonlySet<string> = EMPTY_DETACHED,
 ): Map<string, { x: number; y: number }> {
   const out = new Map<string, { x: number; y: number }>();
 
   // Each machine contributes a group of boxes. `rep` is the machine's own box
-  // (frame, or chip when broken) — the control edges attach to it. Members are
-  // the resource boxes that only exist as separate boxes when broken out.
+  // (frame, or chip once every card is out) — the control edges attach to it.
+  // Members are the resource boxes that floated free of it.
   type Box = { id: string; w: number; h: number };
   type Group = { rep: Box; members: Box[]; machine: string };
   const groups: Group[] = [];
-  // node id (agent/engine) → the box id it occupies (its own when broken).
+  // node id (agent/engine) → the box id it occupies (its own when floating).
   const boxOf = new Map<string, string>();
 
   for (const f of graph.frames) {
-    const isBroken = broken.has(f.name);
-    if (!isBroken) {
-      const { w, h } = meshFrameSize(f);
-      groups.push({ rep: { id: f.id, w, h }, members: [], machine: f.name });
-      for (const a of f.agents) boxOf.set(a.id, f.id);
-      for (const e of f.engines) boxOf.set(e.id, f.id);
-    } else {
-      const chip: Box = { id: f.id, w: CHIP_W, h: f.headerH }; // rep keyed by machine id
-      const members: Box[] = [];
-      for (const a of f.agents) {
-        const b: Box = { id: a.id, w: CARD_W, h: AGENT_H };
-        members.push(b);
-        boxOf.set(a.id, a.id);
-      }
-      for (const e of f.engines) {
-        const b: Box = { id: e.id, w: CARD_W, h: ENGINE_H };
-        members.push(b);
-        boxOf.set(e.id, e.id);
-      }
-      groups.push({ rep: chip, members, machine: f.name });
+    const framedAgents = f.agents.filter((a) => !detached.has(a.id));
+    const framedEngines = f.engines.filter((e) => !detached.has(e.id));
+    const outAgents = f.agents.filter((a) => detached.has(a.id));
+    const outEngines = f.engines.filter((e) => detached.has(e.id));
+    const isChip = machineShape(f, detached) === "chip";
+    const rep: Box = isChip
+      ? { id: f.id, w: CHIP_W, h: f.headerH } // rep keyed by machine id
+      : { id: f.id, ...meshFrameSize(f, detached) };
+    const members: Box[] = [];
+    for (const a of framedAgents) boxOf.set(a.id, f.id);
+    for (const e of framedEngines) boxOf.set(e.id, f.id);
+    for (const a of outAgents) {
+      members.push({ id: a.id, w: CARD_W, h: AGENT_H });
+      boxOf.set(a.id, a.id);
     }
+    for (const e of outEngines) {
+      members.push({ id: e.id, w: CARD_W, h: ENGINE_H });
+      boxOf.set(e.id, e.id);
+    }
+    groups.push({ rep, members, machine: f.name });
   }
 
   if (mode === "row") {
     let x = 0;
     for (const g of groups) {
-      // A machine column: the rep (frame or chip) on top, then its broken
+      // A machine column: the rep (frame or chip) on top, then its floating
       // cards stacked below it. Column width = the widest box; next machine
       // advances by that. Children of a grouped frame are offset in-view, so
       // only the frame box is placed here.
@@ -498,14 +529,15 @@ export function layoutMesh(
   for (const b of allBoxes) g.setNode(b.id, { width: b.w, height: b.h });
 
   // Ranking edges. Control edges (weight 3) run machine-box → machine-box; the
-  // machine box is the frame when grouped, the chip when broken (same id).
+  // machine box is the frame whenever a child stays inside, the chip once the
+  // whole machine floated out (same id).
   for (const c of graph.controls) {
     if (g.hasNode(c.from) && g.hasNode(c.to) && c.from !== c.to) g.setEdge(c.from, c.to, { weight: 3 });
   }
   // Flow edges (agent→engine): to the box each endpoint lives in. Aggregated
   // per box-pair so a busy machine pulls its neighbours upstream. Self-loops
-  // (an agent feeding an engine in the SAME box — same machine, or a machine
-  // that broke its own agent+engine out together) never rank.
+  // (an agent feeding an engine in the SAME box — same machine, or both of a
+  // machine's cards floating in the same break-out) never rank.
   const pairW = new Map<string, number>();
   for (const fl of graph.flows) {
     const src = boxOf.get(fl.from);
@@ -518,8 +550,8 @@ export function layoutMesh(
     const [from, to] = k.split("|");
     if (g.hasNode(from) && g.hasNode(to)) g.setEdge(from, to, { weight });
   }
-  // Weak pull (weight 1) from a broken chip to each of its own cards, so a
-  // broken-out machine stays visually a cluster rather than scattering.
+  // Weak pull (weight 1) from a machine's box to each of its floating cards,
+  // so a broken-out machine stays visually a cluster rather than scattering.
   for (const grp of groups) {
     for (const m of grp.members) if (g.hasNode(grp.rep.id) && g.hasNode(m.id)) g.setEdge(grp.rep.id, m.id, { weight: 1 });
   }
