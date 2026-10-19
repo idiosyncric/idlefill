@@ -374,21 +374,32 @@ function AgentNode({ data }: NodeProps) {
         )}
         {a.behind && <span className="text-warn"> · daemon behind</span>}
       </div>
+      {/* The unprofiled live sessions, listed with the same chain lines a
+          profile card shows — the count above already names the total. */}
+      {a.unprofiledSessions.slice(0, PROFILE_ROWS_MAX).map((s) => (
+        <ProfileSessionLine
+          key={s.flowId}
+          s={s}
+          note="— its provenance names no roster profile, so its pipe starts here"
+        />
+      ))}
       <Handle id="agt-r" type="source" position={Position.Right} className="mesh-handle" />
       {detached && <Handle id="host-t" type="target" position={Position.Top} className="mesh-handle" />}
     </div>
   );
 }
 
-/** One live session LISTED on its profile card — the same pipe facts the
- *  flow edge carries (dot color = the pipe phase, tooltip = the shared
- *  pipeTitle). Writes (gate, pin) stay on the Sessions tab. */
-function ProfileSessionLine({ s }: { s: MeshProfileSession }) {
+/** One live session LISTED on a card — the same pipe facts the flow edge
+ *  carries (dot color = the pipe phase, tooltip = the shared pipeTitle).
+ *  `note` says WHY the line sits where it does (profile card: the exact
+ *  provenance join; daemon card: no profile names it). Writes (gate, pin)
+ *  stay on the Sessions tab. */
+function ProfileSessionLine({ s, note }: { s: MeshProfileSession; note: string }) {
   const mid = s.alias ?? s.model; // the idlefill abstraction when it joins, else the row's model name
   return (
     <div
       className="flex h-[15px] items-center gap-1.5 overflow-hidden px-2.5 text-[10px]"
-      title={`${s.title}${s.cross ? " · crosses machines" : ""} — nests here on the gateway ledger's provenance stamp`}
+      title={`${s.title}${s.cross ? " · crosses machines" : ""} ${note}`}
     >
       <span
         className="size-1.5 shrink-0 rounded-full"
@@ -449,7 +460,7 @@ function ProfileNode({ data }: NodeProps) {
         </span>
       </div>
       {shown.map((s) => (
-        <ProfileSessionLine key={s.flowId} s={s} />
+        <ProfileSessionLine key={s.flowId} s={s} note="— nests here on the gateway ledger's provenance stamp" />
       ))}
       {more > 0 && <div className="h-[15px] px-2.5 text-[10px] text-dim/70">+{more} more (Sessions tab)</div>}
       <Handle id="agt-r" type="source" position={Position.Right} className="mesh-handle" />
@@ -752,7 +763,7 @@ function Canvas({
               parentId: f.id,
               extent: superHeld ? undefined : "parent",
               width: CARD_W,
-              height: AGENT_H,
+              height: a.h,
               draggable: childDraggable,
               selectable: false,
               data: { kind: "agent", agent: a, detached: false } satisfies AgentData,
@@ -798,7 +809,7 @@ function Canvas({
             type: "agent",
             position: (mode === "free" ? dragPos.current.get(a.id) : undefined) ?? auto.get(a.id) ?? { x: 0, y: 0 },
             width: CARD_W,
-            height: AGENT_H,
+            height: a.h,
             draggable: resDraggable,
             selectable: false,
             data: { kind: "agent", agent: a, detached: true } satisfies AgentData,

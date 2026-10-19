@@ -13,6 +13,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   agentNodeId,
+  AGENT_H,
   buildMeshGraph,
   engineNodeId,
   frameId,
@@ -24,6 +25,7 @@ import {
   meshChildOffsets,
   meshFrameSize,
   profileCardH,
+  PROFILE_ROW_H,
   profileNodeId,
 } from "../src/lib/mesh-graph.js";
 import { LOCAL_MACHINE } from "../src/lib/hierarchy.js";
@@ -555,4 +557,57 @@ test("a profile card's listed line spells the full chain (shared facts, card nev
   const line = g.frames[0].agents[0].profiles[0].sessions[0];
   assert.deepEqual([line.shortToken, line.model, line.alias, line.engineName], ["tok-ho", "qwen3.8-flash-next-q2_0", "Qwen3.8-Flash-Next", "eng1"]);
   assert.match(line.title, /model qwen3\.8-flash-next-q2_0 .* via alias Qwen3\.8-Flash-Next/);
+});
+
+// --- the daemon card LISTENS its unprofiled sessions (owner ask 2026-10-19,
+// second pass). A session whose provenance names no roster profile cannot
+// nest on a profile card (exact-join law) — but it must not hide as an
+// invisible count either: the daemon card lists the SAME session ⇢ alias ⇢
+// engine lines, and grows to fit them (fixed math, layout-shared). ---------
+
+test("unprofiled live sessions are LISTED on the daemon card, capped, card grown to fit", () => {
+  const g = buildMeshGraph(
+    st({
+      servers: [srv("eng1", "http://127.0.0.1:8000")],
+      clients: [client("c", "127.0.0.1", NOW - 1_000)],
+      model_aliases: [alias("Solo", "eng1", "qwen-real")],
+      sessions: [
+        ...Array.from({ length: 7 }, (_, i) =>
+          sess(`u-${i}`, "c", "eng1", { history: { rpm: [], model: "qwen-real", reported_at: NOW - 1_000 } }),
+        ),
+        sess("stamped", "c", "eng1", { hermes_meta: { profile: "ghost" } }), // no roster row matches — still the daemon's
+      ],
+    }),
+    NOW,
+  );
+  const a = g.frames[0].agents[0];
+  assert.equal(a.unprofiled, 8);
+  assert.equal(a.unprofiledSessions.length, 8);
+  const line = a.unprofiledSessions[0];
+  assert.deepEqual([line.shortToken, line.model, line.alias, line.engineName], ["u-0", "qwen-real", "Solo", "eng1"]);
+  // height: AGENT_H + the LISTED rows (capped) — the same fixed math the layout reads.
+  assert.equal(a.h, AGENT_H + 5 * PROFILE_ROW_H);
+  const cards = framedAgentCards(g.frames[0]);
+  assert.equal(cards[0].h, a.h);
+  const offs = meshChildOffsets(g.frames[0]);
+  assert.ok(offs.get(engineNodeId("eng1"))!.y >= offs.get(a.id)!.y + a.h); // children shift, never overlap
+  assert.deepEqual(a.profiles, []); // an unmatched stamp nests NOTHING
+});
+
+test("a stamped session lists on its profile card and is never duplicated on the daemon card", () => {
+  const g = buildMeshGraph(
+    st({
+      servers: [srv("eng1", "http://127.0.0.1:8000")],
+      clients: [rosterClient([{ profile: "flash", posture: "adopted" }])],
+      sessions: [
+        sess("tok-a", "cli-a", "eng1", { hermes_meta: { profile: "flash" } }),
+        sess("tok-b", "cli-a", "eng1", {}),
+      ],
+    }),
+    NOW,
+  );
+  const a = g.frames[0].agents[0];
+  assert.deepEqual(a.unprofiledSessions.map((l) => l.shortToken), ["tok-b"]);
+  assert.equal(a.h, AGENT_H + PROFILE_ROW_H);
+  assert.deepEqual(a.profiles[0].sessions.map((l) => l.shortToken), ["tok-a"]);
 });

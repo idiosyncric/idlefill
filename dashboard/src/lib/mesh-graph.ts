@@ -19,8 +19,9 @@
 // published `agent_roster` names the profile EXACTLY and the session's
 // gateway-ledger provenance stamp (`hermes_meta.profile`) on that same
 // client names the card. A session with no stamp, or a stamp no roster row
-// matches, keeps riding its DAEMON card (counted as `unprofiled` there) —
-// never a guessed profile.
+// matches, keeps riding its DAEMON card — LISTED there in the same session
+// lines (counted as `unprofiled`, the card growing to fit them), never a
+// guessed profile and never an invisible count.
 //
 // The honesty law (the load-read precedent): every field is a PUBLISHED
 // fact or null/absent — never a fake zero. Peer snapshot numbers ride the
@@ -167,9 +168,13 @@ export type MeshAgentSlot = {
    *  daemon card — containment, the hierarchy's own join). */
   profiles: MeshProfileSlot[];
   /** Live sessions this daemon runs that anchor HERE instead of a profile
-   *  card: no provenance stamp, or a stamp no roster row matches. Named on
-   *  the card, never silently absorbed. */
+   *  card: no provenance stamp, or a stamp no roster row matches. LISTED on
+   *  the card (same lines a profile card shows), never silently absorbed. */
   unprofiled: number;
+  unprofiledSessions: MeshProfileSession[];
+  /** The card height: AGENT_H plus one row per LISTED unprofiled session
+   *  (capped) — the layout and the view share it, like the profile cards. */
+  h: number;
 };
 
 export type MeshFrame = {
@@ -321,6 +326,8 @@ function agentSlot(c: ClientRow, now: number, machine: string): MeshAgentSlot {
     behind: !!c.daemon_behind,
     profiles,
     unprofiled: 0,
+    unprofiledSessions: [],
+    h: AGENT_H,
   };
 }
 
@@ -521,23 +528,33 @@ export function buildMeshGraph(st: StateSnapshot, now: number): MeshGraph {
       offset: 0,
     };
     flows.push(flow);
-    if (slot)
-      slot.sessions.push({
-        flowId: flow.id,
-        shortToken,
-        model,
-        alias,
-        engineName: row.name,
-        title: flow.title,
-        phase: pipe.phase,
-        animated: pipe.animated,
-        muted: pipe.muted,
-        cross: flow.cross,
-      });
-    else agentSlotOf.get(daemon)!.unprofiled++;
+    const line: MeshProfileSession = {
+      flowId: flow.id,
+      shortToken,
+      model,
+      alias,
+      engineName: row.name,
+      title: flow.title,
+      phase: pipe.phase,
+      animated: pipe.animated,
+      muted: pipe.muted,
+      cross: flow.cross,
+    };
+    if (slot) slot.sessions.push(line);
+    else {
+      const ag = agentSlotOf.get(daemon)!;
+      ag.unprofiled++;
+      ag.unprofiledSessions.push(line);
+    }
   }
-  // The profile cards size to the sessions they now list.
+  // The profile cards size to the sessions they now list; the daemon card
+  // grows the same way over its LISTED unprofiled rows (a session whose
+  // provenance names no profile still SPELLS its chain — daemon cards used
+  // to count them invisibly).
   for (const p of profileSlotOf.values()) p.h = profileCardH(p.sessions.length);
+  for (const f of frames)
+    for (const a of f.agents)
+      a.h = AGENT_H + Math.min(a.unprofiledSessions.length, PROFILE_ROWS_MAX) * PROFILE_ROW_H;
   // Fan-out: parallel edges between the same pair curve apart, centered.
   const byPair = new Map<string, MeshFlow[]>();
   for (const f of flows) {
@@ -610,7 +627,7 @@ export type MeshStackCard = { id: string; h: number };
 export function framedAgentCards(f: MeshFrame, detached: ReadonlySet<string> = EMPTY_DETACHED): MeshStackCard[] {
   const out: MeshStackCard[] = [];
   for (const a of f.agents) {
-    if (!detached.has(a.id)) out.push({ id: a.id, h: AGENT_H });
+    if (!detached.has(a.id)) out.push({ id: a.id, h: a.h });
     for (const p of a.profiles) if (!detached.has(p.id)) out.push({ id: p.id, h: p.h });
   }
   return out;
@@ -698,7 +715,7 @@ export function layoutMesh(
     for (const c of framedAgentCards(f, detached)) boxOf.set(c.id, f.id);
     for (const e of framedEngines) boxOf.set(e.id, f.id);
     for (const a of outAgents) {
-      members.push({ id: a.id, w: CARD_W, h: AGENT_H });
+      members.push({ id: a.id, w: CARD_W, h: a.h });
       boxOf.set(a.id, a.id);
     }
     for (const a of f.agents)
