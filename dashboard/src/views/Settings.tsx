@@ -16,6 +16,7 @@ import {
   type StateSnapshot,
 } from "@/lib/api";
 import { THEME_KEYS, DEFAULT_THEME, isHexColor, applyTheme } from "@/lib/theme";
+import { copyText } from "@/lib/clipboard";
 
 // ---------------------------------------------------------------------------
 // Settings → the operator-tuned color scheme (#68) PLUS the Hermes-gateway
@@ -93,7 +94,7 @@ export function Settings({ st }: { st: StateSnapshot | null }) {
     <section>
       <div className="flex items-center gap-3 mb-3">
         <h2 className="text-[12px] font-semibold uppercase tracking-wide text-dim">Settings</h2>
-        <p className="text-[12px] text-dim">the dashboard color scheme — the nine :root tokens.</p>
+        <p className="text-[12px] text-dim">the color scheme, the agent hand-off, and the per-machine connectors.</p>
       </div>
       <Card>
         <CardHeader>
@@ -166,6 +167,11 @@ export function Settings({ st }: { st: StateSnapshot | null }) {
         </CardFooter>
       </Card>
 
+      {/* Hand-off pair — moved out of the every-view header chrome on the
+          owner ask 2026-10-19: a config hand-off is a settings task, so the
+          two buttons live on this tab only. */}
+      <HandoffSection />
+
       {/* #84: the Hermes-gateway connector card, per ONLINE local client
           (loopback page origin only — the card talks to the client's own
           loopback proxy, same posture as the Projects local-config editor). */}
@@ -178,6 +184,74 @@ export function Settings({ st }: { st: StateSnapshot | null }) {
           connect; only the forwarding daemon itself can answer that). */}
       <EgressSelfTestSection st={st} />
     </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Hand-off pair (owner ask 2026-10-19: Settings-tab only, never header
+// chrome). The two values an agent config needs to reach this arbiter —
+// server_url and the API token. One button per value (the paste targets are
+// two different config fields, so one combined button would force the
+// operator to split the string by hand). `copy url` copies location.origin —
+// the origin the page is provably served from; dev bakes the proxy target
+// in (__IDLEFILL_DEV_API__, see vite.config.ts) because the page's own
+// origin there is Vite, not the arbiter. The token is copied, never
+// rendered: it is the value THIS browser already holds — the arbiter never
+// serves it over any route. "copied" / "copy failed" / "paste it in first"
+// rides the button label for ~1.4s, then the label resets.
+// ---------------------------------------------------------------------------
+
+function HandoffSection() {
+  const [urlFlash, setUrlFlash] = React.useState<string | null>(null);
+  const [tokFlash, setTokFlash] = React.useState<string | null>(null);
+
+  const flash = (set: (s: string | null) => void, msg: string) => {
+    set(msg);
+    window.setTimeout(() => set(null), 1400);
+  };
+  const doCopy = (text: string | null, missing: string, set: (s: string | null) => void) => {
+    if (!text) {
+      flash(set, missing);
+      return;
+    }
+    copyText(text).then((ok) => flash(set, ok ? "copied" : "copy failed"));
+  };
+
+  return (
+    <div className="mt-3 flex flex-col gap-2">
+      <h3 className="text-[12px] font-semibold uppercase tracking-wide text-dim">Agent hand-off</h3>
+      <Card className="py-2 shadow-none">
+        <CardHeader className="flex-row items-center gap-2 px-3 py-0">
+          <CardTitle className="text-[13px] font-semibold">This arbiter's URL and API token</CardTitle>
+          <CardAction className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="xs"
+              title="copy this arbiter's URL — what an agent's server_url points at"
+              onClick={() => doCopy(__IDLEFILL_DEV_API__ ?? window.location.origin, "no url", setUrlFlash)}
+            >
+              {urlFlash ?? "copy url"}
+            </Button>
+            <Button
+              variant="outline"
+              size="xs"
+              title="copy the arbiter API token stored in this browser — what an agent's token points at"
+              onClick={() => doCopy(apiToken(), "paste it in first", setTokFlash)}
+            >
+              {tokFlash ?? "copy token"}
+            </Button>
+          </CardAction>
+        </CardHeader>
+        <CardContent className="px-3 py-2">
+          <p className="text-[11px] text-dim">
+            the two values an agent config needs to reach this arbiter: server_url and the API token. the
+            token is copied, never shown — it is the value THIS browser already holds; the arbiter never
+            serves it over any route. a loopback URL only answers this machine; a remote agent needs the
+            tailnet URL.
+          </p>
+        </CardContent>
+      </Card>
+    </div>
   );
 }
 

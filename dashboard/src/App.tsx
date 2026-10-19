@@ -26,8 +26,6 @@ import { Input } from "@/components/ui/input";
 import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
 import { getState, apiToken, setApiToken, type StateSnapshot } from "@/lib/api";
-import { copyText } from "@/lib/clipboard";
-import { Button } from "@/components/ui/button";
 import { InferenceServers } from "@/views/InferenceServers";
 import { Overview } from "@/views/Overview";
 import { Sessions } from "@/views/Sessions";
@@ -121,22 +119,6 @@ export function App() {
   const [st, setSt] = React.useState<StateSnapshot | null>(null);
   const [stErr, setStErr] = React.useState<string | null>(null);
   const [tokenDraft, setTokenDraft] = React.useState(apiToken() ?? "");
-  // Hand-off pair: "copied" / "copy failed" / "paste it in first" rides the
-  // button label for ~1.2s, then the label resets. null = resting.
-  const [urlFlash, setUrlFlash] = React.useState<string | null>(null);
-  const [tokFlash, setTokFlash] = React.useState<string | null>(null);
-
-  const flash = (set: (s: string | null) => void, msg: string) => {
-    set(msg);
-    window.setTimeout(() => set(null), 1400);
-  };
-  const doCopy = (text: string | null, missing: string, set: (s: string | null) => void) => {
-    if (!text) {
-      flash(set, missing);
-      return;
-    }
-    copyText(text).then((ok) => flash(set, ok ? "copied" : "copy failed"));
-  };
 
   // 5s poll, like the legacy dashboard (the WS push plane comes later). The
   // apply channel for the color scheme (#68): at boot and on every poll, if
@@ -299,6 +281,11 @@ export function App() {
       />
       <SidebarInset>
         <SiteHeader crumb={crumb} globalWord={globalWord} />
+        {/* The gate-token field: writes stay one keystroke away from every
+            view (the "paste it in the header first" toasts point here). The
+            hand-off pair (copy url / copy token) moved to the Settings tab
+            (owner ask 2026-10-19): a config hand-off is a settings task, not
+            chrome for every part of the UI. */}
         <div className="flex flex-wrap items-center gap-1.5 border-b border-border px-5 py-2.5">
           <Input
             type="password"
@@ -312,27 +299,6 @@ export function App() {
             }}
           />
           {apiToken() && <span className="text-[11px] text-ok">stored ✓</span>}
-          {/* Hand-off pair: the two values an agent config needs to reach this
-              arbiter — server_url and the API token. One button per value (the
-              paste targets are two different config fields). The token is
-              copied, never rendered: it is the value THIS browser already
-              holds — the arbiter never serves it over any route. */}
-          <Button
-            variant="outline"
-            size="xs"
-            title="copy this arbiter's URL — what an agent's server_url points at"
-            onClick={() => doCopy(__IDLEFILL_DEV_API__ ?? window.location.origin, "no url", setUrlFlash)}
-          >
-            {urlFlash ?? "copy url"}
-          </Button>
-          <Button
-            variant="outline"
-            size="xs"
-            title="copy the arbiter API token stored in this browser — what an agent's token points at"
-            onClick={() => doCopy(apiToken(), "paste it in first", setTokFlash)}
-          >
-            {tokFlash ?? "copy token"}
-          </Button>
         </div>
         <main className="flex-1 px-5 py-4">
           {stErr && (

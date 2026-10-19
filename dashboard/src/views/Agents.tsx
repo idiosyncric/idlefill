@@ -54,10 +54,10 @@ import { StatTiles, TilesSkeleton } from "@/components/stat-tiles";
 // ---------------------------------------------------------------------------
 // Agent keys (#68 server plane, #72 dashboard flow): idlefill's own
 // credential for agents (a Hermes profile, any OpenAI client).
-// CREDENTIAL MAP: the header's gate-token field + hand-off pair = the
-// CONTROL-API token (writes to this arbiter); an agent key minted here = the
-// AGENT-INFERENCE credential (the agent presents it at the aggregate
-// endpoint). Two different credentials — never merged.
+// CREDENTIAL MAP: the header's gate-token field (+ the Settings tab's
+// hand-off pair) = the CONTROL-API token (writes to this arbiter); an agent
+// key minted here = the AGENT-INFERENCE credential (the agent presents it at
+// the aggregate endpoint). Two different credentials — never merged.
 //
 // Write-only posture: the mint response shows the plaintext ONCE — copy it
 // then, it never appears again (the rows list labels + ids, the state file

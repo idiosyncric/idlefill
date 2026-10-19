@@ -1,4 +1,4 @@
-// Copy-to-clipboard for the header's hand-off pair.
+// Copy-to-clipboard for the Settings hand-off pair.
 //
 // navigator.clipboard is undefined on a plain-HTTP origin that is NOT
 // loopback — isSecureContext excludes http://<tailnet-ip>:8787, and the

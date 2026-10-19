@@ -58,10 +58,10 @@ function devConfigBridge(cfg: ClientConfig | null) {
   };
 }
 
-// command === "serve" is the dev server ONLY. The header's "copy url" is
-// the value an agent's server_url needs, and on :5273 the page's own origin
-// is the Vite dev server, not the arbiter — so dev bakes the proxy target
-// in. A production build (the arbiter serves dist/ itself) bakes null and
+// command === "serve" is the dev server ONLY. The Settings hand-off's
+// "copy url" is the value an agent's server_url needs, and on :5273 the
+// page's own origin is the Vite dev server, not the arbiter — so dev bakes
+// the proxy target in. A production build (the arbiter serves dist/ itself) bakes null and
 // falls back to location.origin, which is then the serving arbiter's real
 // origin — a build-time constant could never name the tailnet origin the
 // page is actually reached on.

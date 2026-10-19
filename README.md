@@ -964,19 +964,22 @@ webview reads as one tabbed surface), then the sections of the active view,
 and the fixed bottom **logs** tray (Events/Leases tabs, shared
 records-to-show — a dock, not a tab: it stays reachable from every view).
 
-- **The hand-off pair** — two quiet header buttons, `copy url` and
-  `copy token`, next to the gate-token field. They put the two values an
-  agent config needs to reach this arbiter on the clipboard: `server_url`
-  and the API token. One button per value (the paste targets are two
-  different config fields, so one combined button would force the operator
-  to split the string by hand). `copy url` copies `location.origin` — the
-  origin the page is provably served from, which is also what the
-  dashboard's own fetches ride; a loopback origin only answers this
-  machine, so a remote agent needs the tailnet URL (open the page on that
-  URL, or copy it from the mesh row). `copy token` copies the token THIS
-  browser already holds (`localStorage idlefill.token`); with nothing
-  stored the label says `paste it in first` rather than putting an empty
-  value on the clipboard. **There is deliberately no server route that
+- **The hand-off pair** — two quiet buttons on the **Settings** tab (the
+  `Agent hand-off` card), `copy url` and `copy token` — there, NOT in the
+  header bar (owner ask 2026-10-19: a config hand-off is a settings task, so
+  the pair is invisible from every other part of the UI; the gate-token field
+  alone stays always-visible chrome, since writes are one keystroke away from
+  every view). They put the two values an agent config needs to reach this
+  arbiter on the clipboard: `server_url` and the API token. One button per
+  value (the paste targets are two different config fields, so one combined
+  button would force the operator to split the string by hand). `copy url`
+  copies `location.origin` — the origin the page is provably served from,
+  which is also what the dashboard's own fetches ride; a loopback origin only
+  answers this machine, so a remote agent needs the tailnet URL (open the
+  page on that URL, or copy it from the mesh row). `copy token` copies the
+  token THIS browser already holds (`localStorage idlefill.token`); with
+  nothing stored the label says `paste it in first` rather than putting an
+  empty value on the clipboard. **There is deliberately no server route that
   serves the token** — every `/api/*` read is token-gated or anonymous
   (the write-only credential posture), so a token-returning route would
   hand the credential to any page that can read it. Clipboard mechanics
