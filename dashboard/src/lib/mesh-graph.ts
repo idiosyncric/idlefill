@@ -88,7 +88,7 @@ import { LOCAL_MACHINE, hostedServers, machineClients, machineSummary, type Mach
 import { hostLine } from "./mesh-stats";
 import { engineEdge, EDGE_SAMPLE_STALE_S, type EngineEdge } from "./session-edge";
 import { pipeEdge, pipeTitle, type PipeEdge, type PipePhase } from "./pipe-phases";
-import { durFmt, liveWord, minSec, sessStale, type StateWord } from "./format";
+import { durFmt, liveWord, minSec, sessStale, sessWorking, type StateWord } from "./format";
 import { compact } from "./fleet-stats";
 import { LOAD_FRESHNESS_DEFAULT_S } from "./load-read";
 
@@ -185,6 +185,11 @@ export type MeshProfileSession = {
   animated: boolean;
   muted: boolean;
   cross: boolean;
+  /** Owner ask 2026-10-21: a FRESH Hermes turn lease on this row — the
+   *  agent is mid-turn RIGHT NOW (tool or local work; the pipe stays
+   *  honest: the engine link is quiet, so the EDGE never claims a stream).
+   *  The dot and the profile-card word read this, never a guess. */
+  working: boolean;
 };
 
 /** One Hermes profile (the daemon's published roster row) as its OWN card,
@@ -704,7 +709,17 @@ export function buildMeshGraph(st: StateSnapshot, now: number): MeshGraph {
       animated: pipe.animated,
       muted: pipe.muted,
       cross: flow.cross,
+      // Owner ask 2026-10-21: the row's own live lease fact (see the
+      // type). The EDGE stays the pipe's honest stream truth; the CARD
+      // line says what the row names. One shared freshness law
+      // (sessWorking) — the row word and this dot can never disagree.
+      working: sessWorking(s, now),
     };
+    // The lease clause extends the LISTED line only (the card speaks the
+    // session's state; the flow edge's tooltip is the pipe's truth — the
+    // engine link really is quiet while a tool runs, so it never claims
+    // it).
+    if (line.working) line.title += " · hermes turn lease held — tool or local work, engine stream quiet";
     if (slot) slot.sessions.push(line);
     else {
       const ag = agentSlotOf.get(daemon)!;

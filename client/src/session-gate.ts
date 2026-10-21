@@ -181,6 +181,19 @@ export interface SessionGateDeps {
    *  see onStatePoll. Unset (tests, odd configs) keeps the old
    *  adopt-everything behavior. */
   clientName?: string;
+  /**
+   * Owner ask 2026-10-21: "is a Hermes turn lease held for this session
+   * id RIGHT NOW?" — the Hermes gateway's durable `session_turn_leases`
+   * row (read by the daemon's HermesTurns harvester). A tool executing
+   * mid-turn produces ZERO provider traffic, so the #76 follow-up drop
+   * rule (stale ring + no in-flight + no operator state ⇒ retire the
+   * token) would retire the row from the mesh while the agent is still
+   * WORKING — the row vanishes before the tool finishes. A held lease is
+   * local state, exactly like in-flight/holds/operator state: the token
+   * stays tracked (and keeps heartbeating) while it names the session.
+   * Absent (no harvester) ⇒ the #76 rule is byte-for-byte unchanged.
+   */
+  turnHeld?: (sessionId: string | undefined) => boolean;
   /** Ask the daemon to re-poll /api/state now (on-demand override learn). */
   refreshState?: () => void;
   /** max_active_agent_sessions — concurrent sessions holding a slot. */
@@ -283,6 +296,16 @@ interface Session {
   /** #47: the PEAK `total_tokens` observed in this session's streamed
    *  usage (sticky max across requests). The token-budget comparison. */
   tokensPeak?: number;
+  /**
+   * Owner ask 2026-10-21: the harvester's HELD verdict for this session at
+   * the last daemon tick (the lease's own TTL makes it ephemeral — no
+   * staleness bookkeeping beyond the transition latch). True→false
+   * triggers ONE immediate register so the body carries the explicit
+   * `turn` CLEAR (the #67 phase-settle ride's precedent: leaving a
+   * "working" row lit until the drop would render a lie); the current
+   * value exempts the token from the #76 drop rule (see deps.turnHeld).
+   */
+  leaseWasHeld?: boolean;
 }
 
 /** #45: cap on the in-memory request ring (a restart starts empty). */
@@ -952,7 +975,20 @@ export class SessionGate {
       // needs the pause tracked, and a parked session's request keeps
       // holding its queue position.
       const recentRing = s.ring.length > 0 && now - (s.ring.at(-1) ?? 0) < RING_TTL_MS;
-      if (!recentRing && s.inflight === 0 && s.holds.length === 0 && s.override === null && !s.pin) {
+      // Owner ask 2026-10-21: a held Hermes turn lease is LOCAL state —
+      // a tool running mid-turn has no provider traffic, and dropping the
+      // token here would vanish the row from the mesh while the agent is
+      // working. BOTH lease transitions ride ONE immediate register (the
+      // #67 phase-transition precedent, bounded by construction: ≤1 per
+      // edge): the START edge makes the surface light "working" at once,
+      // the END edge carries the explicit `turn` CLEAR so a retiring row
+      // never leaves a stored held block lit at the arbiter.
+      const leaseHeld = this.deps.turnHeld?.(s.session_id) ?? false;
+      if (leaseHeld !== !!s.leaseWasHeld) {
+        s.leaseWasHeld = leaseHeld;
+        if (s.registered && this.linkUp && !this.released) void this.register(s);
+      }
+      if (!recentRing && s.inflight === 0 && s.holds.length === 0 && s.override === null && !s.pin && !leaseHeld) {
         const lastRing = s.ring.at(-1);
         const idleNote = lastRing !== undefined ? ` no local traffic for ${Math.round((now - lastRing) / 60000)}m` : ' no local traffic since adoption';
         // #42 slice 2: the dropped row's id→token binding is stale —

@@ -218,7 +218,15 @@ type HostData = { label: string };
 
 function PresenceDot({ word }: { word: StateWord }) {
   const bg =
-    word.tone === "ok" ? "bg-ok" : word.tone === "warn" ? "bg-warn" : word.tone === "err" ? "bg-err" : "bg-dim/60";
+    word.tone === "ok"
+      ? "bg-ok"
+      : word.tone === "warn"
+        ? "bg-warn"
+        : word.tone === "err"
+          ? "bg-err"
+          : word.tone === "accent"
+            ? "bg-accent"
+            : "bg-dim/60";
   return <span className={`inline-block size-2 shrink-0 rounded-full ${bg}`} title={word.note} />;
 }
 
@@ -486,7 +494,10 @@ function ProfileSessionLine({ s, note }: { s: MeshProfileSession; note: string }
     >
       <span
         className="size-1.5 shrink-0 rounded-full"
-        style={{ background: PIPE_STROKE[s.phase], opacity: s.muted ? 0.45 : s.phase === "queued" ? 0.8 : 1 }}
+        style={{
+          background: s.working ? "var(--accent)" : PIPE_STROKE[s.phase],
+          opacity: s.muted ? 0.45 : s.phase === "queued" ? 0.8 : 1,
+        }}
       />
       <span className="shrink-0 font-mono text-dim">{s.shortToken}</span>
       {mid && (
@@ -509,6 +520,11 @@ function ProfileNode({ data }: NodeProps) {
   const { profile: p, detached } = data as unknown as ProfileData;
   const anyStream = p.sessions.some((s) => s.animated);
   const anyQueued = p.sessions.some((s) => s.phase === "queued");
+  // Owner ask 2026-10-21: a live Hermes turn lease on any listed session —
+  // the agent is mid-turn (tool or local work) while the engine link is
+  // quiet. It outranks `active` (bare rows with no fresh signal) but not
+  // the warn exception (a session stuck at the router still reads first).
+  const anyWorking = p.sessions.some((s) => s.working);
   const word: StateWord =
     p.sessions.length === 0
       ? { label: "idle", tone: "dim", note: "no live session's provenance stamp names this profile" }
@@ -516,7 +532,13 @@ function ProfileNode({ data }: NodeProps) {
         ? { label: "live", tone: "ok", note: "a session on this profile is streaming" }
         : anyQueued
           ? { label: "waiting", tone: "warn", note: "a session on this profile is held at the router" }
-          : { label: "active", tone: "ok", note: "live session(s) on this profile (no fresh stream signal)" };
+          : anyWorking
+            ? {
+                label: "working",
+                tone: "accent",
+                note: "a session on this profile holds a live Hermes turn lease — tool or local work in flight, engine stream quiet",
+              }
+            : { label: "active", tone: "ok", note: "live session(s) on this profile (no fresh stream signal)" };
   const shown = p.sessions.slice(0, PROFILE_ROWS_MAX);
   const more = p.sessions.length - shown.length;
   const posture = p.posture === "adopted" ? "idlefill" : p.posture === "external" ? "elsewhere" : "no config";

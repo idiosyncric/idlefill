@@ -14,12 +14,17 @@ import type { SessionRow } from "./api.js";
 export function sessionTiles(sessions: SessionRow[], now: number): StatTile[] {
   const n = sessions.length;
   let active = 0;
+  let working = 0;
   let paused = 0;
   let queued = 0;
   let oldestHoldS: number | null = null;
   for (const s of sessions) {
     const w = sessStateWord(s, now);
     if (w.label === "Active") active += 1;
+    // Owner ask 2026-10-21: a held Hermes turn lease (tool running, engine
+    // stream quiet) — its own segment, never folded into "idle" (the row
+    // word rule from lib/format.ts, the tiles and the rows agree).
+    if (w.label === "Working") working += 1;
     if (w.label === "Paused") paused += 1;
     if (s.gate?.state === "queued") {
       queued += 1;
@@ -36,7 +41,7 @@ export function sessionTiles(sessions: SessionRow[], now: number): StatTile[] {
     sub:
       n === 0
         ? "no sessions registered — a router registers one on its first request"
-        : `${active} active · ${n - paused - active} idle${stale > 0 ? ` · ${stale} stale` : ""}`,
+        : `${active} active${working > 0 ? ` · ${working} working` : ""} · ${n - paused - active - working} idle${stale > 0 ? ` · ${stale} stale` : ""}`,
   };
 
   const gate: StatTile = {

@@ -1901,6 +1901,44 @@ test('#67 sessions: phase block — stored on register, cleared on the no-phase 
   rmSync(h.dir, { recursive: true, force: true });
 });
 
+test('owner ask 2026-10-21 sessions: turn block — stored on register, ABSENT keeps the stored value (ADD-key, NOT the phase posture), explicit null CLEARS, invalid dropped', () => {
+  const h = makeMultiHarness();
+  // Fresh row WITH a valid block: verbatim store, member-by-member.
+  const r1 = h.arbiter.registerSession('s-turn', { turn: { at: T0, platform: 'tui', pid: 33339 }, now: T0 });
+  assert.equal(r1.ok, true);
+  assert.deepEqual(r1.session!.turn, { at: T0, platform: 'tui', pid: 33339 });
+  // Fresh row WITHOUT the key: the row carries no turn member at all
+  // (ADD-key posture — unlike phase, absence is never a null tag).
+  const r1b = h.arbiter.registerSession('s-turn-plain', { now: T0 });
+  assert.equal('turn' in (r1b.session ?? {}), false, 'a row created without the key has no turn member');
+  // Members drop individually: oversized platform / bad pid never drop the block.
+  const r2 = h.arbiter.registerSession('s-turn', { turn: { at: T0 + 100, platform: 'z'.repeat(40), pid: -7 }, now: T0 + 100 });
+  assert.deepEqual(r2.session!.turn, { at: T0 + 100 }, 'invalid members drop, the valid at stands');
+  // ABSENT is NOT the phase posture: the stored block STANDS (the client
+  // omits the key when its harvester cannot speak — a register must never
+  // silently un-report a held lease).
+  const r3 = h.arbiter.registerSession('s-turn', { now: T0 + 200 });
+  assert.deepEqual(r3.session!.turn, { at: T0 + 100 }, 'an absent key keeps the stored block (ADD-key posture)');
+  // Explicit null is the confirmed-idle report: the CLEAR rides.
+  const r4 = h.arbiter.registerSession('s-turn', { turn: null, now: T0 + 300 });
+  assert.equal(r4.session!.turn, null, 'the explicit null CLEARS (the tool run is over)');
+  // Invalid blocks are DROPPED (never a rejected registration); stored stands.
+  h.arbiter.registerSession('s-turn', { turn: { at: T0 + 400, platform: 'cron' }, now: T0 + 400 });
+  for (const bad of [{ at: -1 }, { at: 1.5 }, { at: 'x' }, {}, 'held', [1], { platform: 'tui' }]) {
+    const r = h.arbiter.registerSession('s-turn', { turn: bad, now: T0 + 500 });
+    assert.equal(r.ok, true, `invalid turn ${JSON.stringify(bad)} never rejects the registration`);
+    assert.deepEqual(r.session!.turn, { at: T0 + 400, platform: 'cron' }, 'invalid block leaves the stored turn untouched');
+  }
+  // A cleared (null) row survives an absent key too (null is a stored
+  // verdict, not a missing member — the omission must not resurrect it…
+  // and must not silently re-CLEAR a held block either: verdicts only).
+  const r5 = h.arbiter.registerSession('s-turn', { turn: null, now: T0 + 600 });
+  assert.equal(r5.session!.turn, null);
+  const r6 = h.arbiter.registerSession('s-turn', { now: T0 + 700 });
+  assert.equal(r6.session!.turn, null, 'the stored null stands across an omitted key');
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
 test('#67 pins: set/clear a bare-name session pin — the row must carry the model (probed, else declared)', async () => {
   const map: Record<string, string[] | null> = {};
   const h = makeAliasHarness(map);

@@ -871,6 +871,25 @@ export interface SessionRecord {
    */
   phase?: { state: 'thinking' | 'output' | 'tools'; at: number } | null;
   /**
+   * Owner ask 2026-10-21: the Hermes turn-lease block — the client's
+   * read of Hermes' durable `session_turn_leases` row for this session
+   * (held by the agent's own turn loop for the WHOLE turn: model
+   * streaming AND tool execution). This is the fact the router can never
+   * observe: while a tool runs there is no provider traffic, so `phase`
+   * is cleared and the gate is quiet — only the lease says "working".
+   * Carried on the register heartbeat as the `turn` ADD-key. `at` =
+   * epoch-ms of the client's lease-table read (the client's clock is the
+   * right clock — the same box owns the DB; the surface ages the fact
+   * from it, the arbiter stores verbatim). `platform`/`pid` = the lease
+   * holder string's own reduced members (the client liveness-checked the
+   * pid before publishing). null = the harvester read and named NO live
+   * lease (the idle report CLEARS any stored block, the #67 phase
+   * precedent). Absent = the harvester is off / never read a lease DB
+   * (ADD-key posture: stored value stands; old clients never send it).
+   * Sanitizer posture: drop-don't-reject.
+   */
+  turn?: { at: number; platform?: string; pid?: number } | null;
+  /**
    * #73: the Hermes Gateway API session ledger's facts for this session
    * (the OBSERVED complement to the gate — the gateway is the inbound
    * plane, it never holds a provider call in flight). Carried on the

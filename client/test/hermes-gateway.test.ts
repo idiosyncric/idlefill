@@ -34,6 +34,7 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { createRequire } from 'node:module';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -1322,6 +1323,109 @@ test('fail-open (switch on, gateway down): the session body omits hermes_meta; t
     await arb.close();
     await up.close();
     rmSync(dir, { recursive: true, force: true });
+    restoreGwEnv();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Owner ask 2026-10-21 — the `turn` ADD-key on the wire (daemon-level,
+// byte-for-byte): omitted while the harvester cannot speak, the held fact
+// when the lease names the session (the START transition rides immediately),
+// the explicit CLEAR after release. The lease DB is a REAL node:sqlite file
+// in a temp Hermes home; the gateway connector stays OFF (this plane is
+// file-only, no HTTP).
+// ---------------------------------------------------------------------------
+
+function writeTurnLeaseDb(dbPath: string, rows: Array<{ conversation_id: string; holder: string; expires_at: number }>): void {
+  const req = createRequire(import.meta.url);
+  const { DatabaseSync } = req('node:sqlite') as typeof import('node:sqlite');
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec('PRAGMA journal_mode = WAL');
+    db.exec(
+      `CREATE TABLE IF NOT EXISTS session_turn_leases (
+         conversation_id TEXT PRIMARY KEY,
+         holder TEXT NOT NULL,
+         acquired_at REAL NOT NULL,
+         expires_at REAL NOT NULL
+       )`,
+    );
+    db.exec('DELETE FROM session_turn_leases');
+    const ins = db.prepare('INSERT INTO session_turn_leases (conversation_id, holder, acquired_at, expires_at) VALUES (?, ?, ?, ?)');
+    for (const r of rows) ins.run(r.conversation_id, r.holder, Date.now() / 1000, r.expires_at);
+  } finally {
+    db.close();
+  }
+}
+
+test('owner 2026-10-21: the turn lease rides the register heartbeat — omitted without a DB, held when named, CLEAR after release', async () => {
+  setGwEnv({ IDLEFILL_HERMES_GATEWAY: undefined, IDLEFILL_HERMES_GATEWAY_URL: undefined, IDLEFILL_HERMES_GATEWAY_KEY: undefined });
+  const up = await startHeldUpstream();
+  const home = mkdtempSync(join(tmpdir(), 'idlefill-turnwire-'));
+  const arb = await startFakeArbiter();
+  const dir = mkdtempSync(join(tmpdir(), 'idlefill-turnwire-state-'));
+  const cfg: ClientConfig = {
+    server_url: arb.url,
+    token: 'ttw',
+    client_name: 'turn-wire-client',
+    ip: '100.94.165.102',
+    proxy_port: 0,
+    llm_target: up.url,
+    aggregate_port: 0,
+    repo_root: here,
+    state_dir: join(dir, 'state'),
+    state_file: join(dir, 'state.json'),
+    projects: [],
+    hermes_turns: { home, poll_ms: 1000 },
+  };
+  const daemon = new ClientDaemon(cfg, { pollMs: 50, log: { info: () => {} } });
+  await daemon.start();
+  const sessId = '20261021_090000_wire';
+  try {
+    const resP = fetch(`${daemon.proxyUrl}/s/tokturn1/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-hermes-session-id': sessId },
+      body: JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    await waitFor(() => up.hits.length === 1, 3000, 'the upstream hit');
+    up.release();
+    await resP;
+    await waitFor(() => arb.sessionRegisters.some((b) => b.token === 'tokturn1'), 3000, 'the session register heartbeat');
+
+    // Phase 1: no lease DB exists ⇒ the harvester cannot speak ⇒ the body
+    // OMITS the key (ADD-key posture, byte-for-byte the pre-feature shape).
+    for (const b of arb.sessionRegisters.filter((x) => x.token === 'tokturn1')) {
+      assert.ok(!('turn' in b), 'the harvester that never read a DB never adds the key');
+    }
+    assert.equal(daemon.hermesTurnHarvester?.available(), false);
+
+    // Phase 2: the tool starts — a live lease names the session. The gate's
+    // START-transition register rides it immediately (no 10s throttle wait).
+    writeTurnLeaseDb(join(home, 'state.db'), [
+      { conversation_id: sessId, holder: `pid=${process.pid}:turn=x:y:z:platform=tui`, expires_at: Date.now() / 1000 + 240 },
+    ]);
+    await waitFor(
+      () =>
+        arb.sessionRegisters.some(
+          (b) => b.token === 'tokturn1' && typeof b.turn === 'object' && b.turn !== null && (b.turn as Record<string, unknown>).platform === 'tui',
+        ),
+      5000,
+      'the held turn fact on the heartbeat',
+    );
+    const held = arb.sessionRegisters.filter((b) => b.token === 'tokturn1' && b.turn && typeof b.turn === 'object').at(-1)!;
+    assert.equal((held.turn as Record<string, unknown>).pid, process.pid, 'the holder pid the client liveness-checked rides verbatim');
+    assert.ok(typeof (held.turn as Record<string, unknown>).at === 'number');
+
+    // Phase 3: the tool finishes — the lease row goes, the END-transition
+    // register carries the explicit CLEAR (never a lingering held block).
+    writeTurnLeaseDb(join(home, 'state.db'), []);
+    await waitFor(() => arb.sessionRegisters.some((b) => b.token === 'tokturn1' && b.turn === null), 5000, 'the explicit turn CLEAR');
+  } finally {
+    await daemon.stop();
+    await arb.close();
+    await up.close();
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true });
     restoreGwEnv();
   }
 });

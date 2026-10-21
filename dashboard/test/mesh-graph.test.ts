@@ -898,3 +898,33 @@ test("the Projects box sizes to the listed rows and the layouts still place ever
   const rank = layoutMesh(drainGraph, "rank");
   assert.ok(rank.get(PROJECTS_BOX_ID)!.x < rank.get(frameId(LOCAL_MACHINE))!.x);
 });
+
+// --- turn lease (owner ask 2026-10-21: the LISTED line says what the ROW
+// names — a live Hermes turn lease means the agent is mid-turn, tool or
+// local work, while the engine link really is quiet; the PIPE never claims
+// a stream it never saw) -------------------------------------------------------
+
+const turnGraph = buildMeshGraph(
+  rosterState(ROSTER, [
+    sess("tok-held", "cli-a", "eng1", { hermes_meta: { profile: "web-dev" }, turn: { at: NOW - 5_000, platform: "tui", pid: 4242 } }),
+    sess("tok-clear", "cli-a", "eng1", { hermes_meta: { profile: "web-dev" }, turn: null }),
+    sess("tok-stale", "cli-a", "eng1", { hermes_meta: { profile: "web-dev" }, turn: { at: NOW - 120_000 } }),
+    sess("tok-unrep", "cli-a", "eng1", { hermes_meta: { profile: "web-dev" } }),
+  ] as never[]),
+  NOW,
+);
+
+test("a fresh turn lease lights its listed line as working — and never touches the pipe", () => {
+  const card = turnGraph.frames[0].agents[0].profiles.find((p) => p.name === "web-dev")!;
+  const by = Object.fromEntries(card.sessions.map((l) => [l.shortToken, l]));
+  assert.equal(by["tok-he"].working, true, "the lease the row names, fresh ⇒ working");
+  assert.ok(by["tok-he"].title.includes("hermes turn lease held"), "the line tooltip spells the lease, holder-facts only");
+  assert.equal(by["tok-cl"].working, false, "the explicit CLEAR renders nothing — the tool run is over");
+  assert.equal(by["tok-st"].working, false, "a stale lease report dims (the PHASE_MAX_AGE_MS discipline)");
+  assert.equal(by["tok-un"].working, false, "an unreported key never guesses");
+  // The pipe honesty: the engine link saw NO stream while the tool ran —
+  // the edge stays base, never animated by the lease.
+  const heldFlow = turnGraph.flows.find((f) => f.token === "tok-held")!;
+  assert.equal(heldFlow.pipe.phase, "base", "the lease is a SESSION fact; the engine pipe stays the stream truth");
+  assert.equal(heldFlow.pipe.animated, false);
+});

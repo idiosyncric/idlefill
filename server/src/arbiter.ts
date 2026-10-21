@@ -606,6 +606,45 @@ function normalizeSessionPhase(
 }
 
 /**
+ * Owner ask 2026-10-21: sanitize the reported `turn` ADD-key — the
+ * client's read of Hermes' durable session_turn_leases row for this
+ * session ("a turn is in flight RIGHT NOW — model streaming and/or tool
+ * execution — the provider stream itself may be quiet"). THREE VERDICTS,
+ * the #67 phase posture (this is LIVE state, not a ledger):
+ *   - explicit null ⇒ null — the harvester read the lease table and
+ *     named NO live row for this session: the stored block CLEARS (a
+ *     finished tool run never stays tagged "working");
+ *   - valid object ⇒ stored: `at` (epoch-ms of the client's observation)
+ *     is REQUIRED (integer ≥0 — the surface ages the fact from it);
+ *     `platform` a bounded printable string ≤32 (the holder's own
+ *     member), `pid` an integer 1..2^31−1 (the holder pid the client
+ *     liveness-checked); bad members drop individually;
+ *   - anything else (undefined — the key was absent: harvester off /
+ *     never read a lease DB / an old client) ⇒ undefined — DROPPED, the
+ *     stored value stands (never a rejection, never a silent clear).
+ * NOTE the deliberate difference from normalizeSessionPhase: an ABSENT
+ * key must NOT clear here (the client omits, it does not send null, when
+ * the harvester cannot speak) — the route only forwards the key when the
+ * body carries it, so `undefined` here genuinely means "no report".
+ */
+export type SessionTurnBlock = { at: number; platform?: string; pid?: number };
+
+function normalizeSessionTurn(v: unknown): SessionTurnBlock | null | undefined {
+  if (v === null) return null;
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return undefined;
+  const p = v as { at?: unknown; platform?: unknown; pid?: unknown };
+  if (typeof p.at !== 'number' || !Number.isFinite(p.at) || !Number.isInteger(p.at) || p.at < 0) return undefined;
+  const out: SessionTurnBlock = { at: p.at };
+  if (typeof p.platform === 'string') {
+    const s = p.platform.trim();
+    // eslint-disable-next-line no-control-regex
+    if (s !== '' && s.length <= 32 && !/[^\x20-\x7e]/.test(s)) out.platform = s;
+  }
+  if (typeof p.pid === 'number' && Number.isInteger(p.pid) && p.pid > 0 && p.pid <= 0x7fffffff) out.pid = p.pid;
+  return out;
+}
+
+/**
  * Sanitize a reported Hermes conversation id (#42 Slice 0). Token-style
  * posture: bounded printable string, or undefined — an invalid value is
  * DROPPED (the registration is never rejected for it, and a stored id
@@ -2355,7 +2394,7 @@ export class Arbiter {
    */
   registerSession(
     token: string,
-    opts: { client_id?: string; client_name?: string; server_id?: string; last_activity?: number; gate?: unknown; session_id?: unknown; history?: unknown; phase?: unknown; hermes_meta?: unknown; now?: number },
+    opts: { client_id?: string; client_name?: string; server_id?: string; last_activity?: number; gate?: unknown; session_id?: unknown; history?: unknown; phase?: unknown; hermes_meta?: unknown; turn?: unknown; now?: number },
   ): { ok: boolean; reason?: string; created: boolean; session?: SessionRecord } {
     const t = typeof token === 'string' ? token.trim() : '';
     if (!t || t.length > 128) return { ok: false, reason: 'token required (≤128 chars)', created: false };
@@ -2380,6 +2419,13 @@ export class Arbiter {
     // what a better poll reported — the ledger is not ephemeral state like
     // the gate/phase blocks).
     const hermesMeta = cleanReportedHermesMeta(opts.hermes_meta);
+    // Owner ask 2026-10-21: the turn-lease block (the client's read of
+    // Hermes' session_turn_leases). Three verdicts like the phase:
+    // valid ⇒ store; explicit null ⇒ CLEAR; invalid/ABSENT ⇒ dropped,
+    // the stored value stands (the route forwards the key only when the
+    // body carried it — an omitted key is "the harvester cannot speak",
+    // never a report of "not held").
+    const turnVerdict = normalizeSessionTurn(opts.turn);
     const s = this.store.state;
     const existing = s.sessions.find((x) => x.token === t);
     if (existing) {
@@ -2405,6 +2451,10 @@ export class Arbiter {
       // #73 hermes_meta, last-known-wins like session_id/history: a valid
       // report updates; an absent/invalid one never clears the stored block.
       if (hermesMeta) existing.hermes_meta = hermesMeta;
+      // Owner ask 2026-10-21 turn, three verdicts like the #67 phase:
+      // valid ⇒ store; explicit null ⇒ CLEAR; invalid/absent ⇒ dropped,
+      // the stored block stands.
+      if (turnVerdict !== undefined) existing.turn = turnVerdict;
       this.store.save();
       return { ok: true, created: false, session: existing };
     }
@@ -2425,6 +2475,10 @@ export class Arbiter {
       // #73: a valid hermes_meta rides the fresh row; an absent/invalid
       // one leaves the row without the key (the first report creates it).
       ...(hermesMeta ? { hermes_meta: hermesMeta } : {}),
+      // Owner ask 2026-10-21: a valid block or the explicit-null CLEAR
+      // ride the fresh row; an absent/invalid one leaves the row without
+      // the key (the first report's posture — nothing to clear).
+      ...(turnVerdict !== undefined ? { turn: turnVerdict } : {}),
     };
     s.sessions.push(session);
     this.store.appendEvent({ kind: 'session_registered', detail: `${t}${session.client_name ? ` (${session.client_name})` : ''}${session.server_id ? ` → ${session.server_id}` : ''}` });

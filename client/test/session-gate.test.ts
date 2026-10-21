@@ -145,6 +145,8 @@ function makeGate(opts: {
   ) => Promise<boolean>;
   now?: () => number;
   clientName?: string;
+  /** Owner ask 2026-10-21: the turn-lease keep-alive predicate under test. */
+  turnHeld?: (sessionId: string | undefined) => boolean;
   // #47 knobs (opt-in admission priority + per-session budgets).
   priorityEnabled?: boolean;
   tokenBudget?: number;
@@ -181,6 +183,7 @@ function makeGate(opts: {
     holdCapMs: opts.holdCapMs ?? 30_000,
     now: opts.now,
     clientName: opts.clientName,
+    turnHeld: opts.turnHeld,
     priorityEnabled: opts.priorityEnabled,
     tokenBudget: opts.tokenBudget,
     interactiveWindowMs: opts.interactiveWindowMs,
@@ -1496,4 +1499,74 @@ test('#46 interrupt: requestInterrupt arms the flag for a tracked token only; it
   clock.t += 30_001;
   assert.deepEqual(gate.gateStateForSession('id-i', 'tokI'), { state: 'paused' }, 'the flag lapsed: pre-slice shape again, no interrupt key');
   assert.deepEqual(gate.gateStateForSession('id-j', 'tokJ'), { state: 'armed' });
+});
+
+// ---------------------------------------------------------------------------
+// Owner ask 2026-10-21 — the Hermes turn-lease keep-alive (the "a tool is
+// running RIGHT NOW" plane). A mid-turn tool produces ZERO provider traffic:
+// without the lease exemption the #76 drop rule retires the token while the
+// agent is still working (the row would vanish from the mesh mid-tool).
+// ---------------------------------------------------------------------------
+
+test('owner 2026-10-21: a held turn lease keeps a quiet token tracked (the #76 drop exemption)', async () => {
+  const clock = { t: 300_000_000 };
+  let held = false;
+  const { gate, calls, logs } = makeGate({ maxActive: 1, now: () => clock.t, turnHeld: (id) => id === 'sess-keep' && held });
+  const { proxy, up } = await harness({ gate });
+  gate.onStatePoll([]); // arbiter reachable
+
+  const resP = fetch(`${proxy.base_url}/s/keep1/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-hermes-session-id': 'sess-keep' },
+    body: JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  await waitFor(() => up.hits.length === 1, 3000, 'forwarded');
+  up.release(1);
+  assert.equal((await resP).status, 200);
+  await waitFor(() => calls.some((c) => c.token === 'keep1'), 3000, 'first-sight register');
+
+  // The tool starts, the ring goes cold past the 10m window: the token
+  // STAYS tracked while the lease is held (no drop, heartbeats continue).
+  held = true;
+  clock.t += 11 * 60_000;
+  gate.heartbeat();
+  await new Promise((r) => setTimeout(r, 50));
+  assert.ok(!logs.some((l) => l.includes('keep1') && l.includes('dropped')), 'a working session is not retired by the #76 rule');
+  assert.ok(calls.filter((c) => c.token === 'keep1').length >= 2, 'the kept token keeps heartbeating (the row stays fresh at the arbiter)');
+
+  // The tool finishes: the held⇒not-held transition rides ONE immediate
+  // register (the body carries the explicit CLEAR via the daemon closure),
+  // then the now genuinely-idle token follows the #76 rule on the same
+  // tick. One register for the transition, bounded by construction.
+  const beforeTransition = calls.filter((c) => c.token === 'keep1').length;
+  held = false;
+  clock.t += 11 * 60_000;
+  gate.heartbeat();
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(calls.filter((c) => c.token === 'keep1').length, beforeTransition + 1, 'exactly one CLEAR register fires on the lease-end transition');
+  gate.heartbeat();
+  await new Promise((r) => setTimeout(r, 50));
+  assert.ok(logs.some((l) => l.includes('keep1') && l.includes('dropped')), 'after the release the idle token follows the #76 rule');
+  assert.equal(calls.filter((c) => c.token === 'keep1').length, beforeTransition + 1, 'a dropped token stops registering');
+});
+
+test('owner 2026-10-21: without the hook the #76 drop rule is byte-for-byte unchanged', async () => {
+  const clock = { t: 300_000_000 };
+  const { gate, calls } = makeGate({ maxActive: 1, now: () => clock.t });
+  const { proxy, up } = await harness({ gate });
+  gate.onStatePoll([]);
+
+  const resP = fetch(`${proxy.base_url}/s/nolease1/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-hermes-session-id': 'sess-nolease' },
+    body: JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  await waitFor(() => up.hits.length === 1, 3000, 'forwarded');
+  up.release(1);
+  assert.equal((await resP).status, 200);
+  await waitFor(() => calls.some((c) => c.token === 'nolease1'), 3000, 'first-sight register');
+
+  clock.t += 11 * 60_000;
+  gate.heartbeat();
+  assert.equal(gate.snapshot('nolease1'), null, 'no harvester ⇒ no keep-alive: the #76 drop stands');
 });

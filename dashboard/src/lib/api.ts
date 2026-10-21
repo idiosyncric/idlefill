@@ -252,6 +252,23 @@ export type SessionPhase = {
   at: number;
 };
 
+/**
+ * Owner ask 2026-10-21: the Hermes turn-lease block (the client's read of
+ * Hermes' durable `session_turn_leases` row). PRESENT = the lease named
+ * this session at read time — a turn is in flight RIGHT NOW (model
+ * streaming and/or TOOL EXECUTION; the provider stream may be quiet, the
+ * #67 phase never covers the tool part). `at` = epoch-ms of the client's
+ * lease read (surfaces age the fact from it, the PHASE_MAX_AGE_MS
+ * discipline). null = the harvester read and named no live lease (the
+ * CLEAR). Absent = the harvester could not speak (never renders anything
+ * — the old-client / no-Hermes posture).
+ */
+export type SessionTurn = {
+  at: number;
+  platform?: string;
+  pid?: number;
+};
+
 // #78: the ROUTER's read-only transcript for one session — what the router
 // OBSERVED about each request (not the conversation). `at` = epoch-ms the
 // router saw the request; `model` / `tokens` = the last model name + streamed
@@ -282,6 +299,10 @@ export type SessionRow = {
   session_id?: string;
   history?: SessionHistory;
   phase?: SessionPhase | null;
+  /** Owner ask 2026-10-21: the Hermes turn-lease fact (see SessionTurn) —
+   *  "a tool is running / the agent loop is mid-turn RIGHT NOW", the one
+   *  live state the router stream can never show. */
+  turn?: SessionTurn | null;
   override?: { token: string; override: "pause" | "force"; until: number | null; set_at: number } | null;
   engine_pin?: { server_id: string; url: string; engine_model?: string; set_at: number };
   /**

@@ -80,13 +80,27 @@ export function sessGateLabelText(mode: "paused" | "running" | "forced"): string
 }
 
 // The session state word: paused (operator override) > active (online + a
-// request within 30s) > idle. Stale is NOT a word — it is the exception tag
-// on a row whose 90s heartbeat lapsed.
+// request within 30s) > working (online + a fresh Hermes turn lease — the
+// agent is mid-turn, tool executing or local work in flight, while the
+// provider stream is quiet) > idle. Stale is NOT a word — it is the
+// exception tag on a row whose 90s heartbeat lapsed.
 const SESSION_ONLINE_MS = 90_000;
 const SESSION_ACTIVE_MS = 30_000;
+// Owner ask 2026-10-21: the turn-lease freshness window. The client
+// re-observes the lease every poll (~20s) and re-registers every
+// heartbeat (~10s) while held; a fact older than this is a stalled
+// report — render without it (the PHASE_MAX_AGE_MS discipline, sized to
+// the lease surface's slower cadence).
+export const SESSION_WORKING_MAX_AGE_MS = 60_000;
+
+/** The lease-freshness law, shared by every surface (row word, mesh dot,
+ *  profile-card word) so a "working" claim ages identically everywhere. */
+export function sessWorking(sess: { turn?: { at: number } | null }, now: number): boolean {
+  return !!sess.turn && Number.isFinite(sess.turn.at) && now - sess.turn.at < SESSION_WORKING_MAX_AGE_MS;
+}
 
 export function sessStateWord(
-  sess: { last_seen: number; last_activity: number | null; override?: { override: "pause" | "force" } | null },
+  sess: { last_seen: number; last_activity: number | null; override?: { override: "pause" | "force" } | null; turn?: { at: number } | null },
   now: number,
 ): StateWord {
   if (sess.override?.override === "pause") {
@@ -96,6 +110,9 @@ export function sessStateWord(
   const act = sess.last_activity;
   if (online && act !== null && now - act < SESSION_ACTIVE_MS) {
     return { label: "Active", tone: "ok", note: "a request was seen on this session just now" };
+  }
+  if (online && sessWorking(sess, now)) {
+    return { label: "Working", tone: "accent", note: "Hermes holds a live turn lease — tool or local work in flight, engine stream quiet" };
   }
   return { label: "Idle", tone: "dim", note: "no request seen on this session recently" };
 }

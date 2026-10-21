@@ -234,6 +234,19 @@ export interface ClientConfig {
    * = the connector stays env-switch-only (the pre-#84 posture).
    */
   hermes_gateway?: Record<string, unknown>;
+  /**
+   * Owner ask 2026-10-21: the Hermes turn-lease harvester block (the
+   * "is a tool running RIGHT NOW" surface — client/src/hermes-turns.ts
+   * reads the durable `session_turn_leases` rows read-only and the
+   * register heartbeat carries the `turn` ADD-key). The loader passes the
+   * raw object through VERBATIM — the daemon's enablement rule owns every
+   * key's semantics (`enabled` tri-state override, `home`, `poll_ms`),
+   * each sanitized with its own default. ADD key: optional, so hand-built
+   * ClientConfig fixtures stay valid; absent = the default-on rule (the
+   * harvester runs when the Hermes home exists) with the
+   * IDLEFILL_HERMES_TURNS env override standing above it.
+   */
+  hermes_turns?: Record<string, unknown>;
 }
 
 const DEFAULTS = {
@@ -411,6 +424,12 @@ export function loadClientConfig(
     // with its own default, so the loader never interprets it.
     ...(r.hermes_gateway && typeof r.hermes_gateway === 'object' && !Array.isArray(r.hermes_gateway)
       ? { hermes_gateway: r.hermes_gateway as Record<string, unknown> }
+      : {}),
+    // Owner ask 2026-10-21: the hermes_turns block passes through VERBATIM
+    // (a plain object only) — the daemon's enablement rule sanitizes every
+    // member with its own default, so the loader never interprets it.
+    ...(r.hermes_turns && typeof r.hermes_turns === 'object' && !Array.isArray(r.hermes_turns)
+      ? { hermes_turns: r.hermes_turns as Record<string, unknown> }
       : {}),
   };
 }

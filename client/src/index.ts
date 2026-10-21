@@ -73,6 +73,7 @@ import { startLlmProxy, waitProxyReady, type LlmProxy } from './proxy.js';
 import { ROUTE_HOLD_DEFAULT_MS, startAggregateRouter, type AggregateAliasEntry, type AggregateCatalogEntry, type AggregateRouter, type ServerKeyRow } from './aggregate.js';
 import { SessionGate, type SessionStateRow } from './session-gate.js';
 import { HermesGatewayConnector, resolveHermesGatewayConfig, type HermesGatewayConfig } from './hermes-gateway.js';
+import { HermesTurns } from './hermes-turns.js';
 import { resolveVersion } from './version.js';
 import { resolveRevision } from './revision.js';
 import { scanHermesProfiles, type AgentRosterRow } from './agent-roster.js';
@@ -1109,6 +1110,22 @@ export class ClientDaemon {
    * disabled ⇒ it publishes nothing (see the constructor).
    */
   private hermesGateway: HermesGatewayConnector | null = null;
+  /**
+   * Owner ask 2026-10-21: the Hermes turn-lease harvester (the observed
+   * answer to "is a tool running on this session RIGHT NOW?" — the
+   * durable `session_turn_leases` row is the only local record of a
+   * mid-turn agent; the gate's stream phase and the gateway ledger are
+   * both silent while a tool executes). Read-only + fail-quiet: off /
+   * unavailable ⇒ the register bodies stay byte-for-byte the pre-feature
+   * shape (no `turn` key); available ⇒ the key rides as fact-or-CLEAR and
+   * a held lease keeps the #76 drop rule from retiring a working row.
+   * ENABLEMENT: the IDLEFILL_HERMES_TURNS env switch wins over the
+   * `hermes_turns.enabled` block; neither set ⇒ DEFAULT ON when the
+   * Hermes home exists (there is no secret, no network, no write — the
+   * read itself is the whole surface, so a Hermes-less box stays inert by
+   * the harvester's own availability gate rather than an opt-in).
+   */
+  private hermesTurns: HermesTurns | null = null;
   /** #84: the resolved connector config (kept even when disabled — the
    *  /client/hermes-gateway surface reports base_url/profiles/key_file from
    *  it). Resolved at boot; a config write needs a restart to change it. */
@@ -1180,6 +1197,34 @@ export class ClientDaemon {
     if (this.hermesEnabled) {
       this.hermesGateway = new HermesGatewayConnector(this.hermesGwCfg, {
         log: (m) => this.log.info(m),
+      });
+    }
+    // Owner ask 2026-10-21: the turn-lease harvester (see the field doc
+    // for the enablement law). The block sanitizes its own members here
+    // (the connector's resolve-own-your-keys posture, one member at a
+    // time): enabled = a real tri-state override, home = bounded string,
+    // poll_ms = integer ≥1s. The env switch wins over the block.
+    const turnsBlock =
+      this.cfg.hermes_turns && typeof this.cfg.hermes_turns === 'object' && !Array.isArray(this.cfg.hermes_turns)
+        ? this.cfg.hermes_turns
+        : {};
+    const turnsSwitch = (process.env.IDLEFILL_HERMES_TURNS ?? '').trim().toLowerCase();
+    const turnsHome =
+      typeof turnsBlock.home === 'string' && turnsBlock.home.trim() !== '' && turnsBlock.home.length <= 512
+        ? turnsBlock.home
+        : join(homedir(), '.hermes');
+    const turnsPollMs =
+      typeof turnsBlock.poll_ms === 'number' && Number.isInteger(turnsBlock.poll_ms) && turnsBlock.poll_ms >= 1_000
+        ? turnsBlock.poll_ms
+        : undefined;
+    const turnsEnvOn = turnsSwitch === '1' || turnsSwitch === 'true' || turnsSwitch === 'yes';
+    const turnsEnvOff = turnsSwitch === '0' || turnsSwitch === 'false' || turnsSwitch === 'no';
+    const turnsOn =
+      turnsEnvOn || (turnsEnvOff ? false : turnsBlock.enabled === true || (turnsBlock.enabled === undefined && existsSync(turnsHome)));
+    if (turnsOn) {
+      this.hermesTurns = new HermesTurns(turnsHome, {
+        log: (m) => this.log.info(m),
+        ...(turnsPollMs !== undefined ? { pollMs: turnsPollMs } : {}),
       });
     }
   }
@@ -1308,6 +1353,13 @@ export class ClientDaemon {
    *  the env switch is unset (the complement is not constructed). */
   get hermesConnector(): HermesGatewayConnector | null {
     return this.hermesGateway;
+  }
+
+  /** Owner ask 2026-10-21: the turn-lease harvester (tests / operators
+   *  inspect it); null when explicitly disabled (env switch OFF + no
+   *  enabled block, or no Hermes home under the default rule). */
+  get hermesTurnHarvester(): HermesTurns | null {
+    return this.hermesTurns;
   }
 
   /** Loopback proxy base URL once up (tests / operators); null before boot. */
@@ -1616,6 +1668,12 @@ export class ClientDaemon {
     // the gate's behaviour is byte-for-byte unchanged.
     void this.hermesGateway?.poll().catch(() => {});
 
+    // Owner ask 2026-10-21: the turn-lease harvest, same fire-and-forget
+    // posture (a local read, throttled inside the harvester; a failed
+    // round keeps the last map — the `turn` key's honesty rides the fact
+    // age, never on a stalled poll).
+    void this.hermesTurns?.poll().catch(() => {});
+
     const { status, body } = await api<{
       idle: { idle: boolean; degraded: boolean; reidle_gated: boolean };
       active_leases: { lease_id: string }[];
@@ -1911,6 +1969,11 @@ export class ClientDaemon {
         maxActive: this.cfg.max_active_agent_sessions ?? 2,
         holdCapMs: this.cfg.session_hold_cap_ms ?? 120_000,
         clientName: this.cfg.client_name,
+        // Owner ask 2026-10-21: a held Hermes turn lease keeps the token
+        // tracked (the #76 drop rule exemption — a tool-running session
+        // has no provider traffic; without this the row would vanish from
+        // the mesh mid-tool). No harvester ⇒ no hook ⇒ #76 unchanged.
+        ...(this.hermesTurns ? { turnHeld: (id: string | undefined) => this.hermesTurns!.isHeld(id) } : {}),
         // #47: admission priority classes + per-session budgets (opt-in,
         // default OFF — the historical strict-FIFO park stays untouched).
         priorityEnabled: this.cfg.session_priority === true,
@@ -1935,6 +1998,16 @@ export class ClientDaemon {
           // in the last-known ledger — the body then omits `hermes_meta`
           // and the gate's byte-for-byte behaviour stands (fail-quiet).
           const hermesMeta = sessionId ? this.hermesGateway?.metaFor(sessionId) : undefined;
+          // Owner ask 2026-10-21: the turn-lease fact for this session
+          // (is a tool running RIGHT NOW). Tri-state, mirroring the two
+          // established postures: undefined (harvester off / never read a
+          // lease DB) ⇒ the body OMITS `turn` (the arbiter keeps its
+          // stored value — byte-for-byte the pre-feature shape); null
+          // (a successful read named NO live lease) ⇒ the explicit CLEAR
+          // rides (the #67 phase posture — a settled tool run never stays
+          // tagged "working"); an object ⇒ held, with the holder members
+          // the lease row itself names (never a guess).
+          const hermesTurn = this.hermesTurns?.factFor(sessionId);
           const aggregateServerId = this.aggregateServers.get(token);
           const { status } = await api(this.cfg, 'POST', '/api/sessions/register', {
             token,
@@ -1990,6 +2063,12 @@ export class ClientDaemon {
             // then keeps its stored value (never a fake zero). An old
             // arbiter ignores the extra key (back-compat).
             ...(hermesMeta ? { hermes_meta: hermesMeta } : {}),
+            // Owner ask 2026-10-21: the turn-lease block (see above).
+            // Key-OMITTED when the harvester cannot speak (off / never
+            // read a lease DB) — the arbiter then KEEPS its stored value
+            // (ADD-key posture). An explicit null rides the CLEAR. An old
+            // arbiter ignores the extra key (back-compat).
+            ...(hermesTurn !== undefined ? { turn: hermesTurn } : {}),
           });
           return status === 200 || status === 201;
         },

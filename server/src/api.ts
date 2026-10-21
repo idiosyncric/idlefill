@@ -1174,6 +1174,7 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       history?: unknown;
       phase?: unknown;
       hermes_meta?: unknown;
+      turn?: unknown;
     };
     const token = typeof body.token === 'string' ? body.token.trim() : '';
     if (!token) return reply.code(400).send({ error: 'token required' });
@@ -1202,6 +1203,13 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       // registerSession (per-member drop-don't-reject; last-known-wins:
       // absent never clears the stored block).
       ...(body.hermes_meta !== undefined ? { hermes_meta: body.hermes_meta } : {}),
+      // Owner ask 2026-10-21: the turn-lease block (the client's read of
+      // Hermes' session_turn_leases — "a turn is in flight RIGHT NOW").
+      // Forwarded only when the BODY carries the key, so the arbiter can
+      // tell an absent key (harvester cannot speak ⇒ stored value stands)
+      // from the explicit null (confirmed not held ⇒ CLEAR). Verdicts +
+      // sanitization live in registerSession.
+      ...(body.turn !== undefined ? { turn: body.turn } : {}),
     });
     if (!res.ok) return reply.code(400).send({ error: res.reason ?? 'invalid' });
     return reply.code(res.created ? 201 : 200).send({ created: res.created, session: res.session });

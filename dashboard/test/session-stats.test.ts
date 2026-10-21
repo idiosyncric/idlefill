@@ -62,3 +62,19 @@ test("the active window matches the row rule (30 s edge)", () => {
   const [sessionsTile] = sessionTiles(sessions, NOW);
   assert.equal(sessionsTile.sub, "1 active · 1 idle");
 });
+
+// Owner ask 2026-10-21 — the turn-lease row word: a session whose Hermes
+// turn lease is live is WORKING (tool or local execution), never counted
+// idle; the row-word rule lives in format.ts and the tiles follow it.
+test("a live turn lease reads working — its own segment, never folded into idle", () => {
+  const sessions = [
+    sess({ token: "a", last_activity: NOW - 5_000 }), // request seen ⇒ Active wins
+    sess({ token: "b", turn: { at: NOW - 10_000, platform: "tui" } }), // quiet stream, held lease ⇒ Working
+    sess({ token: "c" }), // plain idle
+    sess({ token: "d", turn: { at: NOW - 300_000 } }), // stale report dims to idle
+    sess({ token: "e", turn: { at: NOW - 10_000 }, last_seen: NOW - 120_000 }), // offline: no lease claim
+  ];
+  const [sessionsTile] = sessionTiles(sessions, NOW);
+  assert.equal(sessionsTile.value, "5");
+  assert.equal(sessionsTile.sub, "1 active · 1 working · 3 idle · 1 stale");
+});
