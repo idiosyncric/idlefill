@@ -376,7 +376,18 @@ export function loadClientConfig(
             ...(adapterName ? { adapter: adapterName } : {}),
             ...(adapterError ? { adapter_error: adapterError } : {}),
             // payload_fields / estimates: manifest defaults, config wins.
-            ...(manifest?.payload_fields ? { payload_fields: manifest.payload_fields } : {}),
+            // (BUGFIX 2026-10-21: the comment always promised "config wins"
+            // but only the manifest key was read — a custom-executor project
+            // silently got the career-ops trio no matter what it configured.)
+            ...((Array.isArray(p.payload_fields) && (p.payload_fields as string[]).length
+              ? (p.payload_fields as string[])
+              : manifest?.payload_fields)
+              ? {
+                  payload_fields: Array.isArray(p.payload_fields) && (p.payload_fields as string[]).length
+                    ? (p.payload_fields as string[]).map(String)
+                    : manifest!.payload_fields,
+                }
+              : {}),
             estimated_seconds:
               typeof p.estimated_seconds === 'number'
                 ? p.estimated_seconds
