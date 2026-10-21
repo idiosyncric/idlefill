@@ -1,0 +1,20 @@
+{
+  "name": "idlefill-adapter-paperless-enrich",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "idlefill adapter for the paperless-ngx document enrichment pipeline (classifies one Paperless doc per job via the taxonomy; executor lives in the finance deploy at ~/finance/paperless/enrich_20261016/)",
+  "idlefill": {
+    "name": "paperless-enrich",
+    "version": "0.1.0",
+    "protocol": 1,
+    "executor": "bash {repo}/adapters/paperless-enrich/run.sh {payload_file} {result_file}",
+    "payload_fields": ["url", "extra"],
+    "result_hint": ["ok", "job_id", "doc_id", "tokens_out", "tokens_in", "classification", "applied", "verified", "error", "seconds"],
+    "estimated_seconds": 120,
+    "timeout_seconds": 600
+  },
+  "scripts": {
+    "test": "node --test *.test.mjs"
+  }
+}
