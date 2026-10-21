@@ -33,7 +33,6 @@ import {
   ENGINE_H,
   FRAME_PAD,
   PROFILE_ROWS_MAX,
-  PROJECT_H,
   PROJECTS_BOX_ID,
   SECTION_H,
   buildMeshGraph,
@@ -49,6 +48,8 @@ import {
   MODEL_SOURCE_NOTE,
   projectsBoxSize,
   type MeshAgentSlot,
+  type MeshDrain,
+  type MeshDrainLine,
   type MeshEngineSlot,
   type MeshFlow,
   type MeshFrame,
@@ -94,6 +95,18 @@ import type { StateSnapshot } from "@/lib/api";
 //     frames.
 //   · CONTROL edges (frame → frame) draw the pairing direction: the arrow
 //     points AT the controlled machine (fleet.md D4, `from controls to`).
+//   · DRAIN chains (the DRAIN law, owner ask 2026-10-21): an UNPAUSED project
+//     running jobs shows its routing and progress the way a session does —
+//     one connection per active lease: project card ⇢ the gateway card of the
+//     worker running the job (exact lease.client_id join) ⇢ the engine card
+//     the lease's server_id names (exact row; none named = the chain stops at
+//     the gateway, the tooltip says so). The pipe rides the SAME phase
+//     vocabulary — the engine-side published facts decide it (a fresh live
+//     load animates, a fresh queue warns, degraded/absent signal mutes). The
+//     running jobs are LISTED on the project card too (phase dot + chain +
+//     the shared tooltip, capped like the profile rows). A paused project
+//     lists its running jobs but draws no chains; every undrawn job is
+//     counted and named in the summary, never a silent gap.
 //
 // Honesty, unchanged: engine slots show only published facts (absent keys
 // render nothing), a stale load sample dims the slot and keeps the value,
@@ -451,6 +464,9 @@ function AgentNode({ data }: NodeProps) {
         />
       ))}
       <Handle id="agt-r" type="source" position={Position.Right} className="mesh-handle" />
+      {/* Running jobs land here (the DRAIN law): the project card's chain
+          terminates on the gateway card of the worker actually running it. */}
+      <Handle id="drain-l" type="target" position={Position.Left} className="mesh-handle" />
       {detached && <Handle id="host-t" type="target" position={Position.Top} className="mesh-handle" />}
     </div>
   );
@@ -544,6 +560,7 @@ function ProjectsNode({ data }: NodeProps) {
   const queued = projects.reduce((a, p) => a + p.queued, 0);
   const workers = projects.reduce((a, p) => a + p.workers, 0);
   const online = projects.reduce((a, p) => a + p.online, 0);
+  const running = projects.reduce((a, p) => a + p.running.length, 0);
   return (
     <div className="mesh-frame h-full w-full">
       <div className="flex items-center gap-2 px-3 pt-2.5">
@@ -558,21 +575,63 @@ function ProjectsNode({ data }: NodeProps) {
           {workers > 0
             ? `${online} of ${workers} ${workers === 1 ? "worker" : "workers"} online`
             : "no workers connected for any project"}
+          {running > 0 && (
+            <span className="text-ok" title="active leases the arbiter holds right now — the job chains leave the cards that run them">
+              {" "}
+              · {running} running
+            </span>
+          )}
         </div>
       </div>
     </div>
   );
 }
 
+/** One running job LISTED on its project card (the DRAIN law) — the same
+ *  phase dot + chain + tooltip the drain pipe carries. The line spells the
+ *  hop: job ⇢ the machine running it ⇢ the engine (or "engine not named"). */
+function DrainLine({ d }: { d: MeshDrainLine }) {
+  return (
+    <div
+      className="flex h-[15px] items-center gap-1.5 overflow-hidden px-2.5 text-[10px]"
+      title={`${d.title}${d.cross ? " · crosses machines" : ""} — the arbiter holds this lease (the job is running now)`}
+    >
+      <span
+        className="size-1.5 shrink-0 rounded-full"
+        style={{ background: PIPE_STROKE[d.phase], opacity: d.muted ? 0.45 : d.phase === "queued" ? 0.8 : 1 }}
+      />
+      <span className="shrink-0 font-mono text-dim">{d.job}</span>
+      <span className="shrink-0 text-accent/70">⇢</span>
+      <span className="shrink-0 truncate text-accent/90">{d.machine}</span>
+      <span className="shrink-0 text-accent/70">⇢</span>
+      <span className={`min-w-0 truncate font-mono ${d.engine ? "" : "text-dim/70"}`}>{d.engine ?? "engine not named"}</span>
+    </div>
+  );
+}
+
 /** One arbiter project row as its own card: the queue depth is the hero, the
- *  worker coverage the honest sub (0 renders 0 — the Projects tab's rule). */
+ *  worker coverage the honest sub (0 renders 0 — the Projects tab's rule),
+ *  and the RUNNING jobs (active leases) ride underneath — the profile-card
+ *  posture, capped, the card growing to fit what it renders (the DRAIN law). */
 function ProjectNode({ data }: NodeProps) {
   const { project: p } = data as unknown as ProjectData;
   const word: StateWord = p.paused
-    ? { label: "paused", tone: "dim", note: "this project's scheduling is paused" }
-    : p.queued > 0
-      ? { label: "queued", tone: "warn", note: "jobs waiting in this project's queue" }
-      : { label: "idle", tone: "dim", note: "nothing queued on this project" };
+    ? {
+        label: "paused",
+        tone: "dim",
+        note: p.running.length > 0 ? `scheduling paused — ${p.running.length} in-flight ${p.running.length === 1 ? "job" : "jobs"} still listed` : "this project's scheduling is paused",
+      }
+    : p.running.length > 0
+      ? {
+          label: "running",
+          tone: "ok",
+          note: `${p.running.length} ${p.running.length === 1 ? "job" : "jobs"} running — the arbiter holds ${p.running.length === 1 ? "its lease" : "their leases"} now`,
+        }
+      : p.queued > 0
+        ? { label: "queued", tone: "warn", note: "jobs waiting in this project's queue" }
+        : { label: "idle", tone: "dim", note: "nothing queued on this project" };
+  const shown = p.running.slice(0, PROFILE_ROWS_MAX);
+  const more = p.running.length - shown.length;
   return (
     <div className={`mesh-card h-full w-full ${p.paused ? "opacity-55" : ""}`}>
       <div className="flex items-center gap-2 px-2.5 pt-1.5">
@@ -588,9 +647,23 @@ function ProjectNode({ data }: NodeProps) {
         {p.workers > 0
           ? `${p.online} of ${p.workers} ${p.workers === 1 ? "worker" : "workers"} online`
           : "no workers connected"}
+        {p.running.length > 0 && (
+          <span className="text-ok" title="active leases the arbiter holds for this project right now">
+            {" "}
+            · {p.running.length} running
+          </span>
+        )}
         {p.paused && <span className="text-warn"> · paused</span>}
         {p.failedToday > 0 && <span className="text-warn"> · {p.failedToday} failed today</span>}
       </div>
+      {/* The running jobs, listed the way a profile card lists its sessions
+          (shared pipe + tooltip). Paused: LISTED (a running fact is a fact),
+          no chains drawn — the gate says so on the card and in the summary. */}
+      {shown.map((d) => (
+        <DrainLine key={d.drainId} d={d} />
+      ))}
+      {more > 0 && <div className="h-[15px] px-2.5 text-[10px] text-dim/70">+{more} more (Projects tab)</div>}
+      <Handle id="prj-r" type="source" position={Position.Right} className="mesh-handle" />
     </div>
   );
 }
@@ -699,7 +772,11 @@ function HostEdgeView(props: EdgeProps) {
   );
 }
 
-const edgeTypes = { flow: FlowEdgeView, control: ControlEdgeView, host: HostEdgeView };
+// Drain chains reuse the flow pipe RENDERER untouched (the DRAIN law's whole
+// point: a running job reads like an agent session — same phase colors, same
+// motion posture, same tooltip discipline). They differ only in endpoints and
+// handles, which the Canvas wiring spells.
+const edgeTypes = { flow: FlowEdgeView, drain: FlowEdgeView, control: ControlEdgeView, host: HostEdgeView };
 
 // --- persistence ------------------------------------------------------------
 
@@ -770,13 +847,15 @@ const LAYER_LABEL: Record<MeshLayer, string> = {
   agents: "agents",
   engines: "engines",
   flows: "flow pipes",
+  drains: "job chains",
   controls: "control edges",
   hosts: "hosts hairlines",
 };
 const LAYER_HINT: Record<MeshLayer, string> = {
   agents: "show the client-daemon cards and their profile cards (their flow pipes drop with them)",
-  engines: "show the inference-engine cards (their flow pipes drop with them)",
+  engines: "show the inference-engine cards (their flow pipes and the job chains landing on them drop with them)",
   flows: "show the session pipes between agents and engines",
+  drains: "show the running-job chains: project ⇢ gateway ⇢ engine, one per active lease (paused projects never draw them)",
   controls: "show the paired-control arrows between machines",
   hosts: 'show the dim hairlines tying broken-out cards back to their machine',
 };
@@ -1025,7 +1104,7 @@ function Canvas({
           parentId: PROJECTS_BOX_ID,
           extent: "parent",
           width: CARD_W,
-          height: PROJECT_H,
+          height: p.h,
           draggable: false,
           selectable: false,
           data: { project: p } satisfies ProjectData,
@@ -1077,6 +1156,41 @@ function Canvas({
           offset: fl.offset,
         } satisfies FlowData,
       });
+    }
+    // The running-job chains (the DRAIN law): each active lease draws
+    // project card ⇢ gateway card, and on to the engine card when the lease
+    // names one (the lens already dropped chains whose cards are hidden).
+    // Both segments ride one drain's shared pipe + tooltip + fan-out.
+    for (const d of graph.drains) {
+      const data = {
+        pipe: d.pipe,
+        title: d.cross ? `${d.title} · crosses machines` : d.title,
+        curvature: d.curvature,
+        offset: d.offset,
+      } satisfies FlowData;
+      nextEdges.push({
+        id: d.id,
+        source: d.from,
+        target: d.to,
+        sourceHandle: "prj-r",
+        targetHandle: "drain-l",
+        type: "drain",
+        zIndex: 2,
+        selectable: false,
+        data,
+      });
+      if (d.engineTo)
+        nextEdges.push({
+          id: `${d.id}#eng`,
+          source: d.to,
+          target: d.engineTo,
+          sourceHandle: "agt-r",
+          targetHandle: "eng-l",
+          type: "drain",
+          zIndex: 2,
+          selectable: false,
+          data,
+        });
     }
     setNodes(next);
     setEdges(nextEdges);
@@ -1362,6 +1476,10 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
     }
     const fl = graph.flows.find((x) => x.id === id);
     if (fl) return `${fl.profile ?? fl.shortToken} → ${fl.engineName}`;
+    const d = graph.drains.find((x) => x.id === id);
+    if (d) return `${d.project} · job ${d.job}`;
+    const pr = graph.projects.find((x) => x.id === id);
+    if (pr) return pr.name;
     return null;
   }, [prefs.isolated, graph]);
   // The outliner nests each session under the CARD the pipe starts from:
@@ -1380,6 +1498,18 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
   const engineMachine = useMemo(() => {
     const m = new Map<string, string>();
     for (const f of graph?.frames ?? []) for (const e of f.engines) m.set(e.id, f.name);
+    return m;
+  }, [graph]);
+  // The outliner nests each running job under ITS PROJECT card (the drain's
+  // own from-join) — the chain's other ends (gateway, engine) are named on
+  // the row, exactly like the session rows spell their hop.
+  const drainsByProject = useMemo(() => {
+    const m = new Map<string, MeshDrain[]>();
+    for (const d of graph?.drains ?? []) {
+      const arr = m.get(d.from);
+      if (arr) arr.push(d);
+      else m.set(d.from, [d]);
+    }
     return m;
   }, [graph]);
   // One outliner row for one session pipe — shared by the daemon's direct
@@ -1410,6 +1540,32 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
           active={prefs.isolated === fl.id}
           title="isolate — just this session's hop: its card, the pipe, the engine"
           onClick={() => toggleIsolate(fl.id)}
+        />
+      </div>
+    );
+  };
+
+  // One outliner row for one running-job chain — the same vocabulary as the
+  // session row (eye hides the chain, isolate keeps just this hop). The
+  // label spells the whole chain the pipe draws: job → gateway's machine →
+  // engine (or the honest "engine not named").
+  const drainLine = (d: MeshDrain, disabled: boolean) => {
+    const dhid = hiddenSet.has(d.id);
+    return (
+      <div key={d.id} className="flex items-center gap-1 pl-7">
+        <label
+          className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 py-[1px]"
+          title={`${d.job} · ${d.machine}${d.engineName ? ` → ${d.engineName}` : " → engine not named"}${d.cross ? " · crosses machines" : ""}`}
+        >
+          <input type="checkbox" checked={!dhid} disabled={disabled} onChange={() => toggleHidden(d.id)} />
+          <span className={`truncate font-mono text-[10px] ${dhid || disabled ? "text-dim line-through" : "text-dim"}`}>
+            <span className="text-accent/70">⇢</span> {d.job}
+          </span>
+        </label>
+        <IsoBtn
+          active={prefs.isolated === d.id}
+          title="isolate — just this job's chain: the project, the worker's gateway, the engine"
+          onClick={() => toggleIsolate(d.id)}
         />
       </div>
     );
@@ -1476,8 +1632,13 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
   const held = viewGraph?.flows.filter((f) => f.pipe.phase === "queued").length ?? 0;
   const uf = viewGraph?.unflowed;
   const notShown = (uf?.noClient ?? 0) + (uf?.noEngine ?? 0) + (uf?.stale ?? 0);
+  // The DRAIN law's counts: chains drawn, and the running jobs that draw
+  // none NAMED (no project row / no gateway join / paused project).
+  const runningJobs = viewGraph?.drains.length ?? 0;
+  const ud = viewGraph?.undrained;
+  const undrawn = (ud?.noProject ?? 0) + (ud?.noGateway ?? 0) + (ud?.paused ?? 0);
   const hiddenElems = tally.machines + tally.agents + tally.engines;
-  const hiddenEdges = tally.flows + tally.controls;
+  const hiddenEdges = tally.flows + tally.drains + tally.controls;
 
   const summary =
     `${viewGraph?.frames.length ?? 0} machines · ` +
@@ -1485,17 +1646,23 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
     `${engines} engines · ${agents} ${agents === 1 ? "daemon" : "daemons"} · ` +
     `${profiles} ${profiles === 1 ? "profile" : "profiles"} · ` +
     `${liveFlows} live ${liveFlows === 1 ? "flow" : "flows"}${held > 0 ? ` (${held} waiting)` : ""}` +
+    (runningJobs > 0 ? ` · ${runningJobs} running ${runningJobs === 1 ? "job" : "jobs"}` : "") +
     (prefs.isolated !== null
       ? ` · ⊙ isolated: ${isolatedLost ? "element gone — showing all" : (isolatedLabel ?? "?")}`
       : "") +
     (hiddenElems > 0
       ? ` · ${hiddenElems} ${hiddenElems === 1 ? "element" : "elements"} hidden${
-          hiddenEdges > 0 ? ` (${hiddenEdges} ${hiddenEdges === 1 ? "edge" : "edges"} dropped with them${prefs.layers.flows && prefs.layers.controls ? "" : ", layers off"})` : ""
+          hiddenEdges > 0 ? ` (${hiddenEdges} ${hiddenEdges === 1 ? "edge" : "edges"} dropped with them${prefs.layers.flows && prefs.layers.drains && prefs.layers.controls ? "" : ", layers off"})` : ""
         }`
       : "") +
     (notShown > 0
       ? ` · ${notShown} ${notShown === 1 ? "session" : "sessions"} not shown${
           uf ? ` (${uf.stale} quiet, ${uf.noClient} no machine named, ${uf.noEngine} no engine row)` : ""
+        }`
+      : "") +
+    (undrawn > 0
+      ? ` · ${undrawn} running ${undrawn === 1 ? "job" : "jobs"} draw${undrawn === 1 ? "s" : ""} no chain${
+          ud ? ` (${ud.noGateway} name no gateway, ${ud.paused} on paused projects, ${ud.noProject} name no project row)` : ""
         }`
       : "") +
     ((viewGraph?.unhosted ?? 0) > 0 ? ` · ${viewGraph!.unhosted} engines name no machine (whole on the Servers tab)` : "");
@@ -1721,6 +1888,40 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
                 </div>
               );
             })}
+            {/* The fleet-side Projects stack (the DRAIN law): project rows,
+                and under each one the RUNNING jobs — the chains the canvas
+                draws project ⇢ gateway ⇢ engine (the stack belongs to no
+                machine, so it rides the tree OUTSIDE the machine rows). */}
+            {graph && graph.projects.length > 0 && (
+              <div className="mb-2">
+                <div className={`text-[10px] ${prefs.layers.drains ? "text-dim" : "text-dim/50"}`}>projects</div>
+                {graph.projects.map((p) => {
+                  const pdrains = drainsByProject.get(p.id) ?? [];
+                  return (
+                    <div key={p.id}>
+                      <div className="flex items-center gap-1 py-[2px] pl-1">
+                        <span
+                          className="flex min-w-0 flex-1 items-center gap-2 truncate font-mono text-[10px] text-dim"
+                          title={`arbiter project row ${p.name}${p.paused ? " (paused — chains gated off)" : ""}`}
+                        >
+                          {p.name}
+                          {p.running.length > 0 ? ` · ${p.running.length} running` : ""}
+                        </span>
+                        <IsoBtn
+                          active={prefs.isolated === p.id}
+                          title="isolate — this project, its running-job chains, and the gateways (and engines) at their far ends"
+                          onClick={() => toggleIsolate(p.id)}
+                        />
+                      </div>
+                      {pdrains.map((d) => {
+                        const fr = graph.frames.find((f) => f.agents.some((a) => a.id === d.to));
+                        return drainLine(d, (fr && hiddenSet.has(fr.id)) || hiddenSet.has(d.to));
+                      })}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </section>
           <section>
             <h3 className="mb-1 font-mono text-[10px] uppercase tracking-[0.08em] text-dim">views</h3>
@@ -1762,7 +1963,8 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
           {(hiddenElems > 0 || hiddenEdges > 0) && (
             <div className="mt-auto border-t border-border pt-2 text-[10px] text-dim">
               hidden: {tally.machines} machines · {tally.agents} agents · {tally.engines} engines · {tally.flows}{" "}
-              {tally.flows === 1 ? "flow" : "flows"} · {tally.controls} controls
+              {tally.flows === 1 ? "flow" : "flows"} · {tally.drains} {tally.drains === 1 ? "chain" : "chains"} ·{" "}
+              {tally.controls} controls
             </div>
           )}
         </aside>

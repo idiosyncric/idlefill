@@ -30,6 +30,7 @@ import {
   PROFILE_ROW_H,
   profileNodeId,
   PROJECT_H,
+  projectCardH,
   PROJECTS_BOX_ID,
   projectNodeId,
   projectsBoxSize,
@@ -756,4 +757,144 @@ test("the Projects box sizes, offsets within itself, and rides both layout modes
 test("no projects rows: no stack, in the graph or in either layout mode", () => {
   assert.deepEqual(graph.projects, []); // the base fixture names no project
   for (const mode of ["rank", "row"] as const) assert.ok(!layoutMesh(graph, mode).has(PROJECTS_BOX_ID));
+  // ... and no leases, so no chains and nothing undrawn either
+  assert.deepEqual(graph.drains, []);
+  assert.deepEqual(graph.undrained, { noProject: 0, noGateway: 0, paused: 0 });
+});
+
+// --- the running-job chains (the DRAIN law, owner ask 2026-10-21): an
+// UNPAUSED project running jobs shows its routing and progress the way an
+// agent session does — project card ⇢ the gateway of the worker running the
+// job ⇢ the engine the lease names, every hop an EXACT join; the pipe rides
+// the engine-side published facts; a paused project lists its jobs but
+// draws no chains; every undrawn job is COUNTED and NAMED. ----------------
+
+const lease = (id: string, project: string, clientId: string | undefined, serverId: string | undefined) =>
+  ({
+    lease_id: id,
+    client_id: clientId,
+    client_name: clientId ?? "ghost",
+    server_id: serverId,
+    project,
+    job_id: `job-${id}`,
+    estimated_seconds: 120,
+    status: "active",
+    granted_at: NOW - 70_000,
+    expires_at: NOW + 60_000,
+    tokens_out: 250,
+    tokens_in: 1_200,
+  }) as never;
+
+const drainGraph = buildMeshGraph(
+  st({
+    mesh: {
+      instance_id: "i-mac",
+      peers: [{ url: "http://100.105.225.1:8787", name: "urza", instance_id: "i-urza", online: true, fetch_age_s: 3, snapshot: null }],
+    } as never,
+    servers: [
+      srv("e-live", "http://127.0.0.1:1", { in_flight: 1, tokens_per_second: 40, queue_depth: 0, load_age_s: 2 }),
+      srv("e-queued", "http://127.0.0.1:2", { idle: false, queue_depth: 3, load_age_s: 1 }),
+      srv("e-remote", "http://100.105.225.1:11434", { idle: false, gpu_util_percent: 91 }),
+    ],
+    clients: [client("cli-m", "127.0.0.1", NOW - 1_000)],
+    projects: [
+      projRow("idlefill", [workerRow("cli-m", 4, true, "cli-m")]),
+      projRow("parked", [workerRow("cli-m", 2, true, "cli-m")], true),
+    ] as never,
+    active_leases: [
+      lease("L1", "idlefill", "cli-m", "e-live"),
+      lease("L1b", "idlefill", "cli-m", "e-live"), // same full chain — fan-out pair
+      lease("L2", "idlefill", "cli-m", undefined), // engine not named
+      lease("L3", "idlefill", "ghost", "e-live"), // no gateway join
+      lease("L4", "parked", "cli-m", "e-queued"), // paused project
+      lease("L5", "ghostproj", "cli-m", "e-live"), // no project row
+      lease("L6", "idlefill", "cli-m", "e-remote"), // engine on another machine
+      lease("L7", "idlefill", "cli-m", "e-queued"), // fresh queue depth
+    ] as never,
+  }),
+  NOW,
+);
+
+test("unpaused project running jobs: one chain per lease, EXACT joins only, every undrawn job named", () => {
+  assert.deepEqual(drainGraph.drains.map((d) => d.id).sort(), ["drain:L1", "drain:L1b", "drain:L2", "drain:L6", "drain:L7"]);
+  // the three join failures are COUNTED, never silently absent
+  assert.deepEqual(drainGraph.undrained, { noProject: 1, noGateway: 1, paused: 1 });
+  const l1 = drainGraph.drains.find((d) => d.id === "drain:L1")!;
+  assert.equal(l1.from, projectNodeId("idlefill"));
+  assert.equal(l1.to, agentNodeId("cli-m"));
+  assert.equal(l1.engineTo, engineNodeId("e-live"));
+  assert.equal(l1.machine, LOCAL_MACHINE);
+  assert.equal(l1.cross, false);
+  // a FRESH live-load sample on the engine row animates the chain (the row
+  // itself proves traffic is moving — the Sessions attribution posture)
+  assert.equal(l1.pipe.phase, "output");
+  assert.equal(l1.pipe.animated, true);
+  assert.equal(l1.pipe.muted, false);
+  assert.match(l1.title, /engine e-live/);
+  assert.match(l1.title, /engine streaming/);
+  assert.match(l1.title, /running 1m 10s/); // the lease's own granted_at
+  assert.match(l1.title, /~2m estimate/);
+  assert.match(l1.title, /in 1\.2K \/ out 250/i);
+  // a lease naming no engine row: the chain STOPS at the gateway, muted, and
+  // the tooltip says so — never a guessed engine
+  const l2 = drainGraph.drains.find((d) => d.id === "drain:L2")!;
+  assert.equal(l2.engineTo, null);
+  assert.equal(l2.pipe.muted, true);
+  assert.match(l2.title, /engine not named/);
+  assert.ok(!/not named.*not named/.test(l2.title)); // the clause rides the pipe reason ONCE
+  // the engine row's fresh queue depth warns dashed
+  const l7 = drainGraph.drains.find((d) => d.id === "drain:L7")!;
+  assert.equal(l7.pipe.phase, "queued");
+  assert.equal(l7.pipe.dashed, true);
+  assert.equal(l7.pipe.animated, false);
+  // an engine hosted on ANOTHER machine than the gateway crosses
+  const l6 = drainGraph.drains.find((d) => d.id === "drain:L6")!;
+  assert.equal(l6.engineTo, engineNodeId("e-remote"));
+  assert.equal(l6.cross, true);
+  // chains sharing the WHOLE chain fan out, centered
+  const pair = drainGraph.drains.filter((d) => d.id === "drain:L1" || d.id === "drain:L1b");
+  assert.deepEqual(pair.map((d) => d.offset), [-14, 14]);
+});
+
+test("running jobs are LISTED on the project card, capped, the card height follows; paused lists but never pipes", () => {
+  const idle = drainGraph.projects.find((p) => p.name === "idlefill")!;
+  assert.deepEqual(idle.running.map((r) => r.drainId).sort(), ["drain:L1", "drain:L1b", "drain:L2", "drain:L6", "drain:L7"]);
+  const line2 = idle.running.find((r) => r.drainId === "drain:L2")!;
+  assert.equal(line2.engine, null);
+  assert.equal(line2.title, drainGraph.drains.find((d) => d.id === "drain:L2")!.title); // shared tooltip
+  assert.equal(idle.running.find((r) => r.drainId === "drain:L6")!.cross, true);
+  // machine is the GATEWAY's label (cli-m runs the job on This Machine);
+  // the engine riding on urza is what `cross` names, never the label
+  assert.equal(idle.running.find((r) => r.drainId === "drain:L6")!.machine, LOCAL_MACHINE);
+  assert.equal(idle.h, projectCardH(5)); // PROJECT_H + 5 capped rows, the profile-card posture
+  // the no-gateway lease draws NOTHING on the card either — it is the
+  // undrained.noGateway count that names it (asserted above), never a line
+  assert.ok(!idle.running.some((r) => r.drainId === "drain:L3"));
+  // a PAUSED project lists its running job (a published fact is a fact, the
+  // engine-side pipe facts included) but draws no chains — the paused gate
+  const parked = drainGraph.projects.find((p) => p.name === "parked")!;
+  assert.deepEqual(parked.running.map((r) => r.drainId), ["drain:L4"]);
+  assert.equal(parked.running[0].phase, "queued");
+  assert.equal(parked.h, projectCardH(1));
+  assert.ok(!drainGraph.drains.some((d) => d.id === "drain:L4"));
+});
+
+test("the Projects box sizes to the listed rows and the layouts still place every box", () => {
+  const ps = drainGraph.projects;
+  const { h } = projectsBoxSize(ps);
+  const flat = ps.map((p) => ({ ...p, running: [], h: PROJECT_H }));
+  assert.ok(h > projectsBoxSize(flat).h); // the listed rows grew the box
+  const offs = meshProjectOffsets(ps);
+  for (const p of ps) {
+    const o = offs.get(p.id)!;
+    assert.ok(o.y + p.h <= h, `${p.id} overflows the grown box`);
+  }
+  for (const mode of ["rank", "row"] as const) {
+    const pos = layoutMesh(drainGraph, mode);
+    assert.ok(pos.get(PROJECTS_BOX_ID), `${mode}: the projects box not placed`);
+    assert.ok(pos.get(frameId(LOCAL_MACHINE)), `${mode}: the machine not placed`);
+  }
+  // rank: the stack still rides upstream of the machine whose gateway runs its jobs
+  const rank = layoutMesh(drainGraph, "rank");
+  assert.ok(rank.get(PROJECTS_BOX_ID)!.x < rank.get(frameId(LOCAL_MACHINE))!.x);
 });

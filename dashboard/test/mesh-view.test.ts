@@ -17,6 +17,7 @@ import {
   frameId,
   meshFrameSize,
   profileNodeId,
+  projectNodeId,
 } from "../src/lib/mesh-graph.js";
 import {
   applyMeshView,
@@ -105,7 +106,7 @@ const prefs = (
 test("the default lens is the identity — same reference, nothing counted", () => {
   const { graph: out, tally } = applyMeshView(graph, defaultMeshPrefs());
   assert.equal(out, graph);
-  assert.deepEqual(tally, { machines: 0, agents: 0, engines: 0, flows: 0, controls: 0 });
+  assert.deepEqual(tally, { machines: 0, agents: 0, engines: 0, flows: 0, drains: 0, controls: 0 });
 });
 
 test("agents layer off: agent cards and every flow pipe drop, engines and controls stay", () => {
@@ -217,7 +218,7 @@ test("ISOLATE a vanished element degrades honestly: full view back, named lost",
   assert.equal(isolatedLost, true);
   assert.equal(out.frames.length, graph.frames.length);
   assert.equal(out.flows.length, graph.flows.length);
-  assert.deepEqual(tally, { machines: 0, agents: 0, engines: 0, flows: 0, controls: 0 });
+  assert.deepEqual(tally, { machines: 0, agents: 0, engines: 0, flows: 0, drains: 0, controls: 0 });
 });
 
 test("prefs sanitize: junk yields the default, partial layers merge, hidden dedupes", () => {
@@ -275,7 +276,7 @@ const rosterGraph = buildMeshGraph(
 test("the default lens over profile cards is still the identity", () => {
   const { graph: out, tally } = applyMeshView(rosterGraph, defaultMeshPrefs());
   assert.equal(out, rosterGraph);
-  assert.deepEqual(tally, { machines: 0, agents: 0, engines: 0, flows: 0, controls: 0 });
+  assert.deepEqual(tally, { machines: 0, agents: 0, engines: 0, flows: 0, drains: 0, controls: 0 });
 });
 
 test("hiding one profile card drops exactly that card and the pipe starting on it", () => {
@@ -350,4 +351,102 @@ test("the Projects stack rides EVERY lens untouched — it belongs to no machine
     assert.deepEqual(lens.graph.projects.map((x) => x.id), ["prj:p1"]);
     assert.equal(lens.graph.projects[0].id, "prj:p1");
   }
+});
+
+// --- the DRAIN chains under the lens (owner ask 2026-10-21): the lens drops
+// chains and COUNTS them (tally.drains), never silently; a chain needs its
+// gateway AND (when the lease names one) its engine drawn; the CARD's listed
+// rows are the slot's own truth and ride the pipe lens untouched (the
+// profile-card posture); isolates follow chains as hops — and the mch hop
+// discipline keeps fleet-side chains OUT of a machine's interior. ----------
+
+const leaseRow = (id: string, project: string, clientId: string | undefined, serverId: string | undefined) =>
+  ({
+    lease_id: id,
+    client_id: clientId,
+    client_name: clientId ?? "ghost",
+    server_id: serverId,
+    project,
+    job_id: `job-${id}`,
+    estimated_seconds: 60,
+    status: "active",
+    granted_at: NOW - 30_000,
+    expires_at: NOW + 60_000,
+    tokens_out: 10,
+    tokens_in: 20,
+  }) as never;
+
+const projLite = (name: string, paused = false) =>
+  ({
+    name,
+    paused,
+    daily_token_cap: 0,
+    budget_today: { tokens_out: 0, tokens_in: 0, cap: 0 },
+    workers: [],
+    today: { finished: 0, failed: 0 },
+    scheduling: {},
+  }) as never;
+
+const drainView = buildMeshGraph(
+  st({
+    servers: [srv("eng1", "http://127.0.0.1:1"), srv("eng2", "http://127.0.0.1:2")],
+    clients: [client("c", "127.0.0.1")],
+    projects: [projLite("p1"), projLite("p2", true)] as never,
+    active_leases: [leaseRow("D1", "p1", "c", "eng1"), leaseRow("D2", "p1", "c", undefined), leaseRow("D3", "p2", "c", "eng2")] as never,
+  }),
+  NOW,
+);
+
+test("drains layer off drops every chain and COUNTS them; the card rows ride untouched", () => {
+  assert.deepEqual(drainView.drains.map((d) => d.id), ["drain:D1", "drain:D2"]); // paused p2 lists, never pipes
+  const { graph: out, tally } = applyMeshView(drainView, prefs({ layers: { drains: false } }));
+  assert.deepEqual(out.drains, []);
+  assert.equal(tally.drains, 2);
+  // the honesty posture: the lens hid PIPES; the card still lists its jobs
+  assert.deepEqual(out.projects.find((p) => p.name === "p1")!.running.map((r) => r.drainId), ["drain:D1", "drain:D2"]);
+});
+
+test("a chain needs its gateway AND its named engine drawn; each drop is counted", () => {
+  const hidGateway = applyMeshView(drainView, prefs({ hidden: [agentNodeId("c")] }));
+  assert.deepEqual(hidGateway.graph.drains, []);
+  assert.equal(hidGateway.tally.drains, 2);
+  // the engine-side drop takes ONLY the chain that names that engine
+  const hidEngine = applyMeshView(drainView, prefs({ hidden: [engineNodeId("eng1")] }));
+  assert.deepEqual(hidEngine.graph.drains.map((d) => d.id), ["drain:D2"]); // engine-not-named stops at the gateway
+  assert.equal(hidEngine.tally.drains, 1);
+  // a per-chain hide drops exactly one pipe (the flow:<token> posture)
+  const hidOne = applyMeshView(drainView, prefs({ hidden: ["drain:D1"] }));
+  assert.deepEqual(hidOne.graph.drains.map((d) => d.id), ["drain:D2"]);
+  assert.equal(hidOne.tally.drains, 1);
+});
+
+test("ISOLATE a chain keeps exactly the job's gateway, engine and their machine", () => {
+  const { graph: out, tally } = applyMeshView(drainView, prefs({ isolated: "drain:D1" }));
+  assert.deepEqual(out.drains.map((d) => d.id), ["drain:D1"]);
+  assert.deepEqual(out.frames[0].engines.map((e) => e.id), [engineNodeId("eng1")]); // eng2 is not this hop
+  assert.equal(tally.drains, 1);
+  assert.equal(tally.engines, 1);
+});
+
+test("ISOLATE a gateway keeps its flow pipes AND its running-job chains", () => {
+  const { graph: out, tally } = applyMeshView(drainView, prefs({ isolated: agentNodeId("c") }));
+  assert.deepEqual(out.drains.map((d) => d.id), ["drain:D1", "drain:D2"]);
+  // only eng1 is at a far end of a DRAWN chain (eng2's only lease is parked)
+  assert.deepEqual(out.frames[0].engines.map((e) => e.id), [engineNodeId("eng1")]);
+  assert.equal(tally.drains, 0);
+  assert.equal(tally.engines, 1);
+});
+
+test("ISOLATE a project keeps its chains; a paused project's chains (none) degrade honestly to full view", () => {
+  const { graph: out } = applyMeshView(drainView, prefs({ isolated: projectNodeId("p1") }));
+  assert.deepEqual(out.drains.map((d) => d.id), ["drain:D1", "drain:D2"]);
+  const lost = applyMeshView(drainView, prefs({ isolated: projectNodeId("p2") })); // paused: it draws no chains
+  assert.equal(lost.isolatedLost, true);
+  assert.deepEqual(lost.graph.drains.map((d) => d.id), ["drain:D1", "drain:D2"]); // full view back
+});
+
+test("a machine's isolate keeps the pipes BETWEEN its own cards — fleet-side chains stay out", () => {
+  const { graph: out, tally } = applyMeshView(drainView, prefs({ isolated: frameId(LOCAL_MACHINE) }));
+  assert.deepEqual(out.drains, []); // the chains start at the Projects box, not inside the machine
+  assert.equal(tally.drains, 2);
 });

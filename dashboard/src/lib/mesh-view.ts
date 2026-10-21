@@ -1,9 +1,10 @@
 // ---------------------------------------------------------------------------
 // mesh-view.ts — the pure VISIBILITY model behind the Mesh tab's sidebar.
 // mesh-graph.ts says what EXISTS (the exact joins); this module says what is
-// DRAWN: layer toggles (agents / engines / flows / control edges / hosts
-// edges) and per-element hides (machine / daemon / profile-card / engine node
-// ids), plus the shape of a saved view. No DOM, no React, no localStorage:
+// DRAWN: layer toggles (agents / engines / flows / drain chains / control
+// edges / hosts edges) and per-element hides (machine / daemon / profile-card
+// / engine node ids, session pipes, running-job chains), plus the shape of a
+// saved view. No DOM, no React, no localStorage:
 // the view reads and writes its own browser storage and hands these functions
 // plain values.
 //
@@ -23,7 +24,7 @@
 import type { MeshFrame, MeshGraph } from "./mesh-graph";
 import { hostLine } from "./mesh-stats";
 
-export const MESH_LAYERS = ["agents", "engines", "flows", "controls", "hosts"] as const;
+export const MESH_LAYERS = ["agents", "engines", "flows", "drains", "controls", "hosts"] as const;
 export type MeshLayer = (typeof MESH_LAYERS)[number];
 
 /** The layout modes, spelled once (the view's Mode is this). */
@@ -34,13 +35,16 @@ export type MeshViewPrefs = {
   /** Hidden node ids: `mch:<machine>` hides the machine AND its subtree,
    *  `agt:<client>` hides a daemon card AND its profile cards,
    *  `agt:<client>#<profile>` hides one profile card, `eng:<server>` hides
-   *  one engine card, `flow:<token>` hides one session pipe. */
+   *  one engine card, `flow:<token>` hides one session pipe,
+   *  `drain:<lease>` hides one running-job chain. */
   hidden: string[];
   /** ISOLATE (the outliner's ⊙): when set, the canvas shows ONLY this
    *  element's subtree and its hops — `mch:` the machine's whole interior,
    *  `agt:`/`eng:` the card plus every pipe it touches plus the far ends
    *  and their machines, `flow:` just that session's pipe, its two cards
-   *  and the two machines (the hop, spelled out). Layers still apply on
+   *  and the two machines (the hop, spelled out), `drain:` just that job's
+   *  chain (gateway, engine, their machines), `prj:` that project's card
+   *  and its running-job chains. Layers still apply on
    *  top: isolate picks the subset, layers pick the kinds. A target that
    *  vanishes (a session that ended) degrades honestly to no-isolate and
    *  the view says so (`isolatedLost`). */
@@ -53,7 +57,7 @@ export type MeshViewPrefs = {
 export type SavedMeshView = { name: string; mode: MeshViewMode; prefs: MeshViewPrefs };
 
 export const defaultMeshPrefs = (): MeshViewPrefs => ({
-  layers: { agents: true, engines: true, flows: true, controls: true, hosts: true },
+  layers: { agents: true, engines: true, flows: true, drains: true, controls: true, hosts: true },
   hidden: [],
   isolated: null,
 });
@@ -96,9 +100,9 @@ export function sanitizeMeshViews(raw: unknown): SavedMeshView[] {
 
 /** What the lens dropped, named (the honesty count — the view shows these
  *  numbers, never an unexplained gap). */
-export type MeshViewTally = { machines: number; agents: number; engines: number; flows: number; controls: number };
+export type MeshViewTally = { machines: number; agents: number; engines: number; flows: number; drains: number; controls: number };
 
-export const emptyMeshTally = (): MeshViewTally => ({ machines: 0, agents: 0, engines: 0, flows: 0, controls: 0 });
+export const emptyMeshTally = (): MeshViewTally => ({ machines: 0, agents: 0, engines: 0, flows: 0, drains: 0, controls: 0 });
 
 export type MeshLens = { graph: MeshGraph; tally: MeshViewTally; /** true = an isolate named an element the graph no longer has (the session ended, the card went away) — the lens falls back to the full view and the sidebar SAYS so. */ isolatedLost: boolean };
 
@@ -111,10 +115,18 @@ export type MeshLens = { graph: MeshGraph; tally: MeshViewTally; /** true = an i
  *  `mch:` keeps the machine's whole interior plus only the pipes BETWEEN
  *  its own cards.
  *  null = the isolate targets nothing in this graph (gone). */
-export function focusOf(graph: MeshGraph, iso: string): { frames: Set<string>; cards: Set<string>; flows: Set<string> } | null {
+export function focusOf(graph: MeshGraph, iso: string): { frames: Set<string>; cards: Set<string>; flows: Set<string>; drains: Set<string> } | null {
   const machineOfCard = new Map<string, string>();
   for (const f of graph.frames)
     for (const c of [...f.agents, ...f.agents.flatMap((a) => a.profiles), ...f.engines]) machineOfCard.set(c.id, f.id);
+  const machinesOf = (...cards: (string | null)[]) => {
+    const out = new Set<string>();
+    for (const c of cards) {
+      const m = c ? machineOfCard.get(c) : undefined;
+      if (m) out.add(m);
+    }
+    return out;
+  };
   if (iso.startsWith("mch:")) {
     const fr = graph.frames.find((f) => f.id === iso);
     if (!fr) return null;
@@ -123,27 +135,48 @@ export function focusOf(graph: MeshGraph, iso: string): { frames: Set<string>; c
       ...fr.agents.flatMap((a) => a.profiles.map((p) => p.id)),
       ...fr.engines.map((e) => e.id),
     ]);
+    // A machine's isolate keeps the pipes BETWEEN its own cards; a drain
+    // chain starts at the fleet-side Projects box (never a machine card),
+    // so it is not part of the machine's interior.
     return {
       frames: new Set([fr.id]),
       cards,
       flows: new Set(graph.flows.filter((fl) => cards.has(fl.from) && cards.has(fl.to)).map((fl) => fl.id)),
+      drains: new Set(),
     };
   }
   if (iso.startsWith("flow:")) {
     const fl = graph.flows.find((x) => x.id === iso);
     if (!fl) return null;
+    return { frames: machinesOf(fl.from, fl.to), cards: new Set([fl.from, fl.to]), flows: new Set([fl.id]), drains: new Set() };
+  }
+  if (iso.startsWith("drain:")) {
+    const d = graph.drains.find((x) => x.id === iso);
+    if (!d) return null;
+    // The hop, spelled out: the job's gateway, its engine (when the lease
+    // names one) and their machines. The Projects box always rides (untouched).
+    return { frames: machinesOf(d.to, d.engineTo), cards: new Set([d.to, ...(d.engineTo ? [d.engineTo] : [])]), flows: new Set(), drains: new Set([d.id]) };
+  }
+  if (iso.startsWith("prj:")) {
+    const p = graph.projects.find((x) => x.id === iso);
+    if (!p) return null;
+    const drains = graph.drains.filter((d) => d.from === p.id);
+    if (drains.length === 0) return null;
+    const cards = new Set<string>();
     const frames = new Set<string>();
-    for (const c of [fl.from, fl.to]) {
-      const m = machineOfCard.get(c);
-      if (m) frames.add(m);
+    for (const d of drains) {
+      cards.add(d.to);
+      if (d.engineTo) cards.add(d.engineTo);
+      for (const m of machinesOf(d.to, d.engineTo)) frames.add(m);
     }
-    return { frames, cards: new Set([fl.from, fl.to]), flows: new Set([fl.id]) };
+    return { frames, cards, flows: new Set(), drains: new Set(drains.map((d) => d.id)) };
   }
   const machine = machineOfCard.get(iso);
   if (!machine) return null;
   const frames = new Set([machine]);
   const cards = new Set([iso]);
   const flows = new Set<string>();
+  const drains = new Set<string>();
   for (const fl of graph.flows) {
     if (fl.from !== iso && fl.to !== iso) continue;
     flows.add(fl.id);
@@ -152,7 +185,16 @@ export function focusOf(graph: MeshGraph, iso: string): { frames: Set<string>; c
     const m = machineOfCard.get(far);
     if (m) frames.add(m);
   }
-  return { frames, cards, flows };
+  // A gateway/engine's isolate also keeps the RUNNING-JOB chains it is part
+  // of — the same hop discipline (this element's hops, far ends included).
+  for (const d of graph.drains) {
+    if (d.to !== iso && d.engineTo !== iso) continue;
+    drains.add(d.id);
+    cards.add(d.to);
+    if (d.engineTo) cards.add(d.engineTo);
+    for (const m of machinesOf(d.to, d.engineTo)) frames.add(m);
+  }
+  return { frames, cards, flows, drains };
 }
 
 /** Apply the lens to a graph. Deterministic and pure: the isolate focus
@@ -221,10 +263,22 @@ export function applyMeshView(graph: MeshGraph, prefs: MeshViewPrefs): MeshLens 
 
   // A flow needs its agent AND its engine visible; the flows layer off drops
   // every one of them; a `flow:<token>` hide drops one pipe. Same endpoint
-  // rule for the control edges.
+  // rule for the control edges. A drain chain needs its gateway AND (when
+  // the lease names one) its engine visible; the drains layer off drops every
+  // chain; a `drain:<lease>` hide drops one. Its Projects-box end always
+  // rides (the stack belongs to no machine).
   const shownFlows = prefs.layers.flows
     ? graph.flows.filter(
         (fl) => !hidden.has(fl.id) && (!focus || focus.flows.has(fl.id)) && agentSeen.has(fl.from) && engineSeen.has(fl.to),
+      )
+    : [];
+  const drains = prefs.layers.drains
+    ? graph.drains.filter(
+        (d) =>
+          !hidden.has(d.id) &&
+          (!focus || focus.drains.has(d.id)) &&
+          agentSeen.has(d.to) &&
+          (d.engineTo === null || engineSeen.has(d.engineTo)),
       )
     : [];
   const controls = prefs.layers.controls
@@ -234,7 +288,8 @@ export function applyMeshView(graph: MeshGraph, prefs: MeshViewPrefs): MeshLens 
   tally.agents = allAgents - agentSeen.size;
   tally.engines = allEngines - engineSeen.size;
   tally.flows = graph.flows.length - shownFlows.length;
+  tally.drains = graph.drains.length - drains.length;
   tally.controls = graph.controls.length - controls.length;
 
-  return { graph: { ...graph, frames, flows: shownFlows, controls }, tally, isolatedLost };
+  return { graph: { ...graph, frames, flows: shownFlows, controls, drains }, tally, isolatedLost };
 }

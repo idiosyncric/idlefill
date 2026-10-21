@@ -43,6 +43,24 @@
 // belongs to no machine: it rides the layout as one fleet-side box
 // (PROJECTS_BOX_ID), upstream of the machines it queues on.
 //
+// The DRAIN law (owner ask 2026-10-21): a project that is NOT paused and is
+// running jobs must SHOW its routing and progress the way an agent session
+// does — one connection per running job (the arbiter's active lease: the
+// grant it holds RIGHT NOW, the Projects tab's own "N running" discipline).
+// The chain is project card ⇢ the gateway card of the worker running the job
+// (the EXACT join lease.client_id → client row; no client_id names no card,
+// never a guess) ⇢ the engine card the lease's server_id names (exact row;
+// no row = the chain STOPS at the gateway and the tooltip says so). The pipe
+// rides the Sessions vocabulary: the engine-side facts decide
+// (engineEdge/pipeEdge + a fresh live-load sample animates it; degraded/
+// absent signal is the honest muted posture; a lease that names no engine
+// row is muted with "engine not named"). The running jobs are also LISTED on
+// the project card (the profile-card row discipline: phase dot + chain + the
+// shared tooltip, capped, the card grows, the Projects tab stays the full
+// surface). A PAUSED project lists its running jobs (a published fact) but
+// draws NO pipes — the owner gated the connections on the unpaused state,
+// and every undrawn job is COUNTED and NAMED (undrained), never a silent gap.
+//
 // The honesty law (the load-read precedent): every field is a PUBLISHED
 // fact or null/absent — never a fake zero. Peer snapshot numbers ride the
 // frame ATTRIBUTED as the peer's own report (`reported`, `reportedEngines`),
@@ -68,9 +86,10 @@ import dagre from "@dagrejs/dagre";
 import type { ClientRow, MeshPeer, ServerRow, StateSnapshot } from "./api";
 import { LOCAL_MACHINE, hostedServers, machineClients, machineSummary, type MachineSummary } from "./hierarchy";
 import { hostLine } from "./mesh-stats";
-import { engineEdge, type EngineEdge } from "./session-edge";
+import { engineEdge, EDGE_SAMPLE_STALE_S, type EngineEdge } from "./session-edge";
 import { pipeEdge, pipeTitle, type PipeEdge, type PipePhase } from "./pipe-phases";
-import { liveWord, sessStale, type StateWord } from "./format";
+import { durFmt, liveWord, minSec, sessStale, type StateWord } from "./format";
+import { compact } from "./fleet-stats";
 import { LOAD_FRESHNESS_DEFAULT_S } from "./load-read";
 
 // --- node ids, spelled once (the view never invents its own) -------------
@@ -112,9 +131,13 @@ export const profileCardH = (sessions: number): number =>
 
 /** The fleet-side Projects stack (owner ask 2026-10-21): one fixed-height
  *  card per arbiter project row under a machine-style header that IS the
- *  "Projects" label (name row + one glance line, the machine's 39 + 18 rule). */
+ *  "Projects" label (name row + one glance line, the machine's 39 + 18 rule).
+ *  A card GROWS by one row per running job it lists (projectCardH), exactly
+ *  the profile-card posture — the layout reserves what the view renders. */
 export const PROJECT_H = 46;
 export const PROJECTS_HEADER_H = 57;
+export const projectCardH = (running: number): number =>
+  PROJECT_H + Math.min(running, PROFILE_ROWS_MAX) * PROFILE_ROW_H + (running > PROFILE_ROWS_MAX ? PROFILE_ROW_H : 0);
 
 export type MeshEngineSlot = {
   id: string;
@@ -283,6 +306,52 @@ export type MeshControl = {
   to: string;
 };
 
+/** One running job (an active lease) LISTED on its project card — the same
+ *  facts the drain pipe carries (shared phase + tooltip), never more than
+ *  the pipe says. The chain line: job ⇢ machine ⇢ engine. */
+export type MeshDrainLine = {
+  drainId: string;
+  /** The lease row's own job_id, EXACT (the Projects tab names the same). */
+  job: string;
+  /** The gateway card's machine label (the exact lease.client_id join). */
+  machine: string;
+  /** The engine card name the lease's server_id names; null = none named
+   *  (the line reads job ⇢ machine, the tooltip says "engine not named"). */
+  engine: string | null;
+  /** The shared pipe tooltip — card line and pipe never disagree. */
+  title: string;
+  phase: PipePhase;
+  animated: boolean;
+  muted: boolean;
+  cross: boolean;
+};
+
+/** One running job drawn as a CONNECTION (the DRAIN law): the project card →
+ *  the gateway card of the worker running the job, and on to the engine card
+ *  the lease names. The view draws it as two segments sharing one pipe. */
+export type MeshDrain = {
+  id: string;
+  /** projectNodeId(project) → agentNodeId(worker's client). */
+  from: string;
+  to: string;
+  /** agentNodeId → engineNodeId(server); null = the lease names no engine
+   *  row — the chain STOPS at the gateway (named, never a guessed engine). */
+  engineTo: string | null;
+  job: string;
+  /** The project row's own name, EXACT (the tree row + tooltip). */
+  project: string;
+  /** The gateway's machine label (the exact join, not the lease's text). */
+  machine: string;
+  engineName: string | null;
+  pipe: PipeEdge;
+  title: string;
+  /** true = the job's engine sits on another machine than its gateway. */
+  cross: boolean;
+  /** Bezier fan-out for parallel chains between the same endpoints. */
+  curvature: number;
+  offset: number;
+};
+
 /** One arbiter project row as its OWN card in the fleet-side Projects stack
  *  (owner ask 2026-10-21 — the queue story moved out of the gateway card).
  *  Every field is the row's own DIRECT count: 0 renders 0. */
@@ -302,6 +371,13 @@ export type MeshProjectSlot = {
    *  worker.client_id → client row → frame, deduped. A worker with no
    *  client_id names no machine (never a similarity guess). */
   machines: string[];
+  /** The jobs running NOW (the arbiter's active leases for this project),
+   *  listed on the card; pipes ride `MeshGraph.drains` (paused projects
+   *  list, never pipe — the undrained count names what draws no chain). */
+  running: MeshDrainLine[];
+  /** The card height (projectCardH over the listed count) — layout and
+   *  view share it (fixed heights, no measuring). */
+  h: number;
 };
 
 export type MeshGraph = {
@@ -314,6 +390,13 @@ export type MeshGraph = {
   unhosted: number;
   /** The fleet-side Projects stack (one slot per arbiter project row). */
   projects: MeshProjectSlot[];
+  /** The running-job connections (the DRAIN law): one per active lease of a
+   *  NON-paused project whose worker joins a gateway card exactly. */
+  drains: MeshDrain[];
+  /** Running jobs drawing no pipe, named (the DRAIN law's honesty count):
+   *  no project row to start from, no gateway join to land on, or the
+   *  project is paused (listed on its card, gated off the canvas). */
+  undrained: { noProject: number; noGateway: number; paused: number };
 };
 
 const loadStaleS = (st: StateSnapshot): number => st.metrics_load_stale_s ?? LOAD_FRESHNESS_DEFAULT_S;
@@ -382,6 +465,30 @@ function agentSlot(c: ClientRow, now: number, machine: string): MeshAgentSlot {
     unprofiledSessions: [],
     h: AGENT_H,
   };
+}
+
+/** The pipe for a running job's chain (the DRAIN law). No lease-side phase
+ *  exists to read — the ENGINE side's published facts decide, on the exact
+ *  Sessions rules (engineEdge's posture + pipeEdge's engine clauses, the
+ *  same attribution posture as a session pipe's "engine queue depth N"):
+ *  a fresh live-load sample (in flight / tokens-per-second) streams blue,
+ *  a fresh queue depth warns dashed, degraded/absent signal is the honest
+ *  muted no-signal posture. A lease that names no engine row mutes with
+ *  "engine not named" — never an invented chain. */
+function drainPipe(engineRow: ServerRow | undefined, now: number): PipeEdge {
+  if (!engineRow) return { phase: "base", dashed: false, animated: false, muted: true, reason: "engine not named" };
+  const edge = engineEdge({ server_id: engineRow.id }, engineRow.signal ?? null);
+  const pipe = pipeEdge({ gate: undefined, phase: undefined }, edge, now);
+  // The live-load upgrade: the engine row says traffic is moving RIGHT NOW
+  // (fresh sample, work in flight) — the running job's pipe animates on it.
+  if (!pipe.dashed && !pipe.muted && !pipe.animated) {
+    const inFlight = nnum(engineRow.signal?.in_flight);
+    const tps = nnum(engineRow.signal?.tokens_per_second);
+    const fresh = edge.sampleAgeS !== null && edge.sampleAgeS <= EDGE_SAMPLE_STALE_S;
+    if (fresh && ((inFlight ?? 0) > 0 || (tps ?? 0) > 0))
+      return { phase: "output", dashed: false, animated: true, muted: false, reason: "engine streaming" };
+  }
+  return pipe;
 }
 
 function peerWord(p: MeshPeer, staleS: number): StateWord {
@@ -649,10 +756,96 @@ export function buildMeshGraph(st: StateSnapshot, now: number): MeshGraph {
       finishedToday: p.today?.finished ?? 0,
       failedToday: p.today?.failed ?? 0,
       machines,
+      running: [],
+      h: projectCardH(0),
     });
   }
 
-  return { frames, flows, controls, unflowed, unhosted: unhosted.length, projects };
+  // The running-job connections (the DRAIN law, owner ask 2026-10-21): one
+  // chain per ACTIVE lease — the grant the arbiter holds right now, the
+  // Projects tab's own "N running" fact. Every hop is an EXACT join: the
+  // lease's project names the card, its client_id names the gateway (no
+  // join names NO pipe, counted), its server_id names the engine row or the
+  // chain stops at the gateway (the tooltip says so). A paused project LISTS
+  // its running jobs but draws no pipes (gated, counted, never silent).
+  const drains: MeshDrain[] = [];
+  const undrained = { noProject: 0, noGateway: 0, paused: 0 };
+  const slotOfProject = new Map(projects.map((p) => [p.name, p]));
+  for (const l of st.active_leases ?? []) {
+    const slot = slotOfProject.get(l.project);
+    if (!slot) {
+      undrained.noProject++;
+      continue;
+    }
+    const gateway = l.client_id ? agentNodeId(l.client_id) : null;
+    if (!gateway || !agentSeen.has(gateway)) {
+      undrained.noGateway++;
+      continue;
+    }
+    // The gateway's machine label from the same hosted-clients join that put
+    // the card there (never the lease's client_name as a label).
+    const machine = frameOf.get(frameOfClient.get(l.client_id!) ?? "")?.name ?? l.client_name;
+    const engineRow = l.server_id ? serverById.get(l.server_id) : undefined;
+    const pipe = drainPipe(engineRow, now);
+    const engineMachine = engineRow ? machineOfEngine.get(engineRow.id) ?? null : null;
+    const cross = engineMachine !== null && engineMachine !== machine;
+    const elapsedS = Math.max(0, Math.round((now - l.granted_at) / 1000));
+    // The shared tooltip: the lease's own facts, worded — nothing the
+    // Projects tab's running-job row would not say.
+    const title =
+      `job ${l.job_id} · ${l.client_name} on ${machine}` +
+      ` · running ${minSec(elapsedS)}${l.estimated_seconds > 0 ? ` of ${durFmt(l.estimated_seconds)} estimate` : ""}` +
+      ` · in ${compact(l.tokens_in)} / out ${compact(l.tokens_out)}` +
+      (engineRow ? ` · engine ${engineRow.name}` : "") +
+      (pipe.reason ? ` · ${pipe.reason}` : "");
+    const drainId = `drain:${l.lease_id}`;
+    slot.running.push({
+      drainId,
+      job: l.job_id,
+      machine,
+      engine: engineRow?.name ?? null,
+      title,
+      phase: pipe.phase,
+      animated: pipe.animated,
+      muted: pipe.muted,
+      cross,
+    });
+    if (slot.paused) {
+      undrained.paused++;
+      continue;
+    }
+    drains.push({
+      id: drainId,
+      from: slot.id,
+      to: gateway,
+      engineTo: engineRow ? engineNodeId(engineRow.id) : null,
+      job: l.job_id,
+      project: slot.name,
+      machine,
+      engineName: engineRow?.name ?? null,
+      pipe,
+      title,
+      cross,
+      curvature: 0.25,
+      offset: 0,
+    });
+  }
+  // The project cards size to the running jobs they now list (the profile-
+  // card posture: fixed computed height, layout and view share it).
+  for (const p of projects) p.h = projectCardH(p.running.length);
+  // Fan-out: whole chains sharing all three endpoints curve apart, centered.
+  const dPair = new Map<string, MeshDrain[]>();
+  for (const d of drains) {
+    const k = `${d.from}→${d.to}→${d.engineTo ?? ""}`;
+    (dPair.get(k) ?? dPair.set(k, []).get(k)!).push(d);
+  }
+  for (const group of dPair.values()) {
+    group.forEach((d, i) => {
+      d.offset = group.length > 1 ? (i - (group.length - 1) / 2) * 28 : 0;
+    });
+  }
+
+  return { frames, flows, controls, unflowed, unhosted: unhosted.length, projects, drains, undrained };
 }
 
 // --- layout ---------------------------------------------------------------
@@ -789,10 +982,11 @@ export function meshChildOffsets(
 }
 
 /** The Projects stack's box (fixed math like every other box): the header
- *  IS the section label, then one PROJECT_H card per project, no measuring. */
+ *  IS the section label, then one card per project at its OWN computed
+ *  height (running jobs listed, the DRAIN law), no measuring. */
 export function projectsBoxSize(projects: MeshProjectSlot[]): { w: number; h: number } {
   const n = projects.length;
-  const cards = n > 0 ? n * PROJECT_H + (n - 1) * NODE_GAP : 0;
+  const cards = n > 0 ? projects.reduce((a, p) => a + p.h, 0) + (n - 1) * NODE_GAP : 0;
   return { w: FRAME_W, h: FRAME_PAD + PROJECTS_HEADER_H + cards + FRAME_PAD };
 }
 
@@ -803,7 +997,7 @@ export function meshProjectOffsets(projects: MeshProjectSlot[]): Map<string, { x
   let y = FRAME_PAD + PROJECTS_HEADER_H;
   for (const p of projects) {
     out.set(p.id, { x: FRAME_PAD, y });
-    y += PROJECT_H + NODE_GAP;
+    y += p.h + NODE_GAP;
   }
   return out;
 }
@@ -919,11 +1113,18 @@ export function layoutMesh(
   for (const c of graph.controls) {
     if (g.hasNode(c.from) && g.hasNode(c.to) && c.from !== c.to) g.setEdge(c.from, c.to, { weight: 3 });
   }
-  // Projects pull (weight 1): the stack ranks UPSTREAM of every machine whose
-  // gateway drains its queue (the exact worker.client_id join). This is
-  // layout placement ONLY — these pairs are drawn as edges nowhere.
-  for (const t of new Set(graph.projects.flatMap((p) => p.machines)))
-    if (g.hasNode(t)) g.setEdge(PROJECTS_BOX_ID, t, { weight: 1 });
+  // Projects pull (weight 1; weight 2 where a job is RUNNING — the DRAIN
+  // law's chains): the stack ranks UPSTREAM of every machine whose gateway
+  // drains its queue (the exact worker.client_id join) AND of every machine
+  // actually running one of its leases (the lease's OWN client_id join — a
+  // running job needs no worker-row join to name its machine). The queued-
+  // only pulls are layout placement ONLY; a machine actually running the
+  // queue also gets the drawn drain chains (project ⇢ gateway ⇢ engine),
+  // which rank through these same weighted pairs.
+  const runningFrames = new Set<string>();
+  for (const d of graph.drains) for (const f of graph.frames) if (f.agents.some((a) => a.id === d.to)) runningFrames.add(f.id);
+  const pullTargets = new Set<string>([...graph.projects.flatMap((p) => p.machines), ...runningFrames]);
+  for (const t of pullTargets) if (g.hasNode(t)) g.setEdge(PROJECTS_BOX_ID, t, { weight: runningFrames.has(t) ? 2 : 1 });
   // Flow edges (agent→engine): to the box each endpoint lives in. Aggregated
   // per box-pair so a busy machine pulls its neighbours upstream. Self-loops
   // (an agent feeding an engine in the SAME box — same machine, or both of a
