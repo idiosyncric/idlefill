@@ -11,8 +11,8 @@
     "executor": "bash {repo}/adapters/paperless-enrich/run.sh {payload_file} {result_file}",
     "payload_fields": ["url", "extra"],
     "result_hint": ["ok", "job_id", "doc_id", "tokens_out", "tokens_in", "classification", "applied", "verified", "error", "seconds"],
-    "estimated_seconds": 120,
-    "timeout_seconds": 600
+    "estimated_seconds": 300,
+    "timeout_seconds": 540
   },
   "scripts": {
     "test": "node --test *.test.mjs"
