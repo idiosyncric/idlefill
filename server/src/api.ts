@@ -25,6 +25,7 @@ import { collectHostStats } from './host.js';
 import { UpdateIntents, intentsFileOf, UPDATE_INTENT_TTL_S } from './update.js';
 import { verifyRequester, signEdgePayload, NonceReplayStore, EDGE_TS_SKEW_MS, type EdgeSignaturePayload } from './edges.js';
 import { isLoopbackAddress } from './catalog.js';
+import { openAgentHandoffFile } from './agent-profile-files.js';
 import type { LoadSignalView } from './load.js';
 import type { ClientRecord, CycleStatusRow, HermesJobRow, ProjectAllocation, QueuePreviewRow, RebuildRunState, ServerConfig, ServerConnection } from './types.js';
 
@@ -1047,6 +1048,27 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       return reply.code(res.reason === 'unknown_key' ? 404 : 400).send({ error: res.reason ?? 'invalid' });
     }
     return { ok: true, revoked: res.revoked };
+  });
+
+  /**
+   * POST /api/agent-profile/open (owner ask 2026-10-21): the mint hand-off's
+   * OPEN buttons — opens one Hermes hand-off file of a profile (its
+   * `config.yaml` or `.env`) with THIS machine's default editor, so the
+   * one-time block the dialog copies can be pasted into its real home.
+   * LOCAL-truth like GET /api/agent-roster: the dashboard is served by this
+   * machine's own arbiter, so the route names files on this box only; the
+   * target is fixed to `<profiles>/<profile>/{config.yaml|.env}` — validated
+   * name (the CLI's normalizeProfileName rules), containment-checked join,
+   * a missing FILE in an existing profile created EMPTY (the paste target,
+   * never contents), a missing PROFILE a named 404, never a created one.
+   * See server/src/agent-profile-files.ts. Body:
+   * `{ profile, file: 'config' | 'env' }` → `{ ok, path, created }`.
+   * Token-gated by the standard /api/* onRequest hook.
+   */
+  app.post('/api/agent-profile/open', async (req, reply) => {
+    const res = await openAgentHandoffFile(req.body);
+    if (!res.ok) return reply.code(res.status).send({ error: res.error });
+    return res;
   });
 
   // ------------------------------------------------------------------

@@ -1,6 +1,8 @@
 // The arbiter API client. Shape contract follows the /api/state ADD-key
 // discipline: fields are optional where the server added them later.
 
+import type { AgentHandoffFile } from "./agent-handoff";
+
 export type ServerModel = {
   name: string;
   running: boolean;
@@ -1123,6 +1125,24 @@ export async function revokeAgentKey(id: string) {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ id }),
+  }));
+}
+
+// The mint hand-off's OPEN button: opens the profile's Hermes hand-off file
+// (`config.yaml` / `.env`) in the MACHINE's default editor on the arbiter's
+// box (LOCAL-truth — the same discipline as the roster route; the server
+// pins the target to <profiles>/<profile>/{config.yaml|.env} and creates a
+// missing file EMPTY as the paste target). Rejects with the server's named
+// reason (no such profile / no Hermes home / no opener) — the caller keeps
+// the clipboard copy it made alongside the click.
+export async function openAgentProfileFile(
+  profile: string,
+  file: AgentHandoffFile,
+): Promise<{ ok: boolean; path: string; created: boolean }> {
+  return json(await fetch(`/api/agent-profile/open${qsToken()}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ profile, file }),
   }));
 }
 

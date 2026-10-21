@@ -25,11 +25,19 @@ import {
 } from "@/components/ui/select";
 import { copyText } from "@/lib/clipboard";
 import {
+  KEY_ENV_VAR,
+  configBlock,
+  defaultModelOf,
+  envBlock,
+  type AgentHandoffFile,
+} from "@/lib/agent-handoff";
+import {
   apiToken,
   getAgentKeys,
   getAgentEndpoints,
   getAgentRoster,
   mintAgentKey,
+  openAgentProfileFile,
   revokeAgentKey,
   type AgentEndpoint,
   type AgentKeyRow,
@@ -70,47 +78,8 @@ import { StatTiles, TilesSkeleton } from "@/components/stat-tiles";
 const AUTHORING_MS = 30_000;
 const AGENT_LABEL_MAX = 64; // the server's bound (POST /api/client-keys)
 
-// The env var the minted agent key is stored under. The config.yaml references
-// it via `key_env` (the secret stays in the .env, never inlined in the yaml).
-// Assembled at runtime: the write-path redactor eats whole key literals.
-const KEY_ENV_VAR = ["IDLEFILL", "API", "KEY"].join("_");
-
-// The default model a minted agent config names: the machine's highest-priority
-// alias (the first /v1/models entry), else the first bare name, else null.
-function defaultModelOf(ep: AgentEndpoint | undefined): string {
-  const m = ep?.model;
-  return typeof m === "string" && m.trim() !== "" ? m : "";
-}
-
-// The .env block: the minted key under its env var name. The plaintext rides
-// the copy button only — never a rendered field.
-function envBlock(token: string): string {
-  return `${KEY_ENV_VAR}=${token}\n`;
-}
-
-// The Hermes config.yaml block. `key_env` points at the .env var, so the
-// credential is never inlined in the yaml. The model name is baked into the
-// default, the provider's model, and the discovered-models map. When no model
-// resolved (no alias + no bare name on the machine) a sentinel name marks the
-// field for the operator to fill, and the dialog warns.
-function configBlock(url: string, model: string): string {
-  const m = model.trim() !== "" ? model : "REPLACE_ME";
-  return (
-    `model:\n` +
-    `  default: ${m}\n` +
-    `  provider: idlefill\n` +
-    `providers:\n` +
-    `  idlefill:\n` +
-    `    name: idlefill\n` +
-    `    base_url: ${url}\n` +
-    `    key_env: ${KEY_ENV_VAR}\n` +
-    `    model: ${m}\n` +
-    `    api_mode: chat_completions\n` +
-    `    models:\n` +
-    `      ${m}: {}\n` +
-    `    models_discovered: true\n`
-  );
-}
+// The hand-off blocks (envBlock/configBlock + the Hermes-schema contract)
+// live in lib/agent-handoff.ts — unit-tested against the pinned key set.
 
 export function Agents({ st }: { st: StateSnapshotLike | null }) {
   const [keys, setKeys] = React.useState<AgentKeyRow[]>([]);
@@ -533,7 +502,9 @@ function SessionSubRow({ s, now }: { s: SessionRow; now: number }) {
 
 // The mint dialog. Phase 1: label + machine pick. Phase 2 (minted): the
 // ONE-TIME hand-off block — the plaintext rides the in-memory state only;
-// the copy buttons read it, never a rendered field.
+// the open/copy buttons read it, never a rendered field. Each hand-off file
+// gets one button that opens the profile's real file in the machine's
+// default editor (POST /api/agent-profile/open) AND copies its block.
 function MintDialog({
   open,
   onOpenChange,
@@ -603,6 +574,31 @@ function MintDialog({
     });
   };
 
+  // One click, two effects: the block lands on the clipboard (the paste is
+  // the thing that must never fail) AND the real file opens in the machine's
+  // default editor — config.yaml / .env under the profile dir on the
+  // arbiter's box (the server pins the path; a missing file is created
+  // empty as the paste target). The two are independent: an open refusal
+  // (no such profile here) never eats the copy, and the copied label says
+  // honestly which of the two landed ("copied" vs "opened + copied").
+  const openHandoff = (which: AgentHandoffFile) => {
+    if (!minted) return;
+    const text = which === "env" ? envBlock(minted.token) : configBlock(minted.url, minted.model);
+    void Promise.allSettled([copyText(text), openAgentProfileFile(minted.label, which)]).then(
+      ([c, o]) => {
+        const copied = c.status === "fulfilled" && c.value;
+        if (c.status === "fulfilled" && !copied) toast.error("copy failed — select the block and copy by hand");
+        if (o.status === "rejected") {
+          toast.error(`open refused: ${(o.reason as Error).message}${copied ? " — block copied, paste it wherever it belongs" : ""}`);
+        }
+        if (copied) {
+          setCopied(`${which}:${o.status === "fulfilled" ? "opened" : "copied"}`);
+          window.setTimeout(() => setCopied(null), 1600);
+        }
+      },
+    );
+  };
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-md font-mono text-[12px]">
@@ -631,11 +627,23 @@ function MintDialog({
               </pre>
             </div>
             <DialogFooter>
-              <Button size="sm" variant="outline" className="h-7 text-[12px]" onClick={() => copy(envBlock(minted.token), "env")}>
-                {copied === "env" ? "copied" : "copy .env"}
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 text-[12px]"
+                onClick={() => openHandoff("env")}
+                title={`open ~/.hermes/profiles/${minted.label}/.env in the machine's default editor and copy the block for it`}
+              >
+                {copied === "env:opened" ? "opened + copied" : copied === "env:copied" ? "copied" : "open .env"}
               </Button>
-              <Button size="sm" variant="outline" className="h-7 text-[12px]" onClick={() => copy(configBlock(minted.url, minted.model), "config")}>
-                {copied === "config" ? "copied" : "copy config.yaml"}
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 text-[12px]"
+                onClick={() => openHandoff("config")}
+                title={`open ~/.hermes/profiles/${minted.label}/config.yaml in the machine's default editor and copy the block for it`}
+              >
+                {copied === "config:opened" ? "opened + copied" : copied === "config:copied" ? "copied" : "open config.yaml"}
               </Button>
               <Button size="sm" variant="outline" className="h-7 text-[12px]" onClick={() => copy(minted.token, "key")}>
                 {copied === "key" ? "copied" : "copy key"}
@@ -645,9 +653,11 @@ function MintDialog({
               </Button>
             </DialogFooter>
             <p className="text-[11px] text-dim">
-              Put the .env line in the agent's env, and the config.yaml block in the agent's Hermes config. The config
-              references the key via <code>{KEY_ENV_VAR}</code> (the secret stays in the .env, never inlined). The agent
-              presents this key to IDLEFILL at {minted.url}; IDLEFILL authenticates to the engine with the row
+              Each open button opens the agent profile's file on this machine (creating it empty if the profile lacks
+              one) AND copies its block — paste when the editor lands. The config references the key via{" "}
+              <code>{KEY_ENV_VAR}</code> (the secret stays in the .env, never inlined), and stamps{" "}
+              <code>x-hermes-session-id</code> so the aggregate router keeps the conversation's engine affinity. The
+              agent presents this key to IDLEFILL at {minted.url}; IDLEFILL authenticates to the engine with the row
               credential.
             </p>
           </>
