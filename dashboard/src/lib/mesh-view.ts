@@ -15,7 +15,9 @@
 // (`controls` / `controlledBy`) and `headerH` are recomputed against the
 // VISIBLE set, so a frame never names a control it can no longer draw.
 // `counts` is left untouched: the machine's joins are truth whether or not
-// the operator is showing the cards.
+// the operator is showing the cards. The fleet-side Projects stack (owner
+// ask 2026-10-21) rides the lens UNTOUCHED — it belongs to no machine, so
+// the machine/agent lens never hides it and the tally never counts it.
 // ---------------------------------------------------------------------------
 
 import type { MeshFrame, MeshGraph } from "./mesh-graph";

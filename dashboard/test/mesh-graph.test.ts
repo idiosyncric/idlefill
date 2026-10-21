@@ -16,6 +16,7 @@ import {
   AGENT_H,
   buildMeshGraph,
   engineNodeId,
+  foldReanchorFor,
   frameId,
   frameResourceIds,
   framedAgentCards,
@@ -24,9 +25,14 @@ import {
   machineShape,
   meshChildOffsets,
   meshFrameSize,
+  meshProjectOffsets,
   profileCardH,
   PROFILE_ROW_H,
   profileNodeId,
+  PROJECT_H,
+  PROJECTS_BOX_ID,
+  projectNodeId,
+  projectsBoxSize,
 } from "../src/lib/mesh-graph.js";
 import { LOCAL_MACHINE } from "../src/lib/hierarchy.js";
 import type { StateSnapshot } from "../src/lib/api.js";
@@ -610,4 +616,144 @@ test("a stamped session lists on its profile card and is never duplicated on the
   assert.deepEqual(a.unprofiledSessions.map((l) => l.shortToken), ["tok-b"]);
   assert.equal(a.h, AGENT_H + PROFILE_ROW_H);
   assert.deepEqual(a.profiles[0].sessions.map((l) => l.shortToken), ["tok-a"]);
+});
+
+// --- the gateway FOLD (owner ask 2026-10-21): folding a gateway card hides
+// the profile cards DOCKED under it — a broken-out card is its own box and
+// stays out, the docked pipes re-anchor onto the gateway card that contains
+// them, and the frame closes the gap the hidden cards left. The fold hides
+// CARDS, never sessions or counts (the glance keeps reading "profiles N"). --
+
+const FOLD_DAEMON = agentNodeId("cli-a");
+
+test("the fold hides the docked profile cards: stack, size and offsets follow", () => {
+  const f = rosterGraph.frames[0];
+  const folded = new Set([FOLD_DAEMON]);
+  const stack = framedAgentCards(f, new Set(), folded);
+  assert.deepEqual(stack.map((c) => c.id), [FOLD_DAEMON]); // the docked cards are away
+  assert.ok(meshFrameSize(f, new Set(), folded).h < meshFrameSize(f).h, "the frame shrinks");
+  const offs = meshChildOffsets(f, new Set(), folded);
+  assert.ok(offs.has(FOLD_DAEMON));
+  assert.ok(!offs.has(profileNodeId("cli-a", "web-dev")));
+  assert.ok(!offs.has(profileNodeId("cli-a", "pr-agent")));
+  // the engine card closes the gap the hidden cards left (the same posture
+  // a break-out takes — never a hole in the frame)
+  assert.ok(offs.get(engineNodeId("eng1"))!.y >= offs.get(FOLD_DAEMON)!.y + stack[0].h);
+});
+
+test("the fold hides DOCKED cards only: a broken-out profile keeps its box and its pipes", () => {
+  const webDev = profileNodeId("cli-a", "web-dev");
+  const prAgent = profileNodeId("cli-a", "pr-agent");
+  const folded = new Set([FOLD_DAEMON]);
+  const det = new Set([webDev]);
+  for (const mode of ["rank", "row"] as const) {
+    const pos = layoutMesh(rosterGraph, mode, det, folded);
+    assert.ok(pos.has(webDev), `${mode}: a broken-out profile folded away`);
+    assert.ok(!pos.has(prAgent), `${mode}: a folded docked card leaked top-level`);
+    assert.ok(pos.has(frameId(LOCAL_MACHINE)), `${mode}: machine box missing`);
+    for (const [, p] of pos) assert.ok(Number.isFinite(p.x) && Number.isFinite(p.y)); // still TOTAL
+  }
+  const re = foldReanchorFor(rosterGraph, folded, det);
+  assert.equal(re.get(prAgent), FOLD_DAEMON);
+  assert.ok(!re.has(webDev), "a floating card owns its own pipes");
+});
+
+test("folded docked pipes start on the gateway card; an empty fold moves nothing", () => {
+  const folded = new Set([FOLD_DAEMON]);
+  const re = foldReanchorFor(rosterGraph, folded);
+  assert.equal(re.get(profileNodeId("cli-a", "web-dev")), FOLD_DAEMON);
+  const moved = rosterGraph.flows.filter((fl) => re.has(fl.from)).map((fl) => fl.token).sort();
+  assert.deepEqual(moved, ["tok-owned1", "tok-owned2"]); // the two stamped sessions ride the fold
+  assert.deepEqual([...foldReanchorFor(rosterGraph, new Set())], []);
+});
+
+// --- the fleet-side PROJECTS stack (owner ask 2026-10-21): one card per
+// arbiter project row, the queue depth a DIRECT count (0 renders 0); which
+// machines drain a queue is the EXACT join worker.client_id → client row →
+// frame — no client_id names no machine, never a similarity guess. --------
+
+const workerRow = (client: string, queueDepth: number, online = true, clientId?: string) =>
+  ({
+    client,
+    client_id: clientId,
+    model: "m",
+    estimated_seconds: 60,
+    queue_depth: queueDepth,
+    queue_preview: [],
+    online,
+    stats: {},
+  }) as never;
+
+const projRow = (name: string, workers: never[], paused = false, failed = 0) =>
+  ({
+    name,
+    paused,
+    daily_token_cap: 0,
+    budget_today: { tokens_out: 0, tokens_in: 0, cap: 0 },
+    workers,
+    today: { finished: 3, failed },
+    scheduling: {},
+  }) as never;
+
+const projGraph = buildMeshGraph(
+  st({
+    mesh: {
+      instance_id: "i-mac",
+      peers: [{ url: "http://100.105.225.1:8787", name: "urza", instance_id: "i-urza", online: true, fetch_age_s: 3, snapshot: null }],
+    } as never,
+    servers: [srv("e1", "http://127.0.0.1:1")],
+    clients: [client("cli-m", "127.0.0.1", NOW - 1_000), client("cli-u", "100.105.225.1", NOW - 1_000)],
+    projects: [
+      projRow("idlefill", [workerRow("cli-m", 400, true, "cli-m"), workerRow("cli-u", 45, false, "cli-u")]),
+      projRow("solo", [workerRow("cli-ghost", 7, false)]),
+      projRow("parked", [], true),
+    ] as never,
+  }),
+  NOW,
+);
+
+test("one slot per arbiter project row: direct counts, EXACT drain joins only", () => {
+  assert.deepEqual(
+    projGraph.projects.map((p) => p.id),
+    [projectNodeId("idlefill"), projectNodeId("solo"), projectNodeId("parked")],
+  );
+  const idle = projGraph.projects[0];
+  assert.equal(idle.queued, 445); // the DIRECT sum of the workers' published depths
+  assert.deepEqual([idle.workers, idle.online], [2, 1]);
+  assert.deepEqual(idle.machines, [frameId(LOCAL_MACHINE), frameId("urza")]); // the exact joins, deduped
+  // a worker with no client_id names NO machine — never a guess by name
+  assert.deepEqual([projGraph.projects[1].queued, projGraph.projects[1].machines], [7, []]);
+  // an empty project is an honest zero, its paused flag carried
+  assert.deepEqual([projGraph.projects[2].queued, projGraph.projects[2].workers, projGraph.projects[2].paused], [0, 0, true]);
+});
+
+test("the Projects box sizes, offsets within itself, and rides both layout modes", () => {
+  const ps = projGraph.projects;
+  const { w, h } = projectsBoxSize(ps);
+  assert.equal(w, 330); // FRAME_W — the machine-box width, the cards are CARD_W inside
+  const offs = meshProjectOffsets(ps);
+  for (const p of ps) {
+    const o = offs.get(p.id)!;
+    assert.ok(o.y >= 0 && o.y + PROJECT_H <= h, `${p.id} overflows the box`);
+  }
+  for (const mode of ["rank", "row"] as const) {
+    const pos = layoutMesh(projGraph, mode);
+    const pp = pos.get(PROJECTS_BOX_ID);
+    assert.ok(pp, `${mode}: projects box not placed`);
+    assert.ok(Number.isFinite(pp.x) && Number.isFinite(pp.y) && pp.x >= 0 && pp.y >= 0);
+    for (const f of projGraph.frames) {
+      const fp = pos.get(f.id)!;
+      const s = meshFrameSize(f);
+      const disjoint = pp.x + w <= fp.x || fp.x + s.w <= pp.x || pp.y + h <= fp.y || fp.y + s.h <= pp.y;
+      assert.ok(disjoint, `${mode}: the projects box overlaps ${f.name}`);
+    }
+  }
+  // rank places the stack UPSTREAM of the machines whose gateways drain it
+  const rank = layoutMesh(projGraph, "rank");
+  assert.ok(rank.get(PROJECTS_BOX_ID)!.x < rank.get(frameId(LOCAL_MACHINE))!.x);
+});
+
+test("no projects rows: no stack, in the graph or in either layout mode", () => {
+  assert.deepEqual(graph.projects, []); // the base fixture names no project
+  for (const mode of ["rank", "row"] as const) assert.ok(!layoutMesh(graph, mode).has(PROJECTS_BOX_ID));
 });

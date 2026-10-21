@@ -33,8 +33,11 @@ import {
   ENGINE_H,
   FRAME_PAD,
   PROFILE_ROWS_MAX,
+  PROJECT_H,
+  PROJECTS_BOX_ID,
   SECTION_H,
   buildMeshGraph,
+  foldReanchorFor,
   framedAgentCards,
   frameResourceIds,
   hostEdgesFor,
@@ -42,7 +45,9 @@ import {
   machineShape,
   meshChildOffsets,
   meshFrameSize,
+  meshProjectOffsets,
   MODEL_SOURCE_NOTE,
+  projectsBoxSize,
   type MeshAgentSlot,
   type MeshEngineSlot,
   type MeshFlow,
@@ -50,6 +55,7 @@ import {
   type MeshGraph,
   type MeshProfileSession,
   type MeshProfileSlot,
+  type MeshProjectSlot,
 } from "@/lib/mesh-graph";
 import {
   MESH_LAYERS,
@@ -124,14 +130,34 @@ import type { StateSnapshot } from "@/lib/api";
 // gap. Saved VIEWS store a lens (incl. the isolate) + a layout mode (posi-
 // tions stay the browser's single map — a view picks the lens, not the
 // coordinates). All of it rides localStorage like the layout pick.
+//
+// THE GATEWAY CARD (owner ask 2026-10-21): the daemon card under the agents
+// section reads "hermes gateway" (the roster, the profile cards and the
+// ledger stamps are HERMES' own disclosure — the machine keeps its label on
+// the frame, the published client name rides the tooltip), and its glance
+// counts "profiles N", never "agents". The card FOLDS (a ▸/▾ chevron): a
+// folded gateway hides the profile cards DOCKED under it — a broken-out
+// profile card is its own box and stays out — while the glance still counts
+// the profiles and their pipes re-anchor onto the gateway card
+// (foldReanchorFor): the fold hides CARDS, never sessions. The fold rides
+// localStorage like the break-out set. The queued jobs the glance used to
+// carry now live in the PROJECTS stack: a fleet-side "Projects" box, one
+// card per arbiter project row, queue depth as the direct count (0 renders
+// 0) and "x of y workers online" under it — placed upstream of the machines
+// that drain it (the exact worker.client_id join).
 // ---------------------------------------------------------------------------
 
 const MODE_KEY = "idlefill.meshLayout";
 const POS_KEY = "idlefill.meshPos";
 const BROKEN_KEY = "idlefill.meshBroken";
+const COLLAPSE_KEY = "idlefill.meshCollapsed";
 const VIEW_KEY = "idlefill.meshView";
 const VIEWS_KEY = "idlefill.meshViews";
 type Mode = MeshViewMode;
+
+/** The gateway card's title (owner ask 2026-10-21) — the daemon fronts the
+ *  machine's local Hermes gateway, so the card reads as the gateway. */
+const GATEWAY_LABEL = "hermes gateway";
 
 const TONE: Record<StateWord["tone"], string> = {
   ok: "text-ok",
@@ -151,11 +177,26 @@ const PIPE_STROKE: Record<PipeEdge["phase"], string> = {
   tools: "var(--pipe-tools)",
 };
 
-type FrameData = { kind: "machine"; frame: MeshFrame; detached: ReadonlySet<string>; onAction: (name: string) => void };
+type FrameData = {
+  kind: "machine";
+  frame: MeshFrame;
+  detached: ReadonlySet<string>;
+  collapsed: ReadonlySet<string>;
+  onAction: (name: string) => void;
+};
 type ChipData = { kind: "chip"; frame: MeshFrame; onAction: (name: string) => void };
 type EngineData = { kind: "engine"; engine: MeshEngineSlot; detached: boolean };
-type AgentData = { kind: "agent"; agent: MeshAgentSlot; detached: boolean };
+type AgentData = {
+  kind: "agent";
+  agent: MeshAgentSlot;
+  detached: boolean;
+  /** This gateway card FOLDED: its docked profile cards are hidden. */
+  folded: boolean;
+  onFold: (id: string) => void;
+};
 type ProfileData = { kind: "profile"; profile: MeshProfileSlot; detached: boolean };
+type ProjectsData = { projects: MeshProjectSlot[] };
+type ProjectData = { project: MeshProjectSlot };
 type FlowData = { pipe: PipeEdge; title: string; curvature: number; offset: number };
 type ControlData = { label: string };
 type HostData = { label: string };
@@ -210,14 +251,15 @@ function MachineInfo({ f, action }: { f: MeshFrame; action?: ReactNode }) {
 }
 
 function MachineNode({ data }: NodeProps) {
-  const { frame: f, detached, onAction } = data as unknown as FrameData;
+  const { frame: f, detached, collapsed, onAction } = data as unknown as FrameData;
   // The section hairline labels sit exactly above the first card of each
   // framed section — the same offsets the layout used (detached cards are
-  // gone from the stack), so they never drift.
-  const offsets = meshChildOffsets(f, detached);
+  // gone from the stack, a folded gateway's docked profile cards are too),
+  // so they never drift.
+  const offsets = meshChildOffsets(f, detached, collapsed);
   // The agents section starts at the first card of the framed agent stack —
   // a daemon or, when the daemon floated out, its first profile card.
-  const firstAgentCard = framedAgentCards(f, detached)[0];
+  const firstAgentCard = framedAgentCards(f, detached, collapsed)[0];
   const agentOff = firstAgentCard ? offsets.get(firstAgentCard.id) : undefined;
   const engineOff = f.engines.map((e) => offsets.get(e.id)).find((o): o is { x: number; y: number } => !!o);
   const ids = frameResourceIds(f);
@@ -338,7 +380,7 @@ function EngineNode({ data }: NodeProps) {
 }
 
 function AgentNode({ data }: NodeProps) {
-  const { agent: a, detached } = data as unknown as AgentData;
+  const { agent: a, detached, folded, onFold } = data as unknown as AgentData;
   const word: StateWord = a.override
     ? {
         label: a.override === "pause" ? "paused" : "forced",
@@ -348,21 +390,46 @@ function AgentNode({ data }: NodeProps) {
     : a.online
       ? { label: "online", tone: "ok", note: "heartbeat under 90s" }
       : { label: "offline", tone: "dim", note: "last heartbeat over 90s ago" };
+  // The glance (owner ask 2026-10-21): the queued total + the roster as
+  // PROFILES. The project count left this card — the Projects stack spells
+  // each queue as its own card now.
   const parts: string[] = [];
-  if (a.projects > 0) parts.push(`${a.projects} ${a.projects === 1 ? "project" : "projects"}`);
   if (a.queueDepth > 0) parts.push(`${compact(a.queueDepth)} queued`);
-  if (a.agents !== null && a.agents > 0) parts.push(`${a.agents} agents`);
+  if (a.agents !== null && a.agents > 0) parts.push(`profiles ${a.agents}`);
   return (
     <div className={`mesh-card h-full w-full ${a.online ? "" : "opacity-55"}`}>
       <div className="flex items-center gap-2 px-2.5 pt-2">
         <PresenceDot word={word} />
-        <span className="truncate font-mono text-[12px] font-semibold">{a.name}</span>
+        <span
+          className="truncate font-mono text-[12px] font-semibold"
+          title={`the ${a.machine} Hermes gateway daemon (published client ${a.name})`}
+        >
+          {GATEWAY_LABEL}
+        </span>
         {detached && (
           <span className="shrink-0 text-[10px] text-dim" title={`this daemon runs on ${a.machine} (exact join)`}>
             on {a.machine.toLowerCase()}
           </span>
         )}
-        <span className={`ml-auto shrink-0 text-[11px] ${TONE[word.tone]}`}>{word.label}</span>
+        <span className="ml-auto flex shrink-0 items-center gap-1.5">
+          <span className={`text-[11px] ${TONE[word.tone]}`}>{word.label}</span>
+          {/* FOLD the docked profile cards (owner ask 2026-10-21): hidden from
+              the frame while folded, their pipes ride this card, the glance
+              above keeps counting them — cards away, never sessions away. */}
+          {a.profiles.length > 0 && (
+            <button
+              className="mesh-pop nodrag nopan"
+              title={
+                folded
+                  ? `expand — show the ${a.profiles.length} docked profile ${a.profiles.length === 1 ? "card" : "cards"}`
+                  : `fold — hide the ${a.profiles.length} profile ${a.profiles.length === 1 ? "card" : "cards"} docked under this gateway`
+              }
+              onClick={() => onFold(a.id)}
+            >
+              {folded ? "▸" : "▾"}
+            </button>
+          )}
+        </span>
       </div>
       <div className="truncate px-2.5 pt-0.5 text-[11px] text-dim">
         {parts.length > 0 ? parts.join(" · ") : "idle"}
@@ -469,7 +536,74 @@ function ProfileNode({ data }: NodeProps) {
   );
 }
 
-const nodeTypes = { machine: MachineNode, chip: ChipNode, engine: EngineNode, agent: AgentNode, profile: ProfileNode };
+/** The fleet-side "Projects" stack (owner ask 2026-10-21): the machine-style
+ *  header IS the section label, and its glance sums the rows underneath it —
+ *  the same direct counts, never a merge with the machine joins. */
+function ProjectsNode({ data }: NodeProps) {
+  const { projects } = data as unknown as ProjectsData;
+  const queued = projects.reduce((a, p) => a + p.queued, 0);
+  const workers = projects.reduce((a, p) => a + p.workers, 0);
+  const online = projects.reduce((a, p) => a + p.online, 0);
+  return (
+    <div className="mesh-frame h-full w-full">
+      <div className="flex items-center gap-2 px-3 pt-2.5">
+        <span className="truncate font-mono text-[13px] font-semibold tracking-[0.5px]">Projects</span>
+        <span className="ml-auto shrink-0 text-[11px] text-dim" title="queued jobs across every project (direct worker counts)">
+          {compact(queued)} queued
+        </span>
+      </div>
+      <div className="px-3 pt-1 text-[11px] leading-[1.6] text-dim">
+        <div>
+          {projects.length} {projects.length === 1 ? "project" : "projects"} ·{" "}
+          {workers > 0
+            ? `${online} of ${workers} ${workers === 1 ? "worker" : "workers"} online`
+            : "no workers connected for any project"}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** One arbiter project row as its own card: the queue depth is the hero, the
+ *  worker coverage the honest sub (0 renders 0 — the Projects tab's rule). */
+function ProjectNode({ data }: NodeProps) {
+  const { project: p } = data as unknown as ProjectData;
+  const word: StateWord = p.paused
+    ? { label: "paused", tone: "dim", note: "this project's scheduling is paused" }
+    : p.queued > 0
+      ? { label: "queued", tone: "warn", note: "jobs waiting in this project's queue" }
+      : { label: "idle", tone: "dim", note: "nothing queued on this project" };
+  return (
+    <div className={`mesh-card h-full w-full ${p.paused ? "opacity-55" : ""}`}>
+      <div className="flex items-center gap-2 px-2.5 pt-1.5">
+        <PresenceDot word={word} />
+        <span className="truncate font-mono text-[11px] font-semibold" title={`arbiter project row ${p.name}`}>
+          {p.name}
+        </span>
+        <span className={`ml-auto shrink-0 text-[11px] ${p.queued > 0 ? "text-warn" : "text-dim"}`}>
+          {compact(p.queued)} queued
+        </span>
+      </div>
+      <div className="truncate px-2.5 pt-0.5 text-[10px] text-dim">
+        {p.workers > 0
+          ? `${p.online} of ${p.workers} ${p.workers === 1 ? "worker" : "workers"} online`
+          : "no workers connected"}
+        {p.paused && <span className="text-warn"> · paused</span>}
+        {p.failedToday > 0 && <span className="text-warn"> · {p.failedToday} failed today</span>}
+      </div>
+    </div>
+  );
+}
+
+const nodeTypes = {
+  machine: MachineNode,
+  chip: ChipNode,
+  engine: EngineNode,
+  agent: AgentNode,
+  profile: ProfileNode,
+  projects: ProjectsNode,
+  project: ProjectNode,
+};
 
 // --- edge components -------------------------------------------------------
 
@@ -593,6 +727,21 @@ function readBroken(): Set<string> {
     return new Set();
   }
 }
+// FOLDED gateway cards (the ▸ gesture, owner ask 2026-10-21): daemon NODE ids
+// whose docked profile cards are hidden. Same localStorage posture as the
+// break-out set; sanitize to daemon ids only (a `#profile` id folds no card).
+function readCollapsed(): Set<string> {
+  try {
+    const raw = localStorage.getItem(COLLAPSE_KEY);
+    if (!raw) return new Set();
+    const arr: unknown = JSON.parse(raw);
+    return new Set(
+      Array.isArray(arr) ? arr.filter((x): x is string => typeof x === "string" && x.startsWith("agt:") && !x.includes("#")) : [],
+    );
+  } catch {
+    return new Set();
+  }
+}
 // The sidebar lens (layers + hidden elements) and the saved views ride the
 // same localStorage posture; BOTH sanitize on read — a hand-edited or stale
 // entry yields the default lens, never a crash or a half-trusted shape.
@@ -657,10 +806,13 @@ function Canvas({
   tick,
   detached,
   detachedKey,
+  collapsed,
+  collapsedKey,
   showHosts,
   isoKey,
   onMachineAction,
   onSetResource,
+  onFold,
   onDragged,
 }: {
   graph: MeshGraph | null;
@@ -668,10 +820,13 @@ function Canvas({
   tick: number;
   detached: ReadonlySet<string>;
   detachedKey: string;
+  collapsed: ReadonlySet<string>;
+  collapsedKey: string;
   showHosts: boolean;
   isoKey: string;
   onMachineAction: (name: string) => void;
   onSetResource: (id: string, on: boolean) => void;
+  onFold: (id: string) => void;
   onDragged: (id: string, pos: { x: number; y: number }) => Map<string, { x: number; y: number }>;
 }) {
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
@@ -731,14 +886,17 @@ function Canvas({
       setEdges([]);
       return;
     }
-    const auto = layoutMesh(graph, mode === "free" ? "rank" : mode, detached);
+    const auto = layoutMesh(graph, mode === "free" ? "rank" : mode, detached, collapsed);
+    // The FOLD re-anchor (owner ask 2026-10-21): pipes that started on a
+    // folded gateway's docked profile card start on the gateway card instead.
+    const reanchor = foldReanchorFor(graph, collapsed, detached);
     const next: Node[] = [];
     const resDraggable = mode === "free" || superHeld; // floating cards: free-move, or super-dock
     const childDraggable = superHeld; // framed cards: draggable ONLY for the gesture
     for (const f of graph.frames) {
       const isChip = machineShape(f, detached) === "chip";
       const pos = (mode === "free" ? dragPos.current.get(f.id) : undefined) ?? auto.get(f.id) ?? { x: 0, y: 0 };
-      const size = isChip ? { w: CHIP_W, h: f.headerH } : meshFrameSize(f, detached);
+      const size = isChip ? { w: CHIP_W, h: f.headerH } : meshFrameSize(f, detached, collapsed);
       next.push({
         id: f.id,
         type: isChip ? "chip" : "machine",
@@ -749,11 +907,11 @@ function Canvas({
         selectable: false,
         data: isChip
           ? { kind: "chip", frame: f, onAction: onMachineAction } satisfies ChipData
-          : { kind: "machine", frame: f, detached, onAction: onMachineAction } satisfies FrameData,
+          : { kind: "machine", frame: f, detached, collapsed, onAction: onMachineAction } satisfies FrameData,
       });
       // Cards still inside the frame (never when the whole machine floats).
       if (!isChip) {
-        const offsets = meshChildOffsets(f, detached);
+        const offsets = meshChildOffsets(f, detached, collapsed);
         for (const a of f.agents) {
           if (!detached.has(a.id))
             next.push({
@@ -766,12 +924,14 @@ function Canvas({
               height: a.h,
               draggable: childDraggable,
               selectable: false,
-              data: { kind: "agent", agent: a, detached: false } satisfies AgentData,
+              data: { kind: "agent", agent: a, detached: false, folded: collapsed.has(a.id), onFold } satisfies AgentData,
             });
           // The daemon's roster profiles: each its own card, nested under
-          // it in the same frame (containment — the exact roster join).
+          // it in the same frame (containment — the exact roster join). A
+          // folded gateway's DOCKED cards are not drawn at all (the layout
+          // already closed the gap; their pipes re-anchored above).
           for (const p of a.profiles)
-            if (!detached.has(p.id))
+            if (!detached.has(p.id) && !reanchor.has(p.id))
               next.push({
                 id: p.id,
                 type: "profile",
@@ -812,7 +972,7 @@ function Canvas({
             height: a.h,
             draggable: resDraggable,
             selectable: false,
-            data: { kind: "agent", agent: a, detached: true } satisfies AgentData,
+            data: { kind: "agent", agent: a, detached: true, folded: collapsed.has(a.id), onFold } satisfies AgentData,
           });
         for (const p of a.profiles)
           if (detached.has(p.id))
@@ -839,6 +999,37 @@ function Canvas({
             selectable: false,
             data: { kind: "engine", engine: e, detached: true } satisfies EngineData,
           });
+    }
+    // The fleet-side PROJECTS stack (owner ask 2026-10-21): one box, one card
+    // per arbiter project row, the same in-view-child posture the frames use.
+    if (graph.projects.length > 0) {
+      const psize = projectsBoxSize(graph.projects);
+      const ppos =
+        (mode === "free" ? dragPos.current.get(PROJECTS_BOX_ID) : undefined) ?? auto.get(PROJECTS_BOX_ID) ?? { x: 0, y: 0 };
+      next.push({
+        id: PROJECTS_BOX_ID,
+        type: "projects",
+        position: ppos,
+        width: psize.w,
+        height: psize.h,
+        draggable: mode === "free",
+        selectable: false,
+        data: { projects: graph.projects } satisfies ProjectsData,
+      });
+      const poffs = meshProjectOffsets(graph.projects);
+      for (const p of graph.projects)
+        next.push({
+          id: p.id,
+          type: "project",
+          position: poffs.get(p.id) ?? { x: FRAME_PAD, y: FRAME_PAD },
+          parentId: PROJECTS_BOX_ID,
+          extent: "parent",
+          width: CARD_W,
+          height: PROJECT_H,
+          draggable: false,
+          selectable: false,
+          data: { project: p } satisfies ProjectData,
+        });
     }
     const nextEdges: Edge[] = [];
     for (const c of graph.controls) {
@@ -870,7 +1061,9 @@ function Canvas({
     for (const fl of graph.flows) {
       nextEdges.push({
         id: fl.id,
-        source: fl.from,
+        // A folded gateway hides the card its pipe started on — the pipe
+        // re-anchors to the gateway that CONTAINS the card (never drops).
+        source: reanchor.get(fl.from) ?? fl.from,
         target: fl.to,
         sourceHandle: "agt-r",
         targetHandle: "eng-l",
@@ -891,7 +1084,7 @@ function Canvas({
       fitted.current = true;
       window.setTimeout(() => rf.fitView({ padding: 0.08, duration: 300 }), 60);
     }
-  }, [graph, mode, tick, detached, detachedKey, showHosts, superHeld, gesture, onMachineAction, setNodes, setEdges, rf]);
+  }, [graph, mode, tick, detached, detachedKey, collapsed, collapsedKey, showHosts, superHeld, gesture, onMachineAction, onFold, setNodes, setEdges, rf]);
 
   // A layout pick, re-layout, a break/dock or an isolate change re-frames
   // the graph (a deliberate action).
@@ -899,7 +1092,7 @@ function Canvas({
   useEffect(() => {
     const id = window.setTimeout(() => rf.fitView({ padding: 0.08, duration: 300 }), 60);
     return () => window.clearTimeout(id);
-  }, [mode, tick, framesLen, detachedKey, isoKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [mode, tick, framesLen, detachedKey, collapsedKey, isoKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const saveDrag = useCallback(
     (_: unknown, n: Node) => {
@@ -931,10 +1124,10 @@ function Canvas({
       const f = graph?.frames.find((fr) => fr.id === machineId);
       const n = rf.getNode(machineId);
       if (!f || !n) return null;
-      const s = machineShape(f, detached) === "chip" ? { w: CHIP_W, h: f.headerH } : meshFrameSize(f, detached);
+      const s = machineShape(f, detached) === "chip" ? { w: CHIP_W, h: f.headerH } : meshFrameSize(f, detached, collapsed);
       return { x: n.position.x, y: n.position.y, w: s.w, h: s.h };
     },
-    [graph, rf, detached],
+    [graph, rf, detached, collapsed],
   );
 
   const overBox = (cx: number, cy: number, b: { x: number; y: number; w: number; h: number }) =>
@@ -999,7 +1192,15 @@ function Canvas({
         zoomable
         maskColor="color-mix(in srgb, var(--bg) 70%, transparent)"
         nodeColor={(n) =>
-          n.type === "machine" ? "#30363d" : n.type === "engine" ? "#58a6ff" : n.type === "profile" ? "#d29922" : "#3fb950"
+          n.type === "machine" || n.type === "projects"
+            ? "#30363d"
+            : n.type === "engine"
+              ? "#58a6ff"
+              : n.type === "profile"
+                ? "#d29922"
+                : n.type === "project"
+                  ? "#bc8cff"
+                  : "#3fb950"
         }
       />
       <Controls showInteractive={false} />
@@ -1019,6 +1220,11 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
   // expands them to that machine's resources once the graph exists, and the
   // first write persists the new spelling.
   const [brokenRaw, setBrokenRaw] = useState<Set<string>>(readBroken);
+  // FOLDED gateway cards (the ▸ gesture, owner ask 2026-10-21): daemon node
+  // ids whose docked profile cards are hidden. A view preference persisted
+  // in the browser like the break-out set; a folded gateway's profile-card
+  // pipes ride the gateway card (foldReanchorFor), never disappear.
+  const [collapsed, setCollapsed] = useState<Set<string>>(readCollapsed);
   // The SIDEBAR lens: layer visibility + individually hidden elements, and
   // the saved (named) views that store a lens + a layout mode. Persisted in
   // this browser like the layout pick; the sidebar reads/writes both.
@@ -1054,6 +1260,17 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
     return out;
   }, [brokenRaw, viewGraph]);
   const detachedKey = [...detached].sort().join("|");
+  const collapsedKey = [...collapsed].sort().join("|");
+  // Fold / unfold one gateway card (the ▸ gesture on the card itself).
+  const toggleFold = useCallback((id: string) => {
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      localStorage.setItem(COLLAPSE_KEY, JSON.stringify([...next]));
+      return next;
+    });
+  }, []);
 
   const setResources = useCallback(
     (ids: string[], on: boolean) => {
@@ -1253,6 +1470,7 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
   const engines = viewGraph?.frames.reduce((a, f) => a + f.engines.length, 0) ?? 0;
   const agents = viewGraph?.frames.reduce((a, f) => a + f.agents.length, 0) ?? 0;
   const profiles = viewGraph?.frames.reduce((a, f) => a + f.agents.reduce((x, ag) => x + ag.profiles.length, 0), 0) ?? 0;
+  const projectCount = viewGraph?.projects.length ?? 0;
   const brokenMachines = viewGraph?.frames.filter((f) => frameResourceIds(f).some((id) => detached.has(id))).length ?? 0;
   const liveFlows = viewGraph?.flows.length ?? 0;
   const held = viewGraph?.flows.filter((f) => f.pipe.phase === "queued").length ?? 0;
@@ -1262,7 +1480,9 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
   const hiddenEdges = tally.flows + tally.controls;
 
   const summary =
-    `${viewGraph?.frames.length ?? 0} machines · ${engines} engines · ${agents} ${agents === 1 ? "daemon" : "daemons"} · ` +
+    `${viewGraph?.frames.length ?? 0} machines · ` +
+    (projectCount > 0 ? `${projectCount} ${projectCount === 1 ? "project" : "projects"} · ` : "") +
+    `${engines} engines · ${agents} ${agents === 1 ? "daemon" : "daemons"} · ` +
     `${profiles} ${profiles === 1 ? "profile" : "profiles"} · ` +
     `${liveFlows} live ${liveFlows === 1 ? "flow" : "flows"}${held > 0 ? ` (${held} waiting)` : ""}` +
     (prefs.isolated !== null
@@ -1353,10 +1573,13 @@ export function Mesh({ st }: { st: StateSnapshot | null }) {
               tick={tick}
               detached={detached}
               detachedKey={detachedKey}
+              collapsed={collapsed}
+              collapsedKey={collapsedKey}
               showHosts={prefs.layers.hosts}
               isoKey={`${prefs.isolated ?? ""}|${isolatedLost}`}
               onMachineAction={machineAction}
               onSetResource={setResource}
+              onFold={toggleFold}
               onDragged={onDragged}
             />
           </ReactFlowProvider>

@@ -317,3 +317,37 @@ test("ISOLATE a machine keeps the profile cards inside it and the pipes between 
   assert.equal(tally.agents, 0);
   assert.equal(tally.flows, 0);
 });
+
+// The fleet-side Projects stack (owner ask 2026-10-21) belongs to NO machine:
+// no lens hides it and the tally never counts it — machine hides, the agents
+// layer and even an isolate all leave it exactly as the join drew it.
+test("the Projects stack rides EVERY lens untouched — it belongs to no machine", () => {
+  const g = buildMeshGraph(
+    st({
+      clients: [client("c", "127.0.0.1")],
+      projects: [
+        {
+          name: "p1",
+          paused: false,
+          daily_token_cap: 0,
+          budget_today: { tokens_out: 0, tokens_in: 0, cap: 0 },
+          workers: [],
+          today: { finished: 0, failed: 0 },
+          scheduling: {},
+        },
+      ] as never,
+    }),
+    NOW,
+  );
+  assert.deepEqual(g.projects.map((p) => p.id), ["prj:p1"]);
+  for (const p of [
+    defaultMeshPrefs(),
+    prefs({ isolated: frameId(LOCAL_MACHINE) }),
+    prefs({ hidden: [frameId(LOCAL_MACHINE)] }),
+    prefs({ layers: { ...defaultMeshPrefs().layers, agents: false } }),
+  ]) {
+    const lens = applyMeshView(g, p);
+    assert.deepEqual(lens.graph.projects.map((x) => x.id), ["prj:p1"]);
+    assert.equal(lens.graph.projects[0].id, "prj:p1");
+  }
+});
